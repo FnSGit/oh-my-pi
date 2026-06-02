@@ -10,7 +10,7 @@ import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { readFile } from "../capability/fs";
-import { type Hook, hookCapability } from "../capability/hook";
+import { type ClaudeHookEvent, type ClaudeHooksConfig, type Hook, hookCapability } from "../capability/hook";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import { type Settings, settingsCapability } from "../capability/settings";
 import { type Skill, skillCapability } from "../capability/skill";
@@ -343,6 +343,70 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 // Hooks
 // =============================================================================
 
+/**
+ * Map Claude Code hook event names to omp hook type (pre/post).
+ */
+function claudeEventToHookType(event: ClaudeHookEvent): "pre" | "post" {
+	switch (event) {
+		case "PreToolUse":
+		case "PreCompact":
+		case "PermissionRequest":
+		case "UserPromptSubmit":
+			return "pre";
+		default:
+			return "post";
+	}
+}
+
+/**
+ * Parse Claude Code hooks from settings.json and convert to Hook items.
+ */
+function parseClaudeHooksConfig(
+	config: ClaudeHooksConfig,
+	settingsPath: string,
+	level: "user" | "project",
+): Hook[] {
+	const items: Hook[] = [];
+
+	for (const [eventName, matcherGroups] of Object.entries(config)) {
+		if (!Array.isArray(matcherGroups)) continue;
+		const claudeEvent = eventName as ClaudeHookEvent;
+
+		for (const group of matcherGroups) {
+			const matcher = group.matcher ?? "*";
+			const hooks = group.hooks;
+			if (!Array.isArray(hooks)) continue;
+
+			for (let i = 0; i < hooks.length; i++) {
+				const handler = hooks[i];
+				// Only support command-type hooks for now
+				if (handler.type !== "command" || !handler.command) continue;
+
+				const hookType = claudeEventToHookType(claudeEvent);
+				const tool = matcher === "*" || matcher === "" ? "*" : matcher;
+				const name = `${claudeEvent}:${handler.command}:${i}`;
+				const syntheticPath = `claude-hook:${claudeEvent}:${matcher}:${i}`;
+				items.push({
+					name,
+					path: syntheticPath,
+					type: hookType,
+					tool,
+					level,
+					command: handler.command,
+					args: handler.args ?? [],
+					timeout: handler.timeout,
+					ifCondition: handler.if,
+					claudeEvent,
+					matcher,
+					_source: createSourceMeta(PROVIDER_ID, settingsPath, level),
+				});
+			}
+		}
+	}
+
+	return items;
+}
+
 async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 	const items: Hook[] = [];
 	const warnings: string[] = [];
@@ -354,6 +418,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 
 	const hookTypes = ["pre", "post"] as const;
 
+	// --- Load file-based hooks from .claude/hooks/{pre,post}/ ---
 	const loadTasks: { dir: string; hookType: "pre" | "post"; level: "user" | "project" }[] = [];
 	for (const hookType of hookTypes) {
 		loadTasks.push({ dir: path.join(userHooksDir, hookType), hookType, level: "user" });
@@ -385,9 +450,31 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 		if (result.warnings) warnings.push(...result.warnings);
 	}
 
+	// --- Load command-based hooks from .claude/settings.json ---
+	const settingsPaths: { filePath: string; level: "user" | "project" }[] = [
+		{ filePath: path.join(userBase, "settings.json"), level: "user" },
+		{ filePath: path.join(projectBase, "settings.json"), level: "project" },
+	];
+
+	for (const { filePath, level } of settingsPaths) {
+		const content = await readFile(filePath);
+		if (!content) continue;
+
+		let data: Record<string, unknown>;
+		try {
+			data = JSON.parse(content) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		if (!data || typeof data.hooks !== "object" || !data.hooks) continue;
+
+		const hooksConfig = data.hooks as ClaudeHooksConfig;
+		const parsed = parseClaudeHooksConfig(hooksConfig, filePath, level);
+		items.push(...parsed);
+	}
+
 	return { items, warnings };
 }
-
 // =============================================================================
 // Custom Tools
 // =============================================================================

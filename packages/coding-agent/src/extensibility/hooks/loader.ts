@@ -4,7 +4,7 @@
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
 import * as zod from "zod/v4";
-import { hookCapability } from "../../capability/hook";
+import { type ClaudeHookEvent, hookCapability } from "../../capability/hook";
 import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
 import type { HookMessage } from "../../session/messages";
@@ -223,35 +223,171 @@ export async function loadHooks(paths: string[], cwd: string): Promise<LoadHooks
 }
 
 /**
+ * Map Claude Code hook events to omp internal event names.
+ */
+const CLAUDE_EVENT_MAP: Record<ClaudeHookEvent, string> = {
+	PreToolUse: "tool_call",
+	PostToolUse: "tool_result",
+	PreCompact: "session_before_compact",
+	PostCompact: "session_compact",
+	Notification: "session_start",
+	SessionStart: "session_start",
+	SessionEnd: "session_shutdown",
+	Stop: "session_shutdown",
+	StopFailure: "session_shutdown",
+	UserPromptSubmit: "context",
+	SubagentStart: "agent_start",
+	SubagentStop: "agent_end",
+	PermissionRequest: "tool_call",
+	PermissionDenied: "tool_call",
+};
+
+/**
+ * Create a synthetic LoadedHook that executes a shell command for a Claude Code hook.
+ * The command receives event data as JSON on stdin and returns results on stdout.
+ */
+function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook {
+	const handlers = new Map<string, HandlerFn[]>();
+	const messageRenderers = new Map<string, HookMessageRenderer>();
+	const commands = new Map<string, RegisteredCommand>();
+
+	// Determine which omp event(s) this hook subscribes to
+	const ompEvent = discoveredHook.claudeEvent
+		? CLAUDE_EVENT_MAP[discoveredHook.claudeEvent] ?? "tool_call"
+		: discoveredHook.type === "pre"
+			? "tool_call"
+			: "tool_result";
+
+	// Register a handler that spawns the command
+	const handler: HandlerFn = async (event: unknown, _ctx: unknown) => {
+		const timeoutMs = (discoveredHook.timeout ?? 30) * 1000;
+		const command = discoveredHook.command!;
+		const args = discoveredHook.args ?? [];
+
+		// Build the stdin JSON payload following Claude Code's protocol
+		const stdinPayload = JSON.stringify(event);
+
+		try {
+			const result = await execCommand(command, args, cwd, {
+				timeout: timeoutMs,
+				stdin: stdinPayload,
+			});
+
+			// Parse stdout for JSON decisions
+			const stdout = result.stdout.trim();
+			if (!stdout) {
+				// Exit 0 with no output = no decision, continue normally
+				return undefined;
+			}
+
+			try {
+				const decision = JSON.parse(stdout);
+				// Handle Claude Code hook output format
+				const output = decision.hookSpecificOutput ?? decision;
+				if (discoveredHook.claudeEvent === "PreToolUse") {
+					if (output.permissionDecision === "deny" || output.decision === "block") {
+						return { block: true, reason: output.permissionDecisionReason ?? output.reason ?? "Blocked by hook" };
+					}
+					if (output.permissionDecision === "allow" || output.decision === "allow") {
+						return { block: false };
+					}
+				}
+				if (discoveredHook.claudeEvent === "PreCompact") {
+					if (output.decision === "block") {
+						return { cancel: true, reason: output.reason ?? "Blocked by hook" };
+					}
+					if (output.custom_instructions) {
+						return { compaction: { summary: output.custom_instructions } };
+					}
+				}
+				// For informational events, stdout content is used as context
+				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
+					return { messages: [{ type: "text", text: stdout }] };
+				}
+				return undefined;
+			} catch {
+				// Non-JSON stdout: for informational events, use as context
+				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
+					return { messages: [{ type: "text", text: stdout }] };
+				}
+				return undefined;
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			logger.warn(`Claude command hook failed: ${command}`, { error: message });
+			// Fail-safe: for pre hooks, block on error; for post hooks, ignore
+			if (discoveredHook.type === "pre") {
+				return { block: true, reason: `Hook command failed: ${message}` };
+			}
+			return undefined;
+		}
+	};
+
+	handlers.set(ompEvent, [handler]);
+
+	// Also subscribe to the alternate event for tool_call/tool_result if matcher is set
+	if (ompEvent === "tool_call" && discoveredHook.tool && discoveredHook.tool !== "*") {
+		// The handler already checks nothing about tool name —
+		// the matcher check is done by the runner/wrapper layer
+	}
+
+	return {
+		path: discoveredHook.path,
+		resolvedPath: discoveredHook.path,
+		handlers,
+		messageRenderers,
+		commands,
+		setSendMessageHandler: (_handler: SendMessageHandler) => {},
+		setAppendEntryHandler: (_handler: AppendEntryHandler) => {},
+	};
+}
+
+/**
  * Discover and load hooks from all registered providers.
- * Uses the capability API to discover hook paths from:
- * 1. OMP native configs (.omp/.pi hooks/)
- * 2. Installed plugins
- * 3. Other editor/IDE configurations
- *
- * Plus any explicitly configured paths from settings.
+ * Handles both JS/TS module hooks and command-based hooks from Claude Code settings.json.
  */
 export async function discoverAndLoadHooks(configuredPaths: string[], cwd: string): Promise<LoadHooksResult> {
-	const allPaths: string[] = [];
+	const modulePaths: string[] = [];
+	const commandHooks: Hook[] = [];
 	const seen = new Set<string>();
 
-	// Helper to add paths without duplicates
-	const addPaths = (paths: string[]) => {
-		for (const p of paths) {
-			const resolved = path.resolve(p);
-			if (!seen.has(resolved)) {
-				seen.add(resolved);
-				allPaths.push(p);
-			}
+	const addPath = (p: string) => {
+		const resolved = path.resolve(p);
+		if (!seen.has(resolved)) {
+			seen.add(resolved);
+			modulePaths.push(p);
 		}
 	};
 
 	// 1. Discover hooks via capability API
 	const discovered = await loadCapability<Hook>(hookCapability.id, { cwd });
-	addPaths(discovered.items.map(hook => hook.path));
+
+	for (const hook of discovered.items) {
+		if (hook.command) {
+			// Command-based hook (from settings.json) — create synthetic LoadedHook
+			const key = `${hook.type}:${hook.tool}:${hook.name}`;
+			if (key && !seen.has(key)) {
+				seen.add(key);
+				commandHooks.push(hook);
+			}
+		} else {
+			// File-based hook — need to import as JS/TS module
+			addPath(hook.path);
+		}
+	}
 
 	// 2. Explicitly configured paths (can override/add)
-	addPaths(configuredPaths.map(p => resolvePath(p, cwd)));
+	for (const p of configuredPaths) {
+		addPath(resolvePath(p, cwd));
+	}
 
-	return loadHooks(allPaths, cwd);
+	// Load JS/TS module hooks
+	const result = await loadHooks(modulePaths, cwd);
+
+	// Load command hooks
+	for (const hook of commandHooks) {
+		result.hooks.push(createCommandHook(hook, cwd));
+	}
+
+	return result;
 }
