@@ -2257,9 +2257,21 @@ function buildParams(
 	disableStrictTools = false,
 ): MessageCreateParamsStreaming {
 	const { cacheControl } = getCacheControl(model, baseUrl, options?.cacheRetention, isOAuthToken);
+	const messages = convertAnthropicMessages(context.messages, model, isOAuthToken);
+	// Defense in depth: Anthropic (and any compatible proxy) rejects a request
+	// with `messages: []` (HTTP 400, "messages is required"). If upstream
+	// filtering — extension/hook context handlers, aborts, compaction, image
+	// resize — produced an empty conversation, surface the bug here instead of
+	// burning a 400 round-trip and a noisy proxy error log.
+	if (messages.length === 0) {
+		throw new Error(
+			`anthropic: refusing to build request with empty messages for model ${model.id} (provider ${model.provider}). ` +
+				`Context had ${context.messages.length} input messages; all were filtered out before reaching the provider.`,
+		);
+	}
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
-		messages: convertAnthropicMessages(context.messages, model, isOAuthToken),
+		messages,
 		max_tokens: options?.maxTokens || model.maxTokens,
 		stream: true,
 	};
