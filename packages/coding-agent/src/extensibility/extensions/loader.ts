@@ -11,6 +11,7 @@ import type { KeyId } from "@oh-my-pi/pi-tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import * as Zod from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
+import { type ClaudeHookEvent, type Hook, hookCapability } from "../../capability/hook";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -276,6 +277,157 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		flags: new Map(),
 		shortcuts: new Map(),
 	};
+}
+
+/**
+ * Map Claude Code hook events to omp extension event names.
+ */
+const CLAUDE_EVENT_MAP: Record<ClaudeHookEvent, string> = {
+	PreToolUse: "tool_call",
+	PostToolUse: "tool_result",
+	PreCompact: "session_before_compact",
+	PostCompact: "session_compact",
+	Notification: "session_start",
+	SessionStart: "session_start",
+	SessionEnd: "session_shutdown",
+	Stop: "session_shutdown",
+	StopFailure: "session_shutdown",
+	UserPromptSubmit: "context",
+	SubagentStart: "agent_start",
+	SubagentStop: "agent_end",
+	PermissionRequest: "tool_call",
+	PermissionDenied: "tool_call",
+};
+
+/**
+ * Create a synthetic Extension from a Claude Code command-based hook.
+ * The hook command receives event data as JSON on stdin and returns results on stdout.
+ */
+function createClaudeCommandExtension(discoveredHook: Hook, cwd: string): Extension {
+	const ext = createExtension(discoveredHook.path, discoveredHook.path);
+
+	const ompEvent = discoveredHook.claudeEvent
+		? CLAUDE_EVENT_MAP[discoveredHook.claudeEvent] ?? "tool_call"
+		: discoveredHook.type === "pre"
+			? "tool_call"
+			: "tool_result";
+
+	const matcher = discoveredHook.tool ?? discoveredHook.matcher ?? "*";
+
+	const handler: HandlerFn = async (event: unknown, _ctx: unknown) => {
+		// Matcher check: skip if scoped to a specific tool and the event doesn't match
+		if (matcher !== "*" && matcher !== "") {
+			const toolName = (event as Record<string, unknown>)?.toolName as string | undefined;
+			if (toolName && matcher !== toolName) return undefined;
+		}
+
+		const timeoutMs = (discoveredHook.timeout ?? 30) * 1000;
+		const command = discoveredHook.command!;
+		const args = discoveredHook.args ?? [];
+
+		// Build Claude Code compatible stdin payload
+		const sessionId = (event as Record<string, unknown>)?.sessionId as string | undefined;
+		let stdinPayload: Record<string, unknown>;
+		switch (discoveredHook.claudeEvent) {
+			case "PreToolUse":
+			case "PostToolUse": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					tool_name: ev.toolName ?? matcher,
+					tool_input: ev.toolInput ?? ev.input ?? {},
+					...(discoveredHook.claudeEvent === "PostToolUse" ? { tool_output: ev.toolOutput ?? ev.output ?? "" } : {}),
+					session_id: sessionId ?? "",
+				};
+				break;
+			}
+			case "PreCompact": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					conversation: ev.conversation ?? ev.transcript ?? "",
+					custom_instructions: ev.customInstructions ?? "",
+				};
+				break;
+			}
+			case "UserPromptSubmit": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					prompt: ev.prompt ?? ev.content ?? "",
+					custom_instructions: ev.customInstructions ?? "",
+				};
+				break;
+			}
+			case "Stop":
+			case "StopFailure": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					transcript_path: ev.transcriptPath ?? "",
+					stop_hook_active: ev.stopHookActive ?? false,
+				};
+				break;
+			}
+			default: {
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					...(event as Record<string, unknown> ?? {}),
+				};
+				break;
+			}
+		}
+		const stdinStr = JSON.stringify(stdinPayload);
+
+		try {
+			const result = await execCommand(command, args, cwd, {
+				timeout: timeoutMs,
+				stdin: stdinStr,
+			});
+
+			const stdout = result.stdout.trim();
+			if (!stdout) return undefined;
+
+			try {
+				const decision = JSON.parse(stdout);
+				const output = decision.hookSpecificOutput ?? decision;
+				if (discoveredHook.claudeEvent === "PreToolUse") {
+					if (output.permissionDecision === "deny" || output.decision === "block") {
+						return { block: true, reason: output.permissionDecisionReason ?? output.reason ?? "Blocked by hook" };
+					}
+					if (output.permissionDecision === "allow" || output.decision === "allow") {
+						return { block: false };
+					}
+				}
+				if (discoveredHook.claudeEvent === "PreCompact") {
+					if (output.decision === "block") {
+						return { cancel: true, reason: output.reason ?? "Blocked by hook" };
+					}
+					if (output.custom_instructions) {
+						return { compaction: { summary: output.custom_instructions } };
+					}
+				}
+				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
+					return { messages: [{ type: "text", text: stdout }] };
+				}
+				return undefined;
+			} catch {
+				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
+					return { messages: [{ type: "text", text: stdout }] };
+				}
+				return undefined;
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			logger.warn(`Claude command hook failed: ${command}`, { error: message });
+			if (discoveredHook.type === "pre") {
+				return { block: true, reason: `Hook command failed: ${message}` };
+			}
+			return undefined;
+		}
+	};
+
+	ext.handlers.set(ompEvent, [handler]);
+	return ext;
 }
 
 async function loadExtension(
@@ -545,5 +697,16 @@ export async function discoverAndLoadExtensions(
 		addPath(resolved);
 	}
 
-	return loadExtensions(allPaths, cwd, eventBus);
+	const result = await loadExtensions(allPaths, cwd, eventBus);
+
+	// 4. Discover command-based hooks from Claude Code settings.json
+	//    and inject them as synthetic Extension objects into the runner.
+	const discoveredHooks = await loadCapability<Hook>(hookCapability.id, { cwd });
+	for (const hook of discoveredHooks.items) {
+		if (!hook.command) continue; // file-based hooks are already loaded as extension modules
+		const syntheticExt = createClaudeCommandExtension(hook, cwd);
+		result.extensions.push(syntheticExt);
+	}
+
+	return result;
 }
