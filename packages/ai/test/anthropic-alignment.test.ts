@@ -1574,3 +1574,76 @@ describe("cch attestation", () => {
 		}
 	});
 });
+
+describe("Anthropic empty-messages guard", () => {
+	const XUFEI_MODEL: Model<"anthropic-messages"> = {
+		...ANTHROPIC_MODEL,
+		id: "xopglm51",
+		name: "Xunfei xopglm51",
+		provider: "xufei",
+		baseUrl: "https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic",
+	};
+
+	// `streamAnthropic` runs in an async IIFE; a `buildParams` throw is pushed
+	// as an "error" event rather than thrown synchronously. Drain the stream
+	// and surface the captured AssistantMessage's errorMessage.
+	const captureError = async (context: Context): Promise<string | undefined> => {
+		const stream = streamAnthropic(XUFEI_MODEL, context, {
+			apiKey: "sk-test",
+			signal: createAbortedSignal(),
+		});
+		let captured: string | undefined;
+		for await (const evt of stream) {
+			if (evt.type === "error") {
+				captured = (evt as { error: { errorMessage?: string } }).error?.errorMessage;
+			}
+		}
+		return captured;
+	};
+
+	it("emits an error before sending when context.messages is empty (regression: 400 'messages is required')", async () => {
+		const errMsg = await captureError({
+			systemPrompt: ["x-anthropic-billing-header: cc_version=test; cc_entrypoint=cli; cch=00000;"],
+			messages: [], // <-- the bug: an extension/hook/compaction emptied the context
+			tools: [],
+		});
+		expect(errMsg).toBeDefined();
+		expect(errMsg).toContain("refusing to build request with empty messages");
+		expect(errMsg).toContain("xopglm51");
+		expect(errMsg).toContain("xufei");
+	});
+
+	it("does not emit the empty-messages error when context has at least one message", async () => {
+		// Use onPayload to short-circuit before the actual fetch — we just want
+		// to confirm buildParams didn't reject the non-empty context.
+		const stream = streamAnthropic(XUFEI_MODEL, {
+			systemPrompt: ["x-anthropic-billing-header: cc_version=test; cc_entrypoint=cli; cch=00000;"],
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+			tools: [],
+		}, {
+			apiKey: "sk-test",
+			signal: createAbortedSignal(),
+			onPayload: () => {
+				// Returning a replacement payload causes streamAnthropic to use it
+				// instead of issuing a real request. The aborted signal would
+				// otherwise surface as "Request was aborted" via the stream.
+				return {
+					model: "xopglm51",
+					messages: [{ role: "user", content: "hello" }],
+					max_tokens: 1024,
+					stream: true,
+				};
+			},
+		});
+		let sawEmptyError = false;
+		for await (const evt of stream) {
+			if (evt.type === "error") {
+				const errMsg = (evt as { error: { errorMessage?: string } }).error?.errorMessage ?? "";
+				if (errMsg.includes("refusing to build request with empty messages")) {
+					sawEmptyError = true;
+				}
+			}
+		}
+		expect(sawEmptyError).toBe(false);
+	});
+});
