@@ -247,6 +247,88 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("context event override", () => {
+		const makeUserMsg = (id: string) =>
+			({ role: "user" as const, content: `msg-${id}`, timestamp: Date.now() });
+
+		const runContextHandler = async (handlerSource: string, input: any[]) => {
+			fs.writeFileSync(path.join(extensionsDir, "context-handler.ts"), handlerSource);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			return runner.emitContext(input);
+		};
+
+		// Note: ExtensionRunner.emitContext does a structuredClone of the input
+		// before any handler runs, so we use `.toEqual` (deep) rather than
+		// `.toBe` (reference) for content-preservation assertions.
+
+		it("keeps original messages when handler returns { messages: [] } (regression: empty array is truthy in JS)", async () => {
+			const input = [makeUserMsg("u1"), makeUserMsg("u2")];
+			const result = await runContextHandler(
+				`export default function(pi) { pi.on("context", async () => ({ messages: [] })); }`,
+				input,
+			);
+			expect(result).toEqual(input);
+			expect(result).toHaveLength(2);
+		});
+
+		it("keeps original messages when handler returns { messages: undefined }", async () => {
+			const input = [makeUserMsg("u1")];
+			const result = await runContextHandler(
+				`export default function(pi) { pi.on("context", async () => ({ messages: undefined })); }`,
+				input,
+			);
+			expect(result).toEqual(input);
+		});
+
+		it("keeps original messages when handler returns nothing", async () => {
+			const input = [makeUserMsg("u1")];
+			const result = await runContextHandler(
+				`export default function(pi) { pi.on("context", async () => undefined); }`,
+				input,
+			);
+			expect(result).toEqual(input);
+		});
+
+		it("applies override when handler returns a non-empty array", async () => {
+			const input = [makeUserMsg("original")];
+			const override = [makeUserMsg("override")];
+			const result = await runContextHandler(
+				`export default function(pi) { pi.on("context", async () => ({ messages: ${JSON.stringify(override)} })); }`,
+				input,
+			);
+			expect(result).toEqual(override);
+		});
+
+		it("chains handlers — absent field on the second preserves the first's override", async () => {
+			// Two extensions in same dir; runner chains them in load order.
+			fs.writeFileSync(
+				path.join(extensionsDir, "ctx-1.ts"),
+				`export default function(pi) { pi.on("context", async () => ({ messages: [${JSON.stringify(makeUserMsg("first"))}] })); }`,
+			);
+			fs.writeFileSync(
+				path.join(extensionsDir, "ctx-2.ts"),
+				`export default function(pi) { pi.on("context", async () => ({})); }`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const output = await runner.emitContext([makeUserMsg("original")]);
+			expect(output.map((m: any) => m.content)).toEqual(["msg-first"]);
+		});
+	});
+
 	describe("error handling", () => {
 		it("calls error listeners when handler throws", async () => {
 			const extCode = `
