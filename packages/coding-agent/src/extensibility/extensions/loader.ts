@@ -706,6 +706,7 @@ export async function discoverAndLoadExtensions(
 		if (!hook.command) continue; // file-based hooks are already loaded as extension modules
 		const syntheticExt = createClaudeCommandExtension(hook, cwd);
 		result.extensions.push(syntheticExt);
+		logger.info(`Loaded Claude command hook: ${hook.claudeEvent}/${hook.tool} → ${hook.command}`);
 	}
 
 	return result;

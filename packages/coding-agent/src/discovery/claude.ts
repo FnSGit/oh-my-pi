@@ -12,8 +12,9 @@ import { type ExtensionModule, extensionModuleCapability } from "../capability/e
 import { readFile } from "../capability/fs";
 import { type ClaudeHookEvent, type ClaudeHooksConfig, type Hook, hookCapability } from "../capability/hook";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
-import { type Settings, settingsCapability } from "../capability/settings";
+import { type Rule, ruleCapability } from "../capability/rule";
 import { type Skill, skillCapability } from "../capability/skill";
+import { type Settings, settingsCapability } from "../capability/settings";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import { type CustomTool, toolCapability } from "../capability/tool";
@@ -21,6 +22,7 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import { settings } from "../config/settings";
 import {
 	calculateDepth,
+	buildRuleFromMarkdown,
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
@@ -594,6 +596,40 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	return { items, warnings };
 }
 
+
+// =============================================================================
+// Rules
+// =============================================================================
+
+async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
+	const items: Rule[] = [];
+	const warnings: string[] = [];
+
+	const userRulesDir = path.join(getUserClaude(ctx), "rules");
+	const projectRulesDir = path.join(getProjectClaude(ctx), "rules");
+
+	const [userResult, projectResult] = await Promise.all([
+		loadFilesFromDir<Rule>(ctx, userRulesDir, PROVIDER_ID, "user", {
+			extensions: ["mdc", "md"],
+			transform: (name, content, filePath, source) =>
+				buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(mdc|md)$/ }),
+		}),
+		loadFilesFromDir<Rule>(ctx, projectRulesDir, PROVIDER_ID, "project", {
+			extensions: ["mdc", "md"],
+			transform: (name, content, filePath, source) =>
+				buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(mdc|md)$/ }),
+		}),
+	]);
+
+	items.push(...userResult.items);
+	if (userResult.warnings) warnings.push(...userResult.warnings);
+
+	items.push(...projectResult.items);
+	if (projectResult.warnings) warnings.push(...projectResult.warnings);
+
+	return { items, warnings };
+}
+
 // =============================================================================
 // Provider Registration
 // =============================================================================
@@ -644,6 +680,14 @@ registerProvider<Hook>(hookCapability.id, {
 	description: "Load hooks from .claude/hooks/pre/ and .claude/hooks/post/",
 	priority: PRIORITY,
 	load: loadHooks,
+});
+
+registerProvider<Rule>(ruleCapability.id, {
+	id: PROVIDER_ID,
+	displayName: DISPLAY_NAME,
+	description: "Load rules from .claude/rules/*.mdc and .claude/rules/*.md",
+	priority: PRIORITY,
+	load: loadRules,
 });
 
 registerProvider<CustomTool>(toolCapability.id, {
