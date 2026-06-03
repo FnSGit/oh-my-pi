@@ -802,8 +802,19 @@ export class ExtensionRunner {
 					extensionHandlerTimeoutMs,
 				);
 
-				if (handlerResult && (handlerResult as ContextEventResult).messages) {
-					currentMessages = (handlerResult as ContextEventResult).messages!;
+				// Treat absent/empty `messages` as "handler chose not to override":
+				// the original truthy check mis-classified `{ messages: [] }` as a
+				// valid override and wiped the LLM context, causing the provider to
+				// 400 with "messages is required". A defensive `length > 0` guard
+				// means the only way to actually clear the context is for the
+				// upstream `buildParams` defense-in-depth check to fire (which
+				// raises a clear error) rather than silently produce an invalid
+				// request.
+				if (handlerResult) {
+					const result = handlerResult as ContextEventResult;
+					if (result.messages && result.messages.length > 0) {
+						currentMessages = result.messages;
+					}
 				}
 			}
 		}
