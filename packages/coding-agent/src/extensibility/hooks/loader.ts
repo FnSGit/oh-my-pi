@@ -260,17 +260,75 @@ function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook {
 
 	// Register a handler that spawns the command
 	const handler: HandlerFn = async (event: unknown, _ctx: unknown) => {
+		// Matcher check: skip if this hook is scoped to a specific tool and the event doesn't match
+		const matcher = discoveredHook.tool ?? discoveredHook.matcher ?? "*";
+		if (matcher !== "*" && matcher !== "") {
+			const toolName = (event as Record<string, unknown>)?.toolName as string | undefined;
+			if (toolName && matcher !== toolName) return undefined;
+		}
+
 		const timeoutMs = (discoveredHook.timeout ?? 30) * 1000;
 		const command = discoveredHook.command!;
 		const args = discoveredHook.args ?? [];
 
-		// Build the stdin JSON payload following Claude Code's protocol
-		const stdinPayload = JSON.stringify(event);
+		// Build Claude Code compatible stdin payload
+		const sessionId = (event as Record<string, unknown>)?.sessionId as string | undefined;
+		let stdinPayload: Record<string, unknown>;
+		switch (discoveredHook.claudeEvent) {
+			case "PreToolUse":
+			case "PostToolUse": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					tool_name: ev.toolName ?? matcher,
+					tool_input: ev.toolInput ?? ev.input ?? {},
+					...(discoveredHook.claudeEvent === "PostToolUse" ? { tool_output: ev.toolOutput ?? ev.output ?? "" } : {}),
+					session_id: sessionId ?? "",
+				};
+				break;
+			}
+			case "PreCompact": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					conversation: ev.conversation ?? ev.transcript ?? "",
+					custom_instructions: ev.customInstructions ?? "",
+				};
+				break;
+			}
+			case "UserPromptSubmit": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					prompt: ev.prompt ?? ev.content ?? "",
+					custom_instructions: ev.customInstructions ?? "",
+				};
+				break;
+			}
+			case "Stop":
+			case "StopFailure": {
+				const ev = event as Record<string, unknown>;
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					transcript_path: ev.transcriptPath ?? "",
+					stop_hook_active: ev.stopHookActive ?? false,
+				};
+				break;
+			}
+			default: {
+				// SessionStart, SessionEnd, Notification, SubagentStart/Stop, etc.
+				stdinPayload = {
+					session_id: sessionId ?? "",
+					...(event as Record<string, unknown> ?? {}),
+				};
+				break;
+			}
+		}
+		const stdinStr = JSON.stringify(stdinPayload);
 
 		try {
 			const result = await execCommand(command, args, cwd, {
 				timeout: timeoutMs,
-				stdin: stdinPayload,
+				stdin: stdinStr,
 			});
 
 			// Parse stdout for JSON decisions
@@ -325,11 +383,6 @@ function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook {
 
 	handlers.set(ompEvent, [handler]);
 
-	// Also subscribe to the alternate event for tool_call/tool_result if matcher is set
-	if (ompEvent === "tool_call" && discoveredHook.tool && discoveredHook.tool !== "*") {
-		// The handler already checks nothing about tool name —
-		// the matcher check is done by the runner/wrapper layer
-	}
 
 	return {
 		path: discoveredHook.path,
