@@ -1974,20 +1974,24 @@ export function litellmModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "http://localhost:4000/v1";
-	const references = createBundledReferenceMap<"openai-completions">("litellm");
 	return {
 		providerId: "litellm",
-		fetchDynamicModels: () =>
-			fetchOpenAICompatibleModels({
+		// litellm is a local-only proxy whose /v1/models returns bare ids with no
+		// metadata, and it is never bundled in models.json (that would leak the
+		// machine's localhost catalog). It proxies known upstream models, so we
+		// enrich discovered ids against models.dev — the same reference source the
+		// gateway providers (fireworks et al.) use — instead of a bundled map.
+		fetchDynamicModels: async () => {
+			const modelsDevReferences = await loadModelsDevReferences<"openai-completions">();
+			return fetchOpenAICompatibleModels({
 				api: "openai-completions",
 				provider: "litellm",
 				baseUrl,
 				apiKey,
-				mapModel: (entry, defaults) => {
-					const reference = references.get(defaults.id);
-					return mapWithBundledReference(entry, defaults, reference);
-				},
-			}),
+				mapModel: (entry, defaults) =>
+					mapWithBundledReference(entry, defaults, modelsDevReferences.get(defaults.id)),
+			});
+		},
 	};
 }
 
@@ -2471,19 +2475,32 @@ function createOpenCodeApiResolution(
 	};
 }
 
-const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen");
+// OpenCode Zen: models.dev declares minimax-m3-free (and forward-compat
+// minimax-m3) with `provider.npm = "@ai-sdk/anthropic"`, but the Zen gateway
+// only serves them at https://opencode.ai/zen/v1/chat/completions (verified
+// against the live /v1/models response — minimax-m3-free is listed there, and
+// the gateway has no /v1/messages route for it). Without this override the
+// resolver POSTs anthropic-shaped requests to /v1/messages and the UI surfaces
+// raw <invoke>/<|minimax|>/<tool_call> markup (#1617).
+const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen", {
+	"minimax-m3": "openai-completions",
+	"minimax-m3-free": "openai-completions",
+});
 // OpenCode Go: models.dev declares minimax-m2.7 / qwen3.5-plus / qwen3.6-plus
-// with `provider.npm = "@ai-sdk/anthropic"`, but the OpenCode Go gateway only
-// serves them at `https://opencode.ai/zen/go/v1/chat/completions` (verified
-// against https://opencode.ai/zen/go/v1/models and the upstream endpoint
-// table at https://opencode.ai/docs/go/#endpoints — minimax-m2.5 works the
-// same way and lacks an `npm` field on models.dev so it already falls through
-// to the openai-completions default). Without this override the resolver
-// would POST anthropic-style requests to /v1/messages and the gateway would
-// return its `Page Not Found` HTML (issue #887). Override the resolver so
-// regenerating models.json keeps the correct routing.
+// (and now also minimax-m3) with `provider.npm = "@ai-sdk/anthropic"`, but
+// the OpenCode Go gateway only serves them at
+// `https://opencode.ai/zen/go/v1/chat/completions` (verified against
+// https://opencode.ai/zen/go/v1/models and the upstream endpoint table at
+// https://opencode.ai/docs/go/#endpoints — minimax-m2.5 works the same way
+// and lacks an `npm` field on models.dev so it already falls through to the
+// openai-completions default). Without this override the resolver would POST
+// anthropic-style requests to /v1/messages and the gateway would return its
+// `Page Not Found` HTML (issue #887 for the qwen/m2.7 entries; minimax-m3
+// and minimax-m3-free added under #1617 for the same root cause).
 const OPENCODE_GO_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen/go", {
 	"minimax-m2.7": "openai-completions",
+	"minimax-m3": "openai-completions",
+	"minimax-m3-free": "openai-completions",
 	"qwen3.5-plus": "openai-completions",
 	"qwen3.6-plus": "openai-completions",
 });

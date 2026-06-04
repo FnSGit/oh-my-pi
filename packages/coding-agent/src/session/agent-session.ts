@@ -55,6 +55,7 @@ import {
 	shouldCompact,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "@oh-my-pi/pi-agent-core/compaction/pruning";
+import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
 import type {
 	AssistantMessage,
 	Context,
@@ -163,9 +164,11 @@ import { parseTurnBudget } from "../modes/turn-budget";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
 import { computeNonMessageTokens } from "../modes/utils/context-usage";
 import { containsWorkflow, WORKFLOW_NOTICE } from "../modes/workflow";
+import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
+import emptyStopRetryTemplate from "../prompts/system/empty-stop-retry.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
@@ -200,7 +203,7 @@ import type { CheckpointState } from "../tools/checkpoint";
 import { outputMeta } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 import { isAutoQaEnabled } from "../tools/report-tool-issue";
-import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo-write";
+import { getLatestTodoPhasesFromEntries, type TodoItem, type TodoPhase } from "../tools/todo";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import { parseCommandArgs } from "../utils/command-args";
@@ -274,6 +277,8 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
+
+const EMPTY_STOP_MAX_RETRIES = 3;
 
 export interface AsyncJobSnapshot {
 	running: AsyncJobSnapshotItem[];
@@ -995,6 +1000,7 @@ export class AgentSession {
 	#checkpointState: CheckpointState | undefined = undefined;
 	#pendingRewindReport: string | undefined = undefined;
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
+	#emptyStopRetryCount = 0;
 	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
@@ -1600,17 +1606,19 @@ export class AgentSession {
 		if (event.type === "message_update" && this.#ttsrManager?.hasRules()) {
 			const assistantEvent = event.assistantMessageEvent;
 			let matchContext: TtsrMatchContext | undefined;
+			let streamingToolCall: ToolCall | undefined;
 
 			if (assistantEvent.type === "text_delta") {
 				matchContext = { source: "text" };
 			} else if (assistantEvent.type === "thinking_delta") {
 				matchContext = { source: "thinking" };
 			} else if (assistantEvent.type === "toolcall_delta") {
-				matchContext = this.#getTtsrToolMatchContext(event.message, assistantEvent.contentIndex);
+				streamingToolCall = this.#getStreamingToolCallBlock(event.message, assistantEvent.contentIndex);
+				matchContext = this.#getTtsrToolMatchContext(streamingToolCall, assistantEvent.contentIndex);
 			}
 
 			if (matchContext && "delta" in assistantEvent) {
-				const matches = this.#ttsrManager.checkDelta(assistantEvent.delta, matchContext);
+				const matches = this.#checkTtsrStream(assistantEvent.delta, matchContext, streamingToolCall);
 				if (matches.length > 0) {
 					// Decide first: a non-interrupting tool-source match attaches to the
 					// specific tool call's result instead of driving a loop-wide follow-up.
@@ -1769,6 +1777,7 @@ export class AgentSession {
 				if (
 					assistantMsg.stopReason !== "error" &&
 					assistantMsg.stopReason !== "aborted" &&
+					!this.#isEmptyAssistantStop(assistantMsg) &&
 					this.#retryAttempt > 0
 				) {
 					if (this.#activeRetryFallback && this.model) {
@@ -1798,21 +1807,21 @@ export class AgentSession {
 				if (toolName === "edit" && details?.path) {
 					this.#invalidateFileCacheForPath(details.path);
 				}
-				if (toolName === "todo_write" && !isError && Array.isArray(details?.phases)) {
+				if (toolName === "todo" && !isError && Array.isArray(details?.phases)) {
 					this.setTodoPhases(details.phases);
 				}
-				if (toolName === "todo_write" && isError) {
+				if (toolName === "todo" && isError) {
 					const errorText = content?.find(part => part.type === "text")?.text;
 					const reminderText = [
 						"<system-reminder>",
-						"todo_write failed, so todo progress is not visible to the user.",
-						errorText ? `Failure: ${errorText}` : "Failure: todo_write returned an error.",
-						"Fix the todo payload and call todo_write again before continuing.",
+						"todo failed, so todo progress is not visible to the user.",
+						errorText ? `Failure: ${errorText}` : "Failure: todo returned an error.",
+						"Fix the todo payload and call todo again before continuing.",
 						"</system-reminder>",
 					].join("\n");
 					await this.sendCustomMessage(
 						{
-							customType: "todo-write-error-reminder",
+							customType: "todo-error-reminder",
 							content: reminderText,
 							display: false,
 							details: { toolName, errorText },
@@ -1882,6 +1891,10 @@ export class AgentSession {
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
+
+			if (await this.#handleEmptyAssistantStop(msg)) {
+				return;
+			}
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			if (this.#isRetryableError(msg)) {
@@ -2276,28 +2289,62 @@ export class AgentSession {
 		});
 	}
 
-	/** Build TTSR match context for tool call argument deltas. */
-	#getTtsrToolMatchContext(message: AgentMessage, contentIndex: number): TtsrMatchContext {
-		const context: TtsrMatchContext = { source: "tool" };
+	/** Extract the tool-call block a toolcall_delta event refers to, if present. */
+	#getStreamingToolCallBlock(message: AgentMessage, contentIndex: number): ToolCall | undefined {
 		if (message.role !== "assistant") {
-			return context;
+			return undefined;
 		}
 
 		const content = message.content;
 		if (!Array.isArray(content) || contentIndex < 0 || contentIndex >= content.length) {
-			return context;
+			return undefined;
 		}
 
 		const block = content[contentIndex];
 		if (!block || typeof block !== "object" || block.type !== "toolCall") {
+			return undefined;
+		}
+
+		return block as ToolCall;
+	}
+
+	/** Build TTSR match context for tool call argument deltas. */
+	#getTtsrToolMatchContext(toolCall: ToolCall | undefined, contentIndex: number): TtsrMatchContext {
+		const context: TtsrMatchContext = { source: "tool" };
+		if (!toolCall) {
 			return context;
 		}
 
-		const toolCall = block as ToolCall;
 		context.toolName = toolCall.name;
 		context.streamKey = toolCall.id ? `toolcall:${toolCall.id}` : `tool:${toolCall.name}:${contentIndex}`;
 		context.filePaths = this.#extractTtsrFilePathsFromArgs(toolCall.arguments);
 		return context;
+	}
+
+	/**
+	 * Match a stream delta against TTSR rules.
+	 *
+	 * Tool argument streams prefer the tool's `matcherDigest` normalization — the
+	 * real content the call introduces — over the raw argument delta, so rule
+	 * conditions written against source text keep working regardless of the
+	 * tool's wire format (hashline patches, JSON-escaped strings, ...).
+	 */
+	#checkTtsrStream(delta: string, matchContext: TtsrMatchContext, toolCall: ToolCall | undefined): Rule[] {
+		const manager = this.#ttsrManager;
+		if (!manager) {
+			return [];
+		}
+		if (toolCall) {
+			const tools = this.agent.state.tools;
+			const tool =
+				tools.find(t => t.name === toolCall.name) ??
+				tools.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name);
+			const digest = tool?.matcherDigest?.(toolCall.arguments ?? {});
+			if (digest !== undefined) {
+				return manager.checkSnapshot(digest, matchContext);
+			}
+		}
+		return manager.checkDelta(delta, matchContext);
 	}
 
 	/** Extract path-like arguments from tool call payload for TTSR glob matching. */
@@ -4274,6 +4321,7 @@ export class AgentSession {
 
 			// Reset todo reminder count on new user prompt
 			this.#todoReminderCount = 0;
+			this.#emptyStopRetryCount = 0;
 
 			await this.#maybeRestoreRetryFallbackPrimary();
 
@@ -4946,7 +4994,7 @@ export class AgentSession {
 	// splice mutated canonical `#todoPhases` between tool calls, so the model
 	// observed phase totals shrinking ("5 → 4") after marking tasks done. The
 	// `tasks.todoClearDelay` setting is now inert; completed tasks survive
-	// until the next explicit `todo_write` call removes them via `rm`/`drop`.
+	// until the next explicit `todo` call removes them via `rm`/`drop`.
 
 	/**
 	 * Abort current operation and wait for agent to become idle.
@@ -5612,9 +5660,20 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	/**
+	 * Append plan-read protection to a prune/shake config so the active plan
+	 * file survives compaction alongside skill reads (the config defaults
+	 * already carry skill protection). The matcher reads the current plan
+	 * reference path at match time, so retitled plans are covered.
+	 */
+	#withPlanProtection<T extends { protectedTools: ProtectedToolMatcher[] }>(config: T): T {
+		const planMatcher = createPlanReadMatcher(() => this.#planReferencePath);
+		return { ...config, protectedTools: [...config.protectedTools, planMatcher] };
+	}
+
 	async #pruneToolOutputs(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
-		const result = pruneToolOutputs(branchEntries, DEFAULT_PRUNE_CONFIG);
+		const result = pruneToolOutputs(branchEntries, this.#withPlanProtection(DEFAULT_PRUNE_CONFIG));
 		if (result.prunedCount === 0) {
 			return undefined;
 		}
@@ -5695,7 +5754,7 @@ export class AgentSession {
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0 };
 		}
 
-		const config = opts.config ?? AGGRESSIVE_SHAKE_CONFIG;
+		const config = this.#withPlanProtection(opts.config ?? AGGRESSIVE_SHAKE_CONFIG);
 		const regions = collectShakeRegions(this.sessionManager.getBranch(), config);
 		if (regions.length === 0) {
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
@@ -6287,6 +6346,99 @@ export class AgentSession {
 		return lastToolCall?.name === "yield" && lastToolCall.id === toolCallId;
 	}
 
+	async #handleEmptyAssistantStop(assistantMessage: AssistantMessage): Promise<boolean> {
+		if (!this.#isEmptyAssistantStop(assistantMessage)) {
+			this.#emptyStopRetryCount = 0;
+			return false;
+		}
+
+		this.#emptyStopRetryCount++;
+		if (this.#emptyStopRetryCount > EMPTY_STOP_MAX_RETRIES) {
+			logger.warn("Assistant returned empty stop after retry cap", {
+				attempts: this.#emptyStopRetryCount - 1,
+				model: assistantMessage.model,
+				provider: assistantMessage.provider,
+			});
+			if (this.#retryAttempt > 0) {
+				await this.#emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this.#retryAttempt,
+					finalError: "Assistant returned empty stop after retry cap",
+				});
+				this.#retryAttempt = 0;
+			}
+			this.#resolveRetry();
+			return true;
+		}
+
+		this.#removeEmptyStopFromActiveContext(assistantMessage);
+		this.agent.appendMessage({
+			role: "developer",
+			content: [{ type: "text", text: this.#emptyStopRetryReminder() }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		this.#scheduleAgentContinue({ generation: this.#promptGeneration });
+		return true;
+	}
+
+	#isEmptyAssistantStop(assistantMessage: AssistantMessage): boolean {
+		if (assistantMessage.stopReason !== "stop") return false;
+		return !assistantMessage.content.some(content => {
+			if (content.type === "text") return content.text.trim().length > 0;
+			if (content.type === "thinking") return content.thinking.trim().length > 0;
+			return content.type === "toolCall";
+		});
+	}
+
+	#emptyStopRetryReminder(): string {
+		return prompt.render(emptyStopRetryTemplate, {
+			retryCount: this.#emptyStopRetryCount,
+			maxRetries: EMPTY_STOP_MAX_RETRIES,
+		});
+	}
+
+	#removeEmptyStopFromActiveContext(assistantMessage: AssistantMessage): void {
+		const messages = this.agent.state.messages;
+		const lastMessage = messages[messages.length - 1];
+		if (
+			lastMessage?.role === "assistant" &&
+			this.#isSameAssistantMessage(lastMessage as AssistantMessage, assistantMessage)
+		) {
+			this.agent.replaceMessages(messages.slice(0, -1));
+		}
+
+		const emptyStopEntry = this.sessionManager
+			.getBranch()
+			.slice()
+			.reverse()
+			.find(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					this.#isSameAssistantMessage(entry.message as AssistantMessage, assistantMessage),
+			);
+		if (!emptyStopEntry) {
+			return;
+		}
+		if (emptyStopEntry.parentId === null) {
+			this.sessionManager.resetLeaf();
+		} else {
+			this.sessionManager.branch(emptyStopEntry.parentId);
+		}
+	}
+
+	#isSameAssistantMessage(left: AssistantMessage, right: AssistantMessage): boolean {
+		return (
+			left === right ||
+			(left.timestamp === right.timestamp &&
+				left.provider === right.provider &&
+				left.model === right.model &&
+				left.stopReason === right.stopReason)
+		);
+	}
+
 	#enforceRewindBeforeYield(): boolean {
 		if (!this.#checkpointState || this.#pendingRewindReport) {
 			return false;
@@ -6401,16 +6553,16 @@ export class AgentSession {
 			return undefined;
 		}
 
-		if (!this.#toolRegistry.has("todo_write")) {
-			logger.warn("Eager todo enforcement skipped because todo_write is unavailable", {
+		if (!this.#toolRegistry.has("todo")) {
+			logger.warn("Eager todo enforcement skipped because todo is unavailable", {
 				activeToolNames: this.agent.state.tools.map(tool => tool.name),
 			});
 			return undefined;
 		}
 
-		const todoWriteToolChoice = buildNamedToolChoice("todo_write", this.model);
-		if (!todoWriteToolChoice) {
-			logger.warn("Eager todo enforcement skipped because the current model does not support forcing todo_write", {
+		const todoToolChoice = buildNamedToolChoice("todo", this.model);
+		if (!todoToolChoice) {
+			logger.warn("Eager todo enforcement skipped because the current model does not support forcing todo", {
 				modelApi: this.model?.api,
 				modelId: this.model?.id,
 			});
@@ -6428,7 +6580,7 @@ export class AgentSession {
 				attribution: "agent",
 				timestamp: Date.now(),
 			},
-			toolChoice: todoWriteToolChoice,
+			toolChoice: todoToolChoice,
 		};
 	}
 	/**
