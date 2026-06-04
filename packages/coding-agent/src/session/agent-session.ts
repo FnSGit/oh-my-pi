@@ -6352,6 +6352,25 @@ export class AgentSession {
 			return false;
 		}
 
+		// Log every empty-stop occurrence at debug so callers running with
+		// verbose logging can see how often their model produces empty turns
+		// (xopglm51 / one_api proxies hit this regularly; the LLM-injected
+		// "continue the active task" reminder then surfaces to the user as
+		// a "user sent empty message" feel even though no user input was
+		// involved — the assistant's own response was empty).
+		logger.debug("Assistant returned empty stop", {
+			model: assistantMessage.model,
+			provider: assistantMessage.provider,
+			stopReason: assistantMessage.stopReason,
+			retryCount: this.#emptyStopRetryCount + 1,
+			maxRetries: EMPTY_STOP_MAX_RETRIES,
+			durationMs: assistantMessage.duration,
+			ttftMs: assistantMessage.ttft,
+			errorMessage: assistantMessage.errorMessage,
+			errorStatus: assistantMessage.errorStatus,
+			outputTokens: assistantMessage.usage?.output,
+		});
+
 		this.#emptyStopRetryCount++;
 		if (this.#emptyStopRetryCount > EMPTY_STOP_MAX_RETRIES) {
 			logger.warn("Assistant returned empty stop after retry cap", {
@@ -6371,6 +6390,13 @@ export class AgentSession {
 			this.#resolveRetry();
 			return true;
 		}
+
+		logger.info("Empty-stop retry scheduled", {
+			attempt: this.#emptyStopRetryCount,
+			maxAttempts: EMPTY_STOP_MAX_RETRIES,
+			model: assistantMessage.model,
+			provider: assistantMessage.provider,
+		});
 
 		this.#removeEmptyStopFromActiveContext(assistantMessage);
 		this.agent.appendMessage({

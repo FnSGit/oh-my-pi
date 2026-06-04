@@ -10,7 +10,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { logger, TempDir } from "@oh-my-pi/pi-utils";
 
 const recordToolSchema = z.object({ value: z.string() });
 
@@ -329,5 +329,55 @@ describe("AgentSession empty stop guard", () => {
 		expect(withTool.mock.calls).toHaveLength(2);
 		expect(reminderMessages(withTool.session.agent.state.messages)).toHaveLength(0);
 		expect(assistantText(withTool.session.agent.state.messages)).toContain("tool path complete");
+	});
+
+	it("logs every empty stop with model + retry metadata, and an info line per retry", async () => {
+		// Operators running weak / proxy-routed models (xopglm51 via one_api,
+		// local Ollama, etc.) hit empty stops frequently. The default log
+		// level is too quiet to spot this, so #handleEmptyAssistantStop
+		// emits a debug line on every empty stop (frequency) and an info
+		// line on each retry (which attempt it is). Cap-hit is already
+		// logged at warn elsewhere.
+		const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const infoSpy = vi.spyOn(logger, "info").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { session } = await createHarness([
+			recordCall("delta", "call-record-delta"),
+			emptyStop(),
+			emptyStop(),
+			emptyStop(),
+			emptyStop(), // 4 empty stops: 1 logged + 3 retries, then cap hit
+		]);
+
+		await session.prompt("record delta");
+		await session.waitForIdle();
+
+		// debug: fired once per empty stop occurrence (4 total here)
+		const emptyStopLogs = debugSpy.mock.calls.filter(
+			([msg]) => msg === "Assistant returned empty stop",
+		);
+		expect(emptyStopLogs).toHaveLength(4);
+		for (const [, ctx] of emptyStopLogs) {
+			expect(ctx).toMatchObject({
+				stopReason: "stop",
+				maxRetries: 3,
+			});
+			expect((ctx as { model?: string }).model).toBeDefined();
+			expect((ctx as { provider?: string }).provider).toBeDefined();
+		}
+
+		// info: one per retry that was actually scheduled (cap is 3, so 3)
+		const retryScheduledLogs = infoSpy.mock.calls.filter(
+			([msg]) => msg === "Empty-stop retry scheduled",
+		);
+		expect(retryScheduledLogs).toHaveLength(3);
+		expect(retryScheduledLogs.map(([, ctx]) => (ctx as { attempt: number }).attempt)).toEqual([1, 2, 3]);
+
+		// warn: one cap-hit log (existing behavior)
+		const capLogs = warnSpy.mock.calls.filter(
+			([msg]) => msg === "Assistant returned empty stop after retry cap",
+		);
+		expect(capLogs).toHaveLength(1);
 	});
 });
