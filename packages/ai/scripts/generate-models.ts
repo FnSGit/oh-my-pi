@@ -9,6 +9,17 @@ const COPILOT_PREMIUM_MULTIPLIERS: Record<string, number> = {
 	"github-copilot/grok-code-fast-1": 0.25,
 };
 
+// Per-model `contextWindow` / `maxTokens` overrides keyed by `${provider}/${id}`.
+// Models.dev doesn't always carry the bundled limits our descriptors advertise
+// (e.g. MiniMax-M3 ships with 512K upstream but we deploy 1M), so we pin the
+// values here to survive upstream metadata shifts.
+const CONTEXT_WINDOW_OVERRIDES: Record<string, { contextWindow: number; maxTokens: number }> = {
+	"minimax/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+	"minimax-cn/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+	"minimax-code/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+	"minimax-code-cn/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+};
+
 import * as path from "node:path";
 import { $env } from "@oh-my-pi/pi-utils";
 import { AuthStorage, type OAuthAccess, SqliteAuthCredentialStore } from "../src/auth-storage";
@@ -191,6 +202,24 @@ function applyPremiumMultiplierOverrides(models: readonly Model[]): Model[] {
 		};
 	});
 }
+
+function applyContextWindowOverrides(models: readonly Model[]): Model[] {
+	return models.map(model => {
+		const override = CONTEXT_WINDOW_OVERRIDES[`${model.provider}/${model.id}`];
+		if (!override) {
+			return model;
+		}
+		if (model.contextWindow === override.contextWindow && model.maxTokens === override.maxTokens) {
+			return model;
+		}
+		return {
+			...model,
+			contextWindow: override.contextWindow,
+			maxTokens: override.maxTokens,
+		};
+	});
+}
+
 function hasBillableCost(cost: Model["cost"]): boolean {
 	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
 }
@@ -393,6 +422,7 @@ async function generateModels() {
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
+	allModels = applyContextWindowOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);
