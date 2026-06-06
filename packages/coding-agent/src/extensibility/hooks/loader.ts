@@ -38,6 +38,14 @@ function buildContextEventResultFromStdout(
 	additionalContext: string | undefined,
 	event: unknown,
 ): { messages: AgentMessage[] } | undefined {
+	// When no additionalContext was extracted and stdout is just an empty JSON
+	// object (e.g. "{}" from hooks like hookify that always emit JSON), treat it
+	// as "no context modification" rather than injecting literal "{}" as a user
+	// message. See https://github.com/can1357/oh-my-pi/issues/1580 for the
+	// hookify-driven empty-message regression this closes.
+	if (additionalContext === undefined && /^\s*\{\s*\}\s*$/.test(stdout)) {
+		return undefined;
+	}
 	const text = (additionalContext ?? stdout).trim();
 	if (!text) return undefined;
 	const existing = Array.isArray((event as { messages?: unknown[] } | null)?.messages)

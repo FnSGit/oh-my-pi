@@ -294,6 +294,13 @@ function buildContextEventResultFromStdout(
 	additionalContext: string | undefined,
 	event: unknown,
 ): { messages: Array<Record<string, unknown>> } | undefined {
+	// Mirror fix in extensibility/hooks/loader.ts: when no additionalContext
+	// was extracted and stdout is just "{}" (empty JSON from hooks like hookify
+	// that always emit JSON even when they have no rules), treat it as "no
+	// context modification" rather than injecting literal "{}" as a user message.
+	if (additionalContext === undefined && /^\s*\{\s*\}\s*$/.test(stdout)) {
+		return undefined;
+	}
 	const text = (additionalContext ?? stdout).trim();
 	if (!text) return undefined;
 	const existing = Array.isArray((event as { messages?: unknown[] } | null)?.messages)
