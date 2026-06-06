@@ -35,7 +35,9 @@ export function emergencyTerminalRestore(): void {
 			// Blind restore only if we know a terminal was started but lost track of it
 			// This avoids writing escape sequences for non-TUI commands (grep, commit, etc.)
 			process.stdout.write(
-				"\x1b[?2004l" + // Disable bracketed paste
+				"\x1b[?2026l" + // End synchronized output
+					"\x1b[?7h" + // Restore autowrap
+					"\x1b[?2004l" + // Disable bracketed paste
 					"\x1b[?2031l" + // Disable Mode 2031 appearance notifications
 					"\x1b[?2048l" + // Disable in-band resize notifications
 					"\x1b[<u" + // Pop kitty keyboard protocol
@@ -173,6 +175,7 @@ export class ProcessTerminal implements Terminal {
 	#wasRaw = false;
 	#inputHandler?: (data: string) => void;
 	#resizeHandler?: () => void;
+	#stdoutResizeListener?: () => void;
 	#kittyProtocolActive = false;
 	#modifyOtherKeysActive = false;
 	#modifyOtherKeysTimeout?: Timer;
@@ -239,8 +242,14 @@ export class ProcessTerminal implements Terminal {
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		this.#safeWrite("\x1b[?2004h");
 
-		// Set up resize handler immediately
-		process.stdout.on("resize", this.#resizeHandler);
+		// Set up resize handler immediately. The OS refreshes process.stdout
+		// dimensions before firing `resize`, so it is authoritative for geometry:
+		// reconcile any stale cached DEC 2048 report before notifying the renderer.
+		this.#stdoutResizeListener = () => {
+			this.#reconcileInBandGeometryOnResize();
+			this.#resizeHandler?.();
+		};
+		process.stdout.on("resize", this.#stdoutResizeListener);
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
 		// (SIGWINCH is lost while process is stopped). Unix only.
@@ -281,7 +290,11 @@ export class ProcessTerminal implements Terminal {
 		this.#safeWrite("\x1b[?2031h");
 
 		// Start periodic OSC 11 re-query for terminals without Mode 2031
-		// (Warp, Alacritty, WezTerm, iTerm2). Self-disables once Mode 2031 fires.
+		// (Warp, Alacritty, older WezTerm). Stops once Mode 2031 support is
+		// confirmed via DECRQM (probed below) or a Mode 2031 change notification
+		// fires — push notifications supersede polling, and the poll's repeated
+		// OSC 11/DA1 writes clear the user's active text selection on some
+		// terminals (copy breaks every 2s).
 		// Windows Terminal under WSL has been observed to close the hosting tab
 		// after repeated OSC 11/DA1 probes. Keep the initial/event-driven probes,
 		// but avoid background polling there.
@@ -291,11 +304,14 @@ export class ProcessTerminal implements Terminal {
 
 		// Probe DEC private-mode support via DECRQM. 2026 (synchronized output)
 		// gates the renderer's begin/end markers; 2048 (in-band resize) is enabled
-		// only after the terminal confirms support. Each probe rides the shared DA1
+		// only after the terminal confirms support; 2031 (appearance change
+		// notifications) stops the OSC 11 poll once confirmed, since push
+		// notifications make polling redundant. Each probe rides the shared DA1
 		// sentinel FIFO, so a terminal that ignores DECRQM still resolves (as
 		// unsupported) when the DA1 reply arrives.
 		this.#queryPrivateMode(2026);
 		this.#queryPrivateMode(2048);
+		this.#queryPrivateMode(2031);
 	}
 
 	/**
@@ -785,7 +801,9 @@ export class ProcessTerminal implements Terminal {
 	/**
 	 * Record DECRQM support for a private mode (idempotent — first result wins)
 	 * and notify subscribers. Enables DEC 2048 in-band resize when 2048 resolves
-	 * supported.
+	 * supported, and stops the OSC 11 poll when 2031 resolves supported (Mode 2031
+	 * push notifications make periodic re-querying redundant — and the poll's
+	 * OSC 11/DA1 writes clobber active text selections on some terminals).
 	 */
 	#resolvePrivateMode(mode: number, supported: boolean): void {
 		if (this.#privateModeSupport.has(mode)) return;
@@ -798,6 +816,7 @@ export class ProcessTerminal implements Terminal {
 			}
 		}
 		if (mode === 2048 && supported) this.#enableInBandResize();
+		if (mode === 2031 && supported) this.#stopOsc11Poll();
 	}
 
 	/**
@@ -832,6 +851,31 @@ export class ProcessTerminal implements Terminal {
 		}
 		if (rows > 0 && cols > 0 && (rows !== previousRows || cols !== previousColumns)) {
 			this.#resizeHandler?.();
+		}
+	}
+
+	/**
+	 * Reconcile cached in-band geometry with the OS on an OS-level resize.
+	 *
+	 * SIGWINCH (POSIX) and ConPTY (Windows) refresh `process.stdout.columns`/
+	 * `rows` before the `resize` event fires, so they are authoritative for the
+	 * new cell geometry. A cached DEC 2048 report can be stale: the matching
+	 * post-resize report may be dropped (split across stdin reads past the flush
+	 * window) or carry `:`-subparameters the parser skips, leaving the getters
+	 * pinned to the old size — which freezes the rendered width because the
+	 * renderer reflows against {@link columns}/{@link rows}, not the live OS
+	 * value. Drop a cached dimension that disagrees with the live OS value; the
+	 * terminal's next valid in-band report re-seeds pixel sizing.
+	 */
+	#reconcileInBandGeometryOnResize(): void {
+		if (!this.#inBandResizeActive) return;
+		const osColumns = process.stdout.columns;
+		const osRows = process.stdout.rows;
+		if (this.#reportedColumns !== undefined && osColumns > 0 && this.#reportedColumns !== osColumns) {
+			this.#reportedColumns = undefined;
+		}
+		if (this.#reportedRows !== undefined && osRows > 0 && this.#reportedRows !== osRows) {
+			this.#reportedRows = undefined;
 		}
 	}
 
@@ -886,6 +930,10 @@ export class ProcessTerminal implements Terminal {
 		if (this.#clearProgressTimer()) {
 			this.#safeWrite(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
+
+		// Leave paint-time terminal modes even if the process exits between the
+		// begin/end halves of a frame. Safe no-ops on terminals that ignored them.
+		this.#safeWrite("\x1b[?2026l\x1b[?7h");
 
 		// Disable bracketed paste mode
 		this.#safeWrite("\x1b[?2004l");
@@ -948,10 +996,11 @@ export class ProcessTerminal implements Terminal {
 		}
 		this.#inputHandler = undefined;
 		this.#appearance = undefined;
-		if (this.#resizeHandler) {
-			process.stdout.removeListener("resize", this.#resizeHandler);
-			this.#resizeHandler = undefined;
+		if (this.#stdoutResizeListener) {
+			process.stdout.removeListener("resize", this.#stdoutResizeListener);
+			this.#stdoutResizeListener = undefined;
 		}
+		this.#resizeHandler = undefined;
 
 		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
 		// re-interpreted after raw mode is disabled. This fixes a race condition

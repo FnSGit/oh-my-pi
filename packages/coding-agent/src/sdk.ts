@@ -27,6 +27,7 @@ import {
 	extractRetryHint,
 	getAgentDbPath,
 	getAgentDir,
+	getAuthBrokerSnapshotCachePath,
 	getProjectDir,
 	logger,
 	postmortem,
@@ -39,6 +40,7 @@ import { createAutoresearchExtension } from "./autoresearch";
 import { loadCapability } from "./capability";
 import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
+import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { ModelRegistry } from "./config/model-registry";
 import {
 	formatModelString,
@@ -100,8 +102,16 @@ import {
 } from "./secrets";
 import { AgentSession } from "./session/agent-session";
 import { resolveAuthBrokerConfig } from "./session/auth-broker-config";
-import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "./session/auth-storage";
-import { type CustomMessage, convertToLlm } from "./session/messages";
+import {
+	AuthBrokerClient,
+	AuthStorage,
+	DEFAULT_SNAPSHOT_CACHE_TTL_MS,
+	RemoteAuthCredentialStore,
+	readAuthBrokerSnapshotCache,
+	type SnapshotResponse,
+	writeAuthBrokerSnapshotCache,
+} from "./session/auth-storage";
+import { type CustomMessage, convertToLlm, wrapSteeringForModel } from "./session/messages";
 import { getRestorableSessionModels, SessionManager } from "./session/session-manager";
 import { closeAllConnections } from "./ssh/connection-manager";
 import { unmountAll } from "./ssh/sshfs-mount";
@@ -120,6 +130,7 @@ import {
 	resolveThinkingLevelForModel,
 	toReasoningEffort,
 } from "./thinking";
+import { countToolsForAutoDiscovery, resolveEffectiveToolDiscoveryMode } from "./tool-discovery/mode";
 import {
 	collectDiscoverableTools,
 	type DiscoverableTool,
@@ -147,6 +158,7 @@ import {
 	ResolveTool,
 	renderSearchToolBm25Description,
 	SearchTool,
+	SearchToolBm25Tool,
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	type Tool,
@@ -417,6 +429,17 @@ function getDefaultAgentDir(): string {
 	return getAgentDir();
 }
 
+function resolveSnapshotTtlMs(): number {
+	const raw = process.env.OMP_AUTH_BROKER_SNAPSHOT_TTL_MS;
+	if (raw === undefined) return DEFAULT_SNAPSHOT_CACHE_TTL_MS;
+	const value = raw.trim();
+	if (value === "") return DEFAULT_SNAPSHOT_CACHE_TTL_MS;
+	const ttlMs = Number(value);
+	if (Number.isFinite(ttlMs) && ttlMs >= 0) return ttlMs;
+	logger.warn("Invalid OMP_AUTH_BROKER_SNAPSHOT_TTL_MS; using default", { value: raw });
+	return DEFAULT_SNAPSHOT_CACHE_TTL_MS;
+}
+
 // Discovery Functions
 
 /**
@@ -434,9 +457,42 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 	const brokerConfig = await resolveAuthBrokerConfig();
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
-		const initialResult = await client.fetchSnapshot();
-		if (initialResult.status !== 200) throw new Error("Auth broker returned no initial snapshot");
-		const store = new RemoteAuthCredentialStore({ client, initialSnapshot: initialResult.snapshot });
+		const ttlMs = resolveSnapshotTtlMs();
+		const cachePath = getAuthBrokerSnapshotCachePath();
+		const persist =
+			ttlMs > 0
+				? (snapshot: SnapshotResponse): void => {
+						void writeAuthBrokerSnapshotCache({
+							path: cachePath,
+							token: brokerConfig.token,
+							url: brokerConfig.url,
+							snapshot,
+						}).catch(error => {
+							logger.debug("auth-broker snapshot cache write failed", { error: String(error) });
+						});
+					}
+				: undefined;
+
+		let initialSnapshot: SnapshotResponse | undefined;
+		if (ttlMs > 0) {
+			initialSnapshot =
+				(await readAuthBrokerSnapshotCache({
+					path: cachePath,
+					token: brokerConfig.token,
+					url: brokerConfig.url,
+					ttlMs,
+				}).catch(error => {
+					logger.debug("auth-broker snapshot cache read failed", { error: String(error) });
+					return null;
+				})) ?? undefined;
+		}
+		if (!initialSnapshot) {
+			const initialResult = await client.fetchSnapshot();
+			if (initialResult.status !== 200) throw new Error("Auth broker returned no initial snapshot");
+			initialSnapshot = initialResult.snapshot;
+			persist?.(initialSnapshot);
+		}
+		const store = new RemoteAuthCredentialStore({ client, initialSnapshot, onSnapshot: persist });
 		// Refresh + usage hooks live on RemoteAuthCredentialStore; AuthStorage
 		// discovers them automatically when no explicit option overrides them.
 		const storage = new AuthStorage(store, {
@@ -644,24 +700,6 @@ function registerPythonCleanup(): void {
 	if (pythonCleanupRegistered) return;
 	pythonCleanupRegistered = true;
 	postmortem.register("python-cleanup", disposeAllKernelSessions);
-}
-
-/**
- * Resolve whether to enable append-only context mode based on the setting and provider.
- *
- * - `"on"` → always enable
- * - `"off"` → never enable
- * - `"auto"` → enable for DeepSeek (prefix-caching provider)
- */
-function resolveAppendOnlyMode(setting: "auto" | "on" | "off" | undefined, provider: string): boolean {
-	switch (setting ?? "auto") {
-		case "on":
-			return true;
-		case "off":
-			return false;
-		default:
-			return provider === "deepseek";
-	}
 }
 
 function customToolToDefinition(tool: CustomTool): ToolDefinition {
@@ -1185,12 +1223,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		return preview;
 	};
-	// Only top-level sessions own an AsyncJobManager. Subagents reach the
-	// parent's manager via `AsyncJobManager.instance()` (set below), so creating
-	// a second instance here just to leave it orphaned wastes a constructor and
-	// risks accidental disposal of the parent's manager on subagent teardown.
+	// Only the first top-level session in a process owns an AsyncJobManager.
+	// Subagents inherit the parent's manager via `AsyncJobManager.instance()`
+	// (set below), and any additional top-level session spun up in-process
+	// (e.g. the agent-creation architect in `agent-dashboard.ts`) must share
+	// the live singleton — otherwise its dispose path would clobber the
+	// owning session's manager and break the `task`/`bash` async paths
+	// (issue #1923). The `instance()` guard means later sessions also skip
+	// constructing an orphaned manager that nothing would ever route to.
 	const asyncJobManager =
-		backgroundJobsEnabled && !options.parentTaskPrefix
+		backgroundJobsEnabled && !options.parentTaskPrefix && !AsyncJobManager.instance()
 			? new AsyncJobManager({
 					maxRunningJobs: asyncMaxJobs,
 					onJobComplete: async (jobId, result, job) => {
@@ -1208,6 +1250,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					},
 				})
 			: undefined;
+
+	const scopedAsyncJobManager = asyncJobManager ?? (options.parentTaskPrefix ? AsyncJobManager.instance() : undefined);
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -1310,6 +1354,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
+			// Subagents inherit the singleton (the parent's manager) so their bash/task
+			// completions still flow into the spawning conversation's yieldQueue.
+			// Secondary in-process top-level sessions (no parentTaskPrefix, no
+			// constructed manager because the singleton was already installed) leave
+			// this undefined so tools and session job snapshots refuse async work
+			// instead of silently routing into the owning session (issue #1923).
+			asyncJobManager: scopedAsyncJobManager,
 		};
 
 		// Wire process-wide internal URL singletons owned by their real classes.
@@ -1638,6 +1689,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
+		const effectiveDiscoveryMode = resolveEffectiveToolDiscoveryMode(
+			settings,
+			countToolsForAutoDiscovery(toolRegistry.keys()),
+		);
+		if (effectiveDiscoveryMode !== "off" && !toolRegistry.has("search_tool_bm25")) {
+			const searchTool: Tool = new SearchToolBm25Tool(toolSession);
+			toolRegistry.set(
+				searchTool.name,
+				new ExtensionToolWrapper(wrapToolWithMetaNotice(searchTool), extensionRunner) as Tool,
+			);
+		}
+		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off"; // back-compat: true when any discovery active
+
 		const reloadSshTool = async (): Promise<AgentTool | null> => {
 			if (!requestedToolNameSet.has("ssh")) return null;
 			const sshTool = (await loadSshTool({
@@ -1724,6 +1788,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				memoryRootEnabled: memoryBackend.id === "local",
+				model: settings.get("includeModelInPrompt") ? getActiveModelString() : undefined,
 			});
 
 			if (options.systemPrompt === undefined) {
@@ -1756,15 +1821,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const requestedToolNames = explicitlyRequestedToolNames ?? toolNamesFromRegistry;
 		const normalizedRequested = requestedToolNames.filter(name => toolRegistry.has(name));
 		const requestedToolNameSet = new Set(normalizedRequested);
-		// Effective discovery mode: tools.discoveryMode takes precedence; mcp.discoveryMode is back-compat alias.
-		const toolsDiscoveryModeSetting = settings.get("tools.discoveryMode");
-		const effectiveDiscoveryMode: "off" | "mcp-only" | "all" =
-			toolsDiscoveryModeSetting !== "off"
-				? (toolsDiscoveryModeSetting as "off" | "mcp-only" | "all")
-				: settings.get("mcp.discoveryMode")
-					? "mcp-only"
-					: "off";
-		const mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off"; // back-compat: true when any discovery active
+		// Effective discovery mode is resolved after the full registry exists so auto mode can count MCP/extension tools.
 		const defaultInactiveToolNames = new Set(
 			registeredTools.filter(tool => tool.definition.defaultInactive).map(tool => tool.definition.name),
 		);
@@ -1905,7 +1962,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			return obfuscateMessages(obfuscator, converted);
 		};
 		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal) => {
-			return await extensionRunner.emitContext(messages);
+			const withContext = await extensionRunner.emitContext(messages);
+			return wrapSteeringForModel(withContext);
 		};
 		const onPayload = async (payload: unknown, _model?: Model) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload);
@@ -2028,7 +2086,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolChoice: () => session?.nextToolChoice(),
 			telemetry: options.telemetry,
 			appendOnlyContext: model
-				? resolveAppendOnlyMode(settings.get("provider.appendOnlyContext"), model.provider)
+				? shouldEnableAppendOnlyContext(settings.get("provider.appendOnlyContext"), model)
 					? new AppendOnlyContextManager()
 					: undefined
 				: undefined,
@@ -2065,6 +2123,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// AsyncJobManager on teardown; subagents inherit the parent's and
 			// **MUST NOT** tear it down.
 			ownedAsyncJobManager: asyncJobManager,
+			asyncJobManager: scopedAsyncJobManager,
 			scopedModels: options.scopedModels,
 			promptTemplates,
 			slashCommands,
@@ -2278,6 +2337,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session.dispose();
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
+				if (asyncJobManager) {
+					if (AsyncJobManager.instance() === asyncJobManager) {
+						AsyncJobManager.setInstance(undefined);
+					}
+					await asyncJobManager.dispose({ timeoutMs: 3_000 });
+				}
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 			}
 		} catch (cleanupError) {

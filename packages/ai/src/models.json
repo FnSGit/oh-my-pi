@@ -5413,7 +5413,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 65536,
+			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -5557,7 +5557,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 65536,
+			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -5582,7 +5582,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 262144,
-			"maxTokens": 65536,
+			"maxTokens": 32768,
 			"thinking": {
 				"mode": "effort",
 				"minLevel": "minimal",
@@ -13275,7 +13275,7 @@
 		},
 		"minimax/minimax-m3": {
 			"id": "minimax/minimax-m3",
-			"name": "MiniMax: MiniMax M3 (new)",
+			"name": "MiniMax: MiniMax M3 (50% off through 2026-06-07)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -17290,6 +17290,25 @@
 		"qwen/qwen3.7-plus": {
 			"id": "qwen/qwen3.7-plus",
 			"name": "Qwen: Qwen3.7 Plus",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
+		"qwen/qwen3.7-plus:free": {
+			"id": "qwen/qwen3.7-plus:free",
+			"name": "Qwen: Qwen3.7 Plus (free)",
 			"api": "openai-completions",
 			"provider": "kilo",
 			"baseUrl": "https://api.kilo.ai/api/gateway",
@@ -28210,6 +28229,25 @@
 			"contextWindow": 222222,
 			"maxTokens": 8888
 		},
+		"nex-agi/nex-n2-pro": {
+			"id": "nex-agi/nex-n2-pro",
+			"name": "nex-agi/nex-n2-pro",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
 		"nothingiisreal/L3.1-70B-Celeste-V0.1-BF16": {
 			"id": "nothingiisreal/L3.1-70B-Celeste-V0.1-BF16",
 			"name": "nothingiisreal/L3.1-70B-Celeste-V0.1-BF16",
@@ -32723,6 +32761,25 @@
 		"TEE/qwen3.5-397b-a17b": {
 			"id": "TEE/qwen3.5-397b-a17b",
 			"name": "TEE/qwen3.5-397b-a17b",
+			"api": "openai-completions",
+			"provider": "nanogpt",
+			"baseUrl": "https://nano-gpt.com/api/v1",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 222222,
+			"maxTokens": 8888
+		},
+		"TEE/qwen3.6-27b": {
+			"id": "TEE/qwen3.6-27b",
+			"name": "TEE/qwen3.6-27b",
 			"api": "openai-completions",
 			"provider": "nanogpt",
 			"baseUrl": "https://nano-gpt.com/api/v1",

@@ -142,6 +142,9 @@ export type KnownProvider =
 	| "venice"
 	| "vllm"
 	| "xiaomi"
+	| "xiaomi-token-plan-sgp"
+	| "xiaomi-token-plan-ams"
+	| "xiaomi-token-plan-cn"
 	| "wafer-pass"
 	| "wafer-serverless"
 	| "zenmux"
@@ -576,6 +579,8 @@ export interface UserMessage {
 	content: string | (TextContent | ImageContent)[];
 	/** True if the message was injected by the system (e.g., auto-continue). */
 	synthetic?: boolean;
+	/** True when injected mid-turn as a steer; consumed by the agent's pre-LLM transform to wrap it for emphasis. Never rendered. */
+	steering?: boolean;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
 	/** Provider-specific opaque payload used to reconstruct transport-native history. */
@@ -784,6 +789,8 @@ export interface OpenAICompat {
 	requiresMistralToolIds?: boolean;
 	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "zai" uses thinking: { type: "enabled" | "disabled" } (also used by Moonshot Kimi), "qwen" uses top-level enable_thinking, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
 	thinkingFormat?: "openai" | "openrouter" | "zai" | "qwen" | "qwen-chat-template";
+	/** Optional `thinking.keep` value for Z.ai/Moonshot-style thinking params. Set false to suppress auto-detected keep. Default: auto-detected. */
+	thinkingKeep?: "all" | false;
 	/** Which reasoning content field to emit on assistant messages. Default: auto-detected. */
 	reasoningContentField?: "reasoning_content" | "reasoning" | "reasoning_text";
 	/** Whether assistant tool-call messages must include reasoning content. Default: false. */
@@ -815,6 +822,8 @@ export interface OpenAICompat {
 	vercelGatewayRouting?: VercelGatewayRouting;
 	/** Extra fields to include in request body (e.g. gateway routing hints for OpenClaw-style proxies). */
 	extraBody?: Record<string, unknown>;
+	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
+	cacheControlFormat?: "anthropic" | undefined;
 	/** Whether the provider supports the `strict` field in tool definitions. Default: auto-detected per provider/baseUrl (conservative for unknown providers). */
 	supportsStrictMode?: boolean;
 	/** Whether tool schemas must be sent either all strict or all non-strict. Undefined keeps the existing per-tool mixed behavior. */
@@ -896,6 +905,18 @@ export interface Model<TApi extends Api = any> {
 	premiumMultiplier?: number;
 	contextWindow: number;
 	maxTokens: number;
+	/**
+	 * When `true`, providers MUST omit `max_output_tokens` (Responses) /
+	 * `max_tokens` / `max_completion_tokens` (Completions) from the outbound
+	 * request and let the upstream API decide the per-response cap. `maxTokens`
+	 * is still used locally for budgeting (compaction, context promotion); only
+	 * the wire field is suppressed.
+	 *
+	 * Use this for proxies (notably Ollama) that forward to a backend whose true
+	 * output limit OMP cannot discover — sending the wrong value triggers 400s
+	 * from the upstream provider.
+	 */
+	omitMaxOutputTokens?: boolean;
 	headers?: Record<string, string>;
 	/**
 	 * Streaming transport override. When `"pi-native"`, `streamSimple` routes

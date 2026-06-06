@@ -1,18 +1,19 @@
 import * as fs from "node:fs/promises";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AutocompleteProvider, SlashCommand } from "@oh-my-pi/pi-tui";
-import { $env, sanitizeText } from "@oh-my-pi/pi-utils";
+import { $env, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { getRoleInfo } from "../../config/model-registry";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { renderSegmentTrack } from "../../modes/components/segment-track";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
+import { materializeImageReferenceLinks } from "../../modes/image-references";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
+import { isLowSignalTitleInput } from "../../tiny/text";
 import { tinyTitleClient } from "../../tiny/title-client";
 import type { TinyTitleProgressEvent } from "../../tiny/title-protocol";
 import { copyToClipboard, readImageFromClipboard, readTextFromClipboard } from "../../utils/clipboard";
@@ -253,6 +254,8 @@ export class InputController {
 				if (this.ctx.onInputCallback) {
 					this.ctx.editor.setText("");
 					this.ctx.pendingImages = [];
+					this.ctx.pendingImageLinks = [];
+					this.ctx.editor.imageLinks = undefined;
 					this.ctx.onInputCallback({ text: "", cancelled: false, started: true });
 				}
 				return;
@@ -260,12 +263,15 @@ export class InputController {
 
 			const runner = this.ctx.session.extensionRunner;
 			let inputImages = this.ctx.pendingImages.length > 0 ? [...this.ctx.pendingImages] : undefined;
+			let inputImageLinks = this.ctx.pendingImageLinks.length > 0 ? [...this.ctx.pendingImageLinks] : undefined;
 
 			if (runner?.hasHandlers("input")) {
 				const result = await runner.emitInput(text, inputImages, "interactive");
 				if (result?.handled) {
 					this.ctx.editor.setText("");
 					this.ctx.pendingImages = [];
+					this.ctx.pendingImageLinks = [];
+					this.ctx.editor.imageLinks = undefined;
 					return;
 				}
 				if (result?.text !== undefined) {
@@ -273,6 +279,10 @@ export class InputController {
 				}
 				if (result?.images !== undefined) {
 					inputImages = result.images;
+					inputImageLinks = await materializeImageReferenceLinks(
+						inputImages,
+						this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager),
+					);
 				}
 			}
 
@@ -356,8 +366,10 @@ export class InputController {
 			if (this.ctx.session.isStreaming) {
 				this.ctx.editor.addToHistory(text);
 				this.ctx.editor.setText("");
+				this.ctx.editor.imageLinks = undefined;
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.pendingImages = [];
+				this.ctx.pendingImageLinks = [];
 				// Record the signature so the queued message's eventual delivery
 				// (a user-role `message_start` event) leaves any draft the user has
 				// typed since queuing intact. Same protection as #783, applied to
@@ -376,9 +388,12 @@ export class InputController {
 			// First, move any pending bash components to chat
 			this.ctx.flushPendingBashComponents();
 
-			// Generate session title on first message
-			const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
-			if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE) {
+			// Auto-generate a session title while the session is still unnamed.
+			// Greetings / acknowledgements / empty input carry no task, so they are
+			// skipped deterministically (no model invoked, no download-progress UI)
+			// and the session stays unnamed — the next user message gets a fresh
+			// chance, so titling defers past "hi" instead of latching onto it.
+			if (!this.ctx.sessionManager.getSessionName() && !$env.PI_NO_TITLE && !isLowSignalTitleInput(text)) {
 				this.#showTinyTitleDownloadProgress(this.ctx.settings.get("providers.tinyModel"));
 				const registry = this.ctx.session.modelRegistry;
 				generateSessionTitle(
@@ -390,7 +405,9 @@ export class InputController {
 					provider => this.ctx.session.agent.metadataForProvider(provider),
 				)
 					.then(async title => {
-						if (title) {
+						// Re-check: a concurrent attempt for an earlier message may have
+						// already named the session. Don't clobber it.
+						if (title && !this.ctx.sessionManager.getSessionName()) {
 							const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
 							if (applied) {
 								setSessionTerminalTitle(
@@ -401,16 +418,28 @@ export class InputController {
 							}
 						}
 					})
-					.catch(() => {});
+					.catch(err => {
+						logger.warn("title-generator: uncaught auto-title error", {
+							sessionId: this.ctx.session.sessionId,
+							reason: "uncaught-auto-title-error",
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
 			}
 
 			if (this.ctx.onInputCallback) {
 				// Include any pending images from clipboard paste
+				this.ctx.editor.imageLinks = undefined;
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.pendingImages = [];
+				this.ctx.pendingImageLinks = [];
 
 				// Render user message immediately, then let session events catch up
-				const submission = this.ctx.startPendingSubmission({ text, images });
+				const submission = this.ctx.startPendingSubmission({
+					text,
+					images,
+					imageLinks: inputImageLinks,
+				});
 
 				this.ctx.onInputCallback(submission);
 			}
@@ -674,11 +703,25 @@ export class InputController {
 					}
 				}
 
+				const imageLink = (
+					await materializeImageReferenceLinks(
+						[
+							{
+								type: "image",
+								data: imageData.data,
+								mimeType: imageData.mimeType,
+							},
+						],
+						this.ctx.sessionManager.putBlob.bind(this.ctx.sessionManager),
+					)
+				)?.[0];
 				this.ctx.pendingImages.push({
 					type: "image",
 					data: imageData.data,
 					mimeType: imageData.mimeType,
 				});
+				this.ctx.pendingImageLinks.push(imageLink);
+				this.ctx.editor.imageLinks = this.ctx.pendingImageLinks;
 				// Insert placeholder at cursor like Claude does
 				const imageNum = this.ctx.pendingImages.length;
 				const placeholder = `[Image #${imageNum}]`;
