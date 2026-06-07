@@ -1,5 +1,14 @@
 /**
- * Minimal TUI implementation with differential rendering
+ * Minimal TUI implementation with differential rendering.
+ *
+ * Before changing the render planner, native-scrollback bookkeeping, capability
+ * detection, or width math, read `docs/tui-core-renderer.md`: it documents the
+ * failure modes (yank / corruption / flash / width crashes) and the invariants
+ * this engine must not violate. The short version: the renderer cannot observe
+ * the terminal's scroll position on most hosts, so ED3 (`CSI 3 J`) is confined
+ * to the destructive `clearScrollback` path, an unobservable viewport probe is
+ * never trusted for passive streaming, and the hot path clamps over-wide lines
+ * instead of throwing.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -15,6 +24,7 @@ import {
 	setCellDimensions,
 	setTerminalImageProtocol,
 	shouldEnableSynchronizedOutputByDefault,
+	synchronizedOutputUserOverride,
 	TERMINAL,
 } from "./terminal-capabilities";
 import {
@@ -35,6 +45,8 @@ const SEGMENT_RESET = "\x1b[0m";
  * diffing so `#previousLines` mirrors what was actually written.
  */
 const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
+const ERASE_LINE = "\x1b[2K";
+const ERASE_TO_END_OF_LINE = "\x1b[K";
 // Hide the hardware cursor before each paint/move write. Ghostty-style bar
 // cursors can otherwise leave visual afterimages while the TUI repaints the
 // row under a visible cursor. Paint writes also disable terminal autowrap:
@@ -56,6 +68,11 @@ const CURSOR_BEGIN = `${HIDE_CURSOR}${SYNC_OUTPUT_BEGIN}`;
 const CURSOR_BEGIN_NO_SYNC = HIDE_CURSOR;
 const CURSOR_END = SYNC_OUTPUT_END;
 const CURSOR_END_NO_SYNC = "";
+// Mouse reporting (normal click tracking + SGR extended coordinates), enabled
+// only for the lifetime of a fullscreen overlay so the rest of the app keeps the
+// terminal's native text selection.
+const MOUSE_TRACKING_ON = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_TRACKING_OFF = "\x1b[?1006l\x1b[?1000l";
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
@@ -112,10 +129,18 @@ export interface Component {
 	wantsKeyRelease?: boolean;
 
 	/**
-	 * Invalidate any cached rendering state.
+	 * Optional hook to invalidate any cached rendering state.
 	 * Called when theme changes or when component needs to re-render from scratch.
 	 */
-	invalidate(): void;
+	invalidate?(): void;
+
+	/**
+	 * Optional teardown. Called when the component is permanently removed from
+	 * the live tree (e.g. a transcript reset). Release timers, intervals, and
+	 * subscriptions here. Must be idempotent. Containers propagate dispose to
+	 * their children; leaf components without resources may omit it.
+	 */
+	dispose?(): void;
 }
 
 /**
@@ -286,6 +311,17 @@ export interface OverlayOptions {
 	 * Called each render cycle with current terminal dimensions.
 	 */
 	visible?: (termWidth: number, termHeight: number) => boolean;
+
+	// === Fullscreen ===
+	/**
+	 * Borrow the terminal's alternate screen buffer for this overlay's lifetime
+	 * (vim/less idiom). While the topmost visible overlay sets this, the engine
+	 * paints only the modal on the alt screen and emits no ED3 / scrollback
+	 * bytes, so the transcript on the normal screen stays untouched and is not
+	 * scrollable behind the modal. Defaults off — all other overlays are
+	 * unchanged and still draw over the transcript on the normal screen.
+	 */
+	fullscreen?: boolean;
 }
 
 /**
@@ -327,11 +363,23 @@ export class Container implements Component {
 		}
 	}
 
+	/**
+	 * Propagate teardown to children. Call when the container's children are
+	 * being permanently discarded (not when they are detached for reuse — use
+	 * {@link clear} for that). Idempotent per child via each child's own dispose.
+	 */
+	dispose(): void {
+		for (const child of this.children) {
+			child.dispose?.();
+		}
+	}
+
 	render(width: number): string[] {
 		width = Math.max(1, width);
 		const lines: string[] = [];
 		for (const child of this.children) {
-			lines.push(...child.render(width));
+			const childLines = child.render(width);
+			for (let i = 0; i < childLines.length; i++) lines.push(childLines[i]);
 		}
 		return lines;
 	}
@@ -357,6 +405,10 @@ export class Container implements Component {
  * - `deferredShrink`: pure content shrink would re-expose rows already in
  *   native history. Keep row indices stable with blank tail padding, repaint
  *   only the viewport, and defer the real shorter replay to a checkpoint.
+ * - `deferredTailRepaint`: a deferred history mutation also changed the active
+ *   grid's bottom row; repaint only that row relative to the tracked hardware
+ *   cursor so a bottom-anchored spinner can advance without rewriting rows that
+ *   a slightly-scrolled reader can still see.
  * - `deferredMutation`: a row-inserting edit would reindex native scrollback
  *   while the user is scrolled. Defer all bytes until a safe rebuild checkpoint.
  * - `shrink`: trailing rows were dropped — clear extras inline.
@@ -371,6 +423,7 @@ type RenderIntent =
 	| { kind: "liveRegionPinned"; appendFrom: number; appendTo: number; renderViewportTop: number }
 	| { kind: "viewportRepaint"; appendFrom?: number }
 	| { kind: "deferredShrink"; paddedLength: number }
+	| { kind: "deferredTailRepaint"; row: number; line: string }
 	| { kind: "deferredMutation" }
 	| { kind: "shrink" }
 	| { kind: "diff"; firstChanged: number; lastChanged: number; appendedLines: boolean };
@@ -381,6 +434,11 @@ type RenderIntent =
 export class TUI extends Container {
 	terminal: Terminal;
 	#previousLines: string[] = [];
+	// Per-frame cache of #fitLineToWidth results. Cleared at the top of every
+	// #doRender (where the frame width is fixed), so it only ever holds entries
+	// for one width. Eliminates the duplicate fit work between the compose pass
+	// and the emitters, plus repeated fits of identical blank padding rows.
+	#fitLineCache = new Map<string, string>();
 	#previousWidth = 0;
 	#previousHeight = 0;
 	#focusedComponent: Component | null = null;
@@ -421,6 +479,7 @@ export class TUI extends Container {
 	#nativeScrollbackLiveRegionStart: number | undefined;
 	#nativeScrollbackCommitSafeEnd: number | undefined;
 	#nativeScrollbackDirty = false;
+	#deferredTailLine: string | undefined;
 	// Highest `#maxLinesRendered` reached during a foreground tool turn while
 	// intermediate frames were prevented from committing to terminal scrollback.
 	// Used after the tool finishes to push the settled content into scrollback
@@ -454,6 +513,16 @@ export class TUI extends Container {
 	// describes the screen. Tracking only the dimension delta misses this.
 	#resizeEventPending = false;
 	#stopped = false;
+
+	// Transient alternate-screen state for a fullscreen overlay. While active, the
+	// engine paints only the modal on the alt buffer and leaves every
+	// normal-screen accounting field (#previousLines, #viewportTopRow, …)
+	// untouched, so exiting reconciles cleanly against the terminal-restored
+	// normal screen. #altPreviousLines is the last alt frame, for repaint-skip.
+	#altActive = false;
+	#altPreviousLines: string[] = [];
+	#altEnterWidth = 0;
+	#altEnterHeight = 0;
 
 	// Overlay stack for modal components rendered on top of base content
 	overlayStack: {
@@ -492,7 +561,7 @@ export class TUI extends Container {
 					this.#nativeScrollbackCommitSafeEnd = offset + boundedEnd;
 				}
 			}
-			lines.push(...childLines);
+			for (let i = 0; i < childLines.length; i++) lines.push(childLines[i]);
 		}
 		return lines;
 	}
@@ -550,11 +619,17 @@ export class TUI extends Container {
 
 	/**
 	 * Whether DEC 2026 synchronized-output wrappers are currently emitted around
-	 * paints. Starts from conservative terminal/env detection and is force-disabled
-	 * at runtime if the terminal reports mode 2026 unsupported via DECRQM.
+	 * paints. Starts from conservative terminal/env detection and is reconciled at
+	 * runtime against the terminal's DECRQM mode-2026 report — enabled on a
+	 * positive report, disabled on a negative one.
 	 */
 	get synchronizedOutput(): boolean {
 		return this.#synchronizedOutputEnabled;
+	}
+	#deccaraFillsEnabled(): boolean {
+		// DECCARA fill rectangles arrive after shortened row text; synchronized
+		// output hides that intermediate default-background state from users.
+		return TERMINAL.deccara && this.#synchronizedOutputEnabled;
 	}
 
 	/**
@@ -569,8 +644,8 @@ export class TUI extends Container {
 	 * (the viewport is never observable there and ConPTY hosts erase host
 	 * scrollback on ED3 — #1635/#1746); only the unknown POSIX case is forced to
 	 * rebuild. POSIX hosts known to disturb scrolled readers on xterm ED3
-	 * (`CSI 3 J`, erase saved lines) also defer the eager opt-in; checkpoint and
-	 * direct user-input rebuilds are unaffected.
+	 * (`CSI 3 J`, erase saved lines) also defer the eager opt-in; checkpoint
+	 * rebuilds are unaffected.
 	 *
 	 * Disabling stays active through one already-requested frame: the event batch
 	 * that ends a foreground stream both removes its UI rows (loader/status
@@ -591,7 +666,7 @@ export class TUI extends Container {
 			this.#eagerNativeScrollbackRebuildDisablePending = true;
 			return;
 		}
-		if (process.platform !== "win32" && TERMINAL.eagerEraseScrollbackRisk) {
+		if (this.#hasEagerEraseScrollbackRisk()) {
 			this.#streamingHighWater = 0;
 			this.#markNativeScrollbackDirty();
 		}
@@ -716,20 +791,25 @@ export class TUI extends Container {
 
 	start(): void {
 		this.#stopped = false;
-		// Disable synchronized output if the terminal reports DEC 2026 unsupported
-		// via DECRQM. PI_NO_SYNC_OUTPUT already forces it off at construction, so
-		// only react when the user has not already opted out. Future paints drop
-		// the begin/end markers; the autowrap guards stay (see #1765).
+		// A DECRQM report for mode 2026 is authoritative: enable synchronized
+		// output when the terminal reports support (upgrading conservatively
+		// defaulted-off hosts like zellij/tmux-master/foot) and disable it when
+		// the terminal reports it unsupported. An explicit user opt-out/force
+		// (resolved at construction) still wins, so skip the probe in that case.
 		this.terminal.onPrivateModeReport?.((mode, supported) => {
-			if (mode === 2026 && !supported && !$flag("PI_NO_SYNC_OUTPUT")) {
-				this.#setSynchronizedOutput(false);
-			}
+			if (mode !== 2026) return;
+			if (synchronizedOutputUserOverride() !== null) return;
+			this.#setSynchronizedOutput(supported);
 		});
 		this.terminal.start(
 			data => this.#handleInput(data),
 			() => {
+				// Repaint immediately rather than via the throttled path: a resize must
+				// clear and replay at the fresh geometry before the terminal's reflow
+				// settles into a state a throttled frame would race. Forced render skips
+				// the 16ms coalescing window, matching resetDisplay()'s prompt repaint.
 				this.#resizeEventPending = true;
-				this.requestRender();
+				this.requestRender(true);
 			},
 		);
 		this.terminal.hideCursor();
@@ -886,8 +966,8 @@ export class TUI extends Container {
 
 	/**
 	 * Toggle synchronized-output (DEC 2026) wrappers on paint/cursor writes and
-	 * recompute the cached begin/end sequences. Honors a DECRQM report that the
-	 * terminal does not support 2026 (#1765 covers the static env opt-out).
+	 * recompute the cached begin/end sequences. Driven by the terminal's DECRQM
+	 * mode-2026 report (#1765 covers the static env opt-out).
 	 */
 	#setSynchronizedOutput(enabled: boolean): void {
 		if (this.#synchronizedOutputEnabled === enabled) return;
@@ -899,6 +979,13 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		// Leave the alt buffer first so the teardown cursor math below runs against
+		// the restored normal screen (which #previousLines still describes).
+		if (this.#altActive) {
+			this.terminal.write(`${MOUSE_TRACKING_OFF}\x1b[?1049l`);
+			this.#altActive = false;
+			this.#altPreviousLines = [];
+		}
 		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
 			for (const id of this.#imageBudget.takeAllTransmittedIds()) {
 				this.terminal.write(encodeKittyDeleteImage(id));
@@ -949,14 +1036,45 @@ export class TUI extends Container {
 			return false;
 		}
 		const nativeViewportAtBottom = this.#readNativeViewportAtBottom();
-		if (!this.#canReplayNativeScrollbackAtCheckpoint(nativeViewportAtBottom)) {
-			return false;
-		}
+		// The checkpoint fires at a prompt submit — a bottom-pinning user action. On a
+		// genuine local terminal the submit keystroke scrolls the host to its tail, so
+		// an unprobeable viewport is safely at-bottom and the ED3 replay will not yank
+		// a scrolled reader (the same explicit-user-action reasoning the resize rebuild
+		// uses). Hosts whose scrollback a keystroke does not move — Windows
+		// console/Terminal, SSH, multiplexers, unknown profiles — stay gated on a
+		// positive at-tail probe (#1610/#1682/#1746); a known-scrolled viewport always
+		// defers regardless of terminal.
+		if (nativeViewportAtBottom === false) return false;
+		if (nativeViewportAtBottom === undefined && !TERMINAL.submitPinsViewportToTail) return false;
 		this.#prepareForcedRender(true, false);
 		this.#renderRequested = false;
 		this.#lastRenderAt = this.#renderScheduler.now();
 		this.#doRender();
 		return true;
+	}
+
+	/**
+	 * Force an immediate full replay of the current frame, including native
+	 * scrollback. This is the keyboard-accessible equivalent of the resize reset:
+	 * no queued diff frame or terminal scrollback probe can downgrade it to a
+	 * viewport-only repaint.
+	 *
+	 * Invalidates every component first so the replay reflects current state. A
+	 * geometry-driven reset thaws frozen scrollback snapshots implicitly (the new
+	 * width misses every cached snapshot), but a same-width reset would otherwise
+	 * replay stale snapshots — leaving host-frozen blocks (e.g. a transcript whose
+	 * committed rows are immutable on ED3-risk terminals) showing pre-mutation
+	 * content. Invalidation is the generic signal those containers use to retire
+	 * their snapshots, which is exactly what a user-driven display reset wants.
+	 */
+	resetDisplay(): void {
+		if (this.#stopped) return;
+		this.invalidate();
+		this.#prepareForcedRender(!isMultiplexerSession(), true);
+		this.#resizeEventPending = true;
+		this.#renderRequested = false;
+		this.#lastRenderAt = this.#renderScheduler.now();
+		this.#doRender();
 	}
 
 	requestRender(force = false, options?: RenderRequestOptions): void {
@@ -1424,6 +1542,39 @@ export class TUI extends Container {
 		if (this.#stopped) return;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		// Reset the per-frame fit memo: width is fixed for this frame, so cached
+		// fit results stay valid across the compose pass and every emitter re-fit.
+		this.#fitLineCache.clear();
+
+		// Fullscreen alt-screen short-circuit. While the topmost visible overlay
+		// requests it, borrow the terminal's alternate buffer (saved/restored by
+		// the terminal around 1049h/1049l) and paint only the modal there. This
+		// touches no normal-screen accounting field, so the transcript on the
+		// normal screen stays untouched and unscrollable behind the modal, and
+		// exiting reconciles cleanly against the terminal-restored screen.
+		const wantAlt = this.#wantsAltScreen();
+		if (wantAlt && !this.#altActive) {
+			this.terminal.write(`\x1b[?1049h${MOUSE_TRACKING_ON}`);
+			this.terminal.hideCursor();
+			this.#altActive = true;
+			this.#altPreviousLines = [];
+			this.#altEnterWidth = width;
+			this.#altEnterHeight = height;
+		} else if (!wantAlt && this.#altActive) {
+			this.terminal.write(`${MOUSE_TRACKING_OFF}\x1b[?1049l`);
+			this.#altActive = false;
+			this.#altPreviousLines = [];
+			// A resize while on the alt buffer reflowed the terminal's saved normal
+			// screen; it no longer matches #previousLines, so force the geometry
+			// rebuild path instead of a stale diff.
+			if (width !== this.#altEnterWidth || height !== this.#altEnterHeight) {
+				this.#resizeEventPending = true;
+			}
+		}
+		if (this.#altActive) {
+			this.#renderAltFrame(width, height);
+			return;
+		}
 
 		// 1. Compose the frame. Bracket the transcript render so the image budget
 		// observes every inline image in display order (overlays carry none).
@@ -1463,7 +1614,7 @@ export class TUI extends Container {
 		const heightChanged =
 			(this.#previousHeight > 0 && this.#previousHeight !== height) ||
 			(resizeEventOccurred && this.#previousHeight > 0);
-		const eagerEraseScrollbackRisk = process.platform !== "win32" && TERMINAL.eagerEraseScrollbackRisk;
+		const eagerEraseScrollbackRisk = this.#hasEagerEraseScrollbackRisk();
 		const eagerRebuildAllowed = this.#eagerNativeScrollbackRebuild && !eagerEraseScrollbackRisk;
 		const explicitViewportMutation = this.#allowUnknownViewportMutationOnNextRender;
 		const allowUnknownViewportMutation = explicitViewportMutation || eagerRebuildAllowed;
@@ -1528,6 +1679,7 @@ export class TUI extends Container {
 			} else if (
 				!explicitReconcile &&
 				nativeViewportAtBottom !== true &&
+				!isMultiplexerSession() &&
 				(intent.kind === "sessionReplace" ||
 					intent.kind === "historyRebuild" ||
 					intent.kind === "overlayRebuild" ||
@@ -1535,6 +1687,13 @@ export class TUI extends Container {
 			) {
 				// Cap the frame to the viewport and keep scrollback dirty: transient
 				// rows never enter history, and the checkpoint reconciles later.
+				// Multiplexers (tmux/screen/zellij) are excluded: their checkpoint
+				// reconcile is a no-op (pane history cannot be erased), so any rows
+				// dropped here are dropped forever. Pane history is append-only
+				// anyway, so a normal diff/append `\r\n` commit is exactly what the
+				// multiplexer needs — and the `liveRegionPinned` planner above
+				// keeps the actively-mutating live tail out of pane history while
+				// committing only the sealed prefix (issue #1974).
 				this.#markNativeScrollbackDirty();
 				this.#streamingHighWater = Math.max(this.#streamingHighWater, lines.length);
 				this.#scrollbackHighWater = 0;
@@ -1602,6 +1761,7 @@ export class TUI extends Container {
 					clearViewport: true,
 					clearScrollback: !isMultiplexerSession(),
 				});
+				this.#hasEverRendered = true;
 				return;
 			case "historyRebuild":
 				this.#clearNativeScrollbackDirty();
@@ -1636,6 +1796,16 @@ export class TUI extends Container {
 					this.#emitAppendTail(lines, intent.appendFrom, height, width, prevViewportTop, prevHardwareCursorRow);
 				}
 				this.#emitViewportRepaint(lines, width, height, cursorPos);
+				return;
+			case "deferredTailRepaint":
+				this.#emitDeferredTailRepaint(
+					intent.line,
+					width,
+					height,
+					intent.row,
+					prevViewportTop,
+					prevHardwareCursorRow,
+				);
 				return;
 			case "deferredMutation":
 				return;
@@ -1686,16 +1856,20 @@ export class TUI extends Container {
 		liveRegionStart: number | undefined,
 		commitSafeEnd: number | undefined,
 	): RenderIntent {
+		// A forced scrollback wipe can be queued before start()'s initial paint runs
+		// (cold `omp --resume` does this while replacing the welcome frame with the
+		// restored transcript). Honor it before the normal initial-preserve path so
+		// the first committed frame is the clean session replay, not a deferred wipe
+		// that waits for the user's first keystroke.
+		if (this.#clearScrollbackOnNextRender) return { kind: "sessionReplace" };
+
 		// Initial paint after start(): scrollback must keep its prior shell
 		// content, but the viewport must be cleared so stale rows do not bleed
 		// into the new UI.
 		if (!this.#hasEverRendered) return { kind: "initial" };
 
-		// Caller opted into a scrollback wipe via requestRender(true, { clearScrollback: true }).
-		if (this.#clearScrollbackOnNextRender) return { kind: "sessionReplace" };
-
 		const forceViewportRepaint = this.#forceViewportRepaintOnNextRender;
-		const eagerEraseScrollbackRisk = process.platform !== "win32" && TERMINAL.eagerEraseScrollbackRisk;
+		const eagerEraseScrollbackRisk = this.#hasEagerEraseScrollbackRisk();
 		if (overlayVisibilityReduced && !isMultiplexerSession()) {
 			return hasVisibleOverlay ? { kind: "overlayRebuild" } : { kind: "historyRebuild" };
 		}
@@ -1718,6 +1892,11 @@ export class TUI extends Container {
 			return hasVisibleOverlay ? { kind: "overlayRebuild" } : { kind: "historyRebuild" };
 		}
 
+		// Same dirty-scrollback opt-in policy as the non-overlay branch below: an
+		// ED3-risk macOS/POSIX terminal with an unobservable viewport ignores
+		// focused-input unknown opt-ins, so overlay selector Up/Down moves do not
+		// become ED3 clears plus full transcript replays. Non-ED3-risk POSIX still
+		// honors direct-input/IME/autocomplete opt-ins.
 		if (hasVisibleOverlay) {
 			const nativeViewportAtBottom = this.#readNativeViewportAtBottom();
 			// Multiplexer panes never get a destructive scrollback clear
@@ -1725,10 +1904,11 @@ export class TUI extends Container {
 			// "rebuild" would only append a full duplicate copy of the transcript
 			// to pane history on every dirty frame. Keep repainting the viewport
 			// and leave reconciliation to explicit checkpoints.
+			const allowDirtyUnknownViewportMutation = allowUnknownViewportMutation && !eagerEraseScrollbackRisk;
 			if (
 				this.#nativeScrollbackDirty &&
 				!isMultiplexerSession() &&
-				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, allowUnknownViewportMutation)
+				this.#canRebuildNativeScrollbackLive(nativeViewportAtBottom, allowDirtyUnknownViewportMutation)
 			) {
 				return { kind: "overlayRebuild" };
 			}
@@ -1759,12 +1939,19 @@ export class TUI extends Container {
 			this.#streamingHighWater = 0;
 		}
 
-		if (
-			this.#nativeScrollbackDirty &&
-			!isMultiplexerSession() &&
-			this.#canRebuildNativeScrollbackLive(this.#readNativeViewportAtBottom(), allowUnknownViewportMutation)
-		) {
-			return { kind: "historyRebuild" };
+		if (this.#nativeScrollbackDirty && !isMultiplexerSession()) {
+			// A dirty flag means older native history is stale; it is not required to
+			// make the current focused-input frame correct. On ED3-risk macOS/POSIX
+			// terminals with an unobservable viewport, ignore focused-input unknown
+			// opt-ins so Up/Down selector moves do not become ED3 clears plus full
+			// transcript replays. Non-ED3-risk POSIX terminals keep their safe
+			// direct-input/IME/autocomplete opt-in.
+			const allowDirtyUnknownViewportMutation = allowUnknownViewportMutation && !eagerEraseScrollbackRisk;
+			if (
+				this.#canRebuildNativeScrollbackLive(this.#readNativeViewportAtBottom(), allowDirtyUnknownViewportMutation)
+			) {
+				return { kind: "historyRebuild" };
+			}
 		}
 
 		const diff = this.#diffLines(newLines);
@@ -1802,18 +1989,28 @@ export class TUI extends Container {
 			//
 			const paddedViewportTop = Math.max(0, this.#previousLines.length - height);
 			// ED3-risk terminals with an unobservable viewport cannot safely clear
-			// saved lines. During an active eager streaming turn the user follows the
-			// live tail, so paint the shrink's bottom-anchored viewport in place
-			// whether it still overflows OR now fits — otherwise the UI freezes on
-			// stale rows until the next input even though the frame has a fresh bottom
-			// viewport to show (issues #1682, foreground-stream fidelity on collapse).
-			// Native history stays dirty and reconciles at the next checkpoint. With no
-			// active eager turn the reader may be scrolled; even a padded shrink repaint
-			// can move ED3-risk unknown host scrollback (WSL/Ghostty-style), so defer
+			// saved lines. Direct user-input frames (autocomplete/IME) may still
+			// repaint the live viewport: the user action pins the host to the tail, and
+			// emitting zero bytes leaves stale autocomplete rows on screen until a later
+			// checkpoint. When the changed rows are at or below the previous viewport
+			// top, keep the old bottom anchor by padding the frame to its previous
+			// length; that clears stale popup rows without re-exposing rows already
+			// committed to native history. If an offscreen edit shifted rows above the
+			// viewport, padding would repaint the wrong seam, so use a viewport repaint
+			// for liveness and keep history dirty. Active eager streaming also uses a
+			// viewport repaint so the live tail keeps moving. With neither direct input
+			// nor active eager streaming, the reader may be scrolled, so defer
 			// completely rather than repainting over their history.
 			if (nativeViewportAtBottom === undefined && eagerEraseScrollbackRisk) {
 				this.#markNativeScrollbackDirty();
-				return this.#eagerNativeScrollbackRebuild ? { kind: "viewportRepaint" } : { kind: "deferredMutation" };
+				if (allowUnknownViewportMutation) {
+					return diff.firstChanged < prevViewportTop
+						? { kind: "viewportRepaint" }
+						: { kind: "deferredShrink", paddedLength: this.#previousLines.length };
+				}
+				return this.#eagerNativeScrollbackRebuild
+					? { kind: "viewportRepaint" }
+					: this.#planDeferredTailRepaint(newLines, prevViewportTop, height);
 			}
 
 			// Non-ED3-risk POSIX with an unobservable viewport. `deferredShrink` is
@@ -1825,7 +2022,7 @@ export class TUI extends Container {
 			}
 			this.#markNativeScrollbackDirty();
 			if (diff.firstChanged < prevViewportTop) {
-				return { kind: "deferredMutation" };
+				return this.#planDeferredTailRepaint(newLines, prevViewportTop, height);
 			}
 			return { kind: "deferredShrink", paddedLength: this.#previousLines.length };
 		}
@@ -1924,21 +2121,30 @@ export class TUI extends Container {
 		const contentGrew = newLines.length > this.#previousLines.length;
 		const pureAppend = diff.appendedLines && diff.firstChanged === this.#previousLines.length;
 		const structuralMutation = newLines.length !== this.#previousLines.length || diff.firstChanged < prevViewportTop;
-		if (pureAppend && contentGrew && this.#previousLines.length > height && !isMultiplexerSession()) {
+		if (pureAppend && contentGrew && this.#previousLines.length >= height && !isMultiplexerSession()) {
 			const nativeViewportAtBottom = this.#readNativeViewportAtBottom();
+			if (this.#nativeViewportIsKnownScrolled(nativeViewportAtBottom)) {
+				this.#markNativeScrollbackDirty();
+				return { kind: "deferredMutation" };
+			}
+			if (nativeViewportAtBottom === undefined && allowUnknownViewportMutation) {
+				// Direct input can grow transient live UI (autocomplete/IME/editor
+				// wraps) while the previous frame already touched the viewport bottom.
+				// A diff append would `\r\n`-scroll those transient rows into native
+				// history, and a later popup shrink would duplicate the stable prefix at
+				// the scrollback seam. Repaint the live viewport in place instead; the
+				// dirty checkpoint owns native-history reconciliation.
+				this.#markNativeScrollbackDirty();
+				return { kind: "viewportRepaint" };
+			}
 			if (this.#nativeViewportIsScrolled(nativeViewportAtBottom, allowUnknownViewportMutation)) {
 				this.#markNativeScrollbackDirty();
-				// Confirmed scrolled (probe returned `false`): the reader is parked in
-				// scrollback and writing the live frame is wasted bytes — defer until
-				// the next checkpoint reconciles. Unknown viewport (e.g. native Windows
-				// Terminal where the probe cannot see WT host scrollback) is a
-				// different case: a no-op there freezes the editor on the keystroke
-				// that grows `lines.length` past the viewport (the wrap keystroke).
-				// Fall through to a non-destructive viewport repaint instead so the
-				// live UI keeps updating without yanking a possibly-scrolled reader.
-				if (this.#nativeViewportIsKnownScrolled(nativeViewportAtBottom)) {
-					return { kind: "deferredMutation" };
-				}
+				// Unknown viewport (e.g. native Windows Terminal where the probe cannot
+				// see WT host scrollback) is a different case: a no-op there freezes the
+				// editor on the keystroke that grows `lines.length` past the viewport
+				// (the wrap keystroke). Fall through to a non-destructive viewport
+				// repaint instead so the live UI keeps updating without yanking a
+				// possibly-scrolled reader.
 				return { kind: "viewportRepaint" };
 			}
 		}
@@ -2022,7 +2228,7 @@ export class TUI extends Container {
 				!cleanTailAppend &&
 				!this.#eagerNativeScrollbackRebuild
 			) {
-				return { kind: "deferredMutation" };
+				return this.#planDeferredTailRepaint(newLines, prevViewportTop, height);
 			}
 			return { kind: "viewportRepaint", appendFrom: cleanTailAppend ? this.#previousLines.length : undefined };
 		}
@@ -2108,6 +2314,11 @@ export class TUI extends Container {
 		this.#nativeScrollbackDirty = false;
 	}
 
+	#hasEagerEraseScrollbackRisk(): boolean {
+		if (process.platform === "win32") return false;
+		return this.terminal.hasEagerEraseScrollbackRisk?.() ?? TERMINAL.eagerEraseScrollbackRisk;
+	}
+
 	#readNativeViewportAtBottom(): boolean | undefined {
 		// A stale positive is destructive: live history rebuilds clear native
 		// scrollback. Require two consecutive at-bottom probes before trusting it.
@@ -2174,11 +2385,18 @@ export class TUI extends Container {
 			liveRegionStart >= newLines.length ||
 			!this.#eagerNativeScrollbackRebuild ||
 			!eagerEraseScrollbackRisk ||
-			allowUnknownViewportMutation ||
-			isMultiplexerSession()
+			allowUnknownViewportMutation
 		) {
 			return undefined;
 		}
+		// Multiplexers (tmux/screen/zellij) cannot erase pane history with `\x1b[3J`
+		// and cannot answer a viewport-position probe, so the destructive checkpoint
+		// rebuild path is forever unavailable. The pinned emitter is built from the
+		// opposite primitives — relative cursor moves, per-row rewrite/suffix-clear,
+		// and `\r\n` to scroll sealed rows past the viewport bottom — which are exactly
+		// what tmux pane history accepts. Without this commit-as-you-go path, the
+		// streaming cap below clipped every frame to the visible tail and the
+		// scrolled-off head was committed nowhere (issue #1974).
 		if (newLines.length <= height && this.#scrollbackHighWater === 0) return undefined;
 		if (this.#readNativeViewportAtBottom() !== undefined) return undefined;
 
@@ -2209,6 +2427,19 @@ export class TUI extends Container {
 		return { kind: "liveRegionPinned", appendFrom, appendTo, renderViewportTop };
 	}
 
+	#planDeferredTailRepaint(newLines: string[], prevViewportTop: number, height: number): RenderIntent {
+		const row = prevViewportTop + height - 1;
+		if (row < 0 || row >= this.#previousLines.length || newLines.length !== this.#previousLines.length) {
+			return { kind: "deferredMutation" };
+		}
+		const line = newLines[row] ?? "";
+		const previousLine = this.#deferredTailLine ?? this.#previousLines[row] ?? "";
+		if (line === previousLine) {
+			return { kind: "deferredMutation" };
+		}
+		return { kind: "deferredTailRepaint", row, line };
+	}
+
 	#padDeferredShrinkLines(lines: string[], paddedLength: number): string[] {
 		if (lines.length >= paddedLength) return lines;
 		return [...lines, ...new Array<string>(paddedLength - lines.length).fill("")];
@@ -2228,10 +2459,31 @@ export class TUI extends Container {
 	}
 
 	#fitLineToWidth(line: string, width: number): string {
-		if (TERMINAL.isImageLine(line)) return line;
-		if (visibleWidth(line) <= width) return line;
-		const truncated = truncateToWidth(line, width, Ellipsis.Omit);
-		return truncated + (truncated.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
+		// Frame-scoped memo: #doRender clears this each frame after reading the
+		// terminal width, so within a frame `width` is constant and this map is
+		// keyed by line alone. The compose/fit pass (#fitLinesToWidth) and every
+		// emitter re-fit the same lines (and many repeated blank rows); the result
+		// is pure for a fixed width, so caching it is byte-identical and skips the
+		// redundant native visibleWidth/truncate work.
+		const cached = this.#fitLineCache.get(line);
+		if (cached !== undefined) return cached;
+		let result: string;
+		if (TERMINAL.isImageLine(line)) {
+			result = line;
+		} else if (visibleWidth(line) <= width) {
+			result = line;
+		} else {
+			const truncated = truncateToWidth(line, width, Ellipsis.Omit);
+			result = truncated + (truncated.includes("\x1b]8;") ? LINE_TERMINATOR : SEGMENT_RESET);
+		}
+		this.#fitLineCache.set(line, result);
+		return result;
+	}
+
+	#lineRewriteSequence(line: string, width: number): string {
+		const fitted = this.#fitLineToWidth(line, width);
+		if (TERMINAL.isImageLine(fitted)) return ERASE_LINE + fitted;
+		return visibleWidth(fitted) >= width ? fitted : fitted + ERASE_TO_END_OF_LINE;
 	}
 
 	/**
@@ -2240,6 +2492,7 @@ export class TUI extends Container {
 	 */
 
 	#commit(lines: string[], width: number, height: number, viewportTop: number, hardwareCursorRow: number): void {
+		this.#deferredTailLine = undefined;
 		this.#previousLines = lines;
 		this.#previousVisibleOverlayComponents = this.#visibleOverlayComponentsThisRender;
 		this.#forceViewportRepaintOnNextRender = false;
@@ -2293,7 +2546,7 @@ export class TUI extends Container {
 		const visibleStart = Math.max(0, lines.length - height);
 		let fillSequence = "";
 		let visibleTexts: string[] | null = null;
-		if (TERMINAL.deccara && visibleStart < lines.length) {
+		if (this.#deccaraFillsEnabled() && visibleStart < lines.length) {
 			const visible: string[] = new Array(lines.length - visibleStart);
 			for (let k = 0; k < visible.length; k++) {
 				visible[k] = this.#fitLineToWidth(lines[visibleStart + k], width);
@@ -2393,14 +2646,13 @@ export class TUI extends Container {
 		for (let screenRow = 0; screenRow < height; screenRow++) {
 			visible[screenRow] = this.#fitLineToWidth(lines[viewportTop + screenRow] ?? "", width);
 		}
-		const { texts, sequence } = TERMINAL.deccara
+		const { texts, sequence } = this.#deccaraFillsEnabled()
 			? planDeccaraFills(visible, width)
 			: { texts: visible, sequence: "" };
 		let buffer = `${this.#paintBeginSequence}\x1b[H`;
 		for (let screenRow = 0; screenRow < height; screenRow++) {
 			if (screenRow > 0) buffer += "\r\n";
-			buffer += "\x1b[2K";
-			buffer += texts[screenRow];
+			buffer += this.#lineRewriteSequence(texts[screenRow], width);
 		}
 		// DECCARA rectangles paint the visible fills before cursor positioning;
 		// the cleared cells written above are what the rectangles repaint.
@@ -2431,6 +2683,61 @@ export class TUI extends Container {
 		this.#commit(lines, width, height, viewportTop, toRow);
 	}
 
+	/** Topmost visible overlay requests the alternate-screen buffer. */
+	#wantsAltScreen(): boolean {
+		for (let i = this.overlayStack.length - 1; i >= 0; i--) {
+			const entry = this.overlayStack[i]!;
+			if (!this.#isOverlayVisible(entry)) continue;
+			return entry.options?.fullscreen === true;
+		}
+		return false;
+	}
+
+	/**
+	 * Compose and paint a single fullscreen overlay frame on the alt buffer.
+	 * Cursor markers are stripped (the modal draws its own in-band caret and
+	 * keeps the hardware cursor hidden), and only the modal is composited over a
+	 * blank base — the transcript is never touched while the alt buffer is up.
+	 */
+	#renderAltFrame(width: number, height: number): void {
+		const base: string[] = new Array(Math.max(0, height)).fill("");
+		let lines = this.#compositeOverlays(base, width, height);
+		this.#extractCursorPosition(lines, height);
+		lines = this.#fitLinesToWidth(this.#applyLineResets(lines), width);
+		this.#emitAltFrame(lines, width, height);
+	}
+
+	/**
+	 * Full per-row viewport rewrite on the alt buffer. Emits only sync-output
+	 * brackets, a cursor home, and per-row rewrites — never ED3, append-tail, or
+	 * any native-scrollback byte, so it is fully isolated from the planner and
+	 * #commit. The hardware cursor stays hidden (it is never re-shown here).
+	 */
+	#emitAltFrame(lines: string[], width: number, height: number): void {
+		const fitted: string[] = new Array(height);
+		for (let r = 0; r < height; r++) fitted[r] = this.#fitLineToWidth(lines[r] ?? "", width);
+		// Skip an identical repaint (the modal is mostly static between keystrokes).
+		if (this.#altPreviousLines.length === height) {
+			let same = true;
+			for (let r = 0; r < height; r++) {
+				if (fitted[r] !== this.#altPreviousLines[r]) {
+					same = false;
+					break;
+				}
+			}
+			if (same) return;
+		}
+		let buffer = `${this.#paintBeginSequence}\x1b[H`;
+		for (let r = 0; r < height; r++) {
+			if (r > 0) buffer += "\r\n";
+			buffer += this.#lineRewriteSequence(fitted[r], width);
+		}
+		buffer += this.#paintEndSequence;
+		this.terminal.write(buffer);
+		this.#altPreviousLines = fitted;
+		this.#fullRedrawCount += 1;
+	}
+
 	/**
 	 * Foreground-stream live-region paint for ED3-risk terminals with an
 	 * unobservable viewport. Commits the newly-sealed chunk to native scrollback
@@ -2438,8 +2745,8 @@ export class TUI extends Container {
 	 * leaving the transient live region out of saved lines.
 	 *
 	 * Uses only the no-scroll-snap vocabulary of {@link #emitDiff}: relative
-	 * cursor moves, per-line `\x1b[2K`, and `\r\n` to push the sealed chunk into
-	 * history. It deliberately avoids a full-screen erase (`\x1b[2J`) and absolute
+	 * cursor moves, per-row rewrite/suffix-clear, and `\r\n` to push the sealed
+	 * chunk into history. It deliberately avoids a full-screen erase (`\x1b[2J`) and absolute
 	 * cursor home (`\x1b[H`): on Ghostty those snap a reader scrolled into history
 	 * back to the bottom on every frame.
 	 */
@@ -2471,17 +2778,18 @@ export class TUI extends Container {
 
 		// Write the sealed chunk followed by the full viewport from the top row.
 		// The first (boundedAppendTo - boundedAppendFrom) rows scroll into native
-		// history; the trailing `height` rows fill the viewport. Each row clears
-		// itself with `\x1b[2K` instead of relying on a screen-wide erase.
+		// history; the trailing `height` rows fill the viewport. Text rows overwrite
+		// first and clear only the suffix so non-synchronized hosts do not visibly
+		// blank stable content before repainting it.
 		let wroteLine = false;
 		for (let i = boundedAppendFrom; i < boundedAppendTo; i++) {
 			if (wroteLine) buffer += "\r\n";
-			buffer += `\x1b[2K${this.#fitLineToWidth(lines[i] ?? "", width)}`;
+			buffer += this.#lineRewriteSequence(lines[i] ?? "", width);
 			wroteLine = true;
 		}
 		for (let screenRow = 0; screenRow < height; screenRow++) {
 			if (wroteLine) buffer += "\r\n";
-			buffer += `\x1b[2K${this.#fitLineToWidth(lines[viewportTop + screenRow] ?? "", width)}`;
+			buffer += this.#lineRewriteSequence(lines[viewportTop + screenRow] ?? "", width);
 			wroteLine = true;
 		}
 
@@ -2534,6 +2842,41 @@ export class TUI extends Container {
 		if (pushedNow > this.#scrollbackHighWater) {
 			this.#scrollbackHighWater = pushedNow;
 		}
+	}
+
+	/**
+	 * Paint only the active-grid bottom row while a scrollback mutation remains
+	 * deferred. If the native viewport is unknown and the user is scrolled up by a
+	 * single line, every active-grid row except the bottom can still be visible in
+	 * their scrollback window; touching only this row keeps that reader's viewport
+	 * unchanged while allowing bottom-anchored live chrome (spinner/status tail) to
+	 * advance for users at the tail.
+	 */
+	#emitDeferredTailRepaint(
+		line: string,
+		width: number,
+		height: number,
+		row: number,
+		prevViewportTop: number,
+		prevHardwareCursorRow: number,
+	): void {
+		const viewportBottom = prevViewportTop + height - 1;
+		if (row !== viewportBottom) return;
+
+		let buffer = this.#paintBeginSequence;
+		const clampedCursor = Math.min(prevHardwareCursorRow, viewportBottom);
+		const currentScreenRow = Math.max(0, Math.min(height - 1, clampedCursor - prevViewportTop));
+		const moveDown = height - 1 - currentScreenRow;
+		if (moveDown > 0) buffer += `\x1b[${moveDown}B`;
+		buffer += `\r${this.#lineRewriteSequence(line, width)}\x1b[?25l`;
+		buffer += this.#paintEndSequence;
+		this.terminal.write(buffer);
+
+		this.#deferredTailLine = line;
+		this.#previousWidth = width;
+		this.#previousHeight = height;
+		this.#viewportTopRow = prevViewportTop;
+		this.#hardwareCursorRow = row;
 	}
 
 	/**
@@ -2668,7 +3011,12 @@ export class TUI extends Container {
 		const fillStart = Math.max(firstChanged, fillViewportTop);
 		let fillSequence = "";
 		let fillTexts: string[] | null = null;
-		if (TERMINAL.deccara && !appendStart && moveTargetRow <= prevViewportBottom && renderEnd >= fillStart) {
+		if (
+			this.#deccaraFillsEnabled() &&
+			!appendStart &&
+			moveTargetRow <= prevViewportBottom &&
+			renderEnd >= fillStart
+		) {
 			const slice: string[] = new Array(renderEnd - fillStart + 1);
 			for (let i = fillStart; i <= renderEnd; i++) {
 				slice[i - fillStart] = this.#fitLineToWidth(lines[i], width);
@@ -2679,8 +3027,7 @@ export class TUI extends Container {
 		}
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) buffer += "\r\n";
-			buffer += "\x1b[2K";
-			buffer += fillTexts && i >= fillStart ? fillTexts[i - fillStart] : this.#fitLineToWidth(lines[i], width);
+			buffer += this.#lineRewriteSequence(fillTexts && i >= fillStart ? fillTexts[i - fillStart] : lines[i], width);
 		}
 
 		// If the prior frame was taller, clear the trailing rows.
@@ -2740,7 +3087,9 @@ export class TUI extends Container {
 					? `${intent.kind}(append=${intent.appendFrom}..${intent.appendTo}, viewportTop=${intent.renderViewportTop})`
 					: intent.kind === "viewportRepaint" && intent.appendFrom !== undefined
 						? `${intent.kind}(appendFrom=${intent.appendFrom})`
-						: intent.kind;
+						: intent.kind === "deferredTailRepaint"
+							? `${intent.kind}(row=${intent.row})`
+							: intent.kind;
 		const msg = `[${new Date().toISOString()}] render: ${detail} (prev=${this.#previousLines.length}, new=${newLength}, height=${height})\n`;
 		fs.appendFileSync(getDebugLogPath(), msg);
 	}

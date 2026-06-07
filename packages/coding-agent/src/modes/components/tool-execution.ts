@@ -31,19 +31,11 @@ import {
 	renderJsonTreeLines,
 } from "../../tools/json-tree";
 import { formatExpandHint, replaceTabs, resolveImageOptions, truncateToWidth } from "../../tools/render-utils";
-import { toolRenderers } from "../../tools/renderers";
+import { type ToolRenderer, toolRenderers } from "../../tools/renderers";
 import { TODO_STRIKE_TOTAL_FRAMES } from "../../tools/todo";
 import { renderStatusLine } from "../../tui";
 import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
 import { renderDiff } from "./diff";
-
-function ensureInvalidate(component: unknown): Component {
-	const c = component as { render: Component["render"]; invalidate?: () => void };
-	if (!c.invalidate) {
-		c.invalidate = () => {};
-	}
-	return c as Component;
-}
 
 /**
  * Drop trailing removal/hunk-header lines that appear in a streaming diff
@@ -107,7 +99,7 @@ function rawTextInputFromPartialJson(partialJson: unknown): string | undefined {
 	// Function-tool arguments stream as JSON. Custom/free-form tools stream raw
 	// text in the same transport field; only the raw form is a valid fallback for
 	// the conventional `input` parameter.
-	if (first === "{" || first === "[" || first === '"') return undefined;
+	if (first === "{" || first === '"') return undefined;
 	return partialJson;
 }
 
@@ -233,11 +225,10 @@ export class ToolExecutionComponent extends Container {
 		this.#cwd = cwd;
 		this.#args = args;
 
-		this.addChild(new Spacer(1));
-
-		// Always create both - contentBox for custom tools/bash/tools with renderers, contentText for other built-ins
-		this.#contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.#contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		// Always create both - contentBox for custom tools/bash/tools with renderers, contentText for other built-ins.
+		// paddingY is 0: the transcript owns inter-block spacing (see TranscriptContainer).
+		this.#contentBox = new Box(0, 0);
+		this.#contentText = new Text("", 1, 0);
 
 		// Use Box for custom tools or built-in tools that have renderers
 		const hasRenderer = toolName in toolRenderers;
@@ -519,6 +510,39 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	/**
+	 * While a tool's preview is still streaming, a block whose preview is
+	 * append-only (rows only grow at the bottom, never re-layout) lets the
+	 * renderer commit the scrolled-off head of an over-tall preview to native
+	 * scrollback instead of dropping it — the same anti-yank path a streaming
+	 * assistant reply uses (see {@link TranscriptContainer} +
+	 * `NativeScrollbackLiveRegion`). Covers both phases: a pre-result call preview
+	 * (a `write` whose content streams in) and a partial-result preview that
+	 * streams output below fixed input (an `eval`/`bash` whose stdout grows under
+	 * its code cell). Gated on {@link isTranscriptBlockFinalized} so the boundary
+	 * closes the instant the block reaches a terminal state — a final result that
+	 * may collapse to a compact view, a backgrounded async tool, or a seal — and
+	 * the renderer decides whether its current preview shape qualifies via
+	 * `isStreamingPreviewAppendOnly` (typically: only the expanded full view,
+	 * which is top-anchored; the collapsed tail window re-layouts but is bounded
+	 * so it never overflows anyway).
+	 */
+	isTranscriptBlockAppendOnly(): boolean {
+		// A finalized block's preview can collapse/re-layout; only a live,
+		// still-streaming block is a candidate.
+		if (this.isTranscriptBlockFinalized()) return false;
+		const predicate =
+			(this.#tool as { isStreamingPreviewAppendOnly?: ToolRenderer["isStreamingPreviewAppendOnly"] } | undefined)
+				?.isStreamingPreviewAppendOnly ?? toolRenderers[this.#toolName]?.isStreamingPreviewAppendOnly;
+		if (!predicate) return false;
+		try {
+			return predicate(this.#getCallArgsForRender(), this.#renderState, this.#result);
+		} catch (err) {
+			logger.warn("Tool append-only predicate failed", { tool: this.#toolName, error: String(err) });
+			return false;
+		}
+	}
+
+	/**
 	 * Mark the tool terminal even though no result arrived (the turn aborted or
 	 * abandoned it) and stop animating, so it can freeze and stops pinning the
 	 * transcript live region.
@@ -562,13 +586,6 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	#updateDisplay(): void {
-		// Set background based on state
-		const bgFn = this.#isPartial
-			? (text: string) => theme.bg("toolPendingBg", text)
-			: this.#result?.isError
-				? (text: string) => theme.bg("toolErrorBg", text)
-				: (text: string) => theme.bg("toolSuccessBg", text);
-
 		// Sync shared mutable render state for component closures
 		this.#renderState.expanded = this.#expanded;
 		this.#renderState.isPartial = this.#isPartial;
@@ -579,8 +596,7 @@ export class ToolExecutionComponent extends Container {
 			const tool = this.#tool;
 			const mergeCallAndResult = Boolean((tool as { mergeCallAndResult?: boolean }).mergeCallAndResult);
 			// Custom tools use Box for flexible component rendering
-			const inline = Boolean((tool as { inline?: boolean }).inline);
-			this.#contentBox.setBgFn(inline ? undefined : bgFn);
+			this.#contentBox.setBgFn(undefined);
 			this.#contentBox.clear();
 			// Mirror the built-in renderer branch so custom renderers (notably the
 			// task tool, whose live instance routes through here) receive the same
@@ -588,22 +604,25 @@ export class ToolExecutionComponent extends Container {
 			// call preview once result lines exist.
 			this.#renderState.renderContext = this.#buildRenderContext();
 
-			// Render call component
+			// Render call component. The fallback label only stands in for a
+			// missing `renderCall`; when the call is intentionally suppressed
+			// (mergeCallAndResult once a result exists) we render nothing here so
+			// the result component isn't preceded by a redundant tool-name line.
 			const shouldRenderCall = !this.#result || !mergeCallAndResult;
-			if (shouldRenderCall && tool.renderCall) {
-				try {
-					const callComponent = tool.renderCall(this.#getCallArgsForRender(), this.#renderState, theme);
-					if (callComponent) {
-						this.#contentBox.addChild(ensureInvalidate(callComponent));
+			if (shouldRenderCall) {
+				if (tool.renderCall) {
+					try {
+						const callComponent = tool.renderCall(this.#getCallArgsForRender(), this.#renderState, theme);
+						if (callComponent) this.#contentBox.addChild(callComponent as Component);
+					} catch (err) {
+						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
+						// Fall back to default on error
+						this.#contentBox.addChild(new Text(theme.fg("toolTitle", theme.bold(this.#toolLabel)), 0, 0));
 					}
-				} catch (err) {
-					logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
-					// Fall back to default on error
+				} else {
+					// No custom renderCall, show tool name
 					this.#contentBox.addChild(new Text(theme.fg("toolTitle", theme.bold(this.#toolLabel)), 0, 0));
 				}
-			} else {
-				// No custom renderCall, show tool name
-				this.#contentBox.addChild(new Text(theme.fg("toolTitle", theme.bold(this.#toolLabel)), 0, 0));
 			}
 
 			// Render result component if we have a result
@@ -625,9 +644,7 @@ export class ToolExecutionComponent extends Container {
 						theme,
 						this.#args,
 					);
-					if (resultComponent) {
-						this.#contentBox.addChild(ensureInvalidate(resultComponent));
-					}
+					if (resultComponent) this.#contentBox.addChild(resultComponent);
 				} catch (err) {
 					logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 					// Fall back to showing raw output on error
@@ -672,19 +689,14 @@ export class ToolExecutionComponent extends Container {
 						this.#multiFileBoxes.push(spacer);
 						this.addChild(spacer);
 					}
-					const fileBgFn = fileResult.isError
-						? (text: string) => theme.bg("toolErrorBg", text)
-						: (text: string) => theme.bg("toolSuccessBg", text);
-					const fileBox = new Box(1, 1, fileBgFn);
+					const fileBox = new Box(0, 0);
 					try {
 						const resultComponent = renderer.renderResult(
 							{ content: [], details: fileResult, isError: fileResult.isError },
 							this.#renderState,
 							theme,
 						);
-						if (resultComponent) {
-							fileBox.addChild(ensureInvalidate(resultComponent));
-						}
+						if (resultComponent) fileBox.addChild(resultComponent);
 					} catch (err) {
 						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 					}
@@ -701,7 +713,7 @@ export class ToolExecutionComponent extends Container {
 					const pendingSpacer = new Spacer(1);
 					this.#multiFileBoxes.push(pendingSpacer);
 					this.addChild(pendingSpacer);
-					const pendingBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
+					const pendingBox = new Box(0, 0);
 					const pendingText = renderStatusLine(
 						{
 							icon: "pending",
@@ -717,7 +729,7 @@ export class ToolExecutionComponent extends Container {
 			} else {
 				// Single-file or no result: standard rendering
 				// Inline renderers skip background styling
-				this.#contentBox.setBgFn(renderer.inline ? undefined : bgFn);
+				this.#contentBox.setBgFn(undefined);
 				this.#contentBox.clear();
 
 				const renderContext = this.#buildRenderContext();
@@ -728,9 +740,7 @@ export class ToolExecutionComponent extends Container {
 					// Render call component
 					try {
 						const callComponent = renderer.renderCall(this.#getCallArgsForRender(), this.#renderState, theme);
-						if (callComponent) {
-							this.#contentBox.addChild(ensureInvalidate(callComponent));
-						}
+						if (callComponent) this.#contentBox.addChild(callComponent);
 					} catch (err) {
 						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 						// Fall back to default on error
@@ -751,9 +761,7 @@ export class ToolExecutionComponent extends Container {
 							theme,
 							this.#getCallArgsForRender(),
 						);
-						if (resultComponent) {
-							this.#contentBox.addChild(ensureInvalidate(resultComponent));
-						}
+						if (resultComponent) this.#contentBox.addChild(resultComponent);
 					} catch (err) {
 						logger.warn("Tool renderer failed", { tool: this.#toolName, error: String(err) });
 						// Fall back to showing raw output on error
@@ -766,7 +774,6 @@ export class ToolExecutionComponent extends Container {
 			}
 		} else {
 			// Other built-in tools: use Text directly with caching
-			this.#contentText.setCustomBgFn(bgFn);
 			this.#contentText.setText(this.#formatToolExecution());
 		}
 

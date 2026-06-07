@@ -144,6 +144,8 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.clear", this.ctx.keybindings.getKeys("app.clear"));
 		this.ctx.editor.onClear = () => this.handleCtrlC();
 		this.ctx.editor.setActionKeys("app.exit", this.ctx.keybindings.getKeys("app.exit"));
+		this.ctx.editor.setActionKeys("app.display.reset", this.ctx.keybindings.getKeys("app.display.reset"));
+		this.ctx.editor.onDisplayReset = () => this.ctx.ui.resetDisplay();
 		this.ctx.editor.onExit = () => this.handleCtrlD();
 		this.ctx.editor.setActionKeys("app.suspend", this.ctx.keybindings.getKeys("app.suspend"));
 		this.ctx.editor.onSuspend = () => this.handleCtrlZ();
@@ -188,11 +190,9 @@ export class InputController {
 		this.ctx.editor.onExpandTools = () => this.toggleToolOutputExpansion();
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
 		this.ctx.editor.onDequeue = () => this.handleDequeue();
-
 		this.ctx.editor.clearCustomKeyHandlers();
 		// Wire up extension shortcuts
 		this.registerExtensionShortcuts();
-
 		const planModeKeys = this.ctx.keybindings.getKeys("app.plan.toggle");
 		for (const key of planModeKeys) {
 			this.ctx.editor.setCustomKeyHandler(key, () => void this.ctx.handlePlanModeCommand());
@@ -846,7 +846,15 @@ export class InputController {
 				child.setExpanded(expanded);
 			}
 		}
-		this.ctx.ui.requestRender(false, { allowUnknownViewportMutation: true });
+		// Toggling expansion mutates every block, but on ED3-risk terminals the
+		// transcript freezes a snapshot of each block once it scrolls past the live
+		// region (committed native scrollback is immutable there). A plain repaint
+		// replays those stale snapshots, so the toggle appears to do nothing above
+		// the live block. resetDisplay() invalidates the snapshots and forces a
+		// full clear + replay — the keyboard-accessible resize-reset equivalent —
+		// which is the only path that re-emits the whole transcript at its new
+		// heights.
+		this.ctx.ui.resetDisplay();
 	}
 
 	toggleThinkingBlockVisibility(): void {
