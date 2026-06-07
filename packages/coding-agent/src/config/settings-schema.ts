@@ -23,6 +23,7 @@ import {
 	TINY_TITLE_MODEL_VALUES,
 } from "../tiny/models";
 import { EDIT_MODES } from "../utils/edit-mode";
+import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES } from "../web/search/types";
 
 /** Unified settings schema - single source of truth for all settings.
  * Unified settings schema - single source of truth for all settings.
@@ -608,6 +609,24 @@ export const SETTINGS_SCHEMA = {
 			"Maximum height in terminal rows for inline images (default 20). Set to 0 to use only the viewport-based limit (60% of terminal height).",
 	},
 
+	"tui.maxInlineImages": {
+		type: "number",
+		default: 8,
+		description:
+			"Maximum number of inline images kept as live terminal graphics (default 8). Older images fall back to a text placeholder via a full redraw once the limit is exceeded. Set to 0 to keep every image (no limit).",
+	},
+
+	"tui.textSizing": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			label: "Large Headings (Kitty)",
+			description:
+				"Render Markdown H1 headings at 2x scale using Kitty's OSC 66 text-sizing protocol. Only takes effect on Kitty terminals; ignored everywhere else. Off by default.",
+		},
+	},
+
 	"tui.hyperlinks": {
 		type: "enum",
 		values: ["off", "auto", "always"] as const,
@@ -616,7 +635,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "appearance",
 			label: "Terminal Hyperlinks",
 			description:
-				"Wrap file paths in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
+				"Wrap paths and URLs in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
 		},
 	},
 	// Display rendering
@@ -700,6 +719,16 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Repeat Tool Descriptions",
 			description: "Render full tool descriptions in the system prompt instead of a tool name list",
+		},
+	},
+
+	includeModelInPrompt: {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			label: "Include Model In Prompt",
+			description: "Surface the active model identifier in the system prompt so the agent knows which model it is",
 		},
 	},
 
@@ -871,6 +900,15 @@ export const SETTINGS_SCHEMA = {
 			label: "Max Retry Delay",
 			description:
 				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+		},
+	},
+	"retry.modelFallback": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			label: "Retry Model Fallback",
+			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
 	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
@@ -1826,7 +1864,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "editing",
 			label: "Hash Lines",
 			description:
-				"Include snapshot-tag headers and line numbers in read output for hashline edit mode (¶PATH#tag plus LINE:content)",
+				"Include snapshot-tag headers and line numbers in read output for hashline edit mode ([PATH#TAG] plus LINE:content)",
 		},
 	},
 
@@ -2104,7 +2142,7 @@ export const SETTINGS_SCHEMA = {
 	"todo.enabled": {
 		type: "boolean",
 		default: true,
-		ui: { tab: "tools", label: "Todos", description: "Enable the todo_write tool for task tracking" },
+		ui: { tab: "tools", label: "Todos", description: "Enable the todo tool for task tracking" },
 	},
 
 	"todo.reminders": {
@@ -2464,13 +2502,13 @@ export const SETTINGS_SCHEMA = {
 	// Tool Discovery
 	"tools.discoveryMode": {
 		type: "enum",
-		values: ["off", "mcp-only", "all"] as const,
-		default: "off",
+		values: ["auto", "off", "mcp-only", "all"] as const,
+		default: "auto",
 		ui: {
 			tab: "tools",
 			label: "Tool Discovery",
 			description:
-				"Hide tools behind a search tool to save tokens. 'mcp-only' hides MCP tools; 'all' hides all non-essential built-ins too.",
+				"Hide tools behind a search tool to save tokens. 'auto' hides MCP tools once the tool set has more than 40 tools; 'mcp-only' always hides MCP tools; 'all' hides all non-essential built-ins too.",
 		},
 	},
 
@@ -2866,65 +2904,13 @@ export const SETTINGS_SCHEMA = {
 	// Provider selection
 	"providers.webSearch": {
 		type: "enum",
-		values: [
-			"auto",
-			"exa",
-			"brave",
-			"jina",
-			"kimi",
-			"zai",
-			"perplexity",
-			"anthropic",
-			"gemini",
-			"codex",
-			"tavily",
-			"kagi",
-			"synthetic",
-			"parallel",
-			"searxng",
-		] as const,
+		values: SEARCH_PROVIDER_PREFERENCES,
 		default: "auto",
 		ui: {
 			tab: "providers",
 			label: "Web Search Provider",
 			description: "Provider for web search tool",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description: "Preferred web-search provider",
-				},
-				{ value: "exa", label: "Exa", description: "Requires EXA_API_KEY" },
-				{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },
-				{ value: "jina", label: "Jina", description: "Requires JINA_API_KEY" },
-				{ value: "kimi", label: "Kimi", description: "Requires MOONSHOT_SEARCH_API_KEY or MOONSHOT_API_KEY" },
-				{
-					value: "perplexity",
-					label: "Perplexity",
-					description: "Requires PERPLEXITY_COOKIES or PERPLEXITY_API_KEY",
-				},
-				{
-					value: "anthropic",
-					label: "Anthropic",
-					description: "Claude's native web_search tool (uses Anthropic OAuth or ANTHROPIC_API_KEY)",
-				},
-				{
-					value: "codex",
-					label: "OpenAI",
-					description: "OpenAI's native web_search (uses ChatGPT OAuth via /login openai-codex)",
-				},
-				{
-					value: "gemini",
-					label: "Gemini",
-					description: "Google Search grounding via Gemini (uses google-gemini-cli or google-antigravity OAuth)",
-				},
-				{ value: "zai", label: "Z.AI", description: "Calls Z.AI webSearchPrime MCP" },
-				{ value: "tavily", label: "Tavily", description: "Requires TAVILY_API_KEY" },
-				{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY (Kagi V1 Search API)" },
-				{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
-				{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
-				{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
-			],
+			options: SEARCH_PROVIDER_OPTIONS,
 		},
 	},
 	"providers.image": {
@@ -3073,13 +3059,26 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.parallelFetch": {
-		type: "boolean",
-		default: true,
+	"providers.fetch": {
+		type: "enum",
+		values: ["auto", "native", "trafilatura", "lynx", "parallel", "jina"] as const,
+		default: "auto",
 		ui: {
 			tab: "providers",
-			label: "Parallel Fetch",
-			description: "Use Parallel extract API for URL fetching when credentials are available",
+			label: "Fetch Provider",
+			description: "Reader backend priority for the fetch/read URL tool",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Priority: native > trafilatura > lynx > parallel > jina",
+				},
+				{ value: "native", label: "Native", description: "In-process HTML→Markdown converter (always available)" },
+				{ value: "trafilatura", label: "Trafilatura", description: "Auto-installs via uv/pip" },
+				{ value: "lynx", label: "Lynx", description: "Requires lynx system package" },
+				{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
+				{ value: "jina", label: "Jina", description: "Uses r.jina.ai reader (JINA_API_KEY optional)" },
+			],
 		},
 	},
 	"provider.appendOnlyContext": {
@@ -3090,9 +3089,9 @@ export const SETTINGS_SCHEMA = {
 			tab: "providers",
 			label: "Append-Only Context",
 			description:
-				"Cache system prompt + tool specs and keep an append-only message log so provider prefix caches (DeepSeek, Anthropic) hit at maximum rate. Auto enables for DeepSeek.",
+				"Cache system prompt + tool specs and keep an append-only message log so provider prefix caches (DeepSeek, Xiaomi/SGLang, Anthropic) hit at maximum rate. Auto enables for known prefix-cache providers.",
 			options: [
-				{ value: "auto", label: "Auto", description: "Enable for DeepSeek (recommended)" },
+				{ value: "auto", label: "Auto", description: "Enable for known prefix-cache providers (recommended)" },
 				{ value: "on", label: "On", description: "Always enable append-only context" },
 				{ value: "off", label: "Off", description: "Disable append-only context" },
 			],
@@ -3330,6 +3329,7 @@ export interface RetrySettings {
 	maxRetries: number;
 	baseDelayMs: number;
 	maxDelayMs: number;
+	modelFallback: boolean;
 }
 
 export interface MemoriesSettings {

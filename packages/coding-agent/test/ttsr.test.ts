@@ -1,7 +1,20 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { parseRuleConditionAndScope, type Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import type { TtsrSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { EDIT_MODE_STRATEGIES } from "@oh-my-pi/pi-coding-agent/edit";
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
+
+function ttsrManager(overrides: Partial<TtsrSettings> = {}): TtsrManager {
+	return new TtsrManager({
+		enabled: true,
+		contextMode: "discard",
+		interruptMode: "always",
+		repeatMode: "once",
+		repeatGap: 10,
+		...overrides,
+	});
+}
 
 function makeRule(partial: Partial<Rule>): Rule {
 	return {
@@ -270,6 +283,114 @@ describe("TtsrManager scope matching", () => {
 				filePaths: [absolutePath],
 			}),
 		).toEqual([rule]);
+	});
+});
+
+describe("TtsrManager enabled gate", () => {
+	it("rejects registration when ttsr is disabled", () => {
+		const manager = ttsrManager({ enabled: false });
+		const rule = makeRule({
+			name: "no-foo",
+			condition: ["FORBIDDEN"],
+			scope: ["text"],
+		});
+
+		expect(manager.addRule(rule)).toBe(false);
+	});
+
+	it("reports no rules when ttsr is disabled, even after a registration attempt", () => {
+		const manager = ttsrManager({ enabled: false });
+		manager.addRule(
+			makeRule({
+				name: "no-foo",
+				condition: ["FORBIDDEN"],
+				scope: ["text"],
+			}),
+		);
+
+		expect(manager.hasRules()).toBe(false);
+	});
+
+	it("returns no matches from stream deltas when ttsr is disabled", () => {
+		const manager = ttsrManager({ enabled: false });
+
+		expect(manager.checkDelta("contains FORBIDDEN token", { source: "text" })).toEqual([]);
+		expect(manager.checkDelta("FORBIDDEN", { source: "tool", toolName: "edit" })).toEqual([]);
+	});
+
+	it("preserves the default (enabled) registration and matching contract", () => {
+		const manager = ttsrManager();
+		const rule = makeRule({
+			name: "no-foo",
+			condition: ["FORBIDDEN"],
+			scope: ["text"],
+		});
+
+		expect(manager.addRule(rule)).toBe(true);
+		expect(manager.hasRules()).toBe(true);
+		expect(manager.checkDelta("FORBIDDEN", { source: "text" })).toEqual([rule]);
+	});
+});
+
+describe("TtsrManager snapshot matching", () => {
+	it("matches source-level conditions against a tool digest where the raw patch grammar fails", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "ts-no-tiny-functions",
+			condition: ["\\{\\s*return [^;{}\\n]+;?\\s*\\}"],
+			scope: ["tool:edit(*.ts)"],
+		});
+		manager.addRule(rule);
+
+		const context = {
+			source: "tool" as const,
+			toolName: "edit",
+			filePaths: ["src/repo.ts"],
+			streamKey: "toolcall:tc-1",
+		};
+		const patch = [
+			"[src/repo.ts#AB12]",
+			"replace block 1:",
+			"+export async function isRepository(cwd: string): Promise<boolean> {",
+			"+\treturn repo.isRepository(cwd);",
+			"+}",
+			"",
+		].join("\n");
+
+		// Raw patch grammar: `+` body-row prefixes break source-level regexes.
+		expect(manager.checkDelta(patch, context)).toEqual([]);
+
+		// The edit tool's digest of the same patch is real source text and matches.
+		const digest = EDIT_MODE_STRATEGIES.hashline.matcherDigest({ input: patch });
+		expect(digest).toBe(
+			[
+				"export async function isRepository(cwd: string): Promise<boolean> {",
+				"\treturn repo.isRepository(cwd);",
+				"}",
+			].join("\n"),
+		);
+		expect(manager.checkSnapshot(digest as string, context)).toEqual([rule]);
+	});
+
+	it("replaces the scoped buffer instead of appending snapshots", () => {
+		const manager = new TtsrManager();
+		const rule = makeRule({
+			name: "no-as-any",
+			condition: ["as any"],
+			scope: ["tool:edit(*.ts)"],
+		});
+		manager.addRule(rule);
+
+		const context = {
+			source: "tool" as const,
+			toolName: "edit",
+			filePaths: ["src/main.ts"],
+			streamKey: "toolcall:tc-2",
+		};
+
+		expect(manager.checkSnapshot("const x = y as any;", context)).toEqual([rule]);
+		// A later digest without the pattern must not match stale buffered text.
+		expect(manager.checkSnapshot("const x = y as string;", context)).toEqual([]);
 	});
 });
 

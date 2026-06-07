@@ -17,9 +17,8 @@ import * as os from "node:os";
 import path from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
-import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "..";
-import { AsyncJobManager } from "../async";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import { MCPManager } from "../mcp/manager";
 import type { Theme } from "../modes/theme/theme";
@@ -41,6 +40,7 @@ import {
 // Import review tools for side effects (registers subagent tool handlers)
 import "../tools/review";
 import type { LocalProtocolOptions } from "../internal-urls";
+import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, getAgent } from "./discovery";
@@ -131,6 +131,37 @@ export {
 	taskSchema,
 } from "./types";
 
+// Built-in tools whose approval tier is "read" (see tool classes' `approval`).
+// An agent is read-only iff its declared tools are a non-empty subset of this set.
+// Fail-safe: any unknown tool makes the agent not read-only.
+export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+	"read",
+	"search",
+	"find",
+	"web_search",
+	"ast_grep",
+	"yield",
+	"irc",
+	"ask",
+	"job",
+	"todo",
+	"recall",
+	"reflect",
+	"retain",
+	"memory_edit",
+	"render_mermaid",
+	"inspect_image",
+	"checkpoint",
+	"rewind",
+	"resolve",
+	"report_finding",
+	"search_tool_bm25",
+]);
+
+export function isReadOnlyAgent(agent: AgentDefinition): boolean {
+	return !!agent.tools?.length && agent.tools.every(tool => READ_ONLY_TOOL_NAMES.has(tool));
+}
+
 /**
  * Render the tool description from a cached agent list and current settings.
  */
@@ -157,9 +188,14 @@ function renderDescription(
 		);
 		filteredAgents = filteredAgents.filter(a => allowed.has(a.name));
 	}
+	const renderedAgents = filteredAgents.map(agent => ({
+		name: agent.name,
+		description: agent.description,
+		readOnly: isReadOnlyAgent(agent),
+	}));
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
 	return prompt.render(taskDescriptionTemplate, {
-		agents: filteredAgents,
+		agents: renderedAgents,
 		spawningDisabled,
 		MAX_CONCURRENCY: maxConcurrency,
 		isolationEnabled,
@@ -239,6 +275,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly strict = true;
 	readonly loadMode = "discoverable";
 	readonly renderResult = renderResult;
+	// Suppress the streaming call preview once a (partial or final) result exists
+	// so the task renders as ONE block that transitions in place — not a pending
+	// call frame stacked above the result frame. Mirrors `taskToolRenderer`.
+	readonly mergeCallAndResult = true;
 	readonly #discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
 
@@ -306,12 +346,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return this.#executeSync(_toolCallId, params, signal, onUpdate);
 		}
 
-		const manager = AsyncJobManager.instance();
+		const manager = this.session.asyncJobManager;
 		if (!manager) {
-			return {
-				content: [{ type: "text", text: "Async execution is enabled but no async job manager is available." }],
-				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
-			};
+			// Async was requested but no manager is registered (e.g. an
+			// orphaned session whose host never wired one up). Falling back
+			// to the sync path keeps the tool usable; only background/job-poll
+			// semantics are lost.
+			logger.warn("task: async.enabled but no AsyncJobManager registered; falling back to sync execution");
+			return this.#executeSync(_toolCallId, params, signal, onUpdate);
 		}
 
 		const taskItems = params.tasks ?? [];
@@ -772,6 +814,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// across the whole tree and outputs land flat in the parent's dir.
 		const parentArtifactManager = this.session.getArtifactManager?.() ?? undefined;
 
+		// When the session is executing an approved plan, hand the overall plan to
+		// every subagent so they share the main agent's plan context. Skipped in
+		// plan mode (read-only exploration uses planModeSubagentPrompt instead) and
+		// when no plan file exists at the session's reference path.
+		const planReference = planModeState?.enabled
+			? undefined
+			: await loadOverallPlanReference(
+					this.session.getPlanReferencePath?.() ?? "local://PLAN.md",
+					localProtocolOptions,
+				);
+
 		// Initialize progress tracking
 		const progressMap = new Map<number, AgentProgress>();
 
@@ -898,6 +951,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						task: renderSubagentUserPrompt(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
 						context: sharedContext,
+						planReference,
 						description: task.description,
 						index,
 						id: task.id,
@@ -955,6 +1009,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						task: renderSubagentUserPrompt(task.assignment, simpleMode),
 						assignment: task.assignment.trim(),
 						context: sharedContext,
+						planReference,
 						description: task.description,
 						index,
 						id: task.id,

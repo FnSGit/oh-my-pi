@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [15.9.67] - 2026-06-06
+
+### Breaking Changes
+
+- Changed hashline file section headers from `¶PATH#TAG` to `[PATH#TAG]` so model-authored edits use ASCII delimiters instead of a pilcrow sigil.
+
+### Fixed
+
+- Fixed missing-header diagnostics and copied-content prefix stripping to consistently teach and recognize 4-hex snapshot tags.
+
+## [15.8.2] - 2026-06-03
+
+### Fixed
+
+- Fixed delimiter-balance boundary repair to also drop a single duplicated structural opener (e.g. a restated `foo(` / `if (x) {` signature line surviving just above the range), not only duplicated closers. Zero-balance duplicates remain untouched.
+
 ## [15.8.0] - 2026-06-02
 
 ### Fixed

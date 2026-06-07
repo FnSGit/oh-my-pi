@@ -10,8 +10,9 @@ import {
 	supportsLanguage as nativeSupportsLanguage,
 } from "@oh-my-pi/pi-natives";
 import type { EditorTheme, MarkdownTheme, SelectListTheme, SymbolTheme } from "@oh-my-pi/pi-tui";
-import { adjustHsv, getCustomThemesDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { adjustHsv, colorLuma, getCustomThemesDir, isEnoent, logger, relativeLuminance } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
+import { LRUCache } from "lru-cache/raw";
 import * as z from "zod/v4";
 // Embed theme JSON files at build time
 import darkThemeJson from "./dark.json" with { type: "json" };
@@ -94,6 +95,7 @@ export type SymbolKey =
 	| "icon.pause"
 	| "icon.loop"
 	| "icon.folder"
+	| "icon.search"
 	| "icon.scratchFolder"
 	| "icon.file"
 	| "icon.git"
@@ -136,6 +138,9 @@ export type SymbolKey =
 	// Checkboxes
 	| "checkbox.checked"
 	| "checkbox.unchecked"
+	// Radio (single-choice)
+	| "radio.selected"
+	| "radio.unselected"
 	// Text Formatting
 	| "format.bullet"
 	| "format.dash"
@@ -260,6 +265,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.pause": "⏸",
 	"icon.loop": "↻",
 	"icon.folder": "📁",
+	"icon.search": "🔍",
 	"icon.scratchFolder": "🗑",
 	"icon.file": "📄",
 	"icon.git": "⎇",
@@ -302,6 +308,9 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	// Checkboxes
 	"checkbox.checked": "☑",
 	"checkbox.unchecked": "☐",
+	// Radio (single-choice)
+	"radio.selected": "◉",
+	"radio.unselected": "○",
 	// Formatting
 	"format.bullet": "•",
 	"format.dash": "—",
@@ -481,6 +490,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.loop": "\uf021",
 	// pick:  | alt:  
 	"icon.folder": "\uf115",
+	"icon.search": "\uf002",
 	// pick:  | alt:
 	"icon.scratchFolder": "\uf014",
 	// pick:  | alt:  
@@ -559,6 +569,11 @@ const NERD_SYMBOLS: SymbolMap = {
 	"checkbox.checked": "\uf14a",
 	// pick:  | alt: 
 	"checkbox.unchecked": "\uf096",
+	// Radio (single-choice)
+	// pick:  (fa-dot-circle-o) | alt:  ◉
+	"radio.selected": "\uf192",
+	// pick:  (fa-circle-o) | alt:  ○
+	"radio.unselected": "\uf10c",
 	// pick:  | alt:   •
 	"format.bullet": "\uf111",
 	// pick: – | alt: — ― -
@@ -689,6 +704,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.pause": "||",
 	"icon.loop": "loop",
 	"icon.folder": "[D]",
+	"icon.search": "[/]",
 	"icon.scratchFolder": "[T]",
 	"icon.file": "[F]",
 	"icon.git": "git:",
@@ -731,6 +747,8 @@ const ASCII_SYMBOLS: SymbolMap = {
 	// Checkboxes
 	"checkbox.checked": "[x]",
 	"checkbox.unchecked": "[ ]",
+	"radio.selected": "(o)",
+	"radio.unselected": "( )",
 	"format.bullet": "*",
 	"format.dash": "-",
 	"format.bracketLeft": "[",
@@ -1277,6 +1295,16 @@ export class Theme {
 	#bgColors: Record<ThemeBg, string>;
 	#symbols: SymbolMap;
 	#spinnerFramesOverrides: Partial<Record<SpinnerType, string[]>>;
+	/**
+	 * Perceptual luma (0..1) of the status-line background — used to classify the
+	 * theme light/dark. Undefined when it can't be resolved. Classified against the
+	 * status line (the surface session accents render on) rather than the chat bubble
+	 * (`userMessageBg`), which some themes (e.g. `porcelain`) style dark on an
+	 * otherwise-light theme.
+	 */
+	readonly statusLineLuminance: number | undefined;
+	/** WCAG relative luminance of the status-line background — basis for accent contrast. */
+	readonly #statusLineContrastLuminance: number | undefined;
 
 	constructor(
 		fgColors: Record<ThemeColor, string | number>,
@@ -1286,6 +1314,8 @@ export class Theme {
 		symbolOverrides: Partial<Record<SymbolKey, string>>,
 		spinnerFramesOverrides: Partial<Record<SpinnerType, string[]>> = {},
 	) {
+		this.statusLineLuminance = colorLuma(bgColors.statusLineBg);
+		this.#statusLineContrastLuminance = relativeLuminance(bgColors.statusLineBg);
 		this.#fgColors = {} as Record<ThemeColor, string>;
 		for (const [key, value] of Object.entries(fgColors) as [ThemeColor, string | number][]) {
 			this.#fgColors[key] = fgAnsi(value, mode);
@@ -1305,6 +1335,19 @@ export class Theme {
 			}
 		}
 		this.#spinnerFramesOverrides = spinnerFramesOverrides;
+	}
+
+	/** True when the active theme has a light status-line background. */
+	get isLight(): boolean {
+		return this.statusLineLuminance !== undefined && this.statusLineLuminance > 0.5;
+	}
+
+	/**
+	 * Surface luminance to size session accents against on light themes; undefined on
+	 * dark themes so accents stay vivid. Pass straight to `getSessionAccentHex`.
+	 */
+	get accentSurfaceLuminance(): number | undefined {
+		return this.isLight ? this.#statusLineContrastLuminance : undefined;
 	}
 
 	fg(color: ThemeColor, text: string): string {
@@ -1567,6 +1610,13 @@ export class Theme {
 		return {
 			checked: this.#symbols["checkbox.checked"],
 			unchecked: this.#symbols["checkbox.unchecked"],
+		};
+	}
+
+	get radio() {
+		return {
+			selected: this.#symbols["radio.selected"],
+			unselected: this.#symbols["radio.unselected"],
 		};
 	}
 
@@ -2312,13 +2362,8 @@ export function isLightTheme(themeName?: string): boolean {
 	}
 	try {
 		const resolved = resolveVarRefs(themeJson.colors.userMessageBg, themeJson.vars ?? {});
-		if (typeof resolved !== "string" || !resolved.startsWith("#") || resolved.length !== 7) return false;
-		const r = parseInt(resolved.slice(1, 3), 16) / 255;
-		const g = parseInt(resolved.slice(3, 5), 16) / 255;
-		const b = parseInt(resolved.slice(5, 7), 16) / 255;
-		// Relative luminance (ITU-R BT.709)
-		const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-		return luminance > 0.5;
+		const luminance = colorLuma(resolved);
+		return luminance !== undefined && luminance > 0.5;
 	} catch {
 		return false;
 	}
@@ -2390,16 +2435,53 @@ function getHighlightColors(t: Theme): NativeHighlightColors {
 }
 
 /**
+ * Memoized native syntax highlight. Returns the joined ANSI string, or `null`
+ * when the native tokenizer throws so callers can apply their own fallback.
+ *
+ * Keyed on `(lang, code)` and reset whenever the active `theme` instance
+ * changes — the ANSI colors are baked into the highlighted output, so a theme
+ * switch (which always reassigns `theme`) must invalidate every entry.
+ *
+ * Why this exists: animated tool blocks (eval/bash) repaint their box on every
+ * ~16ms border-shimmer frame, and markdown re-lexes on every streamed delta.
+ * Without memoization each frame re-tokenizes an unchanged code body through the
+ * Rust FFI — ~26ms for 100 lines, ~40ms for 150 — overrunning the 16ms frame
+ * budget and starving the spinner/render timers (the "TUI freeze").
+ */
+const HIGHLIGHT_CACHE_MAX = 256;
+const highlightCache = new LRUCache<string, string>({ max: HIGHLIGHT_CACHE_MAX });
+let highlightCacheTheme: Theme | undefined;
+
+function highlightCached(code: string, validLang: string | undefined): string | null {
+	if (highlightCacheTheme !== theme) {
+		highlightCache.clear();
+		highlightCacheTheme = theme;
+	}
+	const key = `${validLang ?? ""}\x00${code}`;
+	const hit = highlightCache.get(key);
+	if (hit !== undefined) {
+		return hit;
+	}
+	let highlighted: string;
+	try {
+		highlighted = nativeHighlightCode(code, validLang, getHighlightColors(theme));
+	} catch {
+		return null;
+	}
+	highlightCache.set(key, highlighted);
+	return highlighted;
+}
+
+/**
  * Highlight code with syntax coloring based on file extension or language.
  * Returns array of highlighted lines.
  */
 export function highlightCode(code: string, lang?: string): string[] {
 	const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
-	try {
-		return nativeHighlightCode(code, validLang, getHighlightColors(theme)).split("\n");
-	} catch {
-		return code.split("\n");
-	}
+	const highlighted = highlightCached(code, validLang);
+	// Always return a fresh array: callers (e.g. renderCodeCell) push extra lines
+	// onto the result, which would corrupt the cached string otherwise.
+	return (highlighted ?? code).split("\n");
 }
 
 export function getSymbolTheme(): SymbolTheme {
@@ -2444,11 +2526,9 @@ export function getMarkdownTheme(): MarkdownTheme {
 		resolveMermaidAscii,
 		highlightCode: (code: string, lang?: string): string[] => {
 			const validLang = lang && nativeSupportsLanguage(lang) ? lang : undefined;
-			try {
-				return nativeHighlightCode(code, validLang, getHighlightColors(theme)).split("\n");
-			} catch {
-				return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
-			}
+			const highlighted = highlightCached(code, validLang);
+			if (highlighted !== null) return highlighted.split("\n");
+			return code.split("\n").map(line => theme.fg("mdCodeBlock", line));
 		},
 	};
 	cachedMarkdownTheme = markdownTheme;

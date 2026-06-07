@@ -10,7 +10,6 @@ import {
 	DELETE_TAKES_NO_BODY,
 	EMPTY_BLOCK,
 	EMPTY_INSERT,
-	EMPTY_REPLACE,
 	MINUS_ROW_REJECTED,
 } from "./messages";
 import { type BlockTarget, cloneCursor, type ParsedRange, type Token, Tokenizer } from "./tokenizer";
@@ -44,7 +43,7 @@ function detectApplyPatchContamination(text: string, _hasPending: boolean): stri
 		const preview = trimmed.length > 48 ? `${trimmed.slice(0, 48)}…` : trimmed;
 		return (
 			`apply_patch sentinel ${JSON.stringify(preview)} is not valid in hashline. ` +
-			"File sections start with `¶path#HASH` (no `Update File:` / `Add File:` keyword). " +
+			"File sections start with `[path#HASH]` (no `Update File:` / `Add File:` keyword). " +
 			"Use `replace N..M:`, `delete N..M`, or `insert before|after|head|tail:` ops."
 		);
 	}
@@ -280,7 +279,10 @@ export class Executor {
 			return;
 		}
 		if (payloads.length === 0) {
-			if (target.kind === "replace") throw new Error(`line ${lineNum}: ${EMPTY_REPLACE}`);
+			if (target.kind === "replace") {
+				for (const anchor of expandRange(target.range)) this.#pushDelete(anchor, lineNum);
+				return;
+			}
 			throw new Error(`line ${lineNum}: ${EMPTY_INSERT}`);
 		}
 		if (target.kind === "replace") {

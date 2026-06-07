@@ -294,6 +294,9 @@ export class TtsrManager {
 
 	/** Add a TTSR rule to be monitored. */
 	addRule(rule: Rule): boolean {
+		if (!this.#settings.enabled) {
+			return false;
+		}
 		if (this.#rules.has(rule.name)) {
 			return false;
 		}
@@ -339,7 +342,27 @@ export class TtsrManager {
 		const bufferKey = this.#bufferKey(context);
 		const nextBuffer = `${this.#buffers.get(bufferKey) ?? ""}${delta}`;
 		this.#buffers.set(bufferKey, nextBuffer);
+		return this.#matchBuffer(nextBuffer, context);
+	}
 
+	/**
+	 * Replace the scoped buffer with a tool-provided normalized snapshot and
+	 * return matching rules.
+	 *
+	 * Used for tools exposing `matcherDigest`: the digest is recomputed from the
+	 * full (partial) arguments on every delta, so it replaces the buffer instead
+	 * of being appended to it.
+	 */
+	checkSnapshot(snapshot: string, context: TtsrMatchContext): Rule[] {
+		const bufferKey = this.#bufferKey(context);
+		this.#buffers.set(bufferKey, snapshot);
+		return this.#matchBuffer(snapshot, context);
+	}
+
+	#matchBuffer(buffer: string, context: TtsrMatchContext): Rule[] {
+		if (!this.#settings.enabled) {
+			return [];
+		}
 		const matches: Rule[] = [];
 		for (const [name, entry] of this.#rules) {
 			if (!this.#canTrigger(name)) {
@@ -351,7 +374,7 @@ export class TtsrManager {
 			if (!this.#matchesGlobalPaths(entry, context)) {
 				continue;
 			}
-			if (!this.#matchesCondition(entry, nextBuffer)) {
+			if (!this.#matchesCondition(entry, buffer)) {
 				continue;
 			}
 
@@ -416,6 +439,9 @@ export class TtsrManager {
 
 	/** Check if any TTSR rules are registered. */
 	hasRules(): boolean {
+		if (!this.#settings.enabled) {
+			return false;
+		}
 		return this.#rules.size > 0;
 	}
 

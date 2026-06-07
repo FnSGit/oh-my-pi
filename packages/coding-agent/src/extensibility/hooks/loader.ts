@@ -2,6 +2,7 @@
  * Hook loader - loads TypeScript hook modules using native Bun import.
  */
 import * as path from "node:path";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import * as zod from "zod/v4";
 import { type ClaudeHookEvent, hookCapability } from "../../capability/hook";
@@ -13,6 +14,50 @@ import * as typebox from "../typebox";
 import { resolvePath } from "../utils";
 import { execCommand } from "./runner";
 import type { ExecOptions, HookAPI, HookFactory, HookMessageRenderer, RegisteredCommand } from "./types";
+
+/**
+ * Build a `ContextEventResult` for a Claude Code `UserPromptSubmit` command hook.
+ *
+ * The Claude Code spec emits a JSON envelope of shape
+ *   { hookSpecificOutput: { hookEventName, additionalContext } }
+ * and the `additionalContext` string is the actual content the model should
+ * see. The hook must produce a proper `Message` (with `role: "user"`), not a
+ * raw content block, or `convertToLlm` will drop every item on the floor
+ * (it dispatches on `m.role`) and the LLM ends up with an empty conversation.
+ *
+ * For the `UserPromptSubmit` event the runner passes the current context
+ * messages in the event payload, so the loader APPENDS the injected user
+ * message to the existing conversation rather than replacing it. If the
+ * runner's API ever changes and the event no longer carries `messages`,
+ * this falls back to a single-item context override — still better than
+ * the previous malformed payload, since one well-formed user message
+ * passes the provider's `messages` minimum.
+ */
+function buildContextEventResultFromStdout(
+	stdout: string,
+	additionalContext: string | undefined,
+	event: unknown,
+): { messages: AgentMessage[] } | undefined {
+	// When no additionalContext was extracted and stdout is just an empty JSON
+	// object (e.g. "{}" from hooks like hookify that always emit JSON), treat it
+	// as "no context modification" rather than injecting literal "{}" as a user
+	// message. See https://github.com/can1357/oh-my-pi/issues/1580 for the
+	// hookify-driven empty-message regression this closes.
+	if (additionalContext === undefined && /^\s*\{\s*\}\s*$/.test(stdout)) {
+		return undefined;
+	}
+	const text = (additionalContext ?? stdout).trim();
+	if (!text) return undefined;
+	const existing = Array.isArray((event as { messages?: unknown[] } | null)?.messages)
+		? ((event as { messages: AgentMessage[] }).messages)
+		: [];
+	return {
+		messages: [
+			...existing,
+			{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() } as AgentMessage,
+		],
+	};
+}
 
 /**
  * Generic handler function type.
@@ -245,8 +290,12 @@ const CLAUDE_EVENT_MAP: Record<ClaudeHookEvent, string> = {
 /**
  * Create a synthetic LoadedHook that executes a shell command for a Claude Code hook.
  * The command receives event data as JSON on stdin and returns results on stdout.
+ *
+ * Exported for testability — the synthetic handler is the only way to exercise the
+ * Claude-Code-stdin → ContextEventResult conversion end-to-end without standing up
+ * a full extension runner.
  */
-function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook {
+export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook {
 	const handlers = new Map<string, HandlerFn[]>();
 	const messageRenderers = new Map<string, HookMessageRenderer>();
 	const commands = new Map<string, RegisteredCommand>();
@@ -358,15 +407,40 @@ function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook {
 						return { compaction: { summary: output.custom_instructions } };
 					}
 				}
-				// For informational events, stdout content is used as context
-				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
-					return { messages: [{ type: "text", text: stdout }] };
+				// For informational events, stdout content is used as context.
+				//
+				// `UserPromptSubmit` Claude Code hooks emit JSON of shape
+				//   { hookSpecificOutput: { hookEventName, additionalContext } }
+				// — extract `additionalContext` rather than using the entire
+				// JSON wrapper as text. The result is a real `Message` (with
+				// `role: "user"`) appended to the current context, not a
+				// content block that downstream `convertToLlm` would silently
+				// drop (leaving `context.messages` empty and triggering the
+				// `buildParams` "all were filtered out" defensive throw).
+				//
+				// `SessionStart` is mapped to `session_start` (NOT `context`)
+				// in CLAUDE_EVENT_MAP, and the runner's general `emit()` drops
+				// session_start return values. So there is no consumer of a
+				// context override here — return undefined rather than a
+				// malformed payload that no one can use.
+				if (discoveredHook.claudeEvent === "UserPromptSubmit") {
+					return buildContextEventResultFromStdout(
+						stdout,
+						typeof output.additionalContext === "string" ? output.additionalContext : undefined,
+						event,
+					);
+				}
+				if (discoveredHook.claudeEvent === "SessionStart") {
+					return undefined;
 				}
 				return undefined;
 			} catch {
-				// Non-JSON stdout: for informational events, use as context
-				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
-					return { messages: [{ type: "text", text: stdout }] };
+				// Non-JSON stdout: same reasoning as the JSON path above.
+				if (discoveredHook.claudeEvent === "UserPromptSubmit") {
+					return buildContextEventResultFromStdout(stdout, undefined, event);
+				}
+				if (discoveredHook.claudeEvent === "SessionStart") {
+					return undefined;
 				}
 				return undefined;
 			}

@@ -132,7 +132,6 @@ const claudeCodeUtilityBetaDefaults = [
 const claudeCodeAgentBetaDefaults = [
 	"claude-code-20250219",
 	"oauth-2025-04-20",
-	"context-1m-2025-08-07",
 	"interleaved-thinking-2025-05-14",
 	"context-management-2025-06-27",
 	"prompt-caching-scope-2026-01-05",
@@ -1779,16 +1778,12 @@ type SystemBlockOptions = {
 	cacheControl?: AnthropicCacheControl;
 };
 
-function withGlobalCacheScope(cacheControl: AnthropicCacheControl): AnthropicCacheControl {
-	return { ...cacheControl, scope: "global" };
-}
-
 function applyClaudeCodeSystemCache(
 	blocks: AnthropicSystemBlock[],
 	cacheControl: AnthropicCacheControl | undefined,
 ): number {
 	if (!cacheControl || blocks.length <= 2) return 0;
-	blocks[2] = { ...blocks[2], cache_control: withGlobalCacheScope(cacheControl) };
+	blocks[2] = { ...blocks[2], cache_control: cacheControl };
 	if (blocks.length === 3) return 1;
 	const lastIndex = blocks.length - 1;
 	blocks[lastIndex] = { ...blocks[lastIndex], cache_control: cacheControl };
@@ -1933,9 +1928,26 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		};
 	}
 
-	// OpenCode's Anthropic-compatible gateway accepts bearer auth only; leaving
-	// apiKey set lets the SDK add X-Api-Key, which upstream Alibaba rejects.
-	if (model.provider === "opencode-go" || model.provider === "opencode-zen") {
+	// OpenCode Go's Anthropic-compatible gateway validates API-key auth through
+	// `X-Api-Key`; bearer-only requests reach the endpoint but return
+	// `Missing API key` before token validation.
+	if (model.provider === "opencode-go") {
+		delete defaultHeaders.Authorization;
+		return {
+			isOAuthToken: false,
+			apiKey,
+			authToken: null,
+			baseURL: baseUrl,
+			maxRetries: 5,
+			defaultHeaders,
+			...(debugFetch ? { fetch: debugFetch } : {}),
+			...(tlsFetchOptions ? { fetchOptions: tlsFetchOptions } : {}),
+		};
+	}
+
+	// OpenCode Zen's Anthropic-compatible gateway accepts bearer auth only;
+	// leaving apiKey set lets the client add X-Api-Key, which upstream Alibaba rejects.
+	if (model.provider === "opencode-zen") {
 		return {
 			isOAuthToken: false,
 			apiKey: null,
@@ -2427,22 +2439,31 @@ function isZaiAnthropicEndpoint(model: Model<"anthropic-messages">): boolean {
 }
 
 /**
- * Returns true for providers whose Anthropic-compatible endpoints do NOT
- * implement signature-based thinking-chain integrity (DeepSeek, Z.AI, etc.).
- * For these providers, unsigned thinking blocks must be preserved as
- * `type: "thinking"` instead of being degraded to text.
+ * Returns true when unsigned `thinking` blocks from prior assistant turns should
+ * be replayed as Anthropic-native thinking instead of demoted to text.
+ *
+ * Official Anthropic (matched via `isAnthropicApiBaseUrl`, which intentionally
+ * treats a missing baseUrl as official since `resolveAnthropicBaseUrl` routes
+ * it to `https://api.anthropic.com`) enforces signature-based thinking-chain
+ * integrity, so unsigned blocks must remain text there. Anthropic-compatible
+ * reasoning endpoints commonly emit unsigned thinking blocks while still
+ * expecting them back as `type: "thinking"` on continuation; demoting them
+ * loses the model's reasoning chain and can destabilize the next tool-call
+ * arguments (#2005). Known non-signing hosts are also preserved for
+ * compatibility.
  */
-function isNonSigningAnthropicEndpoint(model: Model<"anthropic-messages">): boolean {
-	// Known non-signing providers
+function shouldReplayUnsignedThinking(model: Model<"anthropic-messages">): boolean {
 	if (model.provider === "zai" || model.provider === "deepseek") return true;
 	const baseUrl = model.baseUrl;
-	if (!baseUrl) return false;
-	try {
-		const hostname = new URL(baseUrl).hostname.toLowerCase();
-		return hostname === "api.deepseek.com" || hostname.endsWith(".deepseek.com");
-	} catch {
-		return false;
+	if (baseUrl) {
+		try {
+			const hostname = new URL(baseUrl).hostname.toLowerCase();
+			if (hostname === "api.deepseek.com" || hostname.endsWith(".deepseek.com")) return true;
+		} catch {
+			// Fall through to the protocol-level reasoning rule below.
+		}
 	}
+	return model.reasoning && !isAnthropicApiBaseUrl(baseUrl);
 }
 
 function buildToolResultBlock(model: Model<"anthropic-messages">, msg: ToolResultMessage): ContentBlockParam {
@@ -2533,7 +2554,7 @@ export function convertAnthropicMessages(
 					}
 					if (block.thinking.trim().length === 0) continue;
 					if (!block.thinkingSignature || block.thinkingSignature.trim().length === 0) {
-						if (isNonSigningAnthropicEndpoint(model)) {
+						if (shouldReplayUnsignedThinking(model)) {
 							blocks.push({
 								type: "thinking",
 								thinking: block.thinking.toWellFormed(),

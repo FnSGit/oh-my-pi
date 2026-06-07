@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { Agent, AgentBusyError, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, getBundledModel, type Message, type ToolCall } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -24,6 +25,19 @@ import * as z from "zod/v4";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 // Mock stream that mimics AssistantMessageEventStream
+
+// AgentSession schedules its TTSR retry and context-promotion continuations
+// through `scheduler.wait(delayMs, { signal })` (node:timers/promises), with
+// blind 50ms/100ms "settle" delays. Tests that drive a continuation to
+// completion would otherwise pay that wall-clock time on every run. This spy
+// collapses the blind delay to a single macrotask hop (`scheduler.wait(0)`)
+// while preserving the real abort-signal semantics, so the continuation still
+// fires only after the aborted/overflowed turn has been recorded. Each test
+// that opts in must run inside a block whose afterEach restores mocks.
+const originalSchedulerWait = scheduler.wait.bind(scheduler);
+function collapseSchedulerSettleDelays(): void {
+	vi.spyOn(scheduler, "wait").mockImplementation((_delayMs, options) => originalSchedulerWait(0, options));
+}
 
 describe("AgentSession concurrent prompt guard", () => {
 	let session: AgentSession;
@@ -101,7 +115,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
 			if (predicate()) return;
-			await Bun.sleep(10);
+			await Bun.sleep(1);
 		}
 
 		throw new Error("Timed out waiting for condition");
@@ -131,7 +145,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await waitFor(() => session.isStreaming);
 
 		// steer should work while streaming
-		expect(() => session.steer("Steering message")).not.toThrow();
+		await session.steer("Steer while streaming");
 		expect(session.queuedMessageCount).toBe(1);
 
 		// Cleanup
@@ -147,7 +161,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await waitFor(() => session.isStreaming);
 
 		// followUp should work while streaming
-		expect(() => session.followUp("Follow-up message")).not.toThrow();
+		await session.followUp("Follow-up while streaming");
 		expect(session.queuedMessageCount).toBe(1);
 
 		// Cleanup
@@ -548,6 +562,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			settings,
 			modelRegistry,
 			agentId: "acp-session-b",
+			asyncJobManager,
 		});
 		session = new AgentSession({
 			agent: agentA,
@@ -594,13 +609,14 @@ describe("AgentSession TTSR resume gate", () => {
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
 		}
+		vi.restoreAllMocks();
 	});
 
 	async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
 			if (predicate()) return;
-			await Bun.sleep(10);
+			await Bun.sleep(1);
 		}
 
 		throw new Error("Timed out waiting for condition");
@@ -673,6 +689,7 @@ describe("AgentSession TTSR resume gate", () => {
 	}
 
 	it("prompt() blocks until TTSR interrupt continuation completes", async () => {
+		collapseSchedulerSettleDelays();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let streamCallCount = 0;
 		let continuationCompleted = false;
@@ -730,6 +747,71 @@ describe("AgentSession TTSR resume gate", () => {
 		expect(continuationCompleted).toBe(true);
 		expect(streamCallCount).toBeGreaterThanOrEqual(2);
 		expect(session.isStreaming).toBe(false);
+	});
+
+	it("relativizes the rule file path in the TTSR interrupt injection (no absolute leak)", async () => {
+		collapseSchedulerSettleDelays();
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCallCount = 0;
+
+		const sessionManager = SessionManager.inMemory();
+		const cwd = sessionManager.getCwd();
+		const ruleAbsPath = path.join(cwd, ".omp", "rules", "no-unwrap.md");
+		const expectedRel = path.relative(cwd, ruleAbsPath);
+		const rule: Rule = {
+			name: "no-unwrap",
+			path: ruleAbsPath,
+			content: "Do not use .unwrap()",
+			condition: ["\\.unwrap\\("],
+			_source: { provider: "test", providerName: "test", path: ruleAbsPath, level: "project" },
+		};
+
+		const ttsrManager = new TtsrManager({
+			enabled: true,
+			contextMode: "discard",
+			interruptMode: "always",
+			repeatMode: "once",
+			repeatGap: 10,
+		});
+		ttsrManager.addRule(rule);
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				streamCallCount++;
+				const stream = new AssistantMessageEventStream();
+				if (streamCallCount === 1) {
+					pushAbortableTtsrStream(stream, options?.signal);
+				} else {
+					pushContinuationStream(stream, () => {});
+				}
+				return stream;
+			},
+		});
+
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-rel.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, ttsrManager });
+
+		await session.prompt("Write some Rust code");
+
+		const injection = sessionManager
+			.getEntries()
+			.find(e => e.type === "custom_message" && e.customType === "ttsr-injection");
+		expect(injection?.type).toBe("custom_message");
+		const content = injection?.type === "custom_message" ? injection.content : undefined;
+		expect(typeof content).toBe("string");
+		const text = content as string;
+		// The rendered interrupt the model receives references the rule by a
+		// project-relative path, never the absolute home path.
+		expect(text).toContain('reason="rule_violation"');
+		expect(text).toContain(`path="${expectedRel}"`);
+		expect(text).not.toContain(ruleAbsPath);
 	});
 
 	it("prompt() blocks until TTSR deferred continuation completes", async () => {
@@ -881,6 +963,7 @@ describe("AgentSession TTSR resume gate", () => {
 	});
 
 	it("prompt() waits for TTSR continuation with tool calls to finish", async () => {
+		collapseSchedulerSettleDelays();
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		let streamCallCount = 0;
 		let toolExecutionFinished = false;
@@ -1241,6 +1324,7 @@ describe("AgentSession TTSR resume gate", () => {
 	});
 
 	it("prompt() waits for context-promotion continuation to finish", async () => {
+		collapseSchedulerSettleDelays();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-promo.db"));
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("openai-codex", "test-key");

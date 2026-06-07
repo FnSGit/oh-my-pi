@@ -40,6 +40,7 @@ import {
 	isOpenAIResponsesProgressEvent,
 	normalizeResponsesToolCallIdForTransform,
 	processResponsesStream,
+	repairOrphanResponsesToolCalls,
 } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
 
@@ -296,7 +297,7 @@ function buildParams(
 		prompt_cache_key: normalizeOpenAIResponsesPromptCacheKey(options?.promptCacheKey ?? options?.sessionId),
 	};
 
-	applyCommonResponsesSamplingParams(params, options, model.provider);
+	applyCommonResponsesSamplingParams(params, options, model);
 
 	if (context.tools) {
 		params.tools = convertTools(context.tools);
@@ -347,7 +348,7 @@ function convertMessages(
 		msgIndex++;
 	}
 
-	return messages;
+	return repairOrphanResponsesToolCalls(messages);
 }
 
 function convertTools(tools: Tool[]): OpenAITool[] {

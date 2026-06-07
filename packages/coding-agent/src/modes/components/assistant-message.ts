@@ -1,5 +1,5 @@
 import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
-import { Container, Image, ImageProtocol, Markdown, Spacer, TERMINAL, Text } from "@oh-my-pi/pi-tui";
+import { Container, Image, type ImageBudget, ImageProtocol, Markdown, Spacer, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
 import type { AssistantThinkingRenderer } from "../../extensibility/extensions/types";
@@ -17,14 +17,26 @@ export class AssistantMessageComponent extends Container {
 	#usageInfo?: Usage;
 	#convertedKittyImages = new Map<string, ImageContent>();
 	#kittyConversionsInFlight = new Set<string>();
+	#transcriptBlockFinalized: boolean;
+	/**
+	 * When true, the turn-ending `Error: …` line for `stopReason === "error"` is
+	 * suppressed because the same error is currently shown in the pinned banner
+	 * above the editor (see `EventController` + `ErrorBannerComponent`). Avoids
+	 * rendering the identical error twice (inline + banner) at the error moment.
+	 * Restored to `false` when the banner is cleared at the next turn so the
+	 * transcript keeps the error in history.
+	 */
+	#errorPinned = false;
 
 	constructor(
 		message?: AssistantMessage,
 		private hideThinkingBlock = false,
 		private readonly onImageUpdate?: () => void,
 		private readonly thinkingRenderers: readonly AssistantThinkingRenderer[] = [],
+		private readonly imageBudget?: ImageBudget,
 	) {
 		super();
+		this.#transcriptBlockFinalized = message !== undefined;
 
 		// Container for text/thinking content
 		this.#contentContainer = new Container();
@@ -44,6 +56,38 @@ export class AssistantMessageComponent extends Container {
 
 	setHideThinkingBlock(hide: boolean): void {
 		this.hideThinkingBlock = hide;
+	}
+
+	/**
+	 * Toggle suppression of the inline `Error: …` line while the same error is
+	 * pinned in the banner above the editor. Re-renders so the change is visible.
+	 */
+	setErrorPinned(pinned: boolean): void {
+		if (this.#errorPinned === pinned) return;
+		this.#errorPinned = pinned;
+		if (this.#lastMessage) {
+			this.updateContent(this.#lastMessage);
+		}
+	}
+
+	isTranscriptBlockFinalized(): boolean {
+		return this.#transcriptBlockFinalized;
+	}
+
+	/**
+	 * Assistant text/thinking streams in append-only: earlier rendered rows never
+	 * re-layout, new content only grows the block at the bottom. The transcript
+	 * reports this so the renderer may commit scrolled-off head rows of a long
+	 * streamed reply to native scrollback instead of dropping them (see
+	 * `NativeScrollbackLiveRegion#getNativeScrollbackCommitSafeEnd`). Volatile
+	 * blocks (tool previews that collapse) intentionally do not implement this.
+	 */
+	isTranscriptBlockAppendOnly(): boolean {
+		return true;
+	}
+
+	markTranscriptBlockFinalized(): void {
+		this.#transcriptBlockFinalized = true;
 	}
 
 	setToolResultImages(toolCallId: string, images: ImageContent[]): void {
@@ -124,7 +168,7 @@ export class AssistantMessageComponent extends Container {
 						displayImage.data,
 						displayImage.mimeType,
 						{ fallbackColor: (text: string) => theme.fg("toolOutput", text) },
-						resolveImageOptions(),
+						{ ...resolveImageOptions(), budget: this.imageBudget, imageKey: key },
 					),
 				);
 				continue;
@@ -163,10 +207,6 @@ export class AssistantMessageComponent extends Container {
 		const hasVisibleContent = message.content.some(
 			c => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
 		);
-
-		if (hasVisibleContent) {
-			this.#contentContainer.addChild(new Spacer(1));
-		}
 
 		// Render content in order
 		let thinkingIndex = 0;
@@ -223,7 +263,7 @@ export class AssistantMessageComponent extends Container {
 					this.#contentContainer.addChild(new Spacer(1));
 				}
 				this.#contentContainer.addChild(new Text(theme.fg("error", abortMessage), 1, 0));
-			} else if (message.stopReason === "error") {
+			} else if (message.stopReason === "error" && !this.#errorPinned) {
 				const errorMsg = message.errorMessage || "Unknown error";
 				this.#contentContainer.addChild(new Spacer(1));
 				this.#contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), 1, 0));

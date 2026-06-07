@@ -62,6 +62,7 @@ import {
 	isOpenAIResponsesProgressEvent,
 	normalizeResponsesToolCallIdForTransform,
 	processResponsesStream,
+	repairOrphanResponsesToolCalls,
 	repairOrphanResponsesToolOutputs,
 } from "./openai-responses-shared";
 import { transformMessages } from "./transform-messages";
@@ -463,7 +464,7 @@ function buildParams(
 		stream_options: model.provider === "openai" ? { include_obfuscation: false } : undefined,
 	};
 
-	applyCommonResponsesSamplingParams(params, options, model.provider);
+	applyCommonResponsesSamplingParams(params, options, model);
 	// TODO: openai responses has no top-level `stop`/`stop_sequences`; surface via reasoning.stop?
 	// `StreamOptions.stopSequences` is intentionally dropped for this provider.
 	// TODO: openai responses has no top-level `frequency_penalty` field as of the current SDK;
@@ -614,7 +615,7 @@ function convertConversationMessages(
 		msgIndex++;
 	}
 
-	return repairOrphanResponsesToolOutputs(messages);
+	return repairOrphanResponsesToolCalls(repairOrphanResponsesToolOutputs(messages));
 }
 
 /**

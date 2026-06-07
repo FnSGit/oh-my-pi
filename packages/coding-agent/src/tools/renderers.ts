@@ -28,10 +28,10 @@ import { resolveToolRenderer } from "./resolve";
 import { searchToolRenderer } from "./search";
 import { searchToolBm25Renderer } from "./search-tool-bm25";
 import { sshToolRenderer } from "./ssh";
-import { todoWriteToolRenderer } from "./todo-write";
+import { todoToolRenderer } from "./todo";
 import { writeToolRenderer } from "./write";
 
-type ToolRenderer = {
+export type ToolRenderer = {
 	renderCall: (args: unknown, options: RenderResultOptions, theme: Theme) => Component;
 	renderResult: (
 		result: { content: Array<{ type: string; text?: string }>; details?: unknown; isError?: boolean },
@@ -40,6 +40,21 @@ type ToolRenderer = {
 		args?: unknown,
 	) => Component;
 	mergeCallAndResult?: boolean;
+	/**
+	 * While a tool's preview is still streaming, report whether the
+	 * currently-rendered preview is append-only: its rows only grow at the bottom
+	 * and never re-layout above the bottom live region (a full, top-anchored
+	 * content/code preview). The transcript reports this up to the TUI so a
+	 * streaming preview taller than the viewport commits its scrolled-off head to
+	 * native scrollback instead of dropping it (see
+	 * `ToolExecutionComponent.isTranscriptBlockAppendOnly`). `result` is the
+	 * latest (possibly partial) tool result, or `undefined` before one exists —
+	 * `eval`/`bash` use its presence to defer committing until the streamed input
+	 * (code) has finalized. Omit (or return `false`) for previews that slide a
+	 * tail window or later collapse to a compact result — committing their head
+	 * would strand stale rows.
+	 */
+	isStreamingPreviewAppendOnly?: (args: unknown, options: RenderResultOptions, result?: unknown) => boolean;
 	/** Render without background box, inline in the response flow */
 	inline?: boolean;
 };
@@ -67,7 +82,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	search_tool_bm25: searchToolBm25Renderer as ToolRenderer,
 	ssh: sshToolRenderer as ToolRenderer,
 	task: taskToolRenderer as ToolRenderer,
-	todo_write: todoWriteToolRenderer as ToolRenderer,
+	todo: todoToolRenderer as ToolRenderer,
 	github: githubToolRenderer as ToolRenderer,
 	goal: goalToolRenderer as ToolRenderer,
 	web_search: webSearchToolRenderer as ToolRenderer,

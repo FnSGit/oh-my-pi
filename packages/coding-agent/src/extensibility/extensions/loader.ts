@@ -280,6 +280,41 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 }
 
 /**
+ * Build a context event result for a Claude Code `UserPromptSubmit` hook.
+ *
+ * Kept parallel to `buildContextEventResultFromStdout` in
+ * `extensibility/hooks/loader.ts` — the two loaders implement the same
+ * stdin/stdout contract for command hooks and must produce identical
+ * payload shapes (otherwise hook users see one behavior in some
+ * configurations and another in others). See the hooks loader for the
+ * full rationale and bug history.
+ */
+function buildContextEventResultFromStdout(
+	stdout: string,
+	additionalContext: string | undefined,
+	event: unknown,
+): { messages: Array<Record<string, unknown>> } | undefined {
+	// Mirror fix in extensibility/hooks/loader.ts: when no additionalContext
+	// was extracted and stdout is just "{}" (empty JSON from hooks like hookify
+	// that always emit JSON even when they have no rules), treat it as "no
+	// context modification" rather than injecting literal "{}" as a user message.
+	if (additionalContext === undefined && /^\s*\{\s*\}\s*$/.test(stdout)) {
+		return undefined;
+	}
+	const text = (additionalContext ?? stdout).trim();
+	if (!text) return undefined;
+	const existing = Array.isArray((event as { messages?: unknown[] } | null)?.messages)
+		? ((event as { messages: Array<Record<string, unknown>> }).messages)
+		: [];
+	return {
+		messages: [
+			...existing,
+			{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() },
+		],
+	};
+}
+
+/**
  * Map Claude Code hook events to omp extension event names.
  */
 const CLAUDE_EVENT_MAP: Record<ClaudeHookEvent, string> = {
@@ -406,13 +441,36 @@ function createClaudeCommandExtension(discoveredHook: Hook, cwd: string): Extens
 						return { compaction: { summary: output.custom_instructions } };
 					}
 				}
-				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
-					return { messages: [{ type: "text", text: stdout }] };
+				if (discoveredHook.claudeEvent === "UserPromptSubmit") {
+					// Mirror the fix in `extensibility/hooks/loader.ts`: a
+					// `UserPromptSubmit` Claude Code hook emits
+					// `{ hookSpecificOutput: { hookEventName, additionalContext } }`
+					// and the loader must surface the `additionalContext` as a
+					// real user `Message` appended to the current context —
+					// not a raw content block. See the hooks loader for the
+					// full rationale and the bug it closes
+					// (`buildParams` "all were filtered out" for xopglm51).
+					return buildContextEventResultFromStdout(
+						stdout,
+						typeof output.additionalContext === "string" ? output.additionalContext : undefined,
+						event,
+					);
+				}
+				if (discoveredHook.claudeEvent === "SessionStart") {
+					// SessionStart is mapped to `session_start` (NOT `context`)
+					// — the runner drops its return value, so claiming a
+					// context override here would only build a payload no one
+					// consumes.
+					return undefined;
 				}
 				return undefined;
 			} catch {
-				if (discoveredHook.claudeEvent === "SessionStart" || discoveredHook.claudeEvent === "UserPromptSubmit") {
-					return { messages: [{ type: "text", text: stdout }] };
+				// Non-JSON stdout: same handling as the JSON path.
+				if (discoveredHook.claudeEvent === "UserPromptSubmit") {
+					return buildContextEventResultFromStdout(stdout, undefined, event);
+				}
+				if (discoveredHook.claudeEvent === "SessionStart") {
+					return undefined;
 				}
 				return undefined;
 			}

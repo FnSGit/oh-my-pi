@@ -3,6 +3,7 @@
  * Transforms to Message[] only at the LLM call boundary.
  */
 import {
+	type ApiKeyResolveContext,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
@@ -627,9 +628,12 @@ async function runLoopBody(
 				// toolCall blocks behind. The trailing call's arguments may be incomplete,
 				// so don't execute or continue — pair each with a placeholder result to keep
 				// the tool_use/tool_result contract valid for any later request that
-				// replays this turn.
+				// replays this turn. When the truncation was `length`, surface an actionable
+				// hint so the model doesn't loop by re-emitting the same oversized payload
+				// (e.g. 1000+ line `write` content blowing past the model's output cap).
+				const skipReason = message.stopReason === "length" ? "length" : "skipped";
 				for (const toolCall of toolCalls) {
-					const result = createAbortedToolResult(toolCall, stream, "skipped");
+					const result = createAbortedToolResult(toolCall, stream, skipReason);
 					currentContext.messages.push(result);
 					newMessages.push(result);
 					toolResults.push(result);
@@ -724,8 +728,9 @@ async function streamAssistantResponse(
 	// Resolve API key (important for expiring tokens) — do this before resolving
 	// metadata so that the session-sticky credential recorded by getApiKey is
 	// visible to metadataResolver (e.g. for the correct account_uuid in metadata.user_id).
+	const staticApiKey = typeof config.apiKey === "string" ? config.apiKey : undefined;
 	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || staticApiKey;
 
 	// Re-resolve metadata after credential selection so the per-request value
 	// reflects the credential actually used, not the snapshot from AgentLoopConfig construction.
@@ -795,7 +800,19 @@ async function streamAssistantResponse(
 		return await runInActiveSpan(chatSpan, async () => {
 			const response = await streamFunction(config.model, llmContext, {
 				...config,
-				apiKey: resolvedApiKey,
+				// Hand streamSimple a resolver so its central auth-retry policy can
+				// re-resolve on 401 / usage-limit: the initial step reuses the key
+				// already resolved above (which set the session-sticky credential
+				// feeding metadataResolver), and retry steps forward the a/b/c ctx
+				// to config.getApiKey (force-refresh, then rotate). With no
+				// getApiKey hook the caller's own apiKey (string or resolver) flows
+				// through unchanged.
+				apiKey: config.getApiKey
+					? (ctx: ApiKeyResolveContext) =>
+							ctx.error === undefined
+								? resolvedApiKey
+								: Promise.resolve(config.getApiKey!(config.model.provider, ctx))
+					: config.apiKey,
 				metadata: resolvedMetadata,
 				toolChoice: effectiveToolChoice,
 				reasoning: effectiveReasoning,
@@ -1360,15 +1377,17 @@ async function executeToolCalls(
 function createAbortedToolResult(
 	toolCall: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
-	reason: "aborted" | "error" | "skipped",
+	reason: "aborted" | "error" | "skipped" | "length",
 	errorMessage?: string,
 ): ToolResultMessage {
 	const message =
 		reason === "aborted"
 			? "Tool execution was aborted"
-			: reason === "skipped"
-				? "Tool call was not executed because the assistant ended its turn"
-				: "Tool execution failed due to an error";
+			: reason === "length"
+				? "Tool call was not executed because the assistant hit its output token limit (stop_reason: length) before the arguments could complete; the recorded arguments are truncated and unsafe to run. Do NOT retry by re-emitting the same large payload — split the work into several smaller tool calls (e.g. for `write`/`edit`, write the first chunk then append the rest with subsequent `edit` insert ops, or break the file into multiple `write` targets)"
+				: reason === "skipped"
+					? "Tool call was not executed because the assistant ended its turn"
+					: "Tool execution failed due to an error";
 	const result: AgentToolResult<any> = {
 		content: [{ type: "text", text: errorMessage ? `${message}: ${errorMessage}` : `${message}.` }],
 		details: {},

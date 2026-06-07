@@ -9,6 +9,17 @@ const COPILOT_PREMIUM_MULTIPLIERS: Record<string, number> = {
 	"github-copilot/grok-code-fast-1": 0.25,
 };
 
+// Per-model `contextWindow` / `maxTokens` overrides keyed by `${provider}/${id}`.
+// Models.dev doesn't always carry the bundled limits our descriptors advertise
+// (e.g. MiniMax-M3 ships with 512K upstream but we deploy 1M), so we pin the
+// values here to survive upstream metadata shifts.
+const CONTEXT_WINDOW_OVERRIDES: Record<string, { contextWindow: number; maxTokens: number }> = {
+	"minimax/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+	"minimax-cn/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+	"minimax-code/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+	"minimax-code-cn/MiniMax-M3": { contextWindow: 1000000, maxTokens: 131072 },
+};
+
 import * as path from "node:path";
 import { $env } from "@oh-my-pi/pi-utils";
 import { AuthStorage, type OAuthAccess, SqliteAuthCredentialStore } from "../src/auth-storage";
@@ -28,6 +39,8 @@ import {
 } from "../src/provider-models/descriptors";
 import {
 	buildXaiOAuthStaticSeed,
+	clampFireworksKimiMaxTokens,
+	isFireworksKimiK2ModelId,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
 	UNK_CONTEXT_WINDOW,
@@ -41,6 +54,16 @@ import { fetchCodexModels } from "../src/utils/discovery/codex";
 import type { OAuthProvider } from "../src/utils/oauth/types";
 
 const packageRoot = path.join(import.meta.dir, "..");
+
+/**
+ * Local/self-hosted providers (Ollama, vLLM, LM Studio, LiteLLM). Their model
+ * catalogs are whatever happens to be running on the machine that invokes the
+ * generator — bundling them would leak machine-specific endpoints (e.g.
+ * `http://localhost:4000/v1`) into the committed snapshot. They are discovered
+ * dynamically at runtime instead, so they are never fetched during generation
+ * and never written to models.json.
+ */
+const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm", "lm-studio", "litellm"]);
 
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
@@ -181,6 +204,24 @@ function applyPremiumMultiplierOverrides(models: readonly Model[]): Model[] {
 		};
 	});
 }
+
+function applyContextWindowOverrides(models: readonly Model[]): Model[] {
+	return models.map(model => {
+		const override = CONTEXT_WINDOW_OVERRIDES[`${model.provider}/${model.id}`];
+		if (!override) {
+			return model;
+		}
+		if (model.contextWindow === override.contextWindow && model.maxTokens === override.maxTokens) {
+			return model;
+		}
+		return {
+			...model,
+			contextWindow: override.contextWindow,
+			maxTokens: override.maxTokens,
+		};
+	});
+}
+
 function hasBillableCost(cost: Model["cost"]): boolean {
 	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
 }
@@ -209,6 +250,25 @@ function applyCodexPricingFallback(models: readonly Model[]): Model[] {
 			...model,
 			cost: { ...openAICost },
 		};
+	});
+}
+
+/**
+ * Fireworks-backed Kimi K2.x deployments report `max_completion_tokens: 65536`
+ * over `/v1/models`, but Kimi's documented output budget on Fireworks is
+ * lower (#1849). Cap them here so the post-processing pass — which also folds
+ * in the `prevModelsJson` static fallback used by `firepass` — never lets a
+ * stale or inflated upstream value through. The resolver applies the same
+ * cap when discovery runs at runtime; this is the bundle-time safety net.
+ */
+function applyFireworksKimiMaxTokensCap(models: readonly Model[]): Model[] {
+	const FIREWORKS_KIMI_PROVIDERS = new Set(["fireworks", "firepass"]);
+	return models.map(model => {
+		if (!FIREWORKS_KIMI_PROVIDERS.has(model.provider)) return model;
+		if (!isFireworksKimiK2ModelId(model.id)) return model;
+		const capped = clampFireworksKimiMaxTokens(model.id, model.maxTokens);
+		if (capped === model.maxTokens) return model;
+		return { ...model, maxTokens: capped };
 	});
 }
 
@@ -314,7 +374,9 @@ async function generateModels() {
 	const modelsDevModels = await loadModelsDevData();
 	const catalogProviderModels = (
 		await Promise.all(
-			PROVIDER_DESCRIPTORS.filter(isCatalogDescriptor).map(descriptor => fetchProviderModelsFromCatalog(descriptor)),
+			PROVIDER_DESCRIPTORS.filter(
+				descriptor => isCatalogDescriptor(descriptor) && !DISCOVERY_ONLY_PROVIDERS.has(descriptor.providerId),
+			).map(descriptor => fetchProviderModelsFromCatalog(descriptor as CatalogProviderDescriptor)),
 		)
 	).flat();
 	const gitLabDuoModels = getGitLabDuoModels();
@@ -365,14 +427,13 @@ async function generateModels() {
 	// the upstream list exactly, so retired entries from the previous snapshot do
 	// not reappear during regeneration.
 	// Discovery-only providers (local inference servers) — never bundle static models.
-	const discoveryOnlyProviders = new Set(["ollama", "vllm"]);
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
 
 	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
 		for (const model of Object.values(models)) {
 			if (
 				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
-				!discoveryOnlyProviders.has(model.provider) &&
+				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
 				!modelsDevAuthoritativeProviders.has(model.provider)
 			) {
 				allModels.push(model);
@@ -382,14 +443,16 @@ async function generateModels() {
 
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
+	allModels = applyContextWindowOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
+	allModels = applyFireworksKimiMaxTokensCap(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);
 
 	// Group by provider and sort each provider's models
 	const providers: Record<string, Record<string, Model>> = {};
 	for (const model of allModels) {
-		if (discoveryOnlyProviders.has(model.provider)) continue;
+		if (DISCOVERY_ONLY_PROVIDERS.has(model.provider)) continue;
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
 		}
