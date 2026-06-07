@@ -51,9 +51,7 @@ describe("createCommandHook — UserPromptSubmit context event", () => {
 		expect(handler).toBeDefined();
 
 		const existingUserMsg = { role: "user", content: "user prompt", timestamp: 1000 };
-		const result = (await handler!(contextEventWith([existingUserMsg]), {})) as
-			| { messages?: unknown[] }
-			| undefined;
+		const result = (await handler!(contextEventWith([existingUserMsg]), {})) as { messages?: unknown[] } | undefined;
 
 		// Must return something
 		expect(result).toBeDefined();
@@ -106,21 +104,20 @@ describe("createCommandHook — UserPromptSubmit context event", () => {
 });
 
 describe("createCommandHook — SessionStart event", () => {
-	it("registers for session_start event (not context), so its return value is ignored upstream", async () => {
-		// SessionStart is mapped to "session_start" in CLAUDE_EVENT_MAP, NOT
-		// "context". The general `emit()` ignores session_start handler return
-		// values entirely, so even if the loader tried to construct a messages
-		// override, it would be silently dropped by the runner. The loader
-		// must therefore NOT claim a context override for SessionStart.
+	it("registers for context event so SessionStart additionalContext is chained into emitContext()", async () => {
+		// SessionStart is now mapped to "context" in CLAUDE_EVENT_MAP so the
+		// handler's return value (project memories via additionalContext) is
+		// consumed by emitContext() and chained into the LLM context.  The flag
+		// sessionStartHasRun prevents duplicate injection on subsequent context
+		// events (UserPromptSubmit etc.).
 		const hook = makeHook({
 			claudeEvent: "SessionStart",
 			command: "printf",
 			args: ["%s", "memory injection text"],
 		});
 		const loaded = createCommandHook(hook, process.cwd());
-		// The handler must be registered under "session_start", not "context".
-		expect(loaded.handlers.get("session_start")?.length).toBe(1);
-		expect(loaded.handlers.get("context")).toBeUndefined();
+		expect(loaded.handlers.get("context")?.length).toBe(1);
+		expect(loaded.handlers.get("session_start")).toBeUndefined();
 	});
 });
 
@@ -146,9 +143,7 @@ describe("createCommandHook — malformed-message regression", () => {
 		});
 		const loaded = createCommandHook(hook, process.cwd());
 		const handler = loaded.handlers.get("context")?.[0]!;
-		const result = (await handler(contextEventWith([]), {})) as
-			| { messages?: unknown[] }
-			| undefined;
+		const result = (await handler(contextEventWith([]), {})) as { messages?: unknown[] } | undefined;
 		if (result?.messages) {
 			for (const m of result.messages) {
 				expect((m as { role?: string }).role).toBeDefined();

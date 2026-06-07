@@ -13,16 +13,16 @@ import { readFile } from "../capability/fs";
 import { type ClaudeHookEvent, type ClaudeHooksConfig, type Hook, hookCapability } from "../capability/hook";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import { type Rule, ruleCapability } from "../capability/rule";
-import { type Skill, skillCapability } from "../capability/skill";
 import { type Settings, settingsCapability } from "../capability/settings";
+import { type Skill, skillCapability } from "../capability/skill";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { settings } from "../config/settings";
 import {
-	calculateDepth,
 	buildRuleFromMarkdown,
+	calculateDepth,
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
@@ -363,11 +363,7 @@ function claudeEventToHookType(event: ClaudeHookEvent): "pre" | "post" {
 /**
  * Parse Claude Code hooks from settings.json and convert to Hook items.
  */
-function parseClaudeHooksConfig(
-	config: ClaudeHooksConfig,
-	settingsPath: string,
-	level: "user" | "project",
-): Hook[] {
+function parseClaudeHooksConfig(config: ClaudeHooksConfig, settingsPath: string, level: "user" | "project"): Hook[] {
 	const items: Hook[] = [];
 
 	for (const [eventName, matcherGroups] of Object.entries(config)) {
@@ -595,7 +591,6 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 
 	return { items, warnings };
 }
-
 
 // =============================================================================
 // Rules

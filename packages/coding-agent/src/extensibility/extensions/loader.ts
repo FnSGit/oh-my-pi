@@ -304,13 +304,10 @@ function buildContextEventResultFromStdout(
 	const text = (additionalContext ?? stdout).trim();
 	if (!text) return undefined;
 	const existing = Array.isArray((event as { messages?: unknown[] } | null)?.messages)
-		? ((event as { messages: Array<Record<string, unknown>> }).messages)
+		? (event as { messages: Array<Record<string, unknown>> }).messages
 		: [];
 	return {
-		messages: [
-			...existing,
-			{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() },
-		],
+		messages: [...existing, { role: "user", content: [{ type: "text", text }], timestamp: Date.now() }],
 	};
 }
 
@@ -323,7 +320,7 @@ const CLAUDE_EVENT_MAP: Record<ClaudeHookEvent, string> = {
 	PreCompact: "session_before_compact",
 	PostCompact: "session_compact",
 	Notification: "session_start",
-	SessionStart: "session_start",
+	SessionStart: "context",
 	SessionEnd: "session_shutdown",
 	Stop: "session_shutdown",
 	StopFailure: "session_shutdown",
@@ -342,12 +339,19 @@ function createClaudeCommandExtension(discoveredHook: Hook, cwd: string): Extens
 	const ext = createExtension(discoveredHook.path, discoveredHook.path);
 
 	const ompEvent = discoveredHook.claudeEvent
-		? CLAUDE_EVENT_MAP[discoveredHook.claudeEvent] ?? "tool_call"
+		? (CLAUDE_EVENT_MAP[discoveredHook.claudeEvent] ?? "tool_call")
 		: discoveredHook.type === "pre"
 			? "tool_call"
 			: "tool_result";
 
 	const matcher = discoveredHook.tool ?? discoveredHook.matcher ?? "*";
+
+	// SessionStart fires once per session to inject project memories.
+	// Mapped to "context" so its additionalContext is chained into
+	// emitContext() by buildContextEventResultFromStdout.  The flag
+	// prevents duplicate injection on subsequent context events
+	// (UserPromptSubmit etc.).
+	let sessionStartHasRun = false;
 
 	const handler: HandlerFn = async (event: unknown, _ctx: unknown) => {
 		// Matcher check: skip if scoped to a specific tool and the event doesn't match
@@ -370,7 +374,9 @@ function createClaudeCommandExtension(discoveredHook: Hook, cwd: string): Extens
 				stdinPayload = {
 					tool_name: ev.toolName ?? matcher,
 					tool_input: ev.toolInput ?? ev.input ?? {},
-					...(discoveredHook.claudeEvent === "PostToolUse" ? { tool_output: ev.toolOutput ?? ev.output ?? "" } : {}),
+					...(discoveredHook.claudeEvent === "PostToolUse"
+						? { tool_output: ev.toolOutput ?? ev.output ?? "" }
+						: {}),
 					session_id: sessionId ?? "",
 				};
 				break;
@@ -406,7 +412,7 @@ function createClaudeCommandExtension(discoveredHook: Hook, cwd: string): Extens
 			default: {
 				stdinPayload = {
 					session_id: sessionId ?? "",
-					...(event as Record<string, unknown> ?? {}),
+					...((event as Record<string, unknown>) ?? {}),
 				};
 				break;
 			}
@@ -456,11 +462,10 @@ function createClaudeCommandExtension(discoveredHook: Hook, cwd: string): Extens
 						event,
 					);
 				}
-				if (discoveredHook.claudeEvent === "SessionStart") {
-					// SessionStart is mapped to `session_start` (NOT `context`)
-					// — the runner drops its return value, so claiming a
-					// context override here would only build a payload no one
-					// consumes.
+				if (discoveredHook.claudeEvent === "Stop" || discoveredHook.claudeEvent === "StopFailure") {
+					if (output.systemMessage) {
+						logger.info(`[agent-memory Stop hook] ${output.systemMessage}`);
+					}
 					return undefined;
 				}
 				return undefined;
@@ -470,7 +475,9 @@ function createClaudeCommandExtension(discoveredHook: Hook, cwd: string): Extens
 					return buildContextEventResultFromStdout(stdout, undefined, event);
 				}
 				if (discoveredHook.claudeEvent === "SessionStart") {
-					return undefined;
+					if (sessionStartHasRun) return undefined;
+					sessionStartHasRun = true;
+					return buildContextEventResultFromStdout(stdout, undefined, event);
 				}
 				return undefined;
 			}

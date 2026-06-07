@@ -49,7 +49,7 @@ function buildContextEventResultFromStdout(
 	const text = (additionalContext ?? stdout).trim();
 	if (!text) return undefined;
 	const existing = Array.isArray((event as { messages?: unknown[] } | null)?.messages)
-		? ((event as { messages: AgentMessage[] }).messages)
+		? (event as { messages: AgentMessage[] }).messages
 		: [];
 	return {
 		messages: [
@@ -276,7 +276,7 @@ const CLAUDE_EVENT_MAP: Record<ClaudeHookEvent, string> = {
 	PreCompact: "session_before_compact",
 	PostCompact: "session_compact",
 	Notification: "session_start",
-	SessionStart: "session_start",
+	SessionStart: "context",
 	SessionEnd: "session_shutdown",
 	Stop: "session_shutdown",
 	StopFailure: "session_shutdown",
@@ -302,12 +302,20 @@ export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook
 
 	// Determine which omp event(s) this hook subscribes to
 	const ompEvent = discoveredHook.claudeEvent
-		? CLAUDE_EVENT_MAP[discoveredHook.claudeEvent] ?? "tool_call"
+		? (CLAUDE_EVENT_MAP[discoveredHook.claudeEvent] ?? "tool_call")
 		: discoveredHook.type === "pre"
 			? "tool_call"
 			: "tool_result";
 
 	// Register a handler that spawns the command
+
+	// SessionStart fires once per session to inject project memories.
+	// Mapped to "context" so its additionalContext is chained into
+	// emitContext() by buildContextEventResultFromStdout.  The flag
+	// prevents duplicate injection on subsequent context events
+	// (UserPromptSubmit etc.).
+	let sessionStartHasRun = false;
+
 	const handler: HandlerFn = async (event: unknown, _ctx: unknown) => {
 		// Matcher check: skip if this hook is scoped to a specific tool and the event doesn't match
 		const matcher = discoveredHook.tool ?? discoveredHook.matcher ?? "*";
@@ -330,7 +338,9 @@ export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook
 				stdinPayload = {
 					tool_name: ev.toolName ?? matcher,
 					tool_input: ev.toolInput ?? ev.input ?? {},
-					...(discoveredHook.claudeEvent === "PostToolUse" ? { tool_output: ev.toolOutput ?? ev.output ?? "" } : {}),
+					...(discoveredHook.claudeEvent === "PostToolUse"
+						? { tool_output: ev.toolOutput ?? ev.output ?? "" }
+						: {}),
 					session_id: sessionId ?? "",
 				};
 				break;
@@ -367,7 +377,7 @@ export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook
 				// SessionStart, SessionEnd, Notification, SubagentStart/Stop, etc.
 				stdinPayload = {
 					session_id: sessionId ?? "",
-					...(event as Record<string, unknown> ?? {}),
+					...((event as Record<string, unknown>) ?? {}),
 				};
 				break;
 			}
@@ -416,13 +426,14 @@ export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook
 				// `role: "user"`) appended to the current context, not a
 				// content block that downstream `convertToLlm` would silently
 				// drop (leaving `context.messages` empty and triggering the
+				// `UserPromptSubmit` Claude Code hooks emit JSON of shape
+				//   { hookSpecificOutput: { hookEventName, additionalContext } }
+				// — extract `additionalContext` rather than using the entire
+				// JSON wrapper as text. The result is a real `Message` (with
+				// `role: "user"`) appended to the current context, not a
+				// content block that downstream `convertToLlm` would silently
+				// drop (leaving `context.messages` empty and triggering the
 				// `buildParams` "all were filtered out" defensive throw).
-				//
-				// `SessionStart` is mapped to `session_start` (NOT `context`)
-				// in CLAUDE_EVENT_MAP, and the runner's general `emit()` drops
-				// session_start return values. So there is no consumer of a
-				// context override here — return undefined rather than a
-				// malformed payload that no one can use.
 				if (discoveredHook.claudeEvent === "UserPromptSubmit") {
 					return buildContextEventResultFromStdout(
 						stdout,
@@ -431,7 +442,13 @@ export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook
 					);
 				}
 				if (discoveredHook.claudeEvent === "SessionStart") {
-					return undefined;
+					if (sessionStartHasRun) return undefined;
+					sessionStartHasRun = true;
+					return buildContextEventResultFromStdout(
+						stdout,
+						typeof output.additionalContext === "string" ? output.additionalContext : undefined,
+						event,
+					);
 				}
 				return undefined;
 			} catch {
@@ -440,7 +457,9 @@ export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook
 					return buildContextEventResultFromStdout(stdout, undefined, event);
 				}
 				if (discoveredHook.claudeEvent === "SessionStart") {
-					return undefined;
+					if (sessionStartHasRun) return undefined;
+					sessionStartHasRun = true;
+					return buildContextEventResultFromStdout(stdout, undefined, event);
 				}
 				return undefined;
 			}
@@ -456,7 +475,6 @@ export function createCommandHook(discoveredHook: Hook, cwd: string): LoadedHook
 	};
 
 	handlers.set(ompEvent, [handler]);
-
 
 	return {
 		path: discoveredHook.path,

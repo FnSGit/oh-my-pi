@@ -352,9 +352,7 @@ describe("AgentSession empty stop guard", () => {
 		await session.waitForIdle();
 
 		// debug: fired once per empty stop occurrence (4 total here)
-		const emptyStopLogs = debugSpy.mock.calls.filter(
-			([msg]) => msg === "Assistant returned empty stop",
-		);
+		const emptyStopLogs = debugSpy.mock.calls.filter(([msg]) => msg === "Assistant returned empty stop");
 		expect(emptyStopLogs).toHaveLength(4);
 		for (const [, ctx] of emptyStopLogs) {
 			expect(ctx).toMatchObject({
@@ -366,16 +364,12 @@ describe("AgentSession empty stop guard", () => {
 		}
 
 		// info: one per retry that was actually scheduled (cap is 3, so 3)
-		const retryScheduledLogs = infoSpy.mock.calls.filter(
-			([msg]) => msg === "Empty-stop retry scheduled",
-		);
+		const retryScheduledLogs = infoSpy.mock.calls.filter(([msg]) => msg === "Empty-stop retry scheduled");
 		expect(retryScheduledLogs).toHaveLength(3);
 		expect(retryScheduledLogs.map(([, ctx]) => (ctx as { attempt: number }).attempt)).toEqual([1, 2, 3]);
 
 		// warn: one cap-hit log (existing behavior)
-		const capLogs = warnSpy.mock.calls.filter(
-			([msg]) => msg === "Assistant returned empty stop after retry cap",
-		);
+		const capLogs = warnSpy.mock.calls.filter(([msg]) => msg === "Assistant returned empty stop after retry cap");
 		expect(capLogs).toHaveLength(1);
 	});
 });

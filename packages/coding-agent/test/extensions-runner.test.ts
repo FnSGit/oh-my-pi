@@ -323,8 +323,7 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("context event override", () => {
-		const makeUserMsg = (id: string) =>
-			({ role: "user" as const, content: `msg-${id}`, timestamp: Date.now() });
+		const makeUserMsg = (id: string) => ({ role: "user" as const, content: `msg-${id}`, timestamp: Date.now() });
 
 		const runContextHandler = async (handlerSource: string, input: any[]) => {
 			fs.writeFileSync(path.join(extensionsDir, "context-handler.ts"), handlerSource);

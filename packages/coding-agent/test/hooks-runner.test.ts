@@ -10,8 +10,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
 import type { ContextEventResult, LoadedHook } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/loader";
+import { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -34,10 +34,12 @@ describe("HookRunner context event override", () => {
 		tempDir.removeSync();
 	});
 
-	const makeUserMsg = (id: string) =>
-		({ role: "user" as const, content: `msg-${id}`, timestamp: Date.now() });
+	const makeUserMsg = (id: string) => ({ role: "user" as const, content: `msg-${id}`, timestamp: Date.now() });
 
-	const runContextHandler = async (handlerResult: ContextEventResult | undefined | Promise<ContextEventResult | undefined>, input: any[]) => {
+	const runContextHandler = async (
+		handlerResult: ContextEventResult | undefined | Promise<ContextEventResult | undefined>,
+		input: any[],
+	) => {
 		const resolved = await Promise.resolve(handlerResult);
 		const handlers = new Map<string, Array<(event: any) => any>>();
 		handlers.set("context", [async () => resolved]);
@@ -84,7 +86,11 @@ describe("HookRunner context event override", () => {
 		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 		const input = [makeUserMsg("u1")];
 		const handlers = new Map<string, Array<(event: any) => any>>();
-		handlers.set("context", [async () => { throw new Error("boom"); }]);
+		handlers.set("context", [
+			async () => {
+				throw new Error("boom");
+			},
+		]);
 		const hook: LoadedHook = {
 			path: "test-hook",
 			resolvedPath: "/test/test-hook.ts",
