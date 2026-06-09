@@ -5,10 +5,10 @@ import * as path from "node:path";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EDIT_MODE_STRATEGIES } from "@oh-my-pi/pi-coding-agent/edit";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { theme as activeTheme, initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
-import { ToolExecutionComponent } from "../src/modes/components/tool-execution";
 
 // The streaming edit preview is a fixed-height tail window ("cursor"): the last
 // EDIT_STREAMING_PREVIEW_LINES rows of the recomputed diff are pinned to the
@@ -119,7 +119,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 			tmpDir,
 		);
 		// Await the actual diff recompute rather than racing the spinner's render
-		// ticks. The streaming spinner calls requestRender every ~16ms, so on a
+		// ticks. The streaming spinner calls requestRender every ~33ms, so on a
 		// slow box a tick — not the (file-read + whole-file Myers) compute — would
 		// resolve the wait and let us sample a stale, mid-abort preview. That is the
 		// CI flake that collapsed Math.min(...steady) to 4. whenPreviewSettled()

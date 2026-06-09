@@ -133,6 +133,8 @@ export function formatStatusIcon(status: ToolUIStatus, theme: Theme, spinnerFram
 	switch (status) {
 		case "success":
 			return theme.styledSymbol("status.success", "success");
+		case "done":
+			return theme.styledSymbol("status.done", "success");
 		case "error":
 			return theme.styledSymbol("status.error", "error");
 		case "warning":
@@ -276,7 +278,7 @@ export function formatCodeFrameLine(
 // Tool UI Helpers
 // =============================================================================
 
-export type ToolUIStatus = "success" | "error" | "warning" | "info" | "pending" | "running" | "aborted";
+export type ToolUIStatus = "success" | "done" | "error" | "warning" | "info" | "pending" | "running" | "aborted";
 export type ToolUIColor = "success" | "error" | "warning" | "accent" | "muted";
 
 export interface ToolUITitleOptions {
@@ -338,6 +340,7 @@ export function formatDiagnostics(
 	expanded: boolean,
 	theme: Theme,
 	getLangIcon: (filePath: string) => string,
+	options?: { title?: string },
 ): string {
 	if (diag.messages.length === 0) return "";
 
@@ -369,7 +372,8 @@ export function formatDiagnostics(
 		? theme.styledSymbol("status.error", "error")
 		: theme.styledSymbol("status.warning", "warning");
 	const summary = sanitizeDiagnosticDisplayText(diag.summary);
-	let output = `\n\n${headerIcon} ${theme.fg("toolTitle", "Diagnostics")} ${theme.fg("dim", `(${summary})`)}`;
+	const summaryTag = summary ? ` ${theme.fg("dim", `(${summary})`)}` : "";
+	let output = `\n\n${headerIcon} ${theme.fg("toolTitle", options?.title ?? "Diagnostics")}${summaryTag}`;
 
 	const maxDiags = expanded ? diag.messages.length : 5;
 	let diagsShown = 0;
@@ -753,6 +757,7 @@ export function capParseErrors(
 export function createCachedComponent(
 	getExpanded: () => boolean,
 	compute: (width: number, expanded: boolean) => string[],
+	options: { paddingX?: number } = {},
 ): Component {
 	let cached: { key: bigint; lines: string[] } | undefined;
 	return {
@@ -760,9 +765,13 @@ export function createCachedComponent(
 			const expanded = getExpanded();
 			const key = new Hasher().bool(expanded).u32(width).digest();
 			if (cached?.key === key) return cached.lines;
-			const lines = compute(width, expanded);
-			cached = { key, lines };
-			return lines;
+			const paddingX = Math.max(0, options.paddingX ?? 0);
+			const innerWidth = Math.max(1, width - paddingX * 2);
+			const lines = compute(innerWidth, expanded);
+			const pad = paddingX === 0 ? "" : " ".repeat(paddingX);
+			const paddedLines = paddingX === 0 ? lines : lines.map(line => `${pad}${line}${pad}`);
+			cached = { key, lines: paddedLines };
+			return paddedLines;
 		},
 		invalidate() {
 			cached = undefined;

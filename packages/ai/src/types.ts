@@ -28,9 +28,23 @@ import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 import type { OpenAIResponsesOptions } from "./providers/openai-responses";
+import type { KnownProviderId } from "./registry";
 import type { AssistantMessageEventStream } from "./utils/event-stream";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream";
+
+/**
+ * Ceiling on the output-token count omp requests from any OpenAI-family endpoint
+ * (openai-responses, azure/xai responses, and openai-completions). Mirrors
+ * Anthropic's {@link CLAUDE_CODE_MAX_OUTPUT_TOKENS}.
+ *
+ * Catalog `maxTokens` frequently reflects a model's context window rather than a
+ * given upstream's real per-request output cap. OpenRouter, for instance,
+ * advertises 131072 output tokens for `z-ai/glm-4.7`, but the Cerebras upstream
+ * only allows ~131072 tokens total — so requesting the full ceiling overflows
+ * with a 400. Requested output is clamped to this value (and to `model.maxTokens`).
+ */
+export const OPENAI_MAX_OUTPUT_TOKENS = 64000;
 
 export type KnownApi =
 	| "openai-completions"
@@ -96,61 +110,12 @@ export interface ThinkingConfig {
 	mode: ThinkingControlMode;
 }
 
-export type KnownProvider =
-	| "alibaba-coding-plan"
-	| "amazon-bedrock"
-	| "anthropic"
-	| "google"
-	| "google-gemini-cli"
-	| "google-antigravity"
-	| "google-vertex"
-	| "openai"
-	| "openai-codex"
-	| "kimi-code"
-	| "minimax-code"
-	| "minimax-code-cn"
-	| "github-copilot"
-	| "fireworks"
-	| "firepass"
-	| "gitlab-duo"
-	| "cursor"
-	| "deepseek"
-	| "xai"
-	| "xai-oauth"
-	| "groq"
-	| "cerebras"
-	| "openrouter"
-	| "kilo"
-	| "vercel-ai-gateway"
-	| "zai"
-	| "zhipu-coding-plan"
-	| "mistral"
-	| "minimax"
-	| "opencode-go"
-	| "opencode-zen"
-	| "synthetic"
-	| "cloudflare-ai-gateway"
-	| "huggingface"
-	| "litellm"
-	| "moonshot"
-	| "nvidia"
-	| "nanogpt"
-	| "ollama"
-	| "ollama-cloud"
-	| "qianfan"
-	| "qwen-portal"
-	| "together"
-	| "venice"
-	| "vllm"
-	| "xiaomi"
-	| "xiaomi-token-plan-sgp"
-	| "xiaomi-token-plan-ams"
-	| "xiaomi-token-plan-cn"
-	| "wafer-pass"
-	| "wafer-serverless"
-	| "zenmux"
-	| "lm-studio";
-export type Provider = KnownProvider | string;
+export type KnownProvider = KnownProviderId;
+// `Provider` is any provider-id string; `KnownProvider` enumerates the built-in model
+// providers. Kept structurally `string` (the prior `KnownProvider | string` already
+// collapsed to `string`) so the registry-derived `KnownProvider` can reference the model
+// types below without forming a circular type-alias reference.
+export type Provider = string;
 
 import type { Effort } from "./effort";
 
@@ -608,6 +573,14 @@ export interface AssistantMessage {
 	provider: Provider;
 	model: string;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	/**
+	 * Name of the upstream provider an aggregator routed this request to, as
+	 * reported in the response (e.g. OpenRouter's top-level `provider` field:
+	 * `"OpenAI"`, `"Anthropic"`, `"Together"`). Distinct from `provider`, which
+	 * is the configured gateway we called (`"openrouter"`). Undefined for direct
+	 * providers that expose no such field.
+	 */
+	upstreamProvider?: string;
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;

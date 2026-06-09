@@ -15,7 +15,6 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { getProjectDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { EDIT_MODE_STRATEGIES, type EditMode, type PerFileDiffPreview } from "../../edit";
-import { shimmerEnabled } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
 import { theme } from "../../modes/theme/theme";
 import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
@@ -31,9 +30,9 @@ import {
 	renderJsonTreeLines,
 } from "../../tools/json-tree";
 import { formatExpandHint, replaceTabs, resolveImageOptions, truncateToWidth } from "../../tools/render-utils";
-import { type ToolRenderer, toolRenderers } from "../../tools/renderers";
+import { toolRenderers } from "../../tools/renderers";
 import { TODO_STRIKE_TOTAL_FRAMES } from "../../tools/todo";
-import { renderStatusLine } from "../../tui";
+import { isFramedBlockComponent, renderStatusLine } from "../../tui";
 import { sanitizeWithOptionalSixelPassthrough } from "../../utils/sixel";
 import { renderDiff } from "./diff";
 
@@ -133,12 +132,13 @@ export interface ToolExecutionHandle {
 	setExpanded(expanded: boolean): void;
 }
 
-/** Drive pending-tool redraws at ~60fps so the animated border sweep is smooth.
- * The TUI already throttles at its 16ms `MIN_RENDER_INTERVAL_MS`, so this is the
- * natural upper bound and static frames diff to a no-op redraw at ~zero cost. */
-const SPINNER_RENDER_INTERVAL_MS = 16;
+/** Drive pending-tool redraws at 30fps so the running `task` row's shimmered
+ * subagent name stays smooth without spending twice the frame budget. The TUI
+ * throttles at the same cadence, and static frames diff to a no-op redraw at
+ * ~zero cost. */
+const SPINNER_RENDER_INTERVAL_MS = 1000 / 30;
 /** Advance the spinner glyph at its classic ~12.5fps step, decoupled from the
- * 60fps render cadence (mirrors `Loader`). */
+ * render cadence (mirrors `Loader`). */
 const SPINNER_GLYPH_ADVANCE_MS = 80;
 
 // Stable per-instance counter so each tool execution's inline images get a
@@ -226,9 +226,12 @@ export class ToolExecutionComponent extends Container {
 		this.#args = args;
 
 		// Always create both - contentBox for custom tools/bash/tools with renderers, contentText for other built-ins.
-		// paddingY is 0: the transcript owns inter-block spacing (see TranscriptContainer).
-		this.#contentBox = new Box(0, 0);
-		this.#contentText = new Text("", 1, 0);
+		// paddingY is 1 so background-tinted blocks (custom/extension tools and the
+		// generic fallback) get top/bottom breathing room. TranscriptContainer
+		// strips PLAIN-blank edges, so framed/minimal blocks (no bg set) drop these
+		// lines and keep their tight spacing — only tinted lines survive.
+		this.#contentBox = new Box(0, 1);
+		this.#contentText = new Text("", 1, 1);
 
 		// Use Box for custom tools or built-in tools that have renderers
 		const hasRenderer = toolName in toolRenderers;
@@ -418,26 +421,34 @@ export class ToolExecutionComponent extends Container {
 	#updateSpinnerAnimation(): void {
 		// Spinner for: task tool with partial result, or edit/write while args streaming
 		const isStreamingArgs = !this.#argsComplete && (isEditLikeToolName(this.#toolName) || this.#toolName === "write");
-		const isBackgroundAsyncTask =
-			this.#toolName === "task" &&
+		const isBackgroundAsyncRunning =
 			(this.#result?.details as { async?: { state?: string } } | undefined)?.async?.state === "running";
+		const isBackgroundAsyncTask = this.#toolName === "task" && isBackgroundAsyncRunning;
 		const isPartialTask = this.#isPartial && this.#toolName === "task" && !isBackgroundAsyncTask;
-		// Sweep the border of bash/eval execution blocks while they're pending.
-		const isPendingExecBlock =
-			this.#isPartial && shimmerEnabled() && (this.#toolName === "bash" || this.#toolName === "eval");
-		const needsSpinner = isStreamingArgs || isPartialTask || isPendingExecBlock;
+		const needsSpinner = isStreamingArgs || isPartialTask;
 		if (needsSpinner && !this.#spinnerInterval) {
-			this.#lastSpinnerAdvanceAt = performance.now();
+			const now = performance.now();
+			const frameCount = theme.spinnerFrames.length;
+			this.#lastSpinnerAdvanceAt = now;
+			if (frameCount > 0 && this.#spinnerFrame === undefined) {
+				this.#spinnerFrame = 0;
+				this.#renderState.spinnerFrame = 0;
+			}
 			this.#spinnerInterval = setInterval(() => {
 				const now = performance.now();
 				const frameCount = theme.spinnerFrames.length;
-				// Redraw at ~60fps for a smooth border sweep, but only step the spinner
-				// glyph at its classic ~12.5fps cadence. The TUI throttles renders at
-				// 16ms and the differ drops no-op redraws, so the extra ticks are free.
-				if (frameCount > 0 && now - this.#lastSpinnerAdvanceAt >= SPINNER_GLYPH_ADVANCE_MS) {
-					this.#spinnerFrame = ((this.#spinnerFrame ?? -1) + 1) % frameCount;
-					this.#renderState.spinnerFrame = this.#spinnerFrame;
-					this.#lastSpinnerAdvanceAt = now;
+				// Redraw at 30fps for a smooth `task` name shimmer, but keep the spinner
+				// glyph phase-locked to its classic ~12.5fps cadence. Advancing the
+				// anchor by elapsed frames instead of resetting to `now` avoids the
+				// 30fps timer quantizing the glyph down to one step every three ticks.
+				if (frameCount > 0) {
+					const elapsed = now - this.#lastSpinnerAdvanceAt;
+					if (elapsed >= SPINNER_GLYPH_ADVANCE_MS) {
+						const steps = Math.floor(elapsed / SPINNER_GLYPH_ADVANCE_MS);
+						this.#spinnerFrame = ((this.#spinnerFrame ?? 0) + steps) % frameCount;
+						this.#renderState.spinnerFrame = this.#spinnerFrame;
+						this.#lastSpinnerAdvanceAt += steps * SPINNER_GLYPH_ADVANCE_MS;
+					}
 				}
 				this.#ui.requestRender();
 			}, SPINNER_RENDER_INTERVAL_MS);
@@ -510,39 +521,6 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	/**
-	 * While a tool's preview is still streaming, a block whose preview is
-	 * append-only (rows only grow at the bottom, never re-layout) lets the
-	 * renderer commit the scrolled-off head of an over-tall preview to native
-	 * scrollback instead of dropping it — the same anti-yank path a streaming
-	 * assistant reply uses (see {@link TranscriptContainer} +
-	 * `NativeScrollbackLiveRegion`). Covers both phases: a pre-result call preview
-	 * (a `write` whose content streams in) and a partial-result preview that
-	 * streams output below fixed input (an `eval`/`bash` whose stdout grows under
-	 * its code cell). Gated on {@link isTranscriptBlockFinalized} so the boundary
-	 * closes the instant the block reaches a terminal state — a final result that
-	 * may collapse to a compact view, a backgrounded async tool, or a seal — and
-	 * the renderer decides whether its current preview shape qualifies via
-	 * `isStreamingPreviewAppendOnly` (typically: only the expanded full view,
-	 * which is top-anchored; the collapsed tail window re-layouts but is bounded
-	 * so it never overflows anyway).
-	 */
-	isTranscriptBlockAppendOnly(): boolean {
-		// A finalized block's preview can collapse/re-layout; only a live,
-		// still-streaming block is a candidate.
-		if (this.isTranscriptBlockFinalized()) return false;
-		const predicate =
-			(this.#tool as { isStreamingPreviewAppendOnly?: ToolRenderer["isStreamingPreviewAppendOnly"] } | undefined)
-				?.isStreamingPreviewAppendOnly ?? toolRenderers[this.#toolName]?.isStreamingPreviewAppendOnly;
-		if (!predicate) return false;
-		try {
-			return predicate(this.#getCallArgsForRender(), this.#renderState, this.#result);
-		} catch (err) {
-			logger.warn("Tool append-only predicate failed", { tool: this.#toolName, error: String(err) });
-			return false;
-		}
-	}
-
-	/**
 	 * Mark the tool terminal even though no result arrived (the turn aborted or
 	 * abandoned it) and stop animating, so it can freeze and stops pinning the
 	 * transcript live region.
@@ -590,6 +568,12 @@ export class ToolExecutionComponent extends Container {
 		this.#renderState.expanded = this.#expanded;
 		this.#renderState.isPartial = this.#isPartial;
 		this.#renderState.spinnerFrame = this.#spinnerFrame;
+
+		// Non-self-framing tools (custom/extension renderers and the generic
+		// fallback) get a padded, state-tinted block — built-ins that draw their
+		// own frame opt out below via the framed-component mark.
+		const stateBgKey = this.#isPartial ? "toolPendingBg" : this.#result?.isError ? "toolErrorBg" : "toolSuccessBg";
+		const stateBgFn = (t: string) => theme.bg(stateBgKey, t);
 
 		// Check for custom tool rendering
 		if (this.#tool && (this.#tool.renderCall || this.#tool.renderResult)) {
@@ -660,6 +644,11 @@ export class ToolExecutionComponent extends Container {
 					this.#contentBox.addChild(new Text(theme.fg("toolOutput", replaceTabs(output)), 0, 0));
 				}
 			}
+			// Custom tools that draw their own frame (task) render flush; plain
+			// extension renderers get the padded, state-tinted block back.
+			const customFramed = this.#contentBox.children.some(isFramedBlockComponent);
+			this.#contentBox.setPaddingX(customFramed ? 0 : 1);
+			this.#contentBox.setBgFn(customFramed ? undefined : stateBgFn);
 		} else if (this.#toolName in toolRenderers) {
 			// Built-in tools with renderers
 			const renderer = toolRenderers[this.#toolName];
@@ -774,6 +763,7 @@ export class ToolExecutionComponent extends Container {
 			}
 		} else {
 			// Other built-in tools: use Text directly with caching
+			this.#contentText.setCustomBgFn(stateBgFn);
 			this.#contentText.setText(this.#formatToolExecution());
 		}
 
@@ -924,7 +914,7 @@ export class ToolExecutionComponent extends Container {
 	 */
 	#formatToolExecution(): string {
 		const lines: string[] = [];
-		const icon = this.#isPartial ? "pending" : this.#result?.isError ? "error" : "success";
+		const icon = this.#isPartial ? "pending" : this.#result?.isError ? "error" : "done";
 		lines.push(renderStatusLine({ icon, title: this.#toolLabel }, theme));
 
 		const argsObject = this.#args && typeof this.#args === "object" ? (this.#args as Record<string, unknown>) : null;

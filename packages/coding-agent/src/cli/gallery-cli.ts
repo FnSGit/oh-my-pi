@@ -105,6 +105,10 @@ export async function renderGalleryState(
 	width: number,
 	expanded = false,
 ): Promise<string[]> {
+	if (fixture.renderState) {
+		return await fixture.renderState(state, width, expanded);
+	}
+
 	const tool = fakeToolFor(name, fixture);
 	const streamingArgs = state === "streaming" ? (fixture.streamingArgs ?? fixture.args) : fixture.args;
 	// The component only calls `requestRender` during a static render;
@@ -196,7 +200,10 @@ export async function runGalleryCommand(args: GalleryCommandArgs): Promise<void>
 	const expanded = args.expanded ?? false;
 	const states = args.states && args.states.length > 0 ? args.states : [...GALLERY_STATES];
 
-	const allNames = Object.keys(toolRenderers).sort();
+	// Renderer-registry tools plus fixture-only tools (no dedicated renderer,
+	// e.g. `report_tool_issue` / custom extension tools) so the gallery covers
+	// the generic fallback + custom-tool branches too.
+	const allNames = Array.from(new Set([...Object.keys(toolRenderers), ...Object.keys(galleryFixtures)])).sort();
 	const names = args.tool ? allNames.filter(name => name === args.tool) : allNames;
 	if (args.tool && names.length === 0) {
 		process.stdout.write(`Unknown tool '${args.tool}'. Known tools: ${allNames.join(", ")}\n`);

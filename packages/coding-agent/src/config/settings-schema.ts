@@ -660,6 +660,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"display.smoothStreaming": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Smooth Streaming",
+			description: "Reveal assistant text smoothly while streamed chunks arrive",
+		},
+	},
+
 	"display.showTokenUsage": {
 		type: "boolean",
 		default: false,
@@ -2175,6 +2185,12 @@ export const SETTINGS_SCHEMA = {
 			label: "Create Todos Automatically",
 			description: "Automatically create a comprehensive todo list after the first message",
 		},
+	},
+
+	"bash.enabled": {
+		type: "boolean",
+		default: true,
+		ui: { tab: "tools", label: "Bash", description: "Enable the bash tool for shell command execution" },
 	},
 
 	// Search and AST tools

@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
+import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import type { SettingPath, SettingValue } from "../config/settings";
@@ -97,6 +97,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (hadArgs && wasPlanModeEnabled) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "plan-review",
+		description: "Re-open the plan review for the latest plan (plan mode only)",
+		handleTui: async (_command, runtime) => {
+			await runtime.ctx.openPlanReview();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -894,6 +902,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "tan",
+		description: "Run a full background agent on tangential work",
+		inlineHint: "<work>",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const work = command.text.slice(`/${command.name}`.length).trim();
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleTanCommand(work);
+		},
+	},
+	{
 		name: "omfg",
 		description: "Forge a TTSR rule from a complaint to stop a recurring behavior",
 		inlineHint: "<complaint>",
@@ -913,15 +932,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showStatus("Nothing to retry");
 			}
 			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "background",
-		aliases: ["bg"],
-		description: "Detach UI and continue running in background",
-		handleTui: (_command, runtime) => {
-			runtime.ctx.editor.setText("");
-			runtime.handleBackgroundCommand();
 		},
 	},
 	{

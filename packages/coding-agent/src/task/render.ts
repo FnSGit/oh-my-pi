@@ -6,12 +6,13 @@
  */
 import path from "node:path";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { Container, Text } from "@oh-my-pi/pi-tui";
+import { Container, Markdown, Text } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { formatContextUsage } from "../modes/components/status-line/context-thresholds";
-import type { Theme } from "../modes/theme/theme";
+import { shimmerEnabled, shimmerText } from "../modes/theme/shimmer";
+import { getMarkdownTheme, type Theme } from "../modes/theme/theme";
 import {
 	formatBadge,
 	formatDuration,
@@ -30,6 +31,7 @@ import {
 	type SubmitReviewDetails,
 } from "../tools/review";
 import { framedBlock, renderStatusLine } from "../tui";
+import { repairDoubleEncodedJsonString } from "./repair-args";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails } from "./types";
 
@@ -534,6 +536,37 @@ function renderTaskItemLines(tasks: TaskItem[] | undefined, expanded: boolean, t
 }
 
 /**
+ * Build the shared-context section (the `# Goal / # Constraints` background
+ * passed to every subagent). Rendered in both the streaming call preview and
+ * the merged result frame so the brief stays visible for the whole task
+ * lifecycle — not just until the first progress snapshot replaces the call view.
+ */
+type TaskRenderSection = { lines: string[] };
+type ContextSectionRenderer = (width: number) => TaskRenderSection;
+
+// Default output-block layout is: left border + one-cell content inset + right
+// border. Render markdown at that inner width so the output block does not need
+// to rewrap already-rendered context lines.
+const CONTEXT_FRAME_INSET = 3;
+
+function contextMarkdownWidth(frameWidth: number): number {
+	return Math.max(1, frameWidth - CONTEXT_FRAME_INSET);
+}
+
+function createContextSectionRenderer(args: TaskParams | undefined, theme: Theme): ContextSectionRenderer | undefined {
+	// `renderResult` receives the raw tool args (unlike `renderCall`, which is
+	// fed through `repairTaskParams`), so undo any per-field double-encoding here
+	// too. The repair is idempotent on already-clean text.
+	const context = repairDoubleEncodedJsonString(args?.context ?? "").trim();
+	if (!context) return undefined;
+
+	const markdown = new Markdown(context, 0, 0, getMarkdownTheme(), {
+		color: text => theme.fg("muted", text),
+	});
+	return width => ({ lines: markdown.render(contextMarkdownWidth(width)) });
+}
+
+/**
  * Render the tool call arguments.
  */
 export function renderCall(
@@ -543,16 +576,11 @@ export function renderCall(
 ): Component {
 	const showIsolated = "isolated" in args && args.isolated === true;
 	const header = renderStatusLine({ icon: "pending", title: "Task", description: args.agent }, theme);
+	const contextSectionRenderer = createContextSectionRenderer(args, theme);
 	return framedBlock(theme, width => {
-		const context = (args.context ?? "").trim();
-		const taskCount = args.tasks?.length ?? 0;
-		const sections: Array<{ label?: string; lines: string[] }> = [];
+		const sections: Array<{ label?: string; lines: string[]; separator?: boolean }> = [];
 
-		if (context) {
-			sections.push({
-				lines: context.split("\n").map(line => (line ? theme.fg("muted", replaceTabs(line)) : "")),
-			});
-		}
+		if (contextSectionRenderer) sections.push(contextSectionRenderer(width));
 
 		// The per-task preview list only exists to surface dispatched agents while
 		// the call args stream in. Once a result snapshot exists, `renderResult`
@@ -560,7 +588,7 @@ export function renderCall(
 		// section here would just repeat the count the result frame already shows.
 		if (!options.renderContext?.hasResult) {
 			sections.push({
-				label: `Tasks (${taskCount})`,
+				separator: true,
 				lines: renderTaskItemLines(args.tasks, options.expanded, theme),
 			});
 		}
@@ -601,11 +629,25 @@ function renderAgentProgress(
 	const description = progress.description?.trim();
 	const displayId = formatTaskId(progress.id);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
-	let statusLine = `${prefix ? `${prefix} ` : ""}${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}`;
+	const indent = prefix ? `${prefix} ` : "";
+	let statusLine: string;
+	if (progress.status === "running") {
+		const bullet = theme.styledSymbol("status.done", "text");
+		const name = theme.fg("accent", description ? theme.bold(displayId) : displayId);
+		statusLine = `${indent}${bullet} ${name}`;
+		if (description) {
+			const desc = shimmerEnabled() ? shimmerText(description, theme) : theme.fg("accent", description);
+			statusLine += `${theme.fg("accent", ":")} ${desc}`;
+		}
+	} else {
+		const glyph =
+			progress.status === "completed" ? theme.styledSymbol("status.done", "accent") : theme.fg(iconColor, icon);
+		statusLine = `${indent}${glyph} ${theme.fg("accent", titlePart)}`;
+	}
 
 	// Show retry-blocked badge so the parent immediately sees that a child
 	// is sleeping on a provider 429, not silently progressing. Wins over the
-	// generic running spinner because "we're waiting on a quota window" is
+	// generic running marker because "we're waiting on a quota window" is
 	// the operationally meaningful state.
 	if (progress.retryState && progress.status === "running") {
 		statusLine += ` ${formatBadge("retrying", "warning", theme)}`;
@@ -767,12 +809,15 @@ function renderReviewResult(
 
 	// Verdict line
 	const verdictColor = summary.overall_correctness === "correct" ? "success" : "error";
-	const verdictIcon = summary.overall_correctness === "correct" ? theme.status.success : theme.status.error;
+	const isCorrect = summary.overall_correctness === "correct";
+	const verdictIcon = isCorrect
+		? theme.styledSymbol("status.done", "accent")
+		: theme.fg(verdictColor, theme.status.error);
 	lines.push(
-		`${continuePrefix} Patch is ${theme.fg(verdictColor, summary.overall_correctness)} ${theme.fg(
-			verdictColor,
-			verdictIcon,
-		)} ${theme.fg("dim", `(${(summary.confidence * 100).toFixed(0)}% confidence)`)}`,
+		`${continuePrefix} Patch is ${theme.fg(verdictColor, summary.overall_correctness)} ${verdictIcon} ${theme.fg(
+			"dim",
+			`(${(summary.confidence * 100).toFixed(0)}% confidence)`,
+		)}`,
 	);
 
 	// Explanation preview (first ~80 chars when collapsed, full when expanded)
@@ -873,7 +918,7 @@ function renderAgentResult(
 		: needsWarning
 			? theme.status.warning
 			: success
-				? theme.status.success
+				? theme.styledSymbol("status.done", "accent")
 				: theme.status.error;
 	const iconColor = needsWarning ? "warning" : success ? "success" : mergeFailed ? "warning" : "error";
 	const statusText = aborted
@@ -1031,21 +1076,36 @@ function renderAgentResult(
  * Render the tool result.
  */
 export function renderResult(
-	result: { content: Array<{ type: string; text?: string }>; details?: TaskToolDetails },
+	result: { content: Array<{ type: string; text?: string }>; details?: TaskToolDetails; isError?: boolean },
 	options: RenderResultOptions,
 	theme: Theme,
+	args?: TaskParams,
 ): Component {
 	const fallbackText = result.content.find(c => c.type === "text")?.text ?? "";
 	const details = result.details;
+	const contextSectionRenderer = createContextSectionRenderer(args, theme);
 
 	if (!details) {
 		const text = result.content.find(c => c.type === "text")?.text || "";
-		const header = renderStatusLine({ icon: "success", title: "Task" }, theme);
+		const errored = result.isError === true;
+		const header = errored
+			? renderStatusLine({ icon: "error", title: "Task", description: args?.agent }, theme)
+			: renderStatusLine(
+					{
+						iconOverride: theme.styledSymbol("status.done", "accent"),
+						title: "Task",
+						description: args?.agent,
+					},
+					theme,
+				);
 		return framedBlock(theme, width => ({
 			header,
-			sections: text ? [{ lines: [theme.fg("dim", truncateToWidth(text, width))] }] : [],
-			state: "success",
-			borderColor: "borderMuted",
+			sections: [
+				...(contextSectionRenderer ? [contextSectionRenderer(width)] : []),
+				...(text ? [{ separator: true, lines: [theme.fg("dim", truncateToWidth(text, width))] }] : []),
+			],
+			state: errored ? "error" : "success",
+			borderColor: errored ? "error" : "borderMuted",
 			width,
 		}));
 	}
@@ -1057,12 +1117,18 @@ export function renderResult(
 	const isError = aborted || failed;
 	const agentCount = hasResults ? details.results.length : (details.progress?.length ?? 0);
 	const icon: ToolUIStatus = options.isPartial ? "running" : isError ? "error" : mergeFailed ? "warning" : "success";
+	// Surface the dispatched agent type (e.g. `Reviewer`) alongside the count so
+	// the header reads `Task 16 agents: Reviewer`. All tasks in one call share a
+	// single `agent` type (top-level param), so one label covers the whole batch.
+	const agentName = args?.agent?.trim();
+	const countLabel = agentCount > 0 ? `${agentCount} ${agentCount === 1 ? "agent" : "agents"}` : undefined;
+	const metaLabel = countLabel ? (agentName ? `${countLabel}: ${agentName}` : countLabel) : agentName;
 	const header = renderStatusLine(
 		{
-			icon,
-			spinnerFrame: options.spinnerFrame,
+			icon: icon === "success" ? undefined : icon,
+			iconOverride: icon === "success" ? theme.styledSymbol("status.done", "accent") : undefined,
 			title: "Task",
-			meta: agentCount > 0 ? [`${agentCount} ${agentCount === 1 ? "agent" : "agents"}`] : undefined,
+			meta: metaLabel ? [metaLabel] : undefined,
 		},
 		theme,
 	);
@@ -1086,24 +1152,19 @@ export function renderResult(
 			const mergeFailedCount = details.results.filter(r => !r.aborted && r.exitCode === 0 && r.error).length;
 			const successCount = details.results.filter(r => !r.aborted && r.exitCode === 0 && !r.error).length;
 			const failCount = details.results.length - successCount - mergeFailedCount - abortedCount;
-			let summary = `${theme.fg("dim", "Total:")} `;
-			if (abortedCount > 0) {
-				summary += theme.fg("error", `${abortedCount} aborted`);
-				if (successCount > 0 || mergeFailedCount > 0 || failCount > 0) summary += theme.sep.dot;
-			}
-			if (successCount > 0) {
-				summary += theme.fg("success", `${successCount} succeeded`);
-				if (mergeFailedCount > 0 || failCount > 0) summary += theme.sep.dot;
-			}
-			if (mergeFailedCount > 0) {
-				summary += theme.fg("warning", `${mergeFailedCount} merge failed`);
-				if (failCount > 0) summary += theme.sep.dot;
-			}
-			if (failCount > 0) {
-				summary += theme.fg("error", `${failCount} failed`);
-			}
-			summary += `${theme.sep.dot}${theme.fg("dim", formatDuration(details.totalDurationMs))}`;
-			lines.push(summary);
+			const summaryParts: string[] = [];
+			if (abortedCount > 0) summaryParts.push(theme.fg("error", `${abortedCount} aborted`));
+			if (successCount > 0) summaryParts.push(theme.fg("success", `${successCount} succeeded`));
+			if (mergeFailedCount > 0) summaryParts.push(theme.fg("warning", `${mergeFailedCount} merge failed`));
+			if (failCount > 0) summaryParts.push(theme.fg("error", `${failCount} failed`));
+			summaryParts.push(theme.fg("dim", formatDuration(details.totalDurationMs)));
+			// Wrap the run summary in the theme's bracket glyphs (dim chrome, colored
+			// counts) to match the bash tool's `[Wall: … | Exit: …]` footer.
+			lines.push(
+				theme.fg("dim", theme.format.bracketLeft) +
+					summaryParts.join(theme.fg("dim", theme.sep.dot)) +
+					theme.fg("dim", theme.format.bracketRight),
+			);
 		}
 
 		const state = isPartial ? "running" : isError ? "error" : mergeFailed ? "warning" : "success";
@@ -1113,7 +1174,10 @@ export function renderResult(
 			const text = fallbackText.trim() ? fallbackText : "No results";
 			return {
 				header,
-				sections: [{ lines: [theme.fg("dim", truncateToWidth(text, width))] }],
+				sections: [
+					...(contextSectionRenderer ? [contextSectionRenderer(width)] : []),
+					{ separator: true, lines: [theme.fg("dim", truncateToWidth(text, width))] },
+				],
 				state,
 				borderColor,
 				width,
@@ -1140,7 +1204,10 @@ export function renderResult(
 		while (lines.length > 0 && lines[0].trim() === "") lines.shift();
 		return {
 			header,
-			sections: lines.length > 0 ? [{ lines }] : [],
+			sections: [
+				...(contextSectionRenderer ? [contextSectionRenderer(width)] : []),
+				...(lines.length > 0 ? [{ separator: true, lines }] : []),
+			],
 			state,
 			borderColor,
 			width,

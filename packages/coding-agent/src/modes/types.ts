@@ -14,7 +14,7 @@ import type {
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSession } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import type { ShakeMode } from "../session/shake-types";
@@ -35,6 +35,7 @@ import type { Theme } from "./theme/theme";
 export type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	images?: ImageContent[];
 };
 
 export type SubmittedUserInput = {
@@ -42,6 +43,10 @@ export type SubmittedUserInput = {
 	images?: ImageContent[];
 	imageLinks?: (string | undefined)[];
 	customType?: string;
+	/** Route through `session.prompt(text, { synthetic: true })` so the text lands
+	 *  as a hidden agent-authored `developer` message rather than a visible user
+	 *  turn. Used by the `c`/`.` continue shortcut. */
+	synthetic?: boolean;
 	display?: boolean;
 	cancelled: boolean;
 	started: boolean;
@@ -63,6 +68,7 @@ export type TodoPhase = {
 
 export interface InteractiveModeInitOptions {
 	suppressWelcomeIntro?: boolean;
+	clearInitialTerminalHistory?: boolean;
 }
 
 export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions & Pick<HookSelectorOptions, "disabledIndices">;
@@ -95,7 +101,6 @@ export interface InteractiveModeContext {
 
 	// State
 	isInitialized: boolean;
-	isBackgrounded: boolean;
 	isBashMode: boolean;
 	toolOutputExpanded: boolean;
 	todoExpanded: boolean;
@@ -149,13 +154,9 @@ export interface InteractiveModeContext {
 	// Extension UI integration
 	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void;
 	initializeHookRunner(uiContext: ExtensionUIContext, hasUI: boolean): void;
-	createBackgroundUiContext(): ExtensionUIContext;
 	setEditorComponent(
 		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
 	): void;
-
-	// Event handling
-	handleBackgroundEvent(event: AgentSessionEvent): Promise<void>;
 
 	// UI helpers
 	/**
@@ -180,12 +181,15 @@ export interface InteractiveModeContext {
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
+	/** Acknowledge a user interrupt (Esc) by switching the loader to an
+	 *  "Interrupting…" label until the agent turn unwinds. */
+	notifyInterrupting(): void;
 	ensureLoadingAnimation(): void;
 	startPendingSubmission(input: {
 		text: string;
@@ -293,9 +297,9 @@ export interface InteractiveModeContext {
 	handleCtrlD(): void;
 	handleCtrlZ(): void;
 	handleDequeue(): void;
-	handleBackgroundCommand(): void;
 	handleImagePaste(): Promise<boolean>;
 	handleBtwCommand(question: string): Promise<void>;
+	handleTanCommand(work: string): Promise<void>;
 	hasActiveBtw(): boolean;
 	handleBtwEscape(): boolean;
 	handleOmfgCommand(complaint: string): Promise<void>;
@@ -314,6 +318,7 @@ export interface InteractiveModeContext {
 	disableLoopMode(): void;
 	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
+	openPlanReview(): Promise<void>;
 
 	// Hook UI methods
 	initHooksAndCustomTools(): Promise<void>;

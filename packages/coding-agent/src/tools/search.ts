@@ -83,6 +83,7 @@ const searchSchema = z
 		gitignore: z.boolean().optional().describe("respect gitignore"),
 		skip: z
 			.number()
+			.nullable()
 			.optional()
 			.describe("files to skip before collecting results — use to paginate when the prior call hit the file limit"),
 	})
@@ -107,6 +108,10 @@ export const SINGLE_FILE_MATCHES = 200;
  * (DEFAULT_FILE_LIMIT files × MULTI_FILE_PER_FILE_MATCHES matches) plus
  * pagination headroom so the caller can see total file count. */
 const INTERNAL_TOTAL_CAP = 2000;
+/** Mirrors `MAX_FILE_BYTES` in `crates/pi-natives/src/grep.rs`. Native grep
+ * silently returns no matches for files larger than this; surface a warning
+ * when the caller explicitly targeted such a file so they know to chunk it. */
+const NATIVE_GREP_MAX_FILE_BYTES = 4 * 1024 * 1024;
 
 /**
  * Parsed `paths` entry — a path (possibly archive-shaped) plus an optional
@@ -621,6 +626,10 @@ export interface SearchToolDetails {
 	/** Absolute base directory used during search. Used by the renderer to resolve
 	 * display-relative paths to absolute paths for OSC 8 hyperlinks. */
 	searchPath?: string;
+	/** Session cwd at search time. The renderer resolves the display-relative
+	 * (cwd-relative) header/match paths against this for OSC 8 hyperlinks;
+	 * `searchPath` is the scope label target, not the display-path base. */
+	cwd?: string;
 	/** User-supplied paths whose base directory was missing on disk. The tool
 	 * skipped these and continued with the surviving entries; surfaced as a
 	 * non-fatal warning in the renderer and in the model-facing text. */
@@ -662,7 +671,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				throw new ToolError("Pattern must not be empty");
 			}
 
-			const normalizedSkip = skip === undefined ? 0 : Number.isFinite(skip) ? Math.floor(skip) : Number.NaN;
+			const normalizedSkip =
+				skip === undefined || skip === null ? 0 : Number.isFinite(skip) ? Math.floor(skip) : Number.NaN;
 			if (normalizedSkip < 0 || !Number.isFinite(normalizedSkip)) {
 				throw new ToolError("Skip must be a non-negative number");
 			}
@@ -724,7 +734,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					// reason instead of a downstream "path not found" from the scope resolver.
 					throw new ToolError(
 						`Cannot search archive member(s): ${archiveUnreadable.join(", ")}. ` +
-							`Read the file directly with \`read <archive>:<member>\` and grep the returned content, ` +
+							`Read the member with \`read <archive>:<member>\` and inspect the returned text, ` +
 							`or pass a UTF-8 text member.`,
 					);
 				}
@@ -987,6 +997,34 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					: "";
 				const { record: recordFile, list: fileList } = createFileRecorder();
 				const fileMatchCounts = new Map<string, number>();
+				// Detect explicit file targets that exceed the native grep size cap.
+				// Native silently returns no matches above the cap; without this note the
+				// caller sees "no matches" for a literal pattern that visibly exists.
+				const oversizedNote = await (async (): Promise<string | undefined> => {
+					const explicitFileTargets: string[] = [];
+					if (exactFilePaths) {
+						explicitFileTargets.push(...exactFilePaths);
+					} else if (searchablePaths.length > 0 && !isDirectory && !multiTargets) {
+						explicitFileTargets.push(searchPath);
+					}
+					if (explicitFileTargets.length === 0) return undefined;
+					const oversized: string[] = [];
+					await Promise.all(
+						explicitFileTargets.map(async target => {
+							try {
+								const st = await stat(target);
+								if (st.isFile() && st.size > NATIVE_GREP_MAX_FILE_BYTES) {
+									oversized.push(path.relative(this.session.cwd, target) || target);
+								}
+							} catch {
+								// Stat failures here are surfaced by other code paths.
+							}
+						}),
+					);
+					if (oversized.length === 0) return undefined;
+					const limitMb = Math.floor(NATIVE_GREP_MAX_FILE_BYTES / (1024 * 1024));
+					return `Skipped oversized files (>${limitMb}MB grep limit; split the file or narrow with \`read\`): ${oversized.join(", ")}`;
+				})();
 				const archiveNote =
 					archiveUnreadable.length > 0
 						? `Skipped archive entries (search supports text members only): ${archiveUnreadable.join(", ")}`
@@ -998,11 +1036,13 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const missingPathsNote =
 					missingPathsForNote.length > 0 ? `Skipped missing paths: ${missingPathsForNote.join(", ")}` : undefined;
 				const warningNote =
-					[missingPathsNote, archiveNote].filter((s): s is string => Boolean(s)).join("\n") || undefined;
+					[missingPathsNote, archiveNote, oversizedNote].filter((s): s is string => Boolean(s)).join("\n") ||
+					undefined;
 				if (selectedMatches.length === 0) {
 					const details: SearchToolDetails = {
 						scopePath,
 						searchPath,
+						cwd: this.session.cwd,
 						matchCount: 0,
 						fileCount: 0,
 						files: [],
@@ -1129,6 +1169,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				const details: SearchToolDetails = {
 					scopePath,
 					searchPath,
+					cwd: this.session.cwd,
 					matchCount: selectedMatches.length,
 					fileCount: fileList.length,
 					files: fileList,
@@ -1215,10 +1256,11 @@ const URL_HEADER_PREFIX_RE = /^#+\s+/;
 
 function renderSearchDisplayLines(
 	lines: readonly string[],
-	searchBase: string | undefined,
+	headerBase: string | undefined,
+	fileScope: string | undefined,
 	uiTheme: Theme,
 ): RenderedSearchLine[] {
-	const contexts = classifyGroupedLines(lines, searchBase);
+	const contexts = classifyGroupedLines(lines, headerBase, fileScope);
 	// `classifyGroupedLines` can't resolve internal URLs (TUI-only), so track the
 	// resolved URL target here and use it for the body lines that follow.
 	let urlFile: string | undefined;
@@ -1325,6 +1367,10 @@ function renderBudgetedSearchGroups(
 	return lines;
 }
 
+function searchStatusIcon(uiTheme: Theme): string {
+	return uiTheme.fg("toolTitle", uiTheme.symbol("icon.search"));
+}
+
 export const searchToolRenderer = {
 	inline: true,
 	renderCall(args: SearchRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
@@ -1336,10 +1382,10 @@ export const searchToolRenderer = {
 		if (args.skip !== undefined && args.skip > 0) meta.push(`skip:${args.skip}`);
 
 		const text = renderStatusLine(
-			{ icon: "pending", title: "Search", description: args.pattern || "?", meta },
+			{ icon: "pending", title: "Search", titleColor: "toolTitle", description: args.pattern || "?", meta },
 			uiTheme,
 		);
-		return new Text(text, 0, 0);
+		return new Text(text, 1, 0);
 	},
 
 	renderResult(
@@ -1352,7 +1398,7 @@ export const searchToolRenderer = {
 
 		if (result.isError || details?.error) {
 			const errorText = details?.error || result.content?.find(c => c.type === "text")?.text || "Unknown error";
-			return new Text(formatErrorMessage(errorText, uiTheme), 0, 0);
+			return new Text(formatErrorMessage(errorText, uiTheme), 1, 0);
 		}
 
 		const hasDetailedData = details?.matchCount !== undefined || details?.fileCount !== undefined;
@@ -1360,14 +1406,15 @@ export const searchToolRenderer = {
 		if (!hasDetailedData) {
 			const textContent = result.details?.displayContent ?? result.content?.find(c => c.type === "text")?.text;
 			if (!textContent || textContent === "No matches found") {
-				return new Text(formatEmptyMessage("No matches found", uiTheme), 0, 0);
+				return new Text(formatEmptyMessage("No matches found", uiTheme), 1, 0);
 			}
 			const lines = textContent.split("\n").filter(line => line.trim() !== "");
 			const description = args?.pattern ?? undefined;
 			const header = renderStatusLine(
 				{
-					iconOverride: uiTheme.fg("success", uiTheme.symbol("icon.search")),
+					iconOverride: searchStatusIcon(uiTheme),
 					title: "Search",
+					titleColor: "toolTitle",
 					description,
 					meta: [formatCount("item", lines.length)],
 				},
@@ -1389,6 +1436,7 @@ export const searchToolRenderer = {
 					);
 					return [header, ...listLines].map(l => truncateToWidth(l, width, Ellipsis.Omit));
 				},
+				{ paddingX: 1 },
 			);
 		}
 
@@ -1409,12 +1457,12 @@ export const searchToolRenderer = {
 			const scopeMeta = searchScopeMeta(details);
 			if (scopeMeta) meta.push(scopeMeta);
 			const header = renderStatusLine(
-				{ icon: "warning", title: "Search", description: args?.pattern, meta },
+				{ icon: "warning", title: "Search", titleColor: "toolTitle", description: args?.pattern, meta },
 				uiTheme,
 			);
 			const lines = [header, formatEmptyMessage("No matches found", uiTheme)];
 			if (missingNote) lines.push(missingNote);
-			return new Text(lines.join("\n"), 0, 0);
+			return new Text(lines.join("\n"), 1, 0);
 		}
 
 		const summaryParts = [formatCount("match", matchCount), formatCount("file", fileCount)];
@@ -1425,10 +1473,9 @@ export const searchToolRenderer = {
 		const description = args?.pattern ?? undefined;
 		const header = renderStatusLine(
 			{
-				...(truncated
-					? { icon: "warning" as const }
-					: { iconOverride: uiTheme.fg("success", uiTheme.symbol("icon.search")) }),
+				...(truncated ? { icon: "warning" as const } : { iconOverride: searchStatusIcon(uiTheme) }),
 				title: "Search",
+				titleColor: "toolTitle",
 				description,
 				meta,
 			},
@@ -1439,7 +1486,15 @@ export const searchToolRenderer = {
 		const allLines = textContent.split("\n");
 		// Resolve hyperlinks once over the whole output so a nested directory stack
 		// reconstructs correctly across blank-line group boundaries.
-		const renderedLines = renderSearchDisplayLines(allLines, details?.searchPath, uiTheme);
+		// Header/match display paths are cwd-relative, so resolve them against cwd
+		// (falling back to searchPath for legacy results that predate `cwd`); the
+		// scoped file's absolute path seeds body lines in single-file searches.
+		const renderedLines = renderSearchDisplayLines(
+			allLines,
+			details?.cwd ?? details?.searchPath,
+			details?.searchPath,
+			uiTheme,
+		);
 		const matchGroups = groupLineIndicesByBlank(allLines).map(indices => indices.map(i => renderedLines[i]!));
 
 		const extraLines: string[] = [];
@@ -1455,6 +1510,7 @@ export const searchToolRenderer = {
 				const matchLines = renderBudgetedSearchGroups(matchGroups, budget, matchCount, uiTheme, !options.expanded);
 				return [header, ...matchLines, ...extraLines].map(l => truncateToWidth(l, width, Ellipsis.Omit));
 			},
+			{ paddingX: 1 },
 		);
 	},
 	mergeCallAndResult: true,
