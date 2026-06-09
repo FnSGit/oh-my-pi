@@ -238,3 +238,5 @@ Throttled/debounced paths:
 - Editor autocomplete updates (inside `Editor`) use debounce timers, reducing recompute churn during typing.
 
 The runtime therefore mixes event-driven state transitions with bounded render cadence to keep interactivity responsive without repaint storms.
+
+> Overlay lifecycle (mount/dedup/close) and the "整屏都是同一份选项" regression: see [`tui-overlay-dedup.md`](./tui-overlay-dedup.md).
