@@ -4,10 +4,12 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
-import * as zod from "zod/v4";
+import { z as zod } from "zod/v4";
 import { type ClaudeHookEvent, hookCapability } from "../../capability/hook";
 import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
+// Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
+import * as PiCodingAgent from "../../index";
 import type { HookMessage } from "../../session/messages";
 import type { SessionManager } from "../../session/session-manager";
 import * as typebox from "../typebox";
@@ -183,7 +185,7 @@ async function createHookAPI(
 		logger,
 		typebox,
 		zod,
-		pi: await import("@oh-my-pi/pi-coding-agent"),
+		pi: PiCodingAgent,
 	} as HookAPI;
 
 	return {

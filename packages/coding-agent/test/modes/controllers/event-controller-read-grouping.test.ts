@@ -68,19 +68,22 @@ function assistantMessage(content: Block[]): AssistantMessage {
 
 function createFixture() {
 	const chatContainer = new Container();
+	const sessionMock = { getToolByName: () => undefined, extensionRunner: undefined };
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
-		ui: { requestRender: vi.fn(), setEagerNativeScrollbackRebuild: vi.fn(), imageBudget: undefined },
+		ui: { requestRender: vi.fn(), imageBudget: undefined },
 		chatContainer,
 		pendingTools: new Map(),
 		settings: { get: () => false },
 		toolOutputExpanded: false,
 		hideThinkingBlock: false,
 		setWorkingMessage: vi.fn(),
-		session: { getToolByName: () => undefined, extensionRunner: undefined },
+		clearTransientSessionUi: () => {},
+		session: sessionMock,
+		viewSession: sessionMock,
 	} as unknown as InteractiveModeContext;
 	return { controller: new EventController(ctx), chatContainer };
 }

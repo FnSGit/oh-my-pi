@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import { type Api, completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import { extractTextContent } from "../commit/utils";
 
 import { expandRoleAlias, getModelMatchPreferences, resolveModelFromString } from "../config/model-resolver";
@@ -138,10 +138,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 				],
 			},
 			{
-				apiKey: modelRegistry.resolver(model.provider, {
-					sessionId: this.session.getSessionId?.() ?? undefined,
-					baseUrl: model.baseUrl,
-				}),
+				apiKey: modelRegistry.resolver(model, this.session.getSessionId?.() ?? undefined),
 				signal,
 			},
 			{ telemetry, oneshotKind: "inspect_image", completeImpl: this.completeImageRequest },

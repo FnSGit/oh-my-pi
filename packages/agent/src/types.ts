@@ -3,6 +3,7 @@ import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
+	Context,
 	Effort,
 	ImageContent,
 	Message,
@@ -108,6 +109,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 
 	/**
+	 * Optional transform applied to the final provider context after conversion,
+	 * normalization, and append-only context handling, but before telemetry capture
+	 * and provider send.
+	 */
+	transformProviderContext?: (context: Context, model: Model) => Context;
+
+	/**
 	 * Resolves an API key dynamically for each LLM call.
 	 *
 	 * Useful for short-lived OAuth tokens (e.g., GitHub Copilot) that may expire
@@ -118,11 +126,27 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called after each tool execution to check for user interruptions unless interruptMode is "wait".
-	 * If messages are returned, remaining tool calls are skipped and
-	 * these messages are added to the context before the next LLM call.
+	 * Called at injection boundaries only (loop start and after a tool batch
+	 * fully settles), so dequeued messages are immediately injected. The
+	 * mid-batch interrupt poll uses {@link hasSteeringMessages} instead and
+	 * never consumes the queue.
 	 */
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
+
+	/**
+	 * Peeks whether steering messages are queued, without consuming them.
+	 *
+	 * Called after each tool execution (unless interruptMode is "wait") to decide
+	 * whether to skip the remaining tool calls in the batch. The queue keeps
+	 * owning its messages until the loop reaches the next injection boundary and
+	 * dequeues via {@link getSteeringMessages} — so callers can still cancel or
+	 * restore queued messages while in-flight tools settle, and an external
+	 * abort in that window leaves the queue intact for a post-abort continue.
+	 *
+	 * When omitted, steering never interrupts a running tool batch; queued
+	 * messages are still delivered at the next injection boundary.
+	 */
+	hasSteeringMessages?: () => boolean | Promise<boolean>;
 
 	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
@@ -211,6 +235,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getReasoning?: () => Effort | undefined;
 
 	/**
+	 * Dynamic reasoning-disable override, resolved per LLM call. When set,
+	 * its return value overrides the static `disableReasoning` from
+	 * `SimpleStreamOptions` for that request. Pair with `getReasoning` so
+	 * mid-run transitions into and out of the explicit `off` state propagate
+	 * to the next provider call.
+	 */
+	getDisableReasoning?: () => boolean | undefined;
+
+	/**
 	 * Called after a tool call has been validated and is about to execute.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool
@@ -293,6 +326,8 @@ export interface AfterToolCallResult {
 	details?: unknown;
 	/** If provided, replaces the error flag carried with the tool result. */
 	isError?: boolean;
+	/** If provided, replaces the contextually-useless flag carried with the tool result. */
+	useless?: boolean;
 }
 
 /** Context passed to `beforeToolCall`. */
@@ -358,6 +393,7 @@ export interface AgentState {
 	systemPrompt: string[];
 	model: Model;
 	thinkingLevel?: Effort;
+	disableReasoning?: boolean;
 	tools: AgentTool<any>[];
 	messages: AgentMessage[]; // Can include attachments + custom message types
 	isStreaming: boolean;
@@ -374,6 +410,8 @@ export interface AgentToolResult<T = any, _TInput = unknown> {
 	// Marks a non-throwing failure (e.g. an aggregator catching per-entry errors).
 	// agent-loop honors this and surfaces it as a tool error on the wire.
 	isError?: boolean;
+	/** Marks the result as contextually useless: safe for compaction to elide once consumed (e.g. zero matches, wait timeout). Ignored when isError is set. */
+	useless?: boolean;
 }
 
 // Callback for streaming tool execution updates
@@ -438,8 +476,9 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * Concurrency mode for tool scheduling when multiple calls are in one turn.
 	 * - "shared": can run alongside other shared tools (default)
 	 * - "exclusive": runs alone; other tools wait until it finishes
+	 * - function: resolved per call from the (raw, pre-validation) arguments
 	 */
-	concurrency?: "shared" | "exclusive";
+	concurrency?: "shared" | "exclusive" | ((args: Partial<Static<TParameters>>) => "shared" | "exclusive");
 	/** If true, argument validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM. */
 	lenientArgValidation?: boolean;
 	/**

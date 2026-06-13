@@ -8,7 +8,8 @@ import { glob, type SummaryResult, summarizeCode } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { getRemoteDir, logger, prompt, readImageMetadata, untilAborted } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { LRUCache } from "lru-cache/raw";
+import { z } from "zod/v4";
 import {
 	canonicalSnapshotKey,
 	getFileSnapshotStore,
@@ -87,6 +88,7 @@ import {
 	getTableSchema,
 	isSqliteFile,
 	listTables,
+	MAX_RAW_QUERY_ROWS,
 	parseSqlitePathCandidates,
 	parseSqliteSelector,
 	queryRows,
@@ -98,6 +100,28 @@ import {
 } from "./sqlite-reader";
 import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
+
+// Per-session memo for tree-sitter summaries. `summarizeCode` is a pure function
+// of (code, path, fold settings) but costs ~12-18ms for a ~1500-line file, and a
+// repeat summary read of the same unchanged file re-parses from scratch. Key on
+// the content hash of the freshly-read bytes (+ path + fold settings): the file
+// is still read fresh on every call, so a hit only reuses the deterministic
+// parse — there is no staleness window and no stat guard is needed. Bounded LRU,
+// aged out with the session via WeakMap.
+// Unusable results (not parsed, or nothing elided) are memoized as `false`: the
+// full SummaryResult embeds the whole source in kept segments, and the caller
+// only ever renders `parsed && elided` summaries — caching the segments would
+// retain up to 48 near-2MiB sources just to remember "no summary".
+const SUMMARY_CACHE_MAX = 48;
+const summaryParseCaches = new WeakMap<object, LRUCache<string, SummaryResult | false>>();
+function getSummaryParseCache(session: object): LRUCache<string, SummaryResult | false> {
+	let cache = summaryParseCaches.get(session);
+	if (!cache) {
+		cache = new LRUCache<string, SummaryResult | false>({ max: SUMMARY_CACHE_MAX });
+		summaryParseCaches.set(session, cache);
+	}
+	return cache;
+}
 
 // Document types converted to markdown via markit.
 const CONVERTIBLE_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".rtf", ".epub"]);
@@ -334,6 +358,7 @@ async function streamLinesFromFile(
 	maxBytes: number,
 	selectedLineLimit: number | null,
 	signal?: AbortSignal,
+	stopScanAfterCollect = false,
 ): Promise<{
 	lines: string[];
 	totalFileLines: number;
@@ -342,6 +367,8 @@ async function streamLinesFromFile(
 	firstLinePreview?: { text: string; bytes: number };
 	firstLineByteLength?: number;
 	selectedBytesTotal: number;
+	/** False when `stopScanAfterCollect` cut the scan short — `totalFileLines` is then a lower bound. */
+	reachedEof: boolean;
 }> {
 	const bufferChunk = Buffer.allocUnsafe(READ_CHUNK_SIZE);
 	const collectedLines: string[] = [];
@@ -349,6 +376,7 @@ async function streamLinesFromFile(
 	let collectedBytes = 0;
 	let stoppedByByteLimit = false;
 	let doneCollecting = false;
+	let reachedEof = true;
 	let fileHandle: fs.FileHandle | null = null;
 	let currentLineLength = 0;
 	let currentLineChunks: Buffer[] = [];
@@ -463,6 +491,30 @@ async function streamLinesFromFile(
 			const chunk = bufferChunk.subarray(0, bytesRead);
 			endedWithNewline = chunk[bytesRead - 1] === 0x0a;
 
+			// Once collection and selected-line accounting are both finished, the
+			// remaining scan only computes `totalFileLines` — count newlines with
+			// native indexOf instead of the per-byte JS loop (a multi-GB tail
+			// otherwise stalls the read for seconds to minutes).
+			if (doneCollecting && selectedLineLimit !== null && selectedLinesSeen >= selectedLineLimit) {
+				if (stopScanAfterCollect) {
+					reachedEof = false;
+					break;
+				}
+				let searchFrom = 0;
+				let newlineAt = chunk.indexOf(0x0a);
+				while (newlineAt !== -1) {
+					lineIndex++;
+					searchFrom = newlineAt + 1;
+					newlineAt = chunk.indexOf(0x0a, searchFrom);
+				}
+				if (searchFrom === 0) {
+					currentLineLength += chunk.length;
+				} else {
+					currentLineLength = chunk.length - searchFrom;
+				}
+				continue;
+			}
+
 			let start = 0;
 			for (let i = 0; i < chunk.length; i++) {
 				if (chunk[i] === 0x0a) {
@@ -485,7 +537,7 @@ async function streamLinesFromFile(
 		}
 	}
 
-	if (endedWithNewline || currentLineLength > 0 || !sawAnyByte) {
+	if (reachedEof && (endedWithNewline || currentLineLength > 0 || !sawAnyByte)) {
 		finalizeLine();
 	}
 
@@ -503,6 +555,7 @@ async function streamLinesFromFile(
 		firstLinePreview,
 		firstLineByteLength,
 		selectedBytesTotal,
+		reachedEof,
 	};
 }
 
@@ -517,6 +570,17 @@ function isNotFoundError(error: unknown): boolean {
 }
 
 /**
+ * Escape glob metacharacters so a literal path (e.g. `foo[1].ts`) interpolated
+ * into a suffix-glob pattern matches itself. Each metachar is wrapped in a
+ * character class (the native glob engine rewrites `\` to `/`, so backslash
+ * escaping is unavailable). `]`/`}` need no escaping once their openers are
+ * neutralized — unmatched closers are literal.
+ */
+function escapeGlobMetachars(value: string): string {
+	return value.replace(/[*?[{]/g, "[$&]");
+}
+
+/**
  * Attempt to resolve a non-existent path by finding a unique suffix match within the workspace.
  * Uses a glob suffix pattern so the native engine handles matching directly.
  * Returns null when 0 or >1 candidates match (ambiguous = no auto-resolution).
@@ -528,6 +592,7 @@ async function findUniqueSuffixMatch(
 ): Promise<{ absolutePath: string; displayPath: string } | null> {
 	const normalized = rawPath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
 	if (!normalized) return null;
+	const pattern = `**/${escapeGlobMetachars(normalized)}`;
 
 	const timeoutSignal = AbortSignal.timeout(GLOB_TIMEOUT_MS);
 	const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -536,7 +601,7 @@ async function findUniqueSuffixMatch(
 	try {
 		const result = await untilAborted(combinedSignal, () =>
 			glob({
-				pattern: `**/${normalized}`,
+				pattern,
 				path: cwd,
 				// No fileType filter: matches both files and directories
 				hidden: true,
@@ -560,9 +625,7 @@ async function findUniqueSuffixMatch(
 }
 
 function decodeUtf8Text(bytes: Uint8Array): string | null {
-	for (const byte of bytes) {
-		if (byte === 0) return null;
-	}
+	if (bytes.indexOf(0) !== -1) return null;
 
 	try {
 		return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -580,7 +643,11 @@ function prependSuffixResolutionNotice(text: string, suffixResolution?: { from: 
 
 const readSchema = z
 	.object({
-		path: z.string().describe('path or url; append :<sel> for line ranges or raw mode (e.g. "src/foo.ts:50-100")'),
+		path: z
+			.string()
+			.describe(
+				'Local path, internal URI (e.g. "omp://", "issue://123", "pr://123"), or URL; append :<sel> for line ranges or raw mode (e.g. "src/foo.ts:50-100")',
+			),
 	})
 	.strict();
 
@@ -689,6 +756,9 @@ interface ResolvedSqliteReadPath {
 	suffixResolution?: { from: string; to: string };
 }
 
+/** Per-execute memo of suffix-glob lookups; `null` records a confirmed miss. */
+type SuffixMatchCache = Map<string, { absolutePath: string; displayPath: string } | null>;
+
 /**
  * Read tool implementation.
  *
@@ -772,7 +842,30 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		return toolResult<ReadToolDetails>({ notes, displayReadTargets }).content(content).done();
 	}
 
-	async #resolveArchiveReadPath(readPath: string, signal?: AbortSignal): Promise<ResolvedArchiveReadPath | null> {
+	/**
+	 * Memoized {@link findUniqueSuffixMatch} for a single read call. A missing
+	 * path with archive/sqlite extensions probes the workspace once per stage
+	 * (archive candidates, sqlite candidates, plain path) — each glob carries a
+	 * 5s timeout, so repeated lookups of the same string stack into a long
+	 * stall before erroring. The cache collapses repeats within one execute().
+	 */
+	async #findSuffixMatchCached(
+		cache: SuffixMatchCache,
+		rawPath: string,
+		signal?: AbortSignal,
+	): Promise<{ absolutePath: string; displayPath: string } | null> {
+		const hit = cache.get(rawPath);
+		if (hit !== undefined) return hit;
+		const result = await findUniqueSuffixMatch(rawPath, this.session.cwd, signal);
+		cache.set(rawPath, result);
+		return result;
+	}
+
+	async #resolveArchiveReadPath(
+		readPath: string,
+		suffixCache: SuffixMatchCache,
+		signal?: AbortSignal,
+	): Promise<ResolvedArchiveReadPath | null> {
 		const candidates = parseArchivePathCandidates(readPath);
 		for (const candidate of candidates) {
 			let absolutePath = resolveReadPath(candidate.archivePath, this.session.cwd);
@@ -789,7 +882,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			} catch (error) {
 				if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) continue;
 
-				const suffixMatch = await findUniqueSuffixMatch(candidate.archivePath, this.session.cwd, signal);
+				const suffixMatch = await this.#findSuffixMatchCached(suffixCache, candidate.archivePath, signal);
 				if (!suffixMatch) continue;
 
 				try {
@@ -814,7 +907,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		return null;
 	}
 
-	async #resolveSqliteReadPath(readPath: string, signal?: AbortSignal): Promise<ResolvedSqliteReadPath | null> {
+	async #resolveSqliteReadPath(
+		readPath: string,
+		suffixCache: SuffixMatchCache,
+		signal?: AbortSignal,
+	): Promise<ResolvedSqliteReadPath | null> {
 		const candidates = parseSqlitePathCandidates(readPath);
 		for (const candidate of candidates) {
 			let absolutePath = resolveReadPath(candidate.sqlitePath, this.session.cwd);
@@ -834,7 +931,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			} catch (error) {
 				if (!isNotFoundError(error) || isRemoteMountPath(absolutePath)) continue;
 
-				const suffixMatch = await findUniqueSuffixMatch(candidate.sqlitePath, this.session.cwd, signal);
+				const suffixMatch = await this.#findSuffixMatchCached(suffixCache, candidate.sqlitePath, signal);
 				if (!suffixMatch) continue;
 
 				try {
@@ -1169,17 +1266,29 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const rangeStart = range.startLine - 1; // 0-indexed
 			const requestedLength = range.endLine !== undefined ? range.endLine - range.startLine + 1 : this.#defaultLimit;
 			const maxLines = Math.min(requestedLength, DEFAULT_MAX_LINES);
-			const maxBytesForRead = Math.max(DEFAULT_MAX_BYTES, maxLines * 512);
 
-			const streamResult = await streamLinesFromFile(
-				absolutePath,
-				rangeStart,
-				maxLines,
-				maxBytesForRead,
-				maxLines,
-				signal,
-			);
-			const totalFileLines = streamResult.totalFileLines;
+			// When the full file is already in memory (the common case for files
+			// within the snapshot byte cap), slice ranges from it instead of
+			// re-streaming the file once per range.
+			let collectedLines: string[];
+			let totalFileLines: number;
+			if (fullLines) {
+				totalFileLines = fullLines.length;
+				collectedLines = fullLines.slice(rangeStart, rangeStart + maxLines);
+			} else {
+				const maxBytesForRead = Math.max(DEFAULT_MAX_BYTES, maxLines * 512);
+				const streamResult = await streamLinesFromFile(
+					absolutePath,
+					rangeStart,
+					maxLines,
+					maxBytesForRead,
+					maxLines,
+					signal,
+					fileSize > SNAPSHOT_MAX_BYTES, // giant file: collected ranges don't need an exact EOF line count
+				);
+				totalFileLines = streamResult.totalFileLines;
+				collectedLines = streamResult.lines;
+			}
 
 			if (rangeStart >= totalFileLines) {
 				const bound = range.endLine !== undefined ? `${range.startLine}-${range.endLine}` : `${range.startLine}`;
@@ -1187,7 +1296,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				continue;
 			}
 
-			const collectedLines = streamResult.lines;
 			// Column truncation is display-only; clone before stamping ellipsis so
 			// the original on-disk lines stay intact for display reconstruction.
 			let displayLines: string[] = collectedLines;
@@ -1256,13 +1364,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		archive: ArchiveReader,
 		archivePath: string,
 		subPath: string,
+		offset: number | undefined,
 		limit: number | undefined,
 		details: ReadToolDetails,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const DEFAULT_LIMIT = 500;
 		const effectiveLimit = limit ?? DEFAULT_LIMIT;
-		const entries = archive.listDirectory(subPath);
+		const allEntries = archive.listDirectory(subPath);
+		// `offset` is 1-indexed (line-selector semantics): `a.zip:dir:50` starts
+		// the listing at the 50th entry instead of being silently ignored.
+		const entries = offset !== undefined && offset > 1 ? allEntries.slice(offset - 1) : allEntries;
 
 		const listLimit = applyListLimit(entries, { limit: effectiveLimit });
 		const limitedEntries = listLimit.items;
@@ -1301,27 +1413,41 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			suffixResolution: resolvedArchivePath.suffixResolution,
 		};
 
-		const node = archive.getNode(resolvedArchivePath.archiveSubPath);
+		let archiveSubPath = resolvedArchivePath.archiveSubPath;
+		let sel = parsedSel;
+		let node = archive.getNode(archiveSubPath);
+		if (!node && archiveSubPath) {
+			// `archive.zip:500` / `archive.zip:raw`: the whole subPath is a
+			// selector on the archive root, not a member name. Member names take
+			// precedence (getNode above); fall back to root + selector.
+			const wholeSel = parseSel(archiveSubPath);
+			if (wholeSel.kind !== "none") {
+				node = archive.getNode("");
+				archiveSubPath = "";
+				sel = wholeSel;
+			}
+		}
 		if (!node) {
 			throw new ToolError(`Path '${readPath}' not found inside archive`);
 		}
 
 		if (node.isDirectory) {
-			if (isMultiRange(parsedSel)) {
+			if (isMultiRange(sel)) {
 				throw new ToolError("Multi-range line selectors are not supported for archive directory listings.");
 			}
-			const { limit } = selToOffsetLimit(parsedSel);
+			const { offset, limit } = selToOffsetLimit(sel);
 			return this.#readArchiveDirectory(
 				archive,
 				resolvedArchivePath.absolutePath,
-				resolvedArchivePath.archiveSubPath,
+				archiveSubPath,
+				offset,
 				limit,
 				details,
 				signal,
 			);
 		}
 
-		const entry = await archive.readFile(resolvedArchivePath.archiveSubPath);
+		const entry = await archive.readFile(archiveSubPath);
 		const text = decodeUtf8Text(entry.bytes);
 		if (text === null) {
 			return toolResult<ReadToolDetails>(details)
@@ -1335,26 +1461,26 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				.done();
 		}
 
-		const raw = isRawSelector(parsedSel);
+		// Archive members are immutable: there is no edit path for bytes inside
+		// an archive, and a hashline tag keyed to the archive file would invite
+		// (and fail) edits while clobbering sibling members' snapshots.
+		const raw = isRawSelector(sel);
 		const result =
-			isMultiRange(parsedSel) && parsedSel.kind === "lines"
-				? this.#buildInMemoryMultiRangeResult(text, parsedSel.ranges, {
+			isMultiRange(sel) && sel.kind === "lines"
+				? this.#buildInMemoryMultiRangeResult(text, sel.ranges, {
 						details,
 						sourcePath: resolvedArchivePath.absolutePath,
 						entityLabel: "archive entry",
 						raw,
+						immutable: true,
 					})
-				: this.#buildInMemoryTextResult(
-						text,
-						selToOffsetLimit(parsedSel).offset,
-						selToOffsetLimit(parsedSel).limit,
-						{
-							details,
-							sourcePath: resolvedArchivePath.absolutePath,
-							entityLabel: "archive entry",
-							raw,
-						},
-					);
+				: this.#buildInMemoryTextResult(text, selToOffsetLimit(sel).offset, selToOffsetLimit(sel).limit, {
+						details,
+						sourcePath: resolvedArchivePath.absolutePath,
+						entityLabel: "archive entry",
+						raw,
+						immutable: true,
+					});
 		const firstText = result.content.find((content): content is TextContent => content.type === "text");
 		if (firstText) {
 			firstText.text = prependSuffixResolutionNotice(firstText.text, resolvedArchivePath.suffixResolution);
@@ -1459,19 +1585,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 				case "raw": {
 					const result = executeReadQuery(db, selector.sql);
+					let output = renderTable(result.columns, result.rows, {
+						totalCount: result.rows.length,
+						offset: 0,
+						limit: result.rows.length || DEFAULT_MAX_LINES,
+						table: "query",
+						dbPath: resolvedSqlitePath.absolutePath,
+					});
+					if (result.truncated) {
+						output += `\n[Output capped at ${MAX_RAW_QUERY_ROWS} rows; add a LIMIT/OFFSET clause to the query to page through more]`;
+					}
 					return toolResult<ReadToolDetails>(details)
-						.text(
-							prependSuffixResolutionNotice(
-								renderTable(result.columns, result.rows, {
-									totalCount: result.rows.length,
-									offset: 0,
-									limit: result.rows.length || DEFAULT_MAX_LINES,
-									table: "query",
-									dbPath: resolvedSqlitePath.absolutePath,
-								}),
-								resolvedSqlitePath.suffixResolution,
-							),
-						)
+						.text(prependSuffixResolutionNotice(output, resolvedSqlitePath.suffixResolution))
 						.sourcePath(resolvedSqlitePath.absolutePath)
 						.done();
 				}
@@ -1512,15 +1637,25 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (lineCount > MAX_SUMMARY_LINES) return null;
 			if (lineCount < this.session.settings.get("read.summarize.minTotalLines")) return null;
 
+			const minBodyLines = this.session.settings.get("read.summarize.minBodyLines");
+			const minCommentLines = this.session.settings.get("read.summarize.minCommentLines");
+			const unfoldUntilLines = this.session.settings.get("read.summarize.unfoldUntil");
+			const unfoldLimitLines = this.session.settings.get("read.summarize.unfoldLimit");
+			const cache = getSummaryParseCache(this.session);
+			const cacheKey = `${absolutePath}\0${Bun.hash(code)}\0${minBodyLines},${minCommentLines},${unfoldUntilLines},${unfoldLimitLines}`;
+			const memoized = cache.get(cacheKey);
+			if (memoized !== undefined) return memoized || null;
 			const result = summarizeCode({
 				code,
 				path: absolutePath,
-				minBodyLines: this.session.settings.get("read.summarize.minBodyLines"),
-				minCommentLines: this.session.settings.get("read.summarize.minCommentLines"),
-				unfoldUntilLines: this.session.settings.get("read.summarize.unfoldUntil"),
-				unfoldLimitLines: this.session.settings.get("read.summarize.unfoldLimit"),
+				minBodyLines,
+				minCommentLines,
+				unfoldUntilLines,
+				unfoldLimitLines,
 			});
-			return result;
+			const usable = result.parsed && result.elided ? result : false;
+			cache.set(cacheKey, usable);
+			return usable || null;
 		} catch {
 			return null;
 		}
@@ -1696,10 +1831,19 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (internalRouter.canHandle(readPath)) {
 			const internalTarget = splitInternalUrlSel(readPath);
 			const parsed = parseSel(internalTarget.sel);
+			if (internalTarget.sel !== undefined && parsed.kind === "none") {
+				throw new ToolError(
+					`Invalid selector ':${internalTarget.sel}' on '${internalTarget.path}'. Use :N, :N-M, :N+K, :N- (open-ended), a comma-separated list of ranges, :raw, or a range combined with raw (e.g. :raw:50-100).`,
+				);
+			}
 			return this.#handleInternalUrl(internalTarget.path, parsed, signal);
 		}
 
-		const archivePath = await this.#resolveArchiveReadPath(readPath, signal);
+		// One suffix-glob memo per read call — archive, sqlite, and plain-path
+		// resolution share misses instead of re-globbing the workspace.
+		const suffixCache: SuffixMatchCache = new Map();
+
+		const archivePath = await this.#resolveArchiveReadPath(readPath, suffixCache, signal);
 		if (archivePath) {
 			const archiveSubPath = splitPathAndSel(archivePath.archiveSubPath);
 			const archiveParsed = parseSel(archiveSubPath.sel);
@@ -1711,7 +1855,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			);
 		}
 
-		const sqlitePath = await this.#resolveSqliteReadPath(readPath, signal);
+		const sqlitePath = await this.#resolveSqliteReadPath(readPath, suffixCache, signal);
 		if (sqlitePath) {
 			return this.#readSqlite(sqlitePath, signal);
 		}
@@ -1733,7 +1877,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (isNotFoundError(error)) {
 				// Attempt unique suffix resolution before falling back to fuzzy suggestions
 				if (!isRemoteMountPath(absolutePath)) {
-					const suffixMatch = await findUniqueSuffixMatch(localReadPath, this.session.cwd, signal);
+					const suffixMatch = await this.#findSuffixMatchCached(suffixCache, localReadPath, signal);
 					if (suffixMatch) {
 						try {
 							const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
@@ -1992,6 +2136,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						maxBytesForRead,
 						selectedLineLimit,
 						undefined, // plain-file read: deterministic and fast, never abort mid-read
+						fileSize > SNAPSHOT_MAX_BYTES, // giant file: don't scan to EOF just for an exact line count
 					);
 
 					const {
@@ -2001,6 +2146,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						stoppedByByteLimit,
 						firstLinePreview,
 						firstLineByteLength,
+						reachedEof,
 					} = streamResult;
 
 					// Check if offset is out of bounds - return graceful message instead of throwing
@@ -2021,6 +2167,25 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					// counts in `truncation` keep reflecting the source, not the trimmed
 					// view — column truncation surfaces separately via `.limits()`.
 					const rawSelector = isRawSelector(parsed);
+					// Binary sniff: NUL bytes in the collected window mean the file is
+					// not displayable text (binary, or UTF-16 which has NULs in the
+					// ASCII range) — emit a notice instead of mojibake filling the
+					// line budget. `:raw` stays an explicit escape hatch.
+					if (!rawSelector) {
+						for (const line of collectedLines) {
+							if (line.includes("\u0000")) {
+								return toolResult<ReadToolDetails>({ resolvedPath: absolutePath, suffixResolution })
+									.text(
+										prependSuffixResolutionNotice(
+											`[Cannot read binary file '${formatPathRelativeToCwd(absolutePath, this.session.cwd)}' (${formatBytes(fileSize)}); content contains NUL bytes (binary or UTF-16 encoded)]`,
+											suffixResolution,
+										),
+									)
+									.sourcePath(absolutePath)
+									.done();
+							}
+						}
+					}
 					const maxColumns = resolveOutputMaxColumns(this.session.settings);
 					// Column truncation is display-only. `collectedLines` MUST stay
 					// byte-for-byte with the on-disk content so the snapshot recorded
@@ -2149,7 +2314,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						sourcePath = absolutePath;
 						truncationInfo = {
 							result: truncation,
-							options: { direction: "head", startLine: startLineDisplay, totalFileLines },
+							options: {
+								direction: "head",
+								startLine: startLineDisplay,
+								totalFileLines: reachedEof ? totalFileLines : undefined,
+							},
 						};
 					} else if (truncation.truncated) {
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
@@ -2157,14 +2326,19 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						sourcePath = absolutePath;
 						truncationInfo = {
 							result: truncation,
-							options: { direction: "head", startLine: startLineDisplay, totalFileLines },
+							options: {
+								direction: "head",
+								startLine: startLineDisplay,
+								totalFileLines: reachedEof ? totalFileLines : undefined,
+							},
 						};
-					} else if (startLine + userLimitedLines < totalFileLines) {
-						const remaining = totalFileLines - (startLine + userLimitedLines);
+					} else if (startLine + userLimitedLines < totalFileLines || !reachedEof) {
 						const nextOffset = startLine + userLimitedLines + 1;
 
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
-						outputText += `\n\n[${remaining} more lines in file. Use :${nextOffset} to continue]`;
+						outputText += reachedEof
+							? `\n\n[${totalFileLines - (startLine + userLimitedLines)} more lines in file. Use :${nextOffset} to continue]`
+							: `\n\n[More lines in file (${formatBytes(fileSize)} total; not scanned to EOF). Use :${nextOffset} to continue]`;
 						details = {};
 						sourcePath = absolutePath;
 					} else {

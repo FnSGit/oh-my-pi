@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
-import { type GeneratedProvider, getBundledModel, type Usage } from "@oh-my-pi/pi-ai";
+import type { Usage } from "@oh-my-pi/pi-ai";
+import type { GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getConfigRootDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
 import type {
 	AggregatedStats,
@@ -52,6 +54,9 @@ export async function initDb(): Promise<Database> {
 	await fs.mkdir(getConfigRootDir(), { recursive: true });
 
 	db = new Database(getStatsDbPath());
+	// Install the busy handler BEFORE any lock-taking statement. See
+	// https://github.com/can1357/oh-my-pi/issues/2421.
+	db.exec("PRAGMA busy_timeout = 5000");
 	db.exec("PRAGMA journal_mode = WAL");
 
 	// Create tables

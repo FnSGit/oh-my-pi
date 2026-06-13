@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
@@ -90,6 +90,9 @@ function createStubInputControllerContext(opts: { skillCommands: Map<string, str
 			enqueueCustomMessageDisplay,
 			prompt,
 			promptCustomMessage,
+		},
+		get viewSession() {
+			return (this as typeof ctx).session;
 		},
 		showError,
 		handleGoalModeCommand,
@@ -337,7 +340,7 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		const { session } = fixture;
 		const firstTag = session.enqueueCustomMessageDisplay("/skill:foo bar", "steer");
 		const popped = session.popLastQueuedMessage();
-		expect(popped).toBe("/skill:foo bar");
+		expect(popped?.text).toBe("/skill:foo bar");
 		expect(session.getQueuedMessages().steering).toEqual([]);
 
 		// Push a NEW tagged entry with the same text. Emitting `message_start` for the
@@ -384,6 +387,7 @@ function createStubInteractiveModeContextForUiHelpers(session: AgentSession) {
 		ui: { requestRender },
 		pendingMessagesContainer,
 		session,
+		viewSession: session,
 		compactionQueuedMessages: [],
 		keybindings: {
 			getDisplayString: (_action: string) => "Alt+Up",
@@ -483,13 +487,16 @@ function createEventControllerFixtureForE10() {
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
-		ui: { requestRender, setEagerNativeScrollbackRebuild: vi.fn() },
+		ui: { requestRender },
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		addMessageToChat,
 		updatePendingMessagesDisplay,
 		pendingTools: new Map(),
 		session: {},
+		get viewSession() {
+			return (this as typeof ctx).session;
+		},
 	} as unknown as InteractiveModeContext;
 
 	const controller = new EventController(ctx);

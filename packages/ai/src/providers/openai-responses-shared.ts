@@ -1,17 +1,5 @@
-import { structuredCloneJSON } from "@oh-my-pi/pi-utils";
-import type OpenAI from "openai";
-import type {
-	ResponseCustomToolCall,
-	ResponseFunctionToolCall,
-	ResponseInput,
-	ResponseInputContent,
-	ResponseInputImage,
-	ResponseInputText,
-	ResponseOutputItem,
-	ResponseOutputMessage,
-	ResponseReasoningItem,
-} from "openai/resources/responses/responses";
-import { calculateCost } from "../models";
+import { calculateCost } from "@oh-my-pi/pi-catalog/models";
+import { logger, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import {
 	type Api,
 	type AssistantMessage,
@@ -32,6 +20,20 @@ import {
 import { normalizeResponsesToolCallId } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
 import { parseStreamingJson, parseStreamingJsonThrottled } from "../utils/json-parse";
+import type {
+	ResponseCreateParamsStreaming,
+	ResponseCustomToolCall,
+	ResponseFunctionToolCall,
+	ResponseInput,
+	ResponseInputContent,
+	ResponseInputImage,
+	ResponseInputText,
+	ResponseOutputItem,
+	ResponseOutputMessage,
+	ResponseReasoningItem,
+	ResponseStatus,
+	ResponseStreamEvent,
+} from "./openai-responses-wire";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 export const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES: ReadonlySet<string> = new Set([
 	"response.created",
@@ -49,6 +51,7 @@ export const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES: ReadonlySet<string> = new Se
 	"response.custom_tool_call_input.done",
 	"response.output_item.done",
 	"response.completed",
+	"response.incomplete",
 	"response.failed",
 	"error",
 ]);
@@ -288,7 +291,7 @@ export function convertResponsesInputContent(
 	for (const item of imageBlocks) {
 		normalizedContent.push({
 			type: "input_image",
-			detail: "auto",
+			detail: item.detail ?? "auto",
 			image_url: `data:${item.mimeType};base64,${item.data}`,
 		} satisfies ResponseInputImage);
 	}
@@ -310,6 +313,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	customCallIds?: Set<string>,
 ): ResponseInput {
 	const outputItems: ResponseInput = [];
+	let unsignedTextBlocks = 0;
 	const isDifferentModel =
 		assistantMsg.model !== model.id && assistantMsg.provider === model.provider && assistantMsg.api === model.api;
 
@@ -319,7 +323,12 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 				continue;
 			}
 			if (block.thinkingSignature) {
-				outputItems.push(JSON.parse(block.thinkingSignature) as ResponseReasoningItem);
+				try {
+					outputItems.push(JSON.parse(block.thinkingSignature) as ResponseReasoningItem);
+				} catch {
+					// Legacy/corrupt persisted signature — skip the reasoning item
+					// rather than failing the whole request build.
+				}
 			}
 			continue;
 		}
@@ -328,7 +337,10 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 			const parsedSignature = parseTextSignature(block.textSignature);
 			let msgId = parsedSignature?.id;
 			if (!msgId) {
-				msgId = `msg_${msgIndex}`;
+				// Distinct ids per unsigned block: several text blocks in one message
+				// (cross-provider replay downgrades thinking → text) must not share an id.
+				msgId = unsignedTextBlocks === 0 ? `msg_${msgIndex}` : `msg_${msgIndex}_${unsignedTextBlocks}`;
+				unsignedTextBlocks += 1;
 			} else if (msgId.length > 64) {
 				msgId = `msg_${Bun.hash(msgId).toString(36)}`;
 			}
@@ -393,10 +405,6 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 	const hasImages = toolResult.content.some((block): block is ImageContent => block.type === "image");
 	const omittedImages = hasImages && !supportsImages;
 	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);
-	if (strictResponsesPairing && !knownCallIds.has(normalized.callId)) {
-		return;
-	}
-
 	const output = (
 		omittedImages
 			? joinTextWithImagePlaceholder(textResult, true)
@@ -404,6 +412,19 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 				? textResult
 				: "(see attached image)"
 	).toWellFormed();
+	if (strictResponsesPairing && !knownCallIds.has(normalized.callId)) {
+		// Strict backends (Azure, Copilot) reject unpaired outputs outright, but
+		// silently dropping the result loses information the model needs. Fold it
+		// into an assistant note instead (same shape as repairOrphanResponsesToolOutputs).
+		const limit = 16_000;
+		const noteText = output.length > limit ? `${output.slice(0, limit)}\n...[truncated]` : output;
+		messages.push({
+			type: "message",
+			role: "assistant",
+			content: `[Orphan ${toolResult.toolName || "tool"} result; call_id=${normalized.callId}]: ${noteText}`,
+		} as ResponseInput[number]);
+		return;
+	}
 	if (customCallIds?.has(normalized.callId)) {
 		messages.push({
 			type: "custom_tool_call_output",
@@ -429,7 +450,7 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 		if (block.type === "image") {
 			contentParts.push({
 				type: "input_image",
-				detail: "auto",
+				detail: block.detail ?? "auto",
 				image_url: `data:${block.mimeType};base64,${block.data}`,
 			} satisfies ResponseInputImage);
 		}
@@ -440,10 +461,18 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 export interface ProcessResponsesStreamOptions {
 	onFirstToken?: () => void;
 	onOutputItemDone?: (item: ResponseOutputItem) => void;
+	/**
+	 * Called when a terminal `response.completed` or `response.incomplete` event
+	 * is successfully processed. Only invoked on the successful-completion path;
+	 * thrown failure (`response.failed`) and cancellation paths never call this.
+	 * Used by callers to detect premature stream closure (i.e. the stream ended
+	 * without a recognized terminal event).
+	 */
+	onCompleted?: () => void;
 }
 
 export async function processResponsesStream<TApi extends Api>(
-	openaiStream: AsyncIterable<OpenAI.Responses.ResponseStreamEvent>,
+	openaiStream: AsyncIterable<ResponseStreamEvent>,
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	model: Model<TApi>,
@@ -645,32 +674,42 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.output_text.delta") {
 			const entry = lookupOpenItem(event);
 			if (entry?.item.type === "message" && entry.block.type === "text") {
-				const lastPart = entry.item.content?.[entry.item.content.length - 1];
-				if (lastPart?.type === "output_text") {
-					entry.block.text += event.delta;
-					lastPart.text += event.delta;
-					stream.push({
-						type: "text_delta",
-						contentIndex: contentIndexOf(entry.block),
-						delta: event.delta,
-						partial: output,
-					});
+				entry.item.content = entry.item.content || [];
+				let lastPart = entry.item.content[entry.item.content.length - 1];
+				if (lastPart?.type !== "output_text") {
+					// `content_part.added` never arrived (lossy proxy) — synthesize the
+					// part so live text still streams instead of freezing until the
+					// item's output_item.done recovers the final text.
+					lastPart = { type: "output_text", text: "", annotations: [] };
+					entry.item.content.push(lastPart);
 				}
+				entry.block.text += event.delta;
+				lastPart.text += event.delta;
+				stream.push({
+					type: "text_delta",
+					contentIndex: contentIndexOf(entry.block),
+					delta: event.delta,
+					partial: output,
+				});
 			}
 		} else if (event.type === "response.refusal.delta") {
 			const entry = lookupOpenItem(event);
 			if (entry?.item.type === "message" && entry.block.type === "text") {
-				const lastPart = entry.item.content?.[entry.item.content.length - 1];
-				if (lastPart?.type === "refusal") {
-					entry.block.text += event.delta;
-					lastPart.refusal += event.delta;
-					stream.push({
-						type: "text_delta",
-						contentIndex: contentIndexOf(entry.block),
-						delta: event.delta,
-						partial: output,
-					});
+				entry.item.content = entry.item.content || [];
+				let lastPart = entry.item.content[entry.item.content.length - 1];
+				if (lastPart?.type !== "refusal") {
+					// Same lossy-proxy hardening as the output_text branch above.
+					lastPart = { type: "refusal", refusal: "" };
+					entry.item.content.push(lastPart);
 				}
+				entry.block.text += event.delta;
+				lastPart.refusal += event.delta;
+				stream.push({
+					type: "text_delta",
+					contentIndex: contentIndexOf(entry.block),
+					delta: event.delta,
+					partial: output,
+				});
 			}
 		} else if (event.type === "response.function_call_arguments.delta") {
 			const entry = lookupOpenFunctionCallItem(event);
@@ -732,9 +771,15 @@ export async function processResponsesStream<TApi extends Api>(
 						: item.content?.[0]?.type === "reasoning_text"
 							? (item.content[0].text ?? "")
 							: "";
-				const reasoningBlock = output.content.find(
-					b => b.type === "thinking" && (b as ThinkingContent).itemId === item.id,
-				) as ThinkingContent | undefined;
+				// Prefer the routed entry; the bare itemId find misroutes when ids are
+				// absent (`undefined === undefined` matches the FIRST thinking block) and
+				// misses entirely when the done-event id drifts from the added-event id.
+				const reasoningBlock =
+					entry?.block.type === "thinking"
+						? entry.block
+						: (output.content.find(b => b.type === "thinking" && (b as ThinkingContent).itemId === item.id) as
+								| ThinkingContent
+								| undefined);
 				if (reasoningBlock) {
 					reasoningBlock.thinking = thinking;
 					reasoningBlock.thinkingSignature = JSON.stringify(item);
@@ -746,18 +791,25 @@ export async function processResponsesStream<TApi extends Api>(
 					});
 				}
 				closeOpenItem(event.output_index, item.id, entry);
-			} else if (item.type === "message" && entry?.block.type === "text") {
-				const block = entry.block;
-				block.text = item.content
+			} else if (item.type === "message") {
+				const block = entry?.block.type === "text" ? entry.block : undefined;
+				const text = item.content
 					.map(part => (part.type === "output_text" ? (part.text ?? "") : (part.refusal ?? "")))
 					.join("");
-				block.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
-				stream.push({
-					type: "text_end",
-					contentIndex: contentIndexOf(block),
-					content: block.text,
-					partial: output,
-				});
+				const textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
+				let contentIndex: number;
+				if (block) {
+					block.text = text;
+					block.textSignature = textSignature;
+					contentIndex = contentIndexOf(block);
+				} else {
+					// `output_item.added` never arrived (lossy proxy) — synthesize the
+					// block so the final message still carries the authoritative text.
+					const synthesized: TextContent = { type: "text", text, textSignature };
+					output.content.push(synthesized);
+					contentIndex = output.content.length - 1;
+				}
+				stream.push({ type: "text_end", contentIndex, content: text, partial: output });
 				closeOpenItem(event.output_index, item.id, entry);
 			} else if (item.type === "function_call") {
 				const block = entry?.block.type === "toolCall" ? entry.block : undefined;
@@ -772,6 +824,7 @@ export async function processResponsesStream<TApi extends Api>(
 					name: item.name,
 					arguments: args,
 				};
+				let contentIndex: number;
 				if (block) {
 					// Persist the authoritative final args on the stored block. The
 					// throttled delta parser may have skipped the last partial parse,
@@ -781,8 +834,14 @@ export async function processResponsesStream<TApi extends Api>(
 					delete (block as { partialJson?: string }).partialJson;
 					delete (block as { lastParseLen?: number }).lastParseLen;
 					delete (block as { argumentsDone?: boolean }).argumentsDone;
+					contentIndex = contentIndexOf(block);
+				} else {
+					// `output_item.added` never arrived (lossy proxy) — synthesize the
+					// block so the final message carries the call the consumer was told
+					// completed (the agent loop executes tools from message.content).
+					output.content.push(toolCall);
+					contentIndex = output.content.length - 1;
 				}
-				const contentIndex = block ? contentIndexOf(block) : output.content.length - 1;
 				closeOpenItem(event.output_index, item.id, entry, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "custom_tool_call") {
@@ -795,12 +854,39 @@ export async function processResponsesStream<TApi extends Api>(
 					arguments: { input: rawInput },
 					customWireName: item.name,
 				};
-				const contentIndex = block ? contentIndexOf(block) : output.content.length - 1;
+				let contentIndex: number;
+				if (block) {
+					// Persist the final input on the stored block and drop the transient
+					// accumulation buffer, mirroring the function_call branch above.
+					block.arguments = { input: rawInput };
+					delete (block as { partialJson?: string }).partialJson;
+					delete (block as { lastParseLen?: number }).lastParseLen;
+					contentIndex = contentIndexOf(block);
+				} else {
+					output.content.push(toolCall);
+					contentIndex = output.content.length - 1;
+				}
 				closeOpenItem(event.output_index, item.id, entry, item.call_id);
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			}
-		} else if (event.type === "response.completed") {
+		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			const response = event.response;
+			// Finalize any toolCall block whose output_item.done never arrived: the
+			// throttled delta parser may have left block.arguments stale, and the
+			// toolUse override below would hand the agent incomplete arguments.
+			for (const open of openItemsInOrder) {
+				if (open.block.type !== "toolCall") continue;
+				const block = open.block;
+				if (block.partialJson && !block.argumentsDone) {
+					block.arguments =
+						open.item.type === "custom_tool_call"
+							? { input: block.partialJson }
+							: parseStreamingJson(block.partialJson);
+				}
+				delete (block as { partialJson?: string }).partialJson;
+				delete (block as { lastParseLen?: number }).lastParseLen;
+				delete (block as { argumentsDone?: boolean }).argumentsDone;
+			}
 			if (response?.id) {
 				output.responseId = response.id;
 			}
@@ -820,12 +906,37 @@ export async function processResponsesStream<TApi extends Api>(
 							: "Unknown error (no error details in response)";
 				throw new Error(message);
 			}
+			if (response?.status === "incomplete" && response.incomplete_details?.reason === "content_filter") {
+				// A content-filtered turn is a failure, not a token-cap truncation —
+				// mapping it to "length" would route the agent loop into "shorten your
+				// output" recovery against a filtered prompt.
+				throw new Error("incomplete: content_filter");
+			}
 			if (output.content.some(block => block.type === "toolCall") && output.stopReason === "stop") {
 				output.stopReason = "toolUse";
 			}
+			// Codex-lineage backends/gateways mark an unfinished turn with
+			// `end_turn: false` on the terminal event (the response ended on
+			// commentary only). Not in the SDK types or the platform API today —
+			// inert when absent. Same mapping as openai-codex-responses: surface a
+			// non-terminal stop so the agent loop re-samples instead of ending the
+			// turn.
+			if ((response as { end_turn?: boolean } | undefined)?.end_turn === false && output.stopReason === "stop") {
+				output.stopDetails = { type: "pause_turn" };
+			}
+			options?.onCompleted?.();
+			// `response.completed`/`response.incomplete` is the last event of a
+			// Responses stream. Stop pulling instead of waiting for the server to
+			// close the connection: misbehaving providers keep the socket open
+			// after the terminal event, which would park this loop until the idle
+			// watchdog converts an already-successful turn into a timeout error.
+			// Breaking unwinds the iterator chain (the consumer's `.return()`
+			// reaches the SDK stream), actively releasing the connection.
+			break;
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			throw new Error(`Error Code ${event.code}: ${event.message}`);
 		} else if (event.type === "response.failed") {
+			populateResponsesUsageFromResponse(output, event.response?.usage);
 			const error = event.response?.error ?? (event.response as any)?.status_details?.error;
 			const details = event.response?.incomplete_details;
 			const message = error
@@ -838,7 +949,7 @@ export async function processResponsesStream<TApi extends Api>(
 	}
 }
 
-export function mapOpenAIResponsesStopReason(status: OpenAI.Responses.ResponseStatus | undefined): StopReason {
+export function mapOpenAIResponsesStopReason(status: ResponseStatus | undefined): StopReason {
 	if (!status) return "stop";
 	switch (status) {
 		case "completed":
@@ -852,8 +963,12 @@ export function mapOpenAIResponsesStopReason(status: OpenAI.Responses.ResponseSt
 		case "queued":
 			return "stop";
 		default: {
+			// Compile-time exhaustiveness; at runtime a brand-new status from the
+			// server must degrade gracefully instead of failing a fully-streamed
+			// response.
 			const exhaustive: never = status;
-			throw new Error(`Unhandled stop reason: ${exhaustive}`);
+			logger.warn("Unhandled OpenAI Responses stop reason", { status: exhaustive });
+			return "stop";
 		}
 	}
 }
@@ -888,7 +1003,7 @@ export type ResponsesSamplingParamsExtras = {
 	repetition_penalty?: number;
 };
 
-type CommonResponsesParams = OpenAI.Responses.ResponseCreateParamsStreaming & ResponsesSamplingParamsExtras;
+type CommonResponsesParams = ResponseCreateParamsStreaming & ResponsesSamplingParamsExtras;
 
 type CommonSamplingOptions = Pick<
 	StreamOptions,
@@ -933,8 +1048,12 @@ type ReasoningOptions = {
 
 /**
  * Apply reasoning-related Responses parameters: enable encrypted reasoning content for replay,
- * set effort/summary when requested, and otherwise inject the GPT-5 "Juice: 0" no-reasoning hack.
- * Mutates `params` and may push a developer message into `messages`.
+ * set effort/summary when requested, and otherwise inject the "Juice: 0" no-reasoning hack
+ * when `model.compat.requiresJuiceZeroHack` is set (GPT-5 family by default).
+ * Mutates `params` and may push a developer message into `messages`. Returns
+ * the number of per-turn trailing scaffolding items appended to `messages`
+ * (the "Juice: 0" developer item), so callers doing stateful
+ * `previous_response_id` chaining can exclude them from append-baseline math.
  *
  * @param omitReasoningEffort - When `true`, suppresses `params.reasoning.effort` from the wire
  *   body. Set by `xai-responses.ts` via {@link OpenAIResponsesOptions.omitReasoningEffort} for
@@ -945,21 +1064,23 @@ type ReasoningOptions = {
  *   without needing explicit activation. Callers that pass `options.reasoning` for such models
  *   should expect this documented downgrade: the model will reason, but at its default effort.
  */
-export function applyResponsesReasoningParams<P extends OpenAI.Responses.ResponseCreateParamsStreaming>(
+export function applyResponsesReasoningParams<P extends ResponseCreateParamsStreaming>(
 	params: P,
-	model: Model<Api>,
+	model: Model<"openai-responses" | "azure-openai-responses" | "openai-codex-responses">,
 	options: ReasoningOptions | undefined,
 	messages: ResponseInput,
 	mapEffort?: (effort: string) => string,
 	includeEncryptedReasoning: boolean = true,
 	omitReasoningEffort: boolean = false,
-): void {
-	if (!model.reasoning) return;
+): number {
+	if (!model.reasoning) return 0;
 	// Always request encrypted reasoning content so reasoning items can be replayed in
 	// multi-turn conversations when store is false (items aren't persisted server-side, so
 	// we must include the full content). See: https://github.com/can1357/oh-my-pi/issues/41
 	if (includeEncryptedReasoning) {
-		params.include = ["reasoning.encrypted_content"];
+		const include = params.include ?? [];
+		if (!include.includes("reasoning.encrypted_content")) include.push("reasoning.encrypted_content");
+		params.include = include;
 	}
 
 	if (options?.reasoning || options?.reasoningSummary !== undefined) {
@@ -974,12 +1095,12 @@ export function applyResponsesReasoningParams<P extends OpenAI.Responses.Respons
 			// When only options.reasoning (effort level) is set, params.reasoning
 			// is intentionally omitted — see @param omitReasoningEffort above.
 			if (options?.reasoningSummary !== undefined && options?.reasoningSummary !== null) {
-				type ReasoningParam = NonNullable<OpenAI.Responses.ResponseCreateParamsStreaming["reasoning"]>;
+				type ReasoningParam = NonNullable<ResponseCreateParamsStreaming["reasoning"]>;
 				params.reasoning = { summary: options.reasoningSummary || "auto" } as P["reasoning"] & ReasoningParam;
 			}
 		} else {
 			const requested = options?.reasoning || "medium";
-			type ReasoningParam = NonNullable<OpenAI.Responses.ResponseCreateParamsStreaming["reasoning"]>;
+			type ReasoningParam = NonNullable<ResponseCreateParamsStreaming["reasoning"]>;
 			const reasoningParams: ReasoningParam = {
 				effort: (mapEffort ? mapEffort(requested) : requested) as ReasoningParam["effort"],
 			};
@@ -988,13 +1109,15 @@ export function applyResponsesReasoningParams<P extends OpenAI.Responses.Respons
 			}
 			params.reasoning = reasoningParams as P["reasoning"];
 		}
-	} else if (model.name.toLowerCase().startsWith("gpt-5")) {
+	} else if (model.compat.requiresJuiceZeroHack) {
 		// Jesus Christ, see https://community.openai.com/t/need-reasoning-false-option-for-gpt-5/1351588/7
 		messages.push({
 			role: "developer",
 			content: [{ type: "input_text", text: "# Juice: 0 !important" }],
 		});
+		return 1;
 	}
+	return 0;
 }
 
 /** Populate `output.usage` from a Responses-API `response.usage` payload. Does not invoke `calculateCost`. */
@@ -1014,6 +1137,10 @@ export function populateResponsesUsageFromResponse(
 	if (!usage) return;
 	const cachedTokens = usage.input_tokens_details?.cached_tokens || 0;
 	const reasoningTokens = usage.output_tokens_details?.reasoning_tokens || 0;
+	// Wholesale replacement must not drop provider-annotated extras (Copilot
+	// premium-request accounting): the failed/cancelled paths throw right after
+	// this call with no later chance to re-apply.
+	const premiumRequests = output.usage.premiumRequests;
 	output.usage = {
 		input: (usage.input_tokens || 0) - cachedTokens,
 		output: usage.output_tokens || 0,
@@ -1023,4 +1150,38 @@ export function populateResponsesUsageFromResponse(
 		...(reasoningTokens > 0 ? { reasoningTokens } : {}),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+	if (premiumRequests !== undefined) {
+		output.usage.premiumRequests = premiumRequests;
+	}
+}
+
+/**
+ * Strict-prefix delta for stateful `previous_response_id` chaining (used by the
+ * platform Responses provider and the Codex provider on both transports):
+ * returns the input items the current request appends beyond the previous
+ * request's input plus the previous response's output items, or null when the
+ * request options differ or history mutated (the chain must break). Per-turn
+ * `client_metadata` (e.g. rotating turn ids) is excluded from the option
+ * comparison; codex-rs excludes it from the same check.
+ */
+export function buildResponsesDeltaInput<TItem>(
+	previous: { input?: unknown } | undefined,
+	previousResponseItems: readonly TItem[] | undefined,
+	current: { input?: unknown },
+): TItem[] | null {
+	if (!previous) return null;
+	if (!Array.isArray(previous.input) || !Array.isArray(current.input)) return null;
+	const previousWithoutInput = { ...previous, input: undefined, client_metadata: undefined };
+	const currentWithoutInput = { ...current, input: undefined, client_metadata: undefined };
+	if (JSON.stringify(previousWithoutInput) !== JSON.stringify(currentWithoutInput)) {
+		return null;
+	}
+	const baseline = [...previous.input, ...(previousResponseItems ?? [])];
+	if (current.input.length <= baseline.length) return null;
+	for (let index = 0; index < baseline.length; index += 1) {
+		if (JSON.stringify(baseline[index]) !== JSON.stringify(current.input[index])) {
+			return null;
+		}
+	}
+	return current.input.slice(baseline.length) as TItem[];
 }

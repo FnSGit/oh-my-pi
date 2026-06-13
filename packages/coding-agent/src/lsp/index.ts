@@ -39,6 +39,7 @@ import {
 	flattenWorkspaceTextEdits,
 	rangesOverlap,
 } from "./edits";
+import { resolveFormatOptions } from "./format-options";
 import { detectLspmux } from "./lspmux";
 import {
 	type CodeAction,
@@ -105,7 +106,7 @@ export const LSP_READONLY_ACTIONS: ReadonlySet<string> = new Set([
 
 export interface LspStartupServerInfo {
 	name: string;
-	status: "connecting" | "ready" | "error";
+	status: "connecting" | "ready" | "error" | "available";
 	fileTypes: string[];
 	error?: string;
 }
@@ -121,11 +122,14 @@ export interface LspWarmupOptions {
 	onConnecting?: (serverNames: string[]) => void;
 }
 
-export function discoverStartupLspServers(cwd: string): LspStartupServerInfo[] {
+export function discoverStartupLspServers(
+	cwd: string,
+	status: LspStartupServerInfo["status"] = "connecting",
+): LspStartupServerInfo[] {
 	const config = loadConfig(cwd);
 	return getLspServers(config).map(([name, serverConfig]) => ({
 		name,
-		status: "connecting",
+		status,
 		fileTypes: serverConfig.fileTypes,
 	}));
 }
@@ -454,21 +458,23 @@ function isMethodNotFoundError(err: unknown): boolean {
 }
 
 async function reloadServer(client: LspClient, serverName: string, signal?: AbortSignal): Promise<string> {
-	let output = `Restarted ${serverName}`;
-	const reloadMethods = ["rust-analyzer/reloadWorkspace", "workspace/didChangeConfiguration"];
-	for (const method of reloadMethods) {
-		try {
-			await sendRequest(client, method, method.includes("Configuration") ? { settings: {} } : null, signal);
-			output = `Reloaded ${serverName}`;
-			break;
-		} catch {
-			// Method not supported, try next
-		}
+	// rust-analyzer exposes a real reload request.
+	try {
+		await sendRequest(client, "rust-analyzer/reloadWorkspace", null, signal);
+		return `Reloaded ${serverName}`;
+	} catch {
+		// Method not supported — fall through.
 	}
-	if (output.startsWith("Restarted")) {
+	// workspace/didChangeConfiguration is a notification per spec; sending it
+	// as a request hangs until the tool deadline on servers that route it to
+	// the notification handler and never respond.
+	try {
+		await sendNotification(client, "workspace/didChangeConfiguration", { settings: {} });
+		return `Reloaded ${serverName}`;
+	} catch {
 		client.proc.kill();
+		return `Restarted ${serverName}`;
 	}
-	return output;
 }
 
 interface WaitForDiagnosticsOptions {
@@ -636,12 +642,13 @@ interface GetDiagnosticsForFileOptions {
 async function captureDiagnosticVersions(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
+	initTimeoutMs?: number,
 ): Promise<ServerVersionMap> {
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
 			if (serverConfig.createClient) return;
-			const client = await getOrCreateClient(serverConfig, cwd);
+			const client = await getOrCreateClient(serverConfig, cwd, initTimeoutMs);
 			versions.set(serverName, client.diagnosticsVersion);
 		}),
 	);
@@ -773,15 +780,6 @@ export enum FileFormatResult {
 	FORMATTED = "formatted",
 }
 
-/** Default formatting options for LSP */
-const DEFAULT_FORMAT_OPTIONS = {
-	tabSize: 3,
-	insertSpaces: true,
-	trimTrailingWhitespace: true,
-	insertFinalNewline: true,
-	trimFinalNewlines: true,
-};
-
 /**
  * Format content using LSP or custom linter client.
  *
@@ -828,7 +826,7 @@ async function formatContent(
 				"textDocument/formatting",
 				{
 					textDocument: { uri },
-					options: DEFAULT_FORMAT_OPTIONS,
+					options: resolveFormatOptions(absolutePath, content),
 				},
 				signal,
 			)) as TextEdit[] | null;
@@ -1118,7 +1116,9 @@ async function runLspWritethrough(
 	const useCustomFormatter = enableFormat && customLinterServers.length > 0;
 
 	// Capture diagnostic versions BEFORE syncing to detect stale diagnostics
-	const minVersions = enableDiagnostics ? await captureDiagnosticVersions(cwd, servers) : undefined;
+	// Bound client creation by the writethrough budget: a hung/broken server
+	// must not add its full init wait (30s default) to every edit.
+	const minVersions = enableDiagnostics ? await captureDiagnosticVersions(cwd, servers, 5_000) : undefined;
 	let expectedDocumentVersions: ServerVersionMap | undefined;
 
 	let formatter: FileFormatResult | undefined;
@@ -2132,6 +2132,11 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			const position = { line: resolvedLine - 1, character: resolvedCharacter };
 
 			let output: string;
+			// Set on bare empty-lookup outcomes (no definition/references/…): the
+			// result carries no information once consumed, so compaction may elide
+			// it. Clean diagnostics runs are NOT useless — they are verification
+			// evidence.
+			let useless = false;
 
 			if (needsProjectIndex && !isRustAnalyzerServer) {
 				await waitForProjectLoaded(client, signal);
@@ -2157,6 +2162,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 					if (locations.length === 0) {
 						output = "No definition found";
+						useless = true;
 					} else {
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
@@ -2181,6 +2187,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 					if (locations.length === 0) {
 						output = "No type definition found";
+						useless = true;
 					} else {
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
@@ -2205,6 +2212,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 					if (locations.length === 0) {
 						output = "No implementation found";
+						useless = true;
 					} else {
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
@@ -2242,6 +2250,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 					if (!result || result.length === 0) {
 						output = "No references found";
+						useless = true;
 					} else {
 						const contextualReferences = result.slice(0, REFERENCE_CONTEXT_LIMIT);
 						const plainReferences = result.slice(REFERENCE_CONTEXT_LIMIT);
@@ -2311,11 +2320,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							break;
 						}
 						const parsedIndex = /^\d+$/.test(normalizedQuery) ? Number.parseInt(normalizedQuery, 10) : null;
-						const selectedAction = result.find(
-							(actionItem, index) =>
-								(parsedIndex !== null && index === parsedIndex) ||
-								actionItem.title.toLowerCase().includes(normalizedQuery.toLowerCase()),
-						);
+						const selectedAction =
+							parsedIndex !== null
+								? result[parsedIndex]
+								: result.find(actionItem =>
+										actionItem.title.toLowerCase().includes(normalizedQuery.toLowerCase()),
+									);
 
 						if (!selectedAction) {
 							const actionLines = result.map((actionItem, index) => `  ${formatCodeAction(actionItem, index)}`);
@@ -2380,6 +2390,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 					if (!result || result.length === 0) {
 						output = "No symbols found";
+						useless = true;
 					} else {
 						const relPath = formatPathRelativeToCwd(targetFile, this.session.cwd);
 						if ("selectionRange" in result[0]) {
@@ -2443,6 +2454,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			return {
 				content: [{ type: "text", text: output }],
 				details: { serverName, action, success: true, request: params },
+				...(useless ? { useless: true } : {}),
 			};
 		} catch (err) {
 			if (err instanceof ToolError) throw err;

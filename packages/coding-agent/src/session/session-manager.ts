@@ -27,6 +27,7 @@ import {
 	Snowflake,
 	toError,
 } from "@oh-my-pi/pi-utils";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { ArtifactManager } from "./artifacts";
 import {
 	type BlobPutOptions,
@@ -544,6 +545,17 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+export interface BuildSessionContextOptions {
+	/**
+	 * Build the full-history display transcript instead of the LLM context:
+	 * every path entry in chronological order, with each compaction emitted
+	 * inline as a `compactionSummary` message at the position it fired rather
+	 * than replacing the history before it. Display-only — never send the
+	 * result to a provider.
+	 */
+	transcript?: boolean;
+}
+
 /**
  * Build the session context from entries using tree traversal.
  * If leafId is provided, walks from that entry to root.
@@ -553,6 +565,7 @@ export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
+	options?: BuildSessionContextOptions,
 ): SessionContext {
 	// Build uuid index if not available
 	if (!byId) {
@@ -692,7 +705,29 @@ export function buildSessionContext(
 		}
 	};
 
-	if (compaction) {
+	if (options?.transcript) {
+		// Display transcript: every entry in chronological order. Compactions do
+		// not erase prior history here — each renders inline (as a divider in the
+		// TUI) at the point it fired, with any snapcompact frames re-attached so
+		// the component can report them.
+		for (const entry of path) {
+			if (entry.type === "compaction") {
+				const snapcompactArchive = snapcompact.getPreservedArchive(entry.preserveData);
+				messages.push(
+					createCompactionSummaryMessage(
+						entry.summary,
+						entry.tokensBefore,
+						entry.timestamp,
+						entry.shortSummary,
+						undefined,
+						snapcompactArchive ? snapcompact.images(snapcompactArchive) : undefined,
+					),
+				);
+			} else {
+				appendMessage(entry);
+			}
+		}
+	} else if (compaction) {
 		const providerPayload: ProviderPayload | undefined = (() => {
 			const candidate = compaction.preserveData?.openaiRemoteCompaction;
 			if (!candidate || typeof candidate !== "object") return undefined;
@@ -707,7 +742,9 @@ export function buildSessionContext(
 		})();
 		const remoteReplacementHistory = providerPayload?.items;
 
-		// Emit summary first
+		// Emit summary first; re-attach any archived snapcompact frames so the
+		// model can keep reading the archived history after every context rebuild.
+		const snapcompactArchive = snapcompact.getPreservedArchive(compaction.preserveData);
 		messages.push(
 			createCompactionSummaryMessage(
 				compaction.summary,
@@ -715,6 +752,7 @@ export function buildSessionContext(
 				compaction.timestamp,
 				compaction.shortSummary,
 				providerPayload,
+				snapcompactArchive ? snapcompact.images(snapcompactArchive) : undefined,
 			),
 		);
 
@@ -955,6 +993,21 @@ async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobSto
 	}
 
 	await Promise.all(promises);
+}
+
+/**
+ * Read-only message view of a session file: load entries, migrate to the
+ * current version, resolve blob refs, and build the context along the
+ * persisted leaf path (last entry). Does NOT create a writer or take the
+ * session lock — safe to call against a file another session is writing.
+ */
+export async function loadSessionMessagesReadOnly(filePath: string): Promise<AgentMessage[]> {
+	const entries = await loadEntriesFromFile(filePath);
+	if (entries.length === 0) return [];
+	migrateToCurrentVersion(entries);
+	await resolveBlobRefsInEntries(entries, new BlobStore(getBlobsDir()));
+	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
+	return buildSessionContext(sessionEntries).messages;
 }
 
 /**
@@ -1516,10 +1569,10 @@ class NdjsonFileWriter {
 	}
 }
 
-/** Get recent sessions for display in welcome screen */
+/** Get recent sessions for display in welcome screen (which reserves WELCOME_SESSION_SLOTS rows) */
 export async function getRecentSessions(
 	sessionDir: string,
-	limit = 3,
+	limit = 4,
 	storage: SessionStorage = new FileSessionStorage(),
 ): Promise<RecentSessionInfo[]> {
 	const sessions = await getSortedSessions(sessionDir, storage);
@@ -1941,6 +1994,12 @@ export class SessionManager {
 	#byId: Map<string, SessionEntry> = new Map();
 	#labelsById: Map<string, string> = new Map();
 	#leafId: string | null = null;
+	/**
+	 * Collab replication tap: invoked for every appended entry with the
+	 * in-memory (pre-blob-externalization) entry, so inline images survive.
+	 * Failures are swallowed — a broadcast error must never break persistence.
+	 */
+	onEntryAppended?: (entry: SessionEntry) => void;
 	#usageStatistics = {
 		input: 0,
 		output: 0,
@@ -2874,6 +2933,44 @@ export class SessionManager {
 				this.#usageStatistics.cost += usage.cost.total;
 			}
 		}
+		if (this.onEntryAppended) {
+			try {
+				this.onEntryAppended(entry);
+			} catch (err) {
+				logger.warn("collab entry hook failed", { error: String(err) });
+			}
+		}
+	}
+
+	/**
+	 * Append a foreign (host-authored) entry verbatim, preserving its
+	 * `id`/`parentId` — no id minting. Used by collab guests to mirror the
+	 * host session into the local replica file.
+	 */
+	ingestReplicatedEntry(entry: SessionEntry): void {
+		this.#appendEntry(entry);
+	}
+
+	/**
+	 * Snapshot the session for collab replication: the live header plus a deep
+	 * copy of every entry (the host mutates entries in place on
+	 * truncation/rewrite paths, so guests must not share references).
+	 */
+	snapshotForReplication(): { header: SessionHeader; entries: SessionEntry[] } {
+		const live = this.getHeader();
+		const header: SessionHeader = live
+			? structuredClone(live)
+			: {
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id: this.#sessionId,
+					title: this.#sessionName,
+					titleSource: this.#titleSource,
+					timestamp: new Date().toISOString(),
+					cwd: this.cwd,
+				};
+		const entries = structuredClone(this.#fileEntries.filter(e => e.type !== "session")) as SessionEntry[];
+		return { header, entries };
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -3205,11 +3302,12 @@ export class SessionManager {
 	}
 
 	/**
-	 * Build the session context (what gets sent to the LLM).
+	 * Build the session context (what gets sent to the LLM), or — with
+	 * `{ transcript: true }` — the full-history display transcript.
 	 * Uses tree traversal from current leaf.
 	 */
-	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.#leafId, this.#byId);
+	buildSessionContext(options?: BuildSessionContextOptions): SessionContext {
+		return buildSessionContext(this.getEntries(), this.#leafId, this.#byId, options);
 	}
 
 	/** Strip stale OpenAI Responses assistant replay metadata from loaded in-memory entries. */

@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { RenderResultOptions } from "@oh-my-pi/pi-agent-core";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { bashToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { previewWindowRows } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 
@@ -256,5 +257,87 @@ describe("bashToolRenderer", () => {
 		for (const idx of [forLine, echoLine, doneLine]) {
 			expect(rendered[idx]).toMatch(/\u001b\[38;(?:2|5);/);
 		}
+	});
+
+	it("caches the framed lines across repeated render() calls with identical inputs (issue #2081)", async () => {
+		// The bash result renderer is called per TUI repaint; with a long
+		// transcript and a 50KB-tail output that's the hot path that pinned the
+		// main thread in #2081. The eval renderer already caches by (width,
+		// previewLines) — this test pins the same contract for bash so future
+		// refactors don't silently drop the cache.
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const uiTheme = theme!;
+		// A non-trivial output so a missed cache hit would do real string work.
+		const output = Array.from({ length: 200 }, (_, i) => `line ${i}: payload ${"x".repeat(20)}`).join("\n");
+		const component = bashToolRenderer.renderResult(
+			{
+				content: [{ type: "text", text: output }],
+				details: { timeoutSeconds: 5, wallTimeMs: 12 },
+				isError: false,
+			},
+			{ expanded: false, isPartial: false, renderContext: { output, expanded: false, previewLines: 8 } },
+			uiTheme,
+			{ command: "printf '%s' big" },
+		);
+
+		const first = component.render(120);
+		const second = component.render(120);
+		// Identical inputs → cache hit returns the very same array reference.
+		expect(second).toBe(first);
+
+		// Width change busts the cache; fresh array.
+		const wider = component.render(160);
+		expect(wider).not.toBe(first);
+
+		// Original width hits the cache slot's current binding — proving the
+		// cache key includes width and isn't a stale-single-slot bug.
+		const sameAgain = component.render(120);
+		expect(sameAgain).not.toBe(first); // most-recent slot now holds the 160 result
+		expect(sameAgain).not.toBe(wider);
+
+		// Subsequent identical render reuses the freshly-cached 120 slot.
+		const sameAgainCached = component.render(120);
+		expect(sameAgainCached).toBe(sameAgain);
+
+		// invalidate() clears the cache so the next render produces a brand-new array.
+		(component as { invalidate?: () => void }).invalidate?.();
+		const postInvalidate = component.render(120);
+		expect(postInvalidate).not.toBe(sameAgainCached);
+	});
+
+	it("renders the collapsed command as a viewport tail window in every state — no stream→final expansion", async () => {
+		// The collapsed command is a tail window sized from the viewport: the end
+		// (the live edge while args stream) stays visible behind an "earlier
+		// lines" marker. The finalized collapsed block MUST render the identical
+		// window — snapping the full command open on completion makes the block
+		// jump. Only ctrl+o (expanded) uncaps.
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const uiTheme = theme!;
+		const total = previewWindowRows() + 5;
+		const command = Array.from({ length: total }, (_, i) => `echo step_${i}`).join("\n");
+		const render = (opts: { expanded: boolean; isPartial: boolean }) => {
+			const component = bashToolRenderer.renderResult(
+				{ content: [{ type: "text", text: "" }], details: {}, isError: false },
+				opts,
+				uiTheme,
+				{ command },
+			);
+			return sanitizeText(component.render(120).join("\n"));
+		};
+
+		for (const rendered of [
+			render({ expanded: false, isPartial: true }),
+			render({ expanded: false, isPartial: false }),
+		]) {
+			expect(rendered).toContain(`echo step_${total - 1}`);
+			expect(rendered).toContain("earlier line");
+			expect(rendered).not.toContain("echo step_0");
+		}
+
+		const expandedFinal = render({ expanded: true, isPartial: false });
+		expect(expandedFinal).toContain("echo step_0");
+		expect(expandedFinal).not.toContain("earlier line");
 	});
 });

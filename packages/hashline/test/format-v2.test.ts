@@ -66,6 +66,33 @@ describe("hashline format v4", () => {
 		expect(() => applyEdits("a\nb", edits)).toThrow(/Line 4 does not exist/);
 	});
 
+	it("ignores deleting the trailing blank sentinel of a newline-terminated file", () => {
+		// "a\nb\n" splits into ["a", "b", ""]; line 3 is the phantom sentinel.
+		const edits = parsePatch("delete 3").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\nb\n");
+	});
+
+	it("treats a delete range ending at the trailing sentinel as ending at the last real line", () => {
+		const edits = parsePatch("delete 2..3").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\n");
+	});
+
+	it("treats a replace range ending at the trailing sentinel as ending at the last real line", () => {
+		const edits = parsePatch("replace 2..3:\n+B").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\nB\n");
+	});
+
+	it("still allows inserts anchored on the trailing blank sentinel", () => {
+		const edits = parsePatch("insert after 3:\n+tail").edits;
+		expect(applyEdits("a\nb\n", edits).text).toBe("a\nb\n\ntail");
+	});
+
+	it("still deletes a genuine empty last line of a non-newline-terminated file", () => {
+		// "a\nb" has no sentinel; line 2 is real content.
+		const edits = parsePatch("delete 2").edits;
+		expect(applyEdits("a\nb", edits).text).toBe("a");
+	});
+
 	it("does not flush a trailing streaming pending empty replace hunk", () => {
 		const result = parsePatchStreaming("replace 5..5:\n");
 		expect(result.edits).toEqual([]);

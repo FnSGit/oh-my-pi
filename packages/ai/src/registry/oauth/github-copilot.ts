@@ -2,17 +2,19 @@
  * GitHub Copilot OAuth flow (opencode OAuth app)
  */
 import { scheduler } from "node:timers/promises";
-import { getBundledModels } from "../../models";
+import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import {
+	COPILOT_API_HEADERS,
+	getGitHubCopilotBaseUrl,
+	isPublicGitHubHost,
+	normalizeDomain,
+	normalizeGitHubCopilotEnterpriseDomain,
+	OPENCODE_HEADERS,
+} from "@oh-my-pi/pi-catalog/wire/github-copilot";
 import type { FetchImpl } from "../../types";
 import type { OAuthCredentials } from "./types";
 
 const CLIENT_ID = "Ov23li8tweQw6odWQebz";
-
-export const COPILOT_USER_AGENT = "opencode/1.3.15" as const;
-
-export const OPENCODE_HEADERS = {
-	"User-Agent": COPILOT_USER_AGENT,
-} as const;
 
 const INITIAL_POLL_INTERVAL_MULTIPLIER = 1.2;
 const SLOW_DOWN_POLL_INTERVAL_MULTIPLIER = 1.4;
@@ -46,58 +48,6 @@ type DeviceTokenErrorResponse = {
 	interval?: number;
 };
 
-type GitHubCopilotApiKeyPayload = {
-	token?: unknown;
-	enterpriseUrl?: unknown;
-};
-
-export type ParsedGitHubCopilotApiKey = {
-	accessToken: string;
-	enterpriseUrl?: string;
-};
-
-const PUBLIC_GITHUB_HOSTS = new Set(["api.github.com", "github.com", "www.github.com"]);
-
-function isPublicGitHubHost(host: string): boolean {
-	return PUBLIC_GITHUB_HOSTS.has(host.trim().toLowerCase());
-}
-
-export function normalizeGitHubCopilotEnterpriseDomain(input: string | undefined): string | undefined {
-	const trimmed = input?.trim();
-	if (!trimmed) return undefined;
-	const normalized = normalizeDomain(trimmed) ?? trimmed.toLowerCase();
-	if (!normalized || isPublicGitHubHost(normalized)) return undefined;
-	return normalized;
-}
-
-export function parseGitHubCopilotApiKey(apiKeyRaw: string): ParsedGitHubCopilotApiKey {
-	try {
-		const parsed = JSON.parse(apiKeyRaw) as GitHubCopilotApiKeyPayload;
-		if (typeof parsed.token === "string") {
-			return {
-				accessToken: parsed.token,
-				enterpriseUrl:
-					typeof parsed.enterpriseUrl === "string"
-						? normalizeGitHubCopilotEnterpriseDomain(parsed.enterpriseUrl)
-						: undefined,
-			};
-		}
-	} catch {}
-
-	return { accessToken: apiKeyRaw };
-}
-
-export function normalizeDomain(input: string): string | null {
-	const trimmed = input.trim();
-	if (!trimmed) return null;
-	try {
-		const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
-		return url.hostname;
-	} catch {
-		return null;
-	}
-}
-
 function getUrls(domain: string): {
 	deviceCodeUrl: string;
 	accessTokenUrl: string;
@@ -106,15 +56,6 @@ function getUrls(domain: string): {
 		deviceCodeUrl: `https://${domain}/login/device/code`,
 		accessTokenUrl: `https://${domain}/login/oauth/access_token`,
 	};
-}
-
-export function getGitHubCopilotBaseUrl(enterpriseDomain?: string): string {
-	const normalizedEnterpriseDomain = normalizeGitHubCopilotEnterpriseDomain(enterpriseDomain);
-	if (!normalizedEnterpriseDomain) return "https://api.githubcopilot.com";
-	const host = normalizedEnterpriseDomain.startsWith("copilot-api.")
-		? normalizedEnterpriseDomain
-		: `copilot-api.${normalizedEnterpriseDomain}`;
-	return `https://${host}`;
 }
 
 async function fetchJson(url: string, init: RequestInit, fetchImpl: FetchImpl): Promise<unknown> {
@@ -290,7 +231,7 @@ async function enableGitHubCopilotModel(
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${token}`,
-				...OPENCODE_HEADERS,
+				...COPILOT_API_HEADERS,
 				"openai-intent": "chat-policy",
 				"x-interaction-type": "chat-policy",
 			},
@@ -312,14 +253,16 @@ async function enableAllGitHubCopilotModels(
 	fetchImpl: FetchImpl,
 	onProgress?: (model: string, success: boolean) => void,
 ): Promise<void> {
-	const models = getBundledModels("github-copilot");
+	// Synthesized catalog variants (Copilot long-context `-1m` entries) share
+	// the upstream model id; enable each wire id exactly once.
+	const wireModelIds = [...new Set(getBundledModels("github-copilot").map(model => model.requestModelId ?? model.id))];
 	const BATCH_SIZE = 5;
-	for (let i = 0; i < models.length; i += BATCH_SIZE) {
-		const batch = models.slice(i, i + BATCH_SIZE);
+	for (let i = 0; i < wireModelIds.length; i += BATCH_SIZE) {
+		const batch = wireModelIds.slice(i, i + BATCH_SIZE);
 		await Promise.all(
-			batch.map(async model => {
-				const success = await enableGitHubCopilotModel(token, model.id, fetchImpl, enterpriseDomain);
-				onProgress?.(model.id, success);
+			batch.map(async modelId => {
+				const success = await enableGitHubCopilotModel(token, modelId, fetchImpl, enterpriseDomain);
+				onProgress?.(modelId, success);
 			}),
 		);
 	}

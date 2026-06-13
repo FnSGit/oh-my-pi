@@ -7,6 +7,8 @@
  * Real clients (codex, openai-python, llm-git) routinely send these and a 400
  * is a worse outcome than dropping them on the floor.
  */
+
+import { z } from "zod/v4";
 import type {
 	EasyInputMessage,
 	ResponseCreateParams,
@@ -16,8 +18,7 @@ import type {
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 	Tool as ResponsesTool,
-} from "openai/resources/responses/responses";
-import * as z from "zod/v4";
+} from "./openai-responses-wire";
 
 // ─── Input content blocks ───────────────────────────────────────────────────
 
@@ -97,12 +98,17 @@ const assistantMessageItemSchema = z.object({
 	content: z.union([z.string(), z.array(outputContentBlockSchema)]).optional(),
 });
 
-const reasoningItemSchema = z.object({
-	type: z.literal("reasoning"),
-	id: z.string().optional(),
-	summary: z.array(summaryTextSchema).optional(),
-	content: z.array(reasoningTextSchema).optional(),
-});
+const reasoningItemSchema = z
+	.object({
+		type: z.literal("reasoning"),
+		id: z.string().optional(),
+		summary: z.array(summaryTextSchema).optional(),
+		content: z.array(reasoningTextSchema).optional(),
+	})
+	// Loose: unknown keys like `encrypted_content` must survive the parse —
+	// the outbound encoder replays them verbatim (buildReasoningItem spreads
+	// the persisted item to preserve encrypted reasoning round-trips).
+	.loose();
 
 const functionCallItemSchema = z.object({
 	type: z.literal("function_call"),

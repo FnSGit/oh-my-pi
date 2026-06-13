@@ -199,7 +199,24 @@ export class Patcher {
 		}
 
 		const results: PatchSectionResult[] = [];
-		for (const entry of prepared) results.push(await this.commit(entry));
+		for (let index = 0; index < prepared.length; index++) {
+			try {
+				results.push(await this.commit(prepared[index]));
+			} catch (error) {
+				// A mid-batch write failure leaves earlier sections on disk with no
+				// rollback; report exactly which sections landed so the caller can
+				// re-issue only the missing ones instead of double-applying.
+				const written = prepared.slice(0, index).map(entry => entry.section.path);
+				const notWritten = prepared.slice(index + 1).map(entry => entry.section.path);
+				const message = error instanceof Error ? error.message : String(error);
+				throw new Error(
+					`Failed to write ${prepared[index].section.path}: ${message}` +
+						(written.length > 0 ? ` Sections already written: ${written.join(", ")}.` : "") +
+						(notWritten.length > 0 ? ` Sections not written: ${notWritten.join(", ")}.` : ""),
+					{ cause: error },
+				);
+			}
+		}
 		return { sections: results };
 	}
 
@@ -363,6 +380,7 @@ export class Patcher {
 		// When a block edit needs the tagged snapshot but it is unavailable, the
 		// range cannot be placed safely — reject with a MismatchError (re-read).
 		const blockResolutions: BlockResolution[] = [];
+		const resolveWarnings: string[] = [];
 		let resolved: readonly Edit[] = edits;
 		if (hasBlockEdit(edits)) {
 			const baseText =
@@ -373,8 +391,13 @@ export class Patcher {
 			resolved = resolveBlockEdits(edits, baseText, section.path, this.blockResolver, {
 				onUnresolved: "throw",
 				onResolved: resolution => blockResolutions.push(resolution),
+				onWarning: warning => resolveWarnings.push(warning),
 			});
 		}
+		const withResolveWarnings = (result: ApplyResult): ApplyResult =>
+			resolveWarnings.length === 0
+				? result
+				: { ...result, warnings: [...resolveWarnings, ...(result.warnings ?? [])] };
 
 		// No tag, or the tag still names the live content: an edit anchored at any
 		// line is safe to apply, and the resolved block spans line up with what
@@ -382,7 +405,7 @@ export class Patcher {
 		// recovery below, where line numbers shift, so resolutions are dropped.)
 		if (expected === undefined || liveMatches) {
 			const result = applyEdits(normalized, resolved);
-			return blockResolutions.length > 0 ? { ...result, blockResolutions } : result;
+			return withResolveWarnings(blockResolutions.length > 0 ? { ...result, blockResolutions } : result);
 		}
 		// Head/tail-only inserts are position-stable: "start"/"end" cannot move
 		// with content drift, so a stale tag is non-fatal. Apply onto the live
@@ -390,7 +413,7 @@ export class Patcher {
 		// mismatch, which cannot be safely relocated and must reject.
 		if (!hasAnchorScopedEdit(resolved)) {
 			const result = applyEdits(normalized, resolved);
-			return { ...result, warnings: [HEADTAIL_DRIFT_WARNING, ...(result.warnings ?? [])] };
+			return withResolveWarnings({ ...result, warnings: [HEADTAIL_DRIFT_WARNING, ...(result.warnings ?? [])] });
 		}
 		// File drifted: try to replay the edit against the version the tag
 		// names and 3-way-merge it onto the live content.
@@ -400,7 +423,7 @@ export class Patcher {
 			fileHash: expected,
 			edits: resolved,
 		});
-		if (recovered) return recoveryToApplyResult(recovered);
+		if (recovered) return withResolveWarnings(recoveryToApplyResult(recovered));
 		const hashRecognized = this.snapshots.byHash(canonicalPath, expected) !== null;
 		throw this.#mismatchError(section, canonicalPath, normalized, expected, hashRecognized);
 	}

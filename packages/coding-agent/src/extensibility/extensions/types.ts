@@ -22,6 +22,7 @@ import type {
 	Context,
 	ImageContent,
 	Model,
+	ModelSpec,
 	ProviderResponseMetadata,
 	SimpleStreamOptions,
 	Static,
@@ -29,16 +30,17 @@ import type {
 	TSchema,
 } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
-import type * as piCodingAgent from "@oh-my-pi/pi-coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type * as Zod from "zod/v4";
+import type { z } from "zod/v4";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
+import type * as PiCodingAgent from "../../index";
+import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
 import type { CustomMessage } from "../../session/messages";
@@ -318,6 +320,8 @@ export interface ExtensionContext {
 	shutdown(): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string[];
+	/** Structured memory runtime for status/search/save across the configured backend. */
+	memory?: MemoryRuntimeContext;
 }
 
 /**
@@ -886,10 +890,10 @@ export interface ExtensionAPI {
 	typebox: typeof TypeBox;
 
 	/** Injected zod module for Zod-authored extension tools (canonical going forward). */
-	zod: typeof Zod;
+	zod: typeof z;
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
-	pi: typeof piCodingAgent;
+	pi: typeof PiCodingAgent;
 
 	// =========================================================================
 	// Event Subscription
@@ -1081,7 +1085,7 @@ export interface ExtensionAPI {
 	 *       id: "claude-sonnet-4@20250514",
 	 *       name: "Claude Sonnet 4 (Vertex)",
 	 *       reasoning: true,
-	 *       thinking: { mode: "anthropic-adaptive", minLevel: "minimal", maxLevel: "high" },
+	 *       thinking: { mode: "anthropic-adaptive", efforts: ["minimal", "low", "medium", "high"] },
 	 *       input: ["text", "image"],
 	 *       cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
 	 *       contextWindow: 200000,
@@ -1168,7 +1172,7 @@ export interface ProviderModelConfig {
 	/** Custom headers for this model. */
 	headers?: Record<string, string>;
 	/** OpenAI compatibility settings. */
-	compat?: Model<Api>["compat"];
+	compat?: ModelSpec<Api>["compat"];
 }
 
 /** Extension factory function type. Supports both sync and async initialization. */

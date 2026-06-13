@@ -136,7 +136,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV15_10_8(): void
+export declare function __piNativesV15_12_3(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -751,6 +751,12 @@ export interface GrepOptions {
   maxColumns?: number
   /** Output mode (content, filesWithMatches, or count). */
   mode?: GrepOutputMode
+  /**
+   * Maximum matches collected per file (content mode). Keeps one hot file
+   * from exhausting the global `max_count` budget before other files are
+   * reached.
+   */
+  maxCountPerFile?: number
   /** Abort signal for cancelling the operation. */
   signal?: unknown
   /** Timeout in milliseconds for the operation. */
@@ -782,6 +788,8 @@ export interface GrepResult {
   filesSearched: number
   /** Whether the limit/offset stopped the search early. */
   limitReached?: boolean
+  /** Number of files skipped because they exceed the size limit. */
+  skippedOversized?: number
 }
 
 /**
@@ -1131,6 +1139,18 @@ export interface MinimizerOptions {
    * the raw, un-minimized output. Default 4 MiB.
    */
   maxCaptureBytes?: number
+  /**
+   * Source-outline level for `cat <source-file>` minimization. Accepts
+   * `"default"` (current behavior) or `"aggressive"` (strip function bodies).
+   */
+  sourceOutlineLevel?: string
+  /**
+   * Kill-switch to fall back to the pre-PR (legacy) filter behavior for
+   * grep / find / pytest. When `Some(true)`, filters that opted into the
+   * always-shrink Tier 1 / Tier 2 behavior skip the new code path. When
+   * `None`, defers to the `OMP_MINIMIZER_LEGACY_FILTERS` env var.
+   */
+  legacyFilters?: boolean
 }
 
 /**
@@ -1265,6 +1285,26 @@ export interface PtyStartOptions {
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
 
 /**
+ * Render one snapcompact frame: print pre-normalized text onto a
+ * `size`-wide bitmap and encode it as PNG.
+ *
+ * The bitmap height hugs the rows the text actually occupies
+ * (`usedRows * lineRepeat * cellHeight`), so a partially filled frame never
+ * pays for blank padding rows. The glyph grid holds `floor(size/cellWidth) *
+ * floor(size/cellHeight/lineRepeat)` characters; input beyond that is ignored
+ * (the caller chunks text to capacity). Native-cell shapes encode as 4-bit
+ * indexed PNG; stretched shapes (target cell != font cell) encode as RGB.
+ * `stretch: false` pins the indexed path, printing natural-size glyphs on the
+ * requested cell box; `columns: 2` flows pre-wrapped newline-separated lines
+ * down two newspaper columns. `U+000E`/`U+000F` in `text` toggle dim-gray ink
+ * spans without occupying a cell.
+ * Returns the PNG encoded as base64, created as a one-byte (Latin-1) JS
+ * string straight from native code — no `Uint8Array` hop or JS-side
+ * re-encode.
+ */
+export declare function renderSnapcompactPng(text: string, options: SnapcompactRenderOptions): string
+
+/**
  * Search content for a pattern (one-shot, compiles pattern each time).
  * For repeated searches with the same pattern, use [`grep`] with file filters.
  *
@@ -1392,6 +1432,51 @@ export interface SliceResult {
  * width.
  */
 export declare function sliceWithWidth(line: string, startCol: number, length: number, strict: boolean | undefined | null, tabWidth: number): SliceResult
+
+/** Shape options for one snapcompact frame. */
+export interface SnapcompactRenderOptions {
+  /**
+   * Frame width in pixels; also bounds the grid rows
+   * (`floor(size/cellHeight/lineRepeat)`). Output height hugs the rows the
+   * text actually uses instead of padding to a square.
+   */
+  size: number
+  /**
+   * Bundled font: `"5x8"`, `"6x12"`, `"8x13"` (X.org BDF) or `"8x8"`
+   * (unscii-8). Default `"5x8"`.
+   */
+  font?: string
+  /**
+   * Target cell advance in pixels. Differing from the font's natural cell
+   * triggers the Lanczos stretch path. Default: font natural width.
+   */
+  cellWidth?: number
+  /** Target cell pitch in pixels. Default: font natural height. */
+  cellHeight?: number
+  /**
+   * Ink variant: `"sent"` (six-hue sentence cycling) or `"bw"` (black).
+   * Default `"sent"`.
+   */
+  variant?: string
+  /**
+   * Print each text line this many times; copies after the first sit on a
+   * pale highlight band. Default 1.
+   */
+  lineRepeat?: number
+  /**
+   * Stretch behavior. Unset: auto — Lanczos-stretch whenever the target
+   * cell differs from the font's natural cell. `false`: never stretch —
+   * render indexed with glyphs at natural size on the requested cell box
+   * (e.g. 8x13 glyphs on an 8x16 pitch, the "8on16" shapes). `true`: force
+   * the stretch path (identical to auto; natural cells render indexed).
+   */
+  stretch?: boolean
+  /**
+   * Layout columns: `1` (default) row-major grid; `2` two newspaper "doc"
+   * columns of pre-wrapped newline-separated lines.
+   */
+  columns?: number
+}
 
 export declare function summarizeCode(options: SummaryOptions): SummaryResult
 

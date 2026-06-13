@@ -1,11 +1,4 @@
 import { $env, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
-import { AzureOpenAI, APIConnectionTimeoutError as OpenAIConnectionTimeoutError } from "openai";
-import type {
-	Tool as OpenAITool,
-	ResponseCreateParamsStreaming,
-	ResponseInput,
-	ResponseStreamEvent,
-} from "openai/resources/responses/responses";
 import { getEnvApiKey } from "../stream";
 import type {
 	AssistantMessage,
@@ -27,10 +20,10 @@ import {
 	getOpenAIStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
+import { postOpenAIStream } from "../utils/openai-http";
 import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
-import { notifyRawSseEvent } from "../utils/sse-debug";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
-import { normalizeOpenAIResponsesPromptCacheKey, supportsDeveloperRole } from "./openai-responses";
+import { getOpenAIResponsesCacheSessionId } from "./openai-responses";
 import {
 	appendResponsesToolResultMessages,
 	applyCommonResponsesSamplingParams,
@@ -43,13 +36,19 @@ import {
 	processResponsesStream,
 	repairOrphanResponsesToolCalls,
 } from "./openai-responses-shared";
+import type {
+	Tool as OpenAITool,
+	ResponseCreateParamsStreaming,
+	ResponseInput,
+	ResponseStreamEvent,
+} from "./openai-responses-wire";
 import { transformMessages } from "./transform-messages";
 
 const DEFAULT_AZURE_API_VERSION = "v1";
 const AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"Azure OpenAI responses stream timed out while waiting for the first event";
 
-function parseDeploymentNameMap(value: string | undefined): Map<string, string> {
+export function parseAzureDeploymentNameMap(value: string | undefined): Map<string, string> {
 	const map = new Map<string, string>();
 	if (!value) return map;
 	for (const entry of value.split(",")) {
@@ -66,7 +65,7 @@ function resolveDeploymentName(model: Model<"azure-openai-responses">, options?:
 	if (options?.azureDeploymentName) {
 		return options.azureDeploymentName;
 	}
-	const mappedDeployment = parseDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(model.id);
+	const mappedDeployment = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(model.id);
 	return mappedDeployment ?? model.id;
 }
 
@@ -89,18 +88,6 @@ type AzureOpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 	presence_penalty?: number;
 	repetition_penalty?: number;
 };
-
-async function* observeDecodedAzureResponsesEvents(
-	events: AsyncIterable<ResponseStreamEvent>,
-	observer: (event: RawSseEvent) => void,
-): AsyncGenerator<ResponseStreamEvent> {
-	for await (const event of events) {
-		const data = JSON.stringify(event);
-		// Reconstructed from decoded SDK event; not literal wire bytes.
-		notifyRawSseEvent(observer, { event: event.type, data, raw: [`event: ${event.type}`, `data: ${data}`] });
-		yield event;
-	}
-}
 
 /**
  * Generate function for Azure OpenAI Responses API
@@ -128,14 +115,31 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 		const firstEventTimeoutAbortError = new Error(AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE);
 		const { requestAbortController, requestSignal } = abortTracker;
 		const onSseEvent = options?.onSseEvent;
-		const rawSseObserver = onSseEvent ? (event: RawSseEvent) => onSseEvent(event, model) : undefined;
+		const rawSseObserver = onSseEvent
+			? (event: RawSseEvent) => {
+					if (!event.event && event.data && event.data !== "[DONE]") {
+						try {
+							const parsed = JSON.parse(event.data);
+							const resolvedEvent =
+								typeof parsed.type === "string"
+									? parsed.type
+									: typeof parsed.object === "string"
+										? parsed.object
+										: null;
+							if (resolvedEvent) {
+								event.event = resolvedEvent;
+								event.raw = [`event: ${resolvedEvent}`, ...event.raw];
+							}
+						} catch {}
+					}
+					onSseEvent(event, model);
+				}
+			: undefined;
 
 		try {
-			// Create Azure OpenAI client
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const client = createClient(model, apiKey, options);
-			const { baseUrl } = resolveAzureConfig(model, options);
-			const params = buildParams(model, context, options, deploymentName, baseUrl);
+			const { url, headers } = buildAzureResponsesRequest(model, apiKey, options);
+			const params = buildParams(model, context, options, deploymentName);
 			options?.onPayload?.(params);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
 			const firstEventTimeoutMs =
@@ -147,7 +151,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				api: output.api,
 				model: model.id,
 				method: "POST",
-				url: `${baseUrl}/responses`,
+				url,
 				body: params,
 			};
 			let requestTimeout: NodeJS.Timeout | undefined;
@@ -156,16 +160,21 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			}
 			let openaiStream: AsyncIterable<ResponseStreamEvent>;
 			try {
-				const requestOptions =
-					requestTimeoutMs === undefined
-						? { signal: requestSignal }
-						: { signal: requestSignal, timeout: requestTimeoutMs };
-				openaiStream = await client.responses.create(params, requestOptions);
-			} catch (error) {
-				if (error instanceof OpenAIConnectionTimeoutError && !abortTracker.wasCallerAbort()) {
-					throw firstEventTimeoutAbortError;
+				const headersWithTimeout = { ...headers };
+				if (requestTimeoutMs !== undefined) {
+					headersWithTimeout["X-Stainless-Timeout"] = Math.floor(requestTimeoutMs / 1000).toString();
 				}
-				throw error;
+				const handle = await postOpenAIStream<ResponseStreamEvent>({
+					url,
+					headers: headersWithTimeout,
+					body: params,
+					signal: requestSignal,
+					fetch: options?.fetch,
+					// Watchdog armed → no retries, so they cannot silently extend the deadline.
+					maxAttempts: requestTimeoutMs !== undefined ? 1 : undefined,
+					onSseEvent: rawSseObserver,
+				});
+				openaiStream = handle.events;
 			} finally {
 				if (requestTimeout !== undefined) clearTimeout(requestTimeout);
 			}
@@ -181,12 +190,13 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				abortSignal: options?.signal,
 				isProgressItem: isOpenAIResponsesProgressEvent,
 			});
-			const observedOpenaiStream = rawSseObserver
-				? observeDecodedAzureResponsesEvents(timedOpenaiStream, rawSseObserver)
-				: timedOpenaiStream;
-			await processResponsesStream(observedOpenaiStream, output, stream, model, {
+			let sawCompleted = false;
+			await processResponsesStream(timedOpenaiStream, output, stream, model, {
 				onFirstToken: () => {
 					if (!firstTokenTime) firstTokenTime = Date.now();
+				},
+				onCompleted: () => {
+					sawCompleted = true;
 				},
 			});
 
@@ -197,6 +207,10 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 
 			if (abortTracker.wasCallerAbort()) {
 				throw new Error("Request was aborted");
+			}
+
+			if (!sawCompleted) {
+				throw new Error("Azure OpenAI responses stream closed before response.completed was received");
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
@@ -262,7 +276,20 @@ function resolveAzureConfig(
 	};
 }
 
-function createClient(model: Model<"azure-openai-responses">, apiKey: string, options?: AzureOpenAIResponsesOptions) {
+/**
+ * Replicates the `AzureOpenAI` SDK client's request shape for `/responses`:
+ * a string api key becomes a single `api-key` header (azure.mjs `authHeaders`;
+ * never `Authorization: Bearer`), `api-version` rides as a query parameter
+ * (azure.mjs constructor `defaultQuery`), and `/responses` is not a
+ * deployment-scoped path, so no `/deployments/{model}` URL rewriting applies.
+ * Custom model/options headers may override the auth header, matching the SDK's
+ * `buildHeaders` precedence.
+ */
+function buildAzureResponsesRequest(
+	model: Model<"azure-openai-responses">,
+	apiKey: string,
+	options?: AzureOpenAIResponsesOptions,
+): { url: string; headers: Record<string, string> } {
 	if (!apiKey) {
 		const envKey = $env.AZURE_OPENAI_API_KEY;
 		if (!envKey) {
@@ -273,24 +300,17 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 		apiKey = envKey;
 	}
 
-	const headers = { ...(model.headers ?? {}) };
-
+	const headers: Record<string, string> = { "api-key": apiKey, ...(model.headers ?? {}) };
 	if (options?.headers) {
 		Object.assign(headers, options.headers);
 	}
 
 	const { baseUrl, apiVersion } = resolveAzureConfig(model, options);
 
-	const baseFetch = options?.fetch ?? fetch;
-	return new AzureOpenAI({
-		apiKey,
-		apiVersion,
-		dangerouslyAllowBrowser: true,
-		maxRetries: 5,
-		defaultHeaders: headers,
-		baseURL: baseUrl,
-		fetch: baseFetch,
-	});
+	return {
+		url: `${baseUrl}/responses?api-version=${encodeURIComponent(apiVersion)}`,
+		headers,
+	};
 }
 
 function buildParams(
@@ -298,15 +318,17 @@ function buildParams(
 	context: Context,
 	options: AzureOpenAIResponsesOptions | undefined,
 	deploymentName: string,
-	resolvedBaseUrl?: string,
 ) {
-	const messages = convertMessages(model, context, true, resolvedBaseUrl);
+	const messages = convertMessages(model, context, true);
 
 	const params: AzureOpenAIResponsesSamplingParams = {
 		model: deploymentName,
 		input: messages,
 		stream: true,
-		prompt_cache_key: normalizeOpenAIResponsesPromptCacheKey(options?.promptCacheKey ?? options?.sessionId),
+		prompt_cache_key: getOpenAIResponsesCacheSessionId(options),
+		// Encrypted reasoning replay (applyResponsesReasoningParams) requires
+		// stateless responses, matching the openai provider.
+		store: false,
 	};
 
 	applyCommonResponsesSamplingParams(params, options, model);
@@ -327,15 +349,15 @@ function convertMessages(
 	model: Model<"azure-openai-responses">,
 	context: Context,
 	strictResponsesPairing: boolean,
-	resolvedBaseUrl?: string,
 ): ResponseInput {
 	const messages: ResponseInput = [];
 	const transformedMessages = transformMessages(context.messages, model, normalizeResponsesToolCallIdForTransform);
 	const knownCallIds = new Set<string>();
+	const customCallIds = new Set<string>();
 
 	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
 	if (systemPrompts.length > 0) {
-		const role = model.reasoning && supportsDeveloperRole(resolvedBaseUrl ?? model) ? "developer" : "system";
+		const role = model.reasoning && model.compat.supportsDeveloperRole ? "developer" : "system";
 		for (const systemPrompt of systemPrompts) {
 			messages.push({ role, content: systemPrompt });
 		}
@@ -351,11 +373,18 @@ function convertMessages(
 				content: msg.role === "developer" && typeof msg.content === "string" ? msg.content.toWellFormed() : content,
 			});
 		} else if (msg.role === "assistant") {
-			const outputItems = convertResponsesAssistantMessage(msg as AssistantMessage, model, msgIndex, knownCallIds);
+			const outputItems = convertResponsesAssistantMessage(
+				msg as AssistantMessage,
+				model,
+				msgIndex,
+				knownCallIds,
+				true,
+				customCallIds,
+			);
 			if (outputItems.length === 0) continue;
 			messages.push(...outputItems);
 		} else if (msg.role === "toolResult") {
-			appendResponsesToolResultMessages(messages, msg, model, strictResponsesPairing, knownCallIds);
+			appendResponsesToolResultMessages(messages, msg, model, strictResponsesPairing, knownCallIds, customCallIds);
 		}
 		msgIndex++;
 	}

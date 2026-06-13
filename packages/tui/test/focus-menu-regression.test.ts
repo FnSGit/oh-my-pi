@@ -1,12 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { type Component, CURSOR_MARKER, type Focusable, TERMINAL, TUI } from "@oh-my-pi/pi-tui";
+import { type Component, CURSOR_MARKER, type Focusable, TUI } from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "./virtual-terminal";
-
-class UnknownViewportTerminal extends VirtualTerminal {
-	isNativeViewportAtBottom(): undefined {
-		return undefined;
-	}
-}
 
 class FocusToken implements Component, Focusable {
 	focused = false;
@@ -46,10 +40,7 @@ class MenuFrame implements Component {
 
 describe("focus-changing menu teardown", () => {
 	it("repaints stale menu and working rows on ED3-risk terminals without a viewport oracle", async () => {
-		const previousRisk = TERMINAL.eagerEraseScrollbackRisk;
-		TERMINAL.eagerEraseScrollbackRisk = true;
-
-		const term = new UnknownViewportTerminal(30, 6, 1000);
+		const term = new VirtualTerminal(30, 6, 1000);
 		const tui = new TUI(term, true);
 		const editor = new FocusToken();
 		const menu = new FocusToken();
@@ -62,18 +53,16 @@ describe("focus-changing menu teardown", () => {
 			await term.waitForRender();
 
 			frame.working = true;
-			tui.setEagerNativeScrollbackRebuild(true);
-			tui.requestRender(false, { allowUnknownViewportMutation: true });
+			tui.requestRender();
 			await term.waitForRender();
 
 			frame.menuOpen = true;
 			tui.setFocus(menu);
-			tui.requestRender(false, { allowUnknownViewportMutation: true });
+			tui.requestRender();
 			await term.waitForRender();
 
 			frame.working = false;
 			tui.requestRender();
-			tui.setEagerNativeScrollbackRebuild(false);
 			await term.waitForRender();
 
 			frame.menuOpen = false;
@@ -81,11 +70,17 @@ describe("focus-changing menu teardown", () => {
 			tui.requestRender();
 			await term.waitForRender();
 
+			// The menu rows were committed to history while the menu was tall;
+			// closing it resyncs the commit index at the divergence (stale menu
+			// stays in scrollback). The focused cursor tail is shorter than the
+			// viewport, so the window re-anchors at the frame tail instead of
+			// pinning "prompt" at the top with blank rows underneath —
+			// "assistant" is re-shown on the grid (its committed copy stays in
+			// scrollback; duplication, never loss).
 			expect(term.getViewport().map(line => line.trimEnd())).toEqual(["assistant", "prompt", "", "", "", ""]);
 			expect(term.getCursor()).toEqual({ row: 1, col: 6 });
 		} finally {
 			tui.stop();
-			TERMINAL.eagerEraseScrollbackRisk = previousRisk;
 		}
 	});
 });

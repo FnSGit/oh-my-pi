@@ -3,17 +3,20 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Usage } from "@oh-my-pi/pi-ai";
+import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import type { HookSelectorSlider } from "@oh-my-pi/pi-coding-agent/modes/components/hook-selector";
+import type { PlanReviewOverlay } from "@oh-my-pi/pi-coding-agent/modes/components/plan-review-overlay";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { setKeybindings } from "@oh-my-pi/pi-tui";
 import { formatNumber, TempDir } from "@oh-my-pi/pi-utils";
 
 /**
@@ -109,7 +112,69 @@ describe("InteractiveMode plan review rendering", () => {
 		await currentSession?.dispose();
 		currentAuthStorage?.close();
 		currentTempDir?.removeSync();
+		setKeybindings(KeybindingsManager.inMemory());
 		resetSettingsForTest();
+	});
+
+	it("exits empty plan mode without confirmation", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "\n\t\n");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		const confirm = vi.spyOn(mode, "showHookConfirm");
+
+		await mode.handlePlanModeCommand();
+
+		expect(confirm).not.toHaveBeenCalled();
+		expect(mode.planModeEnabled).toBe(false);
+		expect(mode.planModePaused).toBe(true);
+	});
+
+	it("keeps confirmation before exiting a non-empty plan", async () => {
+		const planFilePath = "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the thing.\n");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = planFilePath;
+		const confirm = vi.spyOn(mode, "showHookConfirm").mockResolvedValue(false);
+
+		await mode.handlePlanModeCommand();
+
+		expect(confirm).toHaveBeenCalledWith("Exit plan mode?", "This exits plan mode without approving a plan.");
+		expect(mode.planModeEnabled).toBe(true);
+	});
+
+	it("keeps confirmation when a slug plan file exists", async () => {
+		const defaultPlanFilePath = "local://PLAN.md";
+		const slugPlanFilePath = "local://auth-token-refresh-plan.md";
+		const defaultPlanPath = resolveLocalUrlToPath(defaultPlanFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		const slugPlanPath = resolveLocalUrlToPath(slugPlanFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(defaultPlanPath, "\n");
+		await Bun.write(slugPlanPath, "# Auth token refresh plan\n\nDo the thing.\n");
+
+		mode.planModeEnabled = true;
+		mode.planModePlanFilePath = defaultPlanFilePath;
+		const confirm = vi.spyOn(mode, "showHookConfirm").mockResolvedValue(false);
+
+		await mode.handlePlanModeCommand();
+
+		expect(confirm).toHaveBeenCalledWith("Exit plan mode?", "This exits plan mode without approving a plan.");
+		expect(mode.planModeEnabled).toBe(true);
 	});
 
 	it("forwards each submitted plan to the review overlay", async () => {
@@ -176,6 +241,63 @@ describe("InteractiveMode plan review rendering", () => {
 
 		expect(startSpy).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("needs detail") }));
 		expect(onInput).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens the annotation external editor from the real plan review overlay", async () => {
+		const editorPath = path.join(tempDir.path(), "annotation-editor.sh");
+		await Bun.write(
+			editorPath,
+			"#!/bin/sh\nprintf '%s\\n%s\\n' '- add rollback command' '- include smoke test' > \"$1\"\n",
+		);
+		await fs.chmod(editorPath, 0o755);
+		const previousEditor = Bun.env.EDITOR;
+		const previousVisual = Bun.env.VISUAL;
+		const keybindings = KeybindingsManager.inMemory({
+			"app.editor.external": "ctrl+e",
+			"tui.select.cancel": "ctrl+g",
+		});
+		mode.keybindings = keybindings;
+		setKeybindings(keybindings);
+		let capturedOverlay: PlanReviewOverlay | undefined;
+		vi.spyOn(mode.ui, "showOverlay").mockImplementation(component => {
+			capturedOverlay = component as PlanReviewOverlay;
+			return { hide: vi.fn() } as never;
+		});
+		let feedback = "";
+
+		try {
+			Bun.env.EDITOR = editorPath;
+			delete Bun.env.VISUAL;
+			const choice = mode.showPlanReview(
+				"# Plan\n\nIntro\n\n## Rollout\n\nSteps\n\n## Verify\n\nChecks\n",
+				"Plan mode - next step",
+				["Approve and execute", "Refine plan"],
+				{ onFeedbackChange: value => (feedback = value) },
+			);
+
+			expect(capturedOverlay).toBeDefined();
+			const overlay = capturedOverlay!;
+			overlay.render(80);
+			overlay.handleInput("\t"); // -> toc (Rollout)
+			overlay.handleInput("a");
+			for (const ch of "draft") overlay.handleInput(ch);
+			overlay.handleInput("\x05"); // ctrl+e
+			for (let i = 0; i < 50 && !feedback.includes("- include smoke test"); i++) {
+				await Bun.sleep(10);
+			}
+			expect(feedback).toContain("## Rollout\n```md\n- add rollback command\n- include smoke test\n```");
+
+			overlay.handleInput("\x1b[B"); // Rollout -> Verify
+			overlay.handleInput("\x1b[B"); // toc -> actions
+			overlay.handleInput("\x1b[B"); // select Refine plan
+			overlay.handleInput("\r");
+			expect(await choice).toBe("Refine plan");
+		} finally {
+			if (previousEditor === undefined) delete Bun.env.EDITOR;
+			else Bun.env.EDITOR = previousEditor;
+			if (previousVisual === undefined) delete Bun.env.VISUAL;
+			else Bun.env.VISUAL = previousVisual;
+		}
 	});
 
 	it("Refine with no annotations does not re-prompt the model", async () => {

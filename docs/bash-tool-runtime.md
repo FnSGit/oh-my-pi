@@ -95,11 +95,14 @@ That means print mode and non-UI RPC/tool contexts always use non-PTY.
 - configured command prefix,
 - snapshot path,
 - serialized shell env,
-- optional agent session key.
+- optional agent session key,
+- minimizer configuration.
 
 Session-level bang-command executions pass `sessionKey: this.sessionId`.
 
 Tool-call executions pass `sessionKey: this.session.getSessionId?.()`, when available. In both surfaces, a session key isolates shell reuse per session; without one, reuse falls back to shell config/snapshot/env.
+
+Concurrent calls never share one `Shell`: the native session runs one command at a time and `Shell.abort()` kills every in-flight run on it. `executeBash()` tracks in-flight keys in `shellSessionsInUse`; while a key is busy, overlapping calls skip the cache and run through one-shot `executeShell()` (same isolation as quarantined sessions). Only the owning call releases the in-use flag or deletes the cached session in its `finally`.
 
 ## Shell config and snapshot behavior
 

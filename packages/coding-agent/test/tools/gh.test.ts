@@ -13,7 +13,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import { getAgentDir, hashPath, setAgentDir } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 
 // Isolate every `git` invocation in this file from the developer's host
 // configuration. The fixture spawns dozens of git subprocesses against tiny
@@ -459,7 +459,8 @@ describe("github tool", () => {
 
 	it("parseSearchDateBound: passes ISO dates through and normalizes ISO datetimes", () => {
 		expect(parseSearchDateBound("2026-05-01")).toBe("2026-05-01");
-		expect(parseSearchDateBound("2026-05-01T08:30:00Z")).toBe("2026-05-01T08:30:00.000Z");
+		expect(parseSearchDateBound("2026-05-01T08:30:00Z")).toBe("2026-05-01T08:30:00Z");
+		expect(parseSearchDateBound("2026-05-01T08:30:00.250Z")).toBe("2026-05-01T08:30:00Z");
 	});
 
 	it("parseSearchDateBound: rejects unparseable input", () => {

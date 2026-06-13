@@ -1,4 +1,5 @@
-import { describe, expect, it, type Mock, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext, SubmittedUserInput } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -16,6 +17,7 @@ type FakeEditor = {
 	onCycleModelBackward?: () => void;
 	onSelectModelTemporary?: () => void;
 	onSelectModel?: () => void;
+	onLeftAtStart?: () => void;
 	onHistorySearch?: () => void;
 	onPasteImage?: () => void;
 	onCopyPrompt?: () => void;
@@ -65,8 +67,10 @@ function createContext(): {
 		onInputCallback: Spy;
 		prompt: Spy;
 		requestRender: Spy;
+		resetDisplay: Spy;
 		startPendingSubmission: StartPendingSubmissionSpy;
 	};
+	inputListeners: Array<(data: string) => { consume?: boolean; data?: string } | undefined>;
 } {
 	let editorText = "";
 	const abort = vi.fn();
@@ -76,13 +80,15 @@ function createContext(): {
 	const cancelPendingSubmission = vi.fn(() => false);
 	const clearQueue = vi.fn(() => ({ steering: [], followUp: [] }));
 	const onInputCallback = vi.fn();
-	const prompt = vi.fn();
 	const requestRender = vi.fn();
+	const resetDisplay = vi.fn();
+	const inputListeners: Array<(data: string) => { consume?: boolean; data?: string } | undefined> = [];
 	const handleBtwCommand = vi.fn(async () => {});
 	const handleBtwEscape = vi.fn(() => true);
 	const hasActiveBtw = vi.fn(() => false);
 	const handleOmfgEscape = vi.fn(() => true);
 	const hasActiveOmfg = vi.fn(() => false);
+	const prompt = vi.fn();
 	const startPendingSubmission = vi.fn(
 		(input: {
 			text: string;
@@ -115,7 +121,11 @@ function createContext(): {
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: {
 			requestRender,
-			addInputListener: vi.fn(),
+			resetDisplay,
+			addInputListener: vi.fn(listener => {
+				inputListeners.push(listener as (data: string) => { consume?: boolean; data?: string } | undefined);
+				return () => {};
+			}),
 			addStartListener: vi.fn(),
 		} as unknown as InteractiveModeContext["ui"],
 		loadingAnimation: undefined,
@@ -163,7 +173,9 @@ function createContext(): {
 		updateEditorBorderColor: vi.fn(),
 		showDebugSelector: vi.fn(),
 		toggleTodoExpansion: vi.fn(),
-		handleHotkeysCommand: vi.fn(),
+		showAgentHub: vi.fn(),
+		unfocusSession: vi.fn(async () => {}),
+		focusParentSession: vi.fn(async () => {}),
 		handleSTTToggle: vi.fn(),
 		handleBtwEscape,
 		handleBtwCommand,
@@ -194,10 +206,19 @@ function createContext(): {
 			onInputCallback,
 			prompt,
 			requestRender,
+			resetDisplay,
 			startPendingSubmission,
 		},
+		inputListeners,
 	};
 }
+beforeEach(async () => {
+	await Settings.init({ inMemory: true });
+});
+
+afterEach(() => {
+	resetSettingsForTest();
+});
 
 describe("InputController escape behavior", () => {
 	it("prefers canceling a pending optimistic submission before aborting the session", async () => {
@@ -335,5 +356,87 @@ describe("InputController escape behavior", () => {
 		expect(spies.cancelPendingSubmission).not.toHaveBeenCalled();
 		expect(spies.clearQueue).not.toHaveBeenCalled();
 		expect(spies.abort).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns focused subagent view to main on Esc instead of aborting", () => {
+		const { ctx, editor, spies } = createContext();
+		Object.defineProperty(ctx, "focusedAgentId", { value: "Worker", configurable: true });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(ctx.unfocusSession).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+	});
+
+	it("routes focused left-left through the global input listener like Esc", () => {
+		const { ctx, inputListeners } = createContext();
+		Object.defineProperty(ctx, "focusedAgentId", { value: "Worker", configurable: true });
+		ctx.lastLeftTapTime = Date.now();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = inputListeners[0]("\x1b[D");
+
+		expect(result).toEqual({ consume: true });
+
+		expect(ctx.unfocusSession).toHaveBeenCalledTimes(1);
+		expect(ctx.focusParentSession).not.toHaveBeenCalled();
+	});
+	it("opens the tree selector and clears the display on default double-Esc", () => {
+		const { ctx, editor, spies } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(ctx.showTreeSelector).toHaveBeenCalledTimes(1);
+		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+		expect(spies.resetDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens the message selector and clears the display when double-Esc is configured for branch", () => {
+		Settings.instance.override("doubleEscapeAction", "branch");
+		const { ctx, editor, spies } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+		expect(spies.resetDisplay).toHaveBeenCalledTimes(1);
+	});
+	it("clears typed editor text on Esc without opening selectors or aborting", () => {
+		const { ctx, editor, spies } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft message");
+		editor.onEscape?.();
+
+		expect(editor.getText()).toBe("");
+		expect(spies.requestRender).toHaveBeenCalledTimes(1);
+		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+		expect(spies.resetDisplay).not.toHaveBeenCalled();
+		expect(spies.abort).not.toHaveBeenCalled();
+	});
+
+	it("does not treat the Esc after a text-clearing Esc as a double-Esc", () => {
+		const { ctx, editor } = createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.(); // empty editor: arms double-Esc timer
+		editor.setText("draft");
+		editor.onEscape?.(); // clears text, must also reset the timer
+		editor.onEscape?.(); // empty again: should only re-arm, not trigger
+
+		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
 	});
 });

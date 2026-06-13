@@ -9,7 +9,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import {
 	type DapBreakpointRecord,
 	type DapCapabilities,
@@ -592,7 +592,7 @@ export const debugToolRenderer = {
 	): Component {
 		const outputBlock = new CachedOutputBlock();
 		return markFramedBlockComponent({
-			render(width: number): string[] {
+			render(width: number): readonly string[] {
 				const action = (args?.action ?? result.details?.action ?? "debug").replaceAll("_", " ");
 				const success = !options.isPartial && !result.isError;
 				const statusIcon = success
