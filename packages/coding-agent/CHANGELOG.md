@@ -67,6 +67,8 @@
 - Retries on the same model now stop after three consecutive generic aborts instead of spending the whole retry budget ([#18535](https://github.com/can1357/oh-my-pi/pull/18535) by [@nick-maderight](https://github.com/nick-maderight))
 - `lsp.formatOnWrite` no longer re-indents 2/4-space files at 1 space per level when they contain JSDoc/block comments or one-off odd indents, and no longer converts tab-indented files that open with a JSDoc block to spaces ([#18544](https://github.com/can1357/oh-my-pi/issues/18544))
 - Isolated task sandboxes now finish cleanup after a SIGHUP or other signal even when releasing them takes longer than the agent shutdown grace period ([#18519](https://github.com/can1357/oh-my-pi/issues/18519)).
+- Added `mnemopi.indexInjection` (with per-section quotas, line length, and token budget) so the Mnemopi backend can inject a compact pi-memory-style memory index into the system prompt, with id prefixes for follow-up `recall` or `memory://<id>` reads
+- Added `scripts/migrate-pi-memory.ts` to import pi-memory sidecars into Mnemopi shared/per-project banks, with a dry run, database backups, idempotent re-runs, and fresh embeddings
 
 ## [18.18.3] - 2026-11-09
 

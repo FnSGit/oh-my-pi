@@ -9,7 +9,14 @@ import { AnnotationStore } from "./annotations";
 import { BankManager } from "./banks";
 import { BeamMemory, initBeam } from "./beam/index";
 import { reconcileEmbeddingModel } from "./beam/store";
-import type { RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
+import type {
+	MemoryIndexEntry,
+	MemoryIndexOptions,
+	RecallEnhancedOptions,
+	RecallOptions,
+	RecallResult,
+	SleepResult,
+} from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
 import {
 	isPiAiModel,
@@ -499,6 +506,11 @@ export class Mnemopi {
 
 	getContext(limit = 10): unknown[] {
 		return this.#withRuntimeOptions("mnemopi.read", () => this.beam.getContext(limit));
+	}
+
+	/** Live rows for a compact prompt index; no embeddings or recall scoring. */
+	listIndex(options: MemoryIndexOptions = {}): MemoryIndexEntry[] {
+		return this.#withRuntimeOptions("mnemopi.read", () => this.beam.listIndex(options));
 	}
 
 	getStats(

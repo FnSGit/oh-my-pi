@@ -290,6 +290,31 @@ export type RecallResult = RecallRowFields & {
 	metadata?: Metadata;
 };
 
+/**
+ * One row of the compact memory index the coding agent injects into its
+ * system prompt. Index reads are intentionally lighter than recall: no
+ * embeddings, no scoring, just the most important live rows of a bank.
+ */
+export interface MemoryIndexEntry {
+	id: string;
+	content: string;
+	source: string | null;
+	timestamp: string | null;
+	importance: number;
+	memory_type: string | null;
+	veracity: string | null;
+	store: "working" | "episodic";
+	tier: number | null;
+}
+
+export interface MemoryIndexOptions {
+	limit?: number;
+	includeWorking?: boolean;
+	includeEpisodic?: boolean;
+	memoryType?: string | null;
+	minImportance?: number;
+}
+
 export interface BeamStats {
 	count: number;
 	by_source?: Record<string, number>;

@@ -45,6 +45,7 @@ import type {
 	MnemopiMemoryEditResult,
 	MnemopiRememberInput,
 	MnemopiRememberOptions,
+	MnemopiScopedIndexEntry,
 	MnemopiScopedMemoryHit,
 	MnemopiSessionStateApi,
 } from "../../mnemopi/state";
@@ -125,5 +126,7 @@ export type MnemopiSessionStateProtocol = {
 		string
 	>;
 	getScopedStats: RpcMethod<[], MnemopiBankStats[]>;
+	listScopedIndexEntries: RpcMethod<[options?: { limit?: number }], MnemopiScopedIndexEntry[]>;
+	formatScopedIndex: RpcMethod<[], string | undefined>;
 	consolidate: RpcMethod<[options?: MnemopiConsolidateOptions], void>;
 };

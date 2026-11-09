@@ -44,6 +44,7 @@ import type {
 	MnemopiMemoryEditResult,
 	MnemopiRememberInput,
 	MnemopiRememberOptions,
+	MnemopiScopedIndexEntry,
 	MnemopiScopedMemoryHit,
 	MnemopiSessionStateApi,
 } from "../../mnemopi/state";
@@ -279,6 +280,14 @@ export class RemoteMnemopiSessionState implements MnemopiSessionStateApi {
 
 	getScopedStats(): MnemopiBankStats[] {
 		return this.#remote.callSync("getScopedStats");
+	}
+
+	listScopedIndexEntries(options?: { limit?: number }): MnemopiScopedIndexEntry[] {
+		return this.#remote.callSync("listScopedIndexEntries", options);
+	}
+
+	formatScopedIndex(): string | undefined {
+		return this.#remote.callSync("formatScopedIndex");
 	}
 
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void> {

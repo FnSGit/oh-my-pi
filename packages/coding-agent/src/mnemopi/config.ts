@@ -17,6 +17,12 @@ import {
 	cfgMnemopiEmbeddingModel,
 	cfgMnemopiEmbeddingVariant,
 	cfgMnemopiEnhancedRecall,
+	cfgMnemopiIndexInjection,
+	cfgMnemopiIndexInjectionChars,
+	cfgMnemopiIndexInjectionKnowledge,
+	cfgMnemopiIndexInjectionPrefs,
+	cfgMnemopiIndexInjectionProject,
+	cfgMnemopiIndexInjectionTokenLimit,
 	cfgMnemopiInjectionTokenLimit,
 	cfgMnemopiLlmApiKey,
 	cfgMnemopiLlmBaseUrl,
@@ -59,6 +65,12 @@ export interface MnemopiBackendConfig {
 	recallContextTurns: number;
 	recallMaxQueryChars: number;
 	injectionTokenLimit: number;
+	indexInjection: boolean;
+	indexInjectionPrefs: number;
+	indexInjectionKnowledge: number;
+	indexInjectionProject: number;
+	indexInjectionChars: number;
+	indexInjectionTokenLimit: number;
 	debug: boolean;
 	providerOptions: MnemopiProviderOptions;
 	llmMode: MnemopiLlmMode;
@@ -104,6 +116,12 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		recallContextTurns: Math.max(1, Math.floor(cfgMnemopiRecallContextTurns.get(settings))),
 		recallMaxQueryChars: Math.max(256, Math.floor(cfgMnemopiRecallMaxQueryChars.get(settings))),
 		injectionTokenLimit: Math.max(256, Math.floor(cfgMnemopiInjectionTokenLimit.get(settings))),
+		indexInjection: cfgMnemopiIndexInjection.get(settings),
+		indexInjectionPrefs: Math.max(0, Math.floor(cfgMnemopiIndexInjectionPrefs.get(settings))),
+		indexInjectionKnowledge: Math.max(0, Math.floor(cfgMnemopiIndexInjectionKnowledge.get(settings))),
+		indexInjectionProject: Math.max(0, Math.floor(cfgMnemopiIndexInjectionProject.get(settings))),
+		indexInjectionChars: Math.max(20, Math.floor(cfgMnemopiIndexInjectionChars.get(settings))),
+		indexInjectionTokenLimit: Math.max(256, Math.floor(cfgMnemopiIndexInjectionTokenLimit.get(settings))),
 		debug: cfgMnemopiDebug.get(settings),
 		providerOptions: {
 			noEmbeddings: cfgMnemopiNoEmbeddings.get(settings),

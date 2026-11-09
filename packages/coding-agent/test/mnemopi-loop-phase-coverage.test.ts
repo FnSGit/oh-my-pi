@@ -97,6 +97,12 @@ function makeMnemopiConfig(): MnemopiBackendConfig {
 		recallContextTurns: 1,
 		recallMaxQueryChars: 800,
 		injectionTokenLimit: 1024,
+		indexInjection: false,
+		indexInjectionPrefs: 20,
+		indexInjectionKnowledge: 25,
+		indexInjectionProject: 25,
+		indexInjectionChars: 70,
+		indexInjectionTokenLimit: 2000,
 		debug: false,
 		providerOptions: {
 			noEmbeddings: true,

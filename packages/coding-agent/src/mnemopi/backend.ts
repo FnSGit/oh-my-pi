@@ -49,7 +49,7 @@ import {
 } from "./state";
 
 import { cfgMemoryBackend } from "../memory-backend/settings";
-import { cfgMnemopiInjectionTokenLimit } from "./settings";
+import { cfgMnemopiIndexInjectionTokenLimit, cfgMnemopiInjectionTokenLimit } from "./settings";
 
 // `/diagnose` is the only user of this subpath; load it lazily alongside the
 // loaders in ./state to keep mnemopi off the CLI startup module graph.
@@ -151,6 +151,16 @@ export const mnemopiBackend: MemoryBackend = {
 			);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 			await installMnemopiState(session, config, getMnemopiSessionStateFromParent(options));
+			// The base prompt is built before this background start installs the state.
+			// Refresh once so an enabled memory index reaches the first turn even when
+			// auto-recall is off or finds nothing.
+			if (config.indexInjection) {
+				try {
+					await session.refreshBaseSystemPrompt();
+				} catch (error) {
+					logger.debug("Mnemopi: prompt refresh after start failed", { error: String(error) });
+				}
+			}
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
 		}
@@ -164,9 +174,14 @@ export const mnemopiBackend: MemoryBackend = {
 				prompt.render(mnemopiInstructions, { toolRefs: memoryToolRefs(session?.getXdevToolEntries()) }),
 			];
 			if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
+			const index = primary?.formatScopedIndex();
+			if (index) parts.push(index);
 			const rendered = parts.join("\n\n").trim();
 			if (!rendered) return undefined;
-			return truncateApproxTokens(rendered, cfgMnemopiInjectionTokenLimit.get(settings));
+			const budget =
+				cfgMnemopiInjectionTokenLimit.get(settings) +
+				(index ? cfgMnemopiIndexInjectionTokenLimit.get(settings) : 0);
+			return truncateApproxTokens(rendered, budget);
 		});
 	},
 

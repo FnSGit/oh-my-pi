@@ -85,6 +85,8 @@ const serveMnemopiState: RpcServe<MnemopiSessionState, MnemopiSessionStateProtoc
 	formatScopedRecallContext: (state, results, format) => state.formatScopedRecallContext(results, format),
 	rememberScoped: (state, memory, options, target) => state.rememberScoped(memory, options, target),
 	getScopedStats: state => state.getScopedStats(),
+	listScopedIndexEntries: (state, options) => state.listScopedIndexEntries(options),
+	formatScopedIndex: state => state.formatScopedIndex(),
 	consolidate: (state, options) => state.consolidate(options),
 };
 

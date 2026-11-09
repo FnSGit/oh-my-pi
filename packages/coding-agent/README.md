@@ -43,3 +43,16 @@ The agent supports three mutually-exclusive memory backends, selected via the `m
    - `HINDSIGHT_BANK_MISSION`, `HINDSIGHT_DEBUG`
 
 Switching backends mid-session immediately replaces the live backend, memory tools, listeners, and system-prompt context. Existing users with `memories.enabled = true|false` are migrated to `memory.backend = "local"|"off"` exactly once on first launch; afterward, `memory.backend` is the sole runtime selector.
+
+### Mnemopi memory index and pi-memory migration
+
+`mnemopi.indexInjection` (default off) appends a compact, quota-bounded index of remembered facts to the system prompt, similar to pi-memory's `<user_memory>` catalog. Tune it with `mnemopi.indexInjectionPrefs`, `mnemopi.indexInjectionKnowledge`, `mnemopi.indexInjectionProject`, `mnemopi.indexInjectionChars`, and `mnemopi.indexInjectionTokenLimit`; entries carry an 8-character id prefix for the follow-up `recall` or `memory://<id>` read.
+
+pi-memory's JSON sidecars can be imported into Mnemopi's shared and per-project banks:
+
+```sh
+bun packages/coding-agent/scripts/migrate-pi-memory.ts            # dry run
+bun packages/coding-agent/scripts/migrate-pi-memory.ts --apply    # write (stop omp first)
+```
+
+The importer preserves the original id, type, tags, timestamps, hit counts, and review status in `metadata`, uses `trustTier: "IMPORTED"` so working-memory TTL does not discard old rows, and re-embeds every entry with Mnemopi's configured model. Use `--scoping per-project-tagged` (the default) to keep preference/knowledge in the shared bank and project facts in their cwd-derived bank; `--no-embeddings` performs an FTS-only trial import.

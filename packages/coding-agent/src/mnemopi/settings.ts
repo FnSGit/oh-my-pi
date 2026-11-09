@@ -297,4 +297,83 @@ export const cfgMnemopiInjectionTokenLimit = register({
 	default: 5000,
 });
 
+export const cfgMnemopiIndexInjection = register({
+	id: "mnemopi.indexInjection",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "memory",
+		group: "Mnemopi",
+		label: "Mnemopi Memory Index",
+		description:
+			"Inject a compact index of remembered facts into the system prompt, so the agent knows what it can recall",
+		condition: "mnemopiActive",
+	},
+});
+
+export const cfgMnemopiIndexInjectionPrefs = register({
+	id: "mnemopi.indexInjectionPrefs",
+	type: "number",
+	default: 20,
+	ui: {
+		tab: "memory",
+		group: "Mnemopi",
+		label: "Index Preference Lines",
+		description: "Maximum preference lines in the injected memory index; 0 hides the section",
+		condition: "mnemopiActive",
+	},
+});
+
+export const cfgMnemopiIndexInjectionKnowledge = register({
+	id: "mnemopi.indexInjectionKnowledge",
+	type: "number",
+	default: 25,
+	ui: {
+		tab: "memory",
+		group: "Mnemopi",
+		label: "Index Knowledge Lines",
+		description: "Maximum knowledge/fact lines in the injected memory index; 0 hides the section",
+		condition: "mnemopiActive",
+	},
+});
+
+export const cfgMnemopiIndexInjectionProject = register({
+	id: "mnemopi.indexInjectionProject",
+	type: "number",
+	default: 25,
+	ui: {
+		tab: "memory",
+		group: "Mnemopi",
+		label: "Index Project Lines",
+		description: "Maximum project lines in the injected memory index; 0 hides the section",
+		condition: "mnemopiActive",
+	},
+});
+
+export const cfgMnemopiIndexInjectionChars = register({
+	id: "mnemopi.indexInjectionChars",
+	type: "number",
+	default: 70,
+	ui: {
+		tab: "memory",
+		group: "Mnemopi",
+		label: "Index Line Length",
+		description: "Maximum characters of each memory's content shown in the index",
+		condition: "mnemopiActive",
+	},
+});
+
+export const cfgMnemopiIndexInjectionTokenLimit = register({
+	id: "mnemopi.indexInjectionTokenLimit",
+	type: "number",
+	default: 2000,
+	ui: {
+		tab: "memory",
+		group: "Mnemopi",
+		label: "Index Token Limit",
+		description: "Approximate token budget for the injected memory index",
+		condition: "mnemopiActive",
+	},
+});
+
 export const cfgMnemopiDebug = register({ id: "mnemopi.debug", type: "boolean", default: false });
