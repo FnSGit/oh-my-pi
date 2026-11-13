@@ -1,9 +1,10 @@
 import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { ftsWeight, importanceWeight, vectorWeight } from "../../config";
+import { ftsWeight, importanceWeight, maxEpisodeChars, proactiveLinkingEnabled, vectorWeight } from "../../config";
 import { closeQuietly, openDatabase } from "../../db";
 import { AnnotationStore } from "../annotations";
 import { EpisodicGraph } from "../episodic-graph";
+import type { VeracityConsolidator } from "../veracity-consolidation";
 import { hasPendingMigration, migrate as migrateTriplestoreSplit } from "../migrations/e6-triplestore-split";
 import {
 	consolidateToEpisodic,
@@ -30,6 +31,7 @@ import {
 	getWorkingStats,
 	importFromDict,
 	invalidate,
+	listIndex,
 	remember,
 	rememberBatch,
 	scratchpadClear,
@@ -46,6 +48,8 @@ import type {
 	BeamStats,
 	ImportStats,
 	MemoriaRetrieveResult,
+	MemoryIndexEntry,
+	MemoryIndexOptions,
 	Metadata,
 	RecallEnhancedOptions,
 	RecallOptions,
@@ -56,6 +60,7 @@ import type {
 	SleepResult,
 } from "./types";
 
+export { clipRecallContent } from "./recall";
 export { initBeam } from "./schema";
 export type * from "./types";
 
@@ -68,11 +73,14 @@ const DEFAULT_CONFIG: BeamConfig = {
 	importanceWeight: 0.2,
 	useCloud: false,
 	localLlmEnabled: false,
+	maxEpisodeChars: 100_000,
+	proactiveLinking: false,
 };
 
 function normalizeConfig(options: BeamMemoryOptions): BeamConfig {
 	const configured = options.config ?? {};
 	const useCloud = options.useCloud ?? configured.useCloud ?? DEFAULT_CONFIG.useCloud;
+	const proactiveLinking = options.proactiveLinking ?? configured.proactiveLinking ?? proactiveLinkingEnabled({});
 	return {
 		workingMemoryLimit: configured.workingMemoryLimit ?? DEFAULT_CONFIG.workingMemoryLimit,
 		workingMemoryTtlHours: configured.workingMemoryTtlHours ?? DEFAULT_CONFIG.workingMemoryTtlHours,
@@ -82,6 +90,12 @@ function normalizeConfig(options: BeamMemoryOptions): BeamConfig {
 		importanceWeight: configured.importanceWeight ?? importanceWeight(),
 		useCloud,
 		localLlmEnabled: configured.localLlmEnabled ?? DEFAULT_CONFIG.localLlmEnabled,
+		maxEpisodeChars: configured.maxEpisodeChars ?? maxEpisodeChars(),
+		proactiveLinking,
+		// Left `undefined` when unset so the process-wide default (`configureRecallFeatures`)
+		// is consulted at recall time; the env vars still win over both.
+		polyphonicRecall: options.polyphonicRecall ?? configured.polyphonicRecall,
+		enhancedRecall: options.enhancedRecall ?? configured.enhancedRecall,
 	};
 }
 function autoMigrateAnnotations(db: Database, dbPath: string | undefined): void {
@@ -114,7 +128,8 @@ export class BeamMemory implements BeamMemoryState {
 	readonly annotations: BeamMemoryState["annotations"];
 	readonly triples: BeamMemoryState["triples"];
 	readonly episodicGraph: unknown | null;
-	readonly veracityConsolidator: unknown | null;
+	/** Created on first polyphonic use (see `ensureVeracityConsolidator`); `null` until then. */
+	veracityConsolidator: VeracityConsolidator | null = null;
 	readonly caches: BeamCaches;
 	readonly config: BeamConfig;
 	readonly pendingExtractions: Set<Promise<void>> = new Set();
@@ -179,7 +194,8 @@ export class BeamMemory implements BeamMemoryState {
 		}
 		this.triples = options.triples ?? null;
 		this.episodicGraph = new EpisodicGraph({ db: this.db, dbPath: this.dbPath });
-		this.veracityConsolidator = null;
+		// `veracityConsolidator` stays null: its tables are only created once polyphonic
+		// recall is used, so the default path does no extra DDL or writes.
 		this.caches = {
 			timestampParse: new Map<string, Date>(),
 			extractionBuffer: [],
@@ -196,7 +212,7 @@ export class BeamMemory implements BeamMemoryState {
 
 	async flushExtractions(): Promise<void> {
 		while (this.pendingExtractions.size > 0) {
-			await Promise.allSettled([...this.pendingExtractions]);
+			await Promise.allSettled(this.pendingExtractions);
 		}
 	}
 
@@ -210,6 +226,11 @@ export class BeamMemory implements BeamMemoryState {
 
 	getContext(limit = 10): unknown[] {
 		return getContext(this, limit);
+	}
+
+	/** Live rows for the coding agent's compact prompt index (no embeddings). */
+	listIndex(options: MemoryIndexOptions = {}): MemoryIndexEntry[] {
+		return listIndex(this, options);
 	}
 
 	invalidate(memoryId: string, replacementId: string | null = null): boolean {

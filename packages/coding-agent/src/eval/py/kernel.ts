@@ -3,18 +3,24 @@
  *
  * Speaks NDJSON with `runner.py` over stdin/stdout. One subprocess per kernel
  * instance; sessions reuse a single subprocess across executions. Cancellation
- * is `kill("SIGINT")` which raises a real `KeyboardInterrupt` inside user
- * code. Shutdown writes `{"type":"exit"}` and escalates to SIGTERM/SIGKILL on
+ * writes `{"type":"interrupt","id":…}` naming the execution, then sends
+ * `kill("SIGINT")`, which interrupts that cell with a `KeyboardInterrupt`.
+ * Shutdown writes `{"type":"exit"}` and escalates to SIGTERM/SIGKILL on
  * timeout.
  */
-import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
-import type { Subprocess } from "bun";
-import { $ } from "bun";
+import { $env, $flag, isBunTestRuntime, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
-import { type KernelDisplayOutput, renderKernelDisplay } from "./display";
+import {
+	BaseKernel,
+	getRemainingTimeMs,
+	type KernelExecuteOptions,
+	type KernelExecuteResult,
+	type KernelStartOptions,
+} from "../kernel-base";
+import { type BackendProbeOptions, probeCandidates } from "../probe";
+import { stageRunnerScript } from "../runner-cache";
+import type { ShadowPlan } from "../speculation/types";
 import { PYTHON_PRELUDE } from "./prelude";
 import RUNNER_SCRIPT from "./runner.py" with { type: "text" };
 import {
@@ -24,29 +30,18 @@ import {
 	resolveExplicitPythonRuntime,
 	resolvePythonRuntime,
 } from "./runtime";
-import { hostHasInheritableConsole, shouldHideKernelWindow } from "./spawn-options";
+import { hostHasInheritableConsole, shouldDetachKernel, shouldHideKernelWindow } from "./spawn-options";
+import type { PythonToolRequest } from "./executor";
 
-export type { KernelDisplayOutput, PythonStatusEvent } from "./display";
-export { renderKernelDisplay } from "./display";
+export type {
+	KernelExecuteOptions,
+	KernelExecuteResult,
+	KernelRuntimeEnv,
+	KernelShutdownOptions,
+	KernelShutdownResult,
+} from "../kernel-base";
 
 const TRACE_IPC = $flag("PI_PYTHON_IPC_TRACE");
-
-// Cache the runner script on disk so the subprocess loads it normally. Cached
-// per script hash so installs don't race across versions.
-const RUNNER_CACHE_DIR = path.join(os.tmpdir(), "omp-python-runner");
-let RUNNER_SCRIPT_PATH: string | null = null;
-
-async function ensureRunnerScript(): Promise<string> {
-	if (RUNNER_SCRIPT_PATH) return RUNNER_SCRIPT_PATH;
-	await fs.promises.mkdir(RUNNER_CACHE_DIR, { recursive: true });
-	const hash = Bun.hash(RUNNER_SCRIPT).toString(36);
-	const target = path.join(RUNNER_CACHE_DIR, `runner-${hash}.py`);
-	if (!fs.existsSync(target)) {
-		await Bun.write(target, RUNNER_SCRIPT);
-	}
-	RUNNER_SCRIPT_PATH = target;
-	return target;
-}
 
 const SHUTDOWN_GRACE_MS = 1_000;
 const STARTUP_TIMEOUT_MS = 10_000;
@@ -57,62 +52,32 @@ const STARTUP_TIMEOUT_MS = 10_000;
 // generous: a clean interrupt is far preferable to losing the persistent
 // kernel's state, so we only kill as a last-resort recovery path.
 const INTERRUPT_ESCALATION_MS = 5_000;
+/** Bounds interrupt escalation plus the three shutdown grace windows before ACP abandons a session. */
+export const PYTHON_KERNEL_CANCEL_BUDGET_MS = INTERRUPT_ESCALATION_MS + 3 * SHUTDOWN_GRACE_MS;
 
-export type KernelRuntimeEnv = Record<string, string | null>;
-
-export interface KernelExecuteOptions {
-	id?: string;
-	/** Runtime working directory applied immediately before this request executes. */
-	cwd?: string;
-	/** Managed runtime environment variables applied immediately before this request executes. */
-	env?: KernelRuntimeEnv;
-	signal?: AbortSignal;
-	onChunk?: (text: string) => Promise<void> | void;
-	onDisplay?: (output: KernelDisplayOutput) => Promise<void> | void;
-	timeoutMs?: number;
-	silent?: boolean;
-	storeHistory?: boolean;
-	allowStdin?: boolean;
-}
-
-export interface KernelExecuteResult {
-	status: "ok" | "error";
-	executionCount?: number;
-	error?: { name: string; value: string; traceback: string[] };
-	cancelled: boolean;
-	timedOut: boolean;
-	stdinRequested: boolean;
-	/**
-	 * True when the kernel subprocess was killed as part of settling this
-	 * execution (e.g. SIGINT was ignored and we escalated to shutdown, or the
-	 * kernel died unexpectedly). When false, the kernel remains reusable.
-	 */
-	kernelKilled?: boolean;
-}
-
-export interface KernelShutdownResult {
-	confirmed: boolean;
-}
-
-interface KernelLifecycleOptions {
-	signal?: AbortSignal;
-	deadlineMs?: number;
-}
-
-interface KernelStartOptions extends KernelLifecycleOptions {
-	cwd: string;
-	env?: Record<string, string | undefined>;
-	/**
-	 * Explicit interpreter path (`python.interpreter` from the session's
-	 * settings). When set, runtime discovery is skipped entirely.
-	 */
-	interpreter?: string;
-}
-
-interface KernelShutdownOptions {
-	signal?: AbortSignal;
-	timeoutMs?: number;
-}
+const PYTHON_RESERVED_PRELUDE_EXPORTS: Record<string, true> = {
+	__omp_tools__: true,
+	_omp_prelude: true,
+	AgentHandle: true,
+	CompletionHandle: true,
+	JudgmentBatch: true,
+	JudgmentItem: true,
+	WorkPool: true,
+	agent: true,
+	budget: true,
+	completion: true,
+	env: true,
+	judge: true,
+	judge_batch: true,
+	log: true,
+	output: true,
+	phase: true,
+	read: true,
+	tool: true,
+	wait: true,
+	workpool: true,
+	write: true,
+};
 
 export interface PythonKernelAvailability {
 	ok: boolean;
@@ -120,53 +85,81 @@ export interface PythonKernelAvailability {
 	reason?: string;
 	/** The probed-working runtime, when one was found. */
 	runtime?: PythonRuntime;
+	/** Cancellation or an exhausted probe budget does not establish runtime unavailability. */
+	transient?: boolean;
 }
 
-function getRemainingTimeMs(deadlineMs?: number): number | undefined {
-	if (deadlineMs === undefined) return undefined;
-	return Math.max(0, deadlineMs - Date.now());
+export interface PythonPreludeSource {
+	name: string;
+	exports: string[];
+	source: string;
 }
 
-function createAbortError(name: "AbortError" | "TimeoutError", message: string): Error {
-	const err = new Error(message);
-	err.name = name;
-	return err;
+export interface PythonShadowSnapshot {
+	revision: number;
+	values: Readonly<Record<string, unknown>>;
+	digest: string;
 }
 
-function throwIfAborted(signal: AbortSignal | undefined, fallbackReason: string): void {
-	if (!signal?.aborted) return;
-	const reason = signal.reason;
-	if (reason instanceof Error) throw reason;
-	throw createAbortError("AbortError", typeof reason === "string" ? reason : fallbackReason);
+export interface PythonShadowPlan extends ShadowPlan {
+	snapshot: PythonShadowSnapshot;
 }
 
-// Cache successful probes per resolved cwd + explicit interpreter: every cell
-// otherwise pays one (or two — backend.isAvailable + ensureKernelAvailable)
-// interpreter spawns even when the kernel is already hot. Failures are not
-// cached so installing a Python mid-session is picked up on the next attempt.
-const availabilityCache = new Map<string, Promise<PythonKernelAvailability>>();
+interface PythonKernelExecuteOptions extends KernelExecuteOptions {
+	expectedShadowRevision?: number;
+	expectedShadowDigest?: string;
+}
+
+// Retain definitive results for synchronous capability advertisement. Execution
+// reuses only successes: failed probes are retried on an explicit invocation, so
+// installing Python mid-session remains discoverable without restarting.
+const availabilityCache = new Map<string, PythonKernelAvailability>();
+
+function availabilityKey(cwd: string, interpreter?: string): string {
+	return [
+		path.resolve(cwd),
+		interpreter ?? "",
+		$env.PATH,
+		$env.VIRTUAL_ENV,
+		$env.CONDA_PREFIX,
+		$env.HOME,
+		$env.PYTHONPATH,
+		$env.LD_LIBRARY_PATH,
+	].join("\0");
+}
+
+/** Read the last definitive probe without spawning or awaiting interpreter discovery. */
+export function getCachedPythonKernelAvailability(
+	cwd: string,
+	interpreter?: string,
+): PythonKernelAvailability | undefined {
+	return availabilityCache.get(availabilityKey(cwd, interpreter));
+}
 
 export async function checkPythonKernelAvailability(
 	cwd: string,
 	interpreter?: string,
+	options?: { forceProbe?: boolean } & BackendProbeOptions,
 ): Promise<PythonKernelAvailability> {
-	if (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK")) {
+	if (!options?.forceProbe && (isBunTestRuntime() || $flag("PI_PYTHON_SKIP_CHECK"))) {
 		return { ok: true };
 	}
 	const resolvedCwd = path.resolve(cwd);
-	const key = `${resolvedCwd}\0${interpreter ?? ""}`;
+	const key = availabilityKey(resolvedCwd, interpreter);
 	const cached = availabilityCache.get(key);
-	if (cached) return await cached;
-	const probe = probePythonKernelAvailability(resolvedCwd, interpreter);
-	availabilityCache.set(key, probe);
-	const result = await probe;
-	if (!result.ok && availabilityCache.get(key) === probe) {
-		availabilityCache.delete(key);
-	}
+	if (!options?.forceProbe && cached?.ok) return cached;
+	// Probe controls belong to one caller. Do not share an in-flight promise:
+	// aborting one eval must not cancel a concurrent session's availability check.
+	const result = await probePythonKernelAvailability(resolvedCwd, interpreter, options);
+	if (!result.transient && !options?.signal?.aborted) availabilityCache.set(key, result);
 	return result;
 }
 
-async function probePythonKernelAvailability(cwd: string, interpreter?: string): Promise<PythonKernelAvailability> {
+async function probePythonKernelAvailability(
+	cwd: string,
+	interpreter?: string,
+	probeOpts?: BackendProbeOptions,
+): Promise<PythonKernelAvailability> {
 	try {
 		const settings = await Settings.init();
 		const { env } = settings.getShellConfig();
@@ -177,78 +170,145 @@ async function probePythonKernelAvailability(cwd: string, interpreter?: string):
 		if (runtimes.length === 0) {
 			return { ok: false, reason: "Python executable not found on PATH" };
 		}
-		// Probe each candidate in priority order and use the first that actually
-		// runs. A managed env left behind by a removed `uv` install can exist on
-		// disk yet fail to execute; falling through to the next candidate lets a
-		// working system Python take over instead of failing the whole session.
-		const failures: string[] = [];
-		for (const runtime of runtimes) {
-			try {
-				const probe = await $`${runtime.pythonPath} -c "import sys;sys.exit(0)"`
-					.quiet()
-					.nothrow()
-					.cwd(cwd)
-					.env(runtime.env);
-				if (probe.exitCode === 0) {
-					return { ok: true, pythonPath: runtime.pythonPath, runtime };
-				}
-				failures.push(`${runtime.pythonPath} (exit code ${probe.exitCode})`);
-			} catch (err) {
-				failures.push(`${runtime.pythonPath} (${err instanceof Error ? err.message : String(err)})`);
-			}
+		const result = await probeCandidates(
+			runtimes.map(runtime => ({
+				command: [runtime.pythonPath, "-c", "import sys;sys.exit(0)"],
+				env: runtime.env,
+				label: runtime.pythonPath,
+			})),
+			{ cwd, signal: probeOpts?.signal, timeoutMs: probeOpts?.timeoutMs },
+		);
+		if (result.ok) {
+			const runtime = runtimes[result.index];
+			return { ok: true, pythonPath: runtime.pythonPath, runtime };
+		}
+		if (result.aborted) {
+			return {
+				ok: false,
+				pythonPath: runtimes[0].pythonPath,
+				reason: "Python availability probe was cancelled.",
+				transient: true,
+			};
 		}
 		return {
 			ok: false,
 			pythonPath: runtimes[0].pythonPath,
-			reason: `No working Python interpreter found. Tried: ${failures.join("; ")}`,
+			reason: `No working Python interpreter found. Tried: ${result.failures.join("; ")}`,
+			...(result.timedOut ? { transient: true } : {}),
 		};
 	} catch (err) {
-		return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+		return { ok: false, reason: err instanceof Error ? err.message : String(err), transient: true };
 	}
 }
 
-type FrameType = "started" | "stdout" | "stderr" | "display" | "result" | "error" | "done";
+export class PythonKernel extends BaseKernel<PythonKernelExecuteOptions> {
+	#installedPreludes = new Map<string, PythonPreludeSource>();
 
-interface Frame {
-	type: FrameType;
-	id?: string;
-	data?: string;
-	bundle?: Record<string, unknown>;
-	ename?: string;
-	evalue?: string;
-	traceback?: string[];
-	status?: "ok" | "error";
-	executionCount?: number;
-	cancelled?: boolean;
-}
+	/** @param pythonPath Interpreter executable this kernel runs on; reported as the runtime in eval state. */
+	private constructor(
+		id: string,
+		readonly pythonPath: string,
+	) {
+		super(id, {
+			languageName: "Python",
+			traceIpc: TRACE_IPC,
+			exitPayload: JSON.stringify({ type: "exit" }),
+			interruptPayload: msgId => JSON.stringify({ type: "interrupt", id: msgId }),
+			interruptEscalationMs: INTERRUPT_ESCALATION_MS,
+			shutdownGraceMs: SHUTDOWN_GRACE_MS,
+			buildPayload: (code, msgId, opts) =>
+				JSON.stringify({
+					id: msgId,
+					code,
+					cwd: opts?.cwd,
+					filename: opts?.filename,
+					env: opts?.env,
+					silent: opts?.silent ?? false,
+					storeHistory: opts?.storeHistory ?? !(opts?.silent ?? false),
+					expectedShadowRevision: opts?.expectedShadowRevision,
+					expectedShadowDigest: opts?.expectedShadowDigest,
+				}),
+		});
+	}
 
-interface PendingExecution {
-	resolve: (result: KernelExecuteResult) => void;
-	options?: KernelExecuteOptions;
-	status: "ok" | "error";
-	executionCount?: number;
-	error?: { name: string; value: string; traceback: string[] };
-	cancelled: boolean;
-	timedOut: boolean;
-	stdinRequested: boolean;
-	kernelKilled: boolean;
-	settled: boolean;
-	escalationTimer?: NodeJS.Timeout;
-}
+	/** Describe or invoke a tool defined in this retained Python kernel; cancelling it cancels an async tool's coroutine. */
+	async invokeTool(request: PythonToolRequest, options?: KernelExecuteOptions): Promise<KernelExecuteResult> {
+		const id = options?.id ?? Snowflake.next();
+		return await this.submitRequest(
+			id,
+			JSON.stringify({ type: "tool", id, ...request }),
+			options,
+			JSON.stringify({ type: "tool_cancel", id }),
+		);
+	}
 
-export class PythonKernel {
-	readonly id: string;
-	#proc: Subprocess | null = null;
-	#stdin: Bun.FileSink | null = null;
-	#alive = true;
-	#disposed = false;
-	#shutdownConfirmed = false;
-	#exitedPromise: Promise<number> | null = null;
-	#pending = new Map<string, PendingExecution>();
-	#readBuffer = "";
+	/** Synchronize enabled capability snippets before the next user cell. */
+	async syncPreludes(
+		preludes: readonly PythonPreludeSource[],
+		signal: AbortSignal | undefined,
+		timeoutMs: number,
+	): Promise<void> {
+		const desired = new Map<string, PythonPreludeSource>();
+		const exportOwners = new Map<string, string>();
+		for (const prelude of preludes) {
+			if (desired.has(prelude.name)) throw new Error(`Duplicate eval prelude name: ${prelude.name}`);
+			for (const name of prelude.exports) {
+				if (Object.hasOwn(PYTHON_RESERVED_PRELUDE_EXPORTS, name)) {
+					throw new Error(`Eval prelude ${prelude.name} cannot replace reserved global ${name}`);
+				}
+				const owner = exportOwners.get(name);
+				if (owner) throw new Error(`Eval preludes ${owner} and ${prelude.name} both export ${name}`);
+				exportOwners.set(name, prelude.name);
+			}
+			desired.set(prelude.name, prelude);
+		}
 
-	private constructor(id: string) {
-		this.id = id;
+		const removedExports: string[] = [];
+		const changed: PythonPreludeSource[] = [];
+		for (const [name, installed] of this.#installedPreludes) {
+			const next = desired.get(name);
+			if (
+				next &&
+				next.source === installed.source &&
+				next.exports.length === installed.exports.length &&
+				next.exports.every((value, index) => value === installed.exports[index])
+			) {
+				continue;
+			}
+			removedExports.push(...installed.exports);
+		}
+		for (const [name, prelude] of desired) {
+			const installed = this.#installedPreludes.get(name);
+			if (
+				installed &&
+				prelude.source === installed.source &&
+				prelude.exports.length === installed.exports.length &&
+				prelude.exports.every((value, index) => value === installed.exports[index])
+			) {
+				continue;
+			}
+			changed.push(prelude);
+		}
+		if (removedExports.length === 0 && changed.length === 0) return;
+
+		const source: string[] = [];
+		if (removedExports.length > 0) {
+			source.push(
+				`for __omp_export in ${JSON.stringify(removedExports)}:\n    globals().pop(__omp_export, None)`,
+				'globals().pop("__omp_export", None)',
+			);
+		}
+		for (const prelude of changed) source.push(prelude.source);
+		await this.executeWithBudget(source.join("\n"), signal, timeoutMs, "Python eval prelude sync");
+
+		this.#installedPreludes.clear();
+		for (const [name, prelude] of desired) {
+			this.#installedPreludes.set(name, {
+				name,
+				exports: [...prelude.exports],
+				source: prelude.source,
+			});
+		}
 	}
 
 	static async start(options: KernelStartOptions): Promise<PythonKernel> {
@@ -262,10 +322,6 @@ export class PythonKernel {
 			throw new Error(availability.reason ?? "Python kernel unavailable");
 		}
 
-		// Reuse the interpreter the availability probe selected so the spawned
-		// kernel matches what we verified actually runs. The fallback computes a
-		// runtime only for the skip-check fast path (test runtime /
-		// PI_PYTHON_SKIP_CHECK), where no candidate was probed.
 		let runtime = availability.runtime;
 		if (!runtime) {
 			const { env: shellEnv } = (await Settings.init()).getShellConfig();
@@ -280,48 +336,34 @@ export class PythonKernel {
 		for (const [key, value] of Object.entries(options.env ?? {})) {
 			if (typeof value === "string") spawnEnv[key] = value;
 		}
-		// Unbuffered IO is critical for streaming.
 		spawnEnv.PYTHONUNBUFFERED = "1";
 		spawnEnv.PYTHONIOENCODING = "utf-8";
 
-		const scriptPath = await ensureRunnerScript();
-		const kernel = new PythonKernel(Snowflake.next());
+		const scriptPath = await stageRunnerScript("omp-python-runner", "py", RUNNER_SCRIPT);
+		const kernel = new PythonKernel(Snowflake.next(), runtime.pythonPath);
 
 		const proc = Bun.spawn([runtime.pythonPath, "-u", scriptPath], {
 			cwd: options.cwd,
+			detached: shouldDetachKernel(process.platform),
 			env: spawnEnv,
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
-			// Detached from any inherited console only when the host itself
-			// has no console — kernel32!GetConsoleWindow() is authoritative
-			// (works even when every stdio stream is redirected), with a
-			// TTY-OR fallback when the FFI probe is unavailable. See #1960
-			// for the numpy/pandas LoadLibraryExW hang + SIGINT-recovery
-			// failure that motivates the predicate.
 			windowsHide: shouldHideKernelWindow({
 				platform: process.platform,
 				hostHasInheritableConsole: hostHasInheritableConsole(),
 			}),
 		});
-		kernel.#proc = proc;
-		kernel.#stdin = proc.stdin;
-		kernel.#exitedPromise = proc.exited;
-		void kernel.#exitedPromise.then(code => {
-			kernel.#alive = false;
-			kernel.#abortPendingExecutions(`Python kernel exited with code ${code}`, { kernelKilled: true });
-		});
 
-		kernel.#startReader(proc.stdout as ReadableStream<Uint8Array>);
-		kernel.#startStderrDrain(proc.stderr as ReadableStream<Uint8Array>);
+		kernel.setProcess(proc);
 
 		const startup = { signal: options.signal, deadlineMs: options.deadlineMs };
 		const startupBudget = Math.min(getRemainingTimeMs(startup.deadlineMs) ?? STARTUP_TIMEOUT_MS, STARTUP_TIMEOUT_MS);
 
 		try {
 			const initScript = buildInitScript(options.cwd, options.env);
-			await kernel.#executeWithBudget(initScript, startup.signal, startupBudget, "Python kernel init");
-			await kernel.#executeWithBudget(PYTHON_PRELUDE, startup.signal, startupBudget, "Python kernel prelude");
+			await kernel.executeWithBudget(initScript, startup.signal, startupBudget, "Python kernel init");
+			await kernel.executeWithBudget(PYTHON_PRELUDE, startup.signal, startupBudget, "Python kernel prelude");
 			return kernel;
 		} catch (err) {
 			await kernel.shutdown({ timeoutMs: SHUTDOWN_GRACE_MS }).catch(() => {});
@@ -329,409 +371,58 @@ export class PythonKernel {
 		}
 	}
 
-	isAlive(): boolean {
-		return this.#alive && !this.#disposed;
+	/**
+	 * Captures the runner's JSON-safe user namespace only when no Python cell is
+	 * executing. Ineligible or malformed responses deliberately fall back.
+	 */
+	async snapshotUserNamespace(timeoutMs?: number): Promise<PythonShadowSnapshot | null> {
+		const id = Snowflake.next();
+		const frame = await this.requestControl(JSON.stringify({ type: "shadow_snapshot", id }), id, timeoutMs);
+		if (
+			frame.type !== "shadow_snapshot" ||
+			frame.eligible !== true ||
+			typeof frame.revision !== "number" ||
+			typeof frame.digest !== "string"
+		) {
+			return null;
+		}
+		return { revision: frame.revision, digest: frame.digest, values: Object.freeze(frame.values ?? {}) };
 	}
 
-	async execute(code: string, options?: KernelExecuteOptions): Promise<KernelExecuteResult> {
-		if (!this.isAlive()) {
-			throw new Error("Python kernel is not running");
+	/** Projects a candidate against an already-running, idle Python kernel. */
+	async shadowPlan(code: string, timeoutMs?: number): Promise<PythonShadowPlan | null> {
+		const id = Snowflake.next();
+		const frame = await this.requestControl(JSON.stringify({ type: "shadow_plan", id, code }), id, timeoutMs);
+		if (
+			frame.type !== "shadow_plan" ||
+			frame.eligible !== true ||
+			typeof frame.revision !== "number" ||
+			typeof frame.digest !== "string" ||
+			!Array.isArray(frame.operations)
+		) {
+			return null;
 		}
-
-		const msgId = options?.id ?? Snowflake.next();
-		const { promise, resolve } = Promise.withResolvers<KernelExecuteResult>();
-		const pending: PendingExecution = {
-			resolve,
-			options,
-			status: "ok",
-			cancelled: false,
-			timedOut: false,
-			stdinRequested: false,
-			settled: false,
-			kernelKilled: false,
+		return {
+			snapshot: { revision: frame.revision, digest: frame.digest, values: Object.freeze(frame.values ?? {}) },
+			operations: frame.operations,
+			...(frame.controls && frame.controls.length > 0 ? { controls: frame.controls } : {}),
+			...(frame.barrier ? { barrier: frame.barrier } : {}),
 		};
-		this.#pending.set(msgId, pending);
-
-		const finalize = () => {
-			if (pending.settled) return;
-			pending.settled = true;
-			this.#pending.delete(msgId);
-			cleanup();
-			resolve({
-				status: pending.status,
-				executionCount: pending.executionCount,
-				error: pending.error,
-				cancelled: pending.cancelled,
-				timedOut: pending.timedOut,
-				stdinRequested: pending.stdinRequested,
-				kernelKilled: pending.kernelKilled,
-			});
-		};
-
-		const requestCancel = () => {
-			if (pending.settled || pending.escalationTimer) return;
-			void this.interrupt();
-			const escalation = setTimeout(() => {
-				if (pending.settled) return;
-				logger.warn("Python runner did not respond to SIGINT; terminating subprocess", {
-					kernelId: this.id,
-				});
-				// SIGINT was ignored; mark the cell as kernel-killed so callers can
-				// surface the harsher recovery message. `shutdown()` aborts pending
-				// executions immediately and escalates to SIGTERM/SIGKILL, so the
-				// host queue unblocks even if the runner is stuck in a
-				// non-interruptible state.
-				pending.kernelKilled = true;
-				void this.shutdown();
-			}, INTERRUPT_ESCALATION_MS);
-			escalation.unref?.();
-			pending.escalationTimer = escalation;
-		};
-
-		const onAbort = () => {
-			pending.cancelled = true;
-			pending.timedOut = pending.timedOut || isTimeoutReason(options?.signal?.reason);
-			requestCancel();
-		};
-		const timeoutId =
-			typeof options?.timeoutMs === "number" && options.timeoutMs > 0
-				? setTimeout(() => {
-						pending.timedOut = true;
-						pending.cancelled = true;
-						requestCancel();
-					}, options.timeoutMs)
-				: undefined;
-
-		const cleanup = () => {
-			if (timeoutId) clearTimeout(timeoutId);
-			if (pending.escalationTimer) clearTimeout(pending.escalationTimer);
-			pending.escalationTimer = undefined;
-			options?.signal?.removeEventListener("abort", onAbort);
-		};
-
-		if (options?.signal) {
-			if (options.signal.aborted) {
-				onAbort();
-			} else {
-				options.signal.addEventListener("abort", onAbort, { once: true });
-			}
-		}
-
-		// Stash finalize on the pending entry so the reader can call it on `done`.
-		(pending as PendingExecution & { finalize: () => void }).finalize = finalize;
-
-		const payload = JSON.stringify({
-			id: msgId,
-			code,
-			cwd: options?.cwd,
-			env: options?.env,
-			silent: options?.silent ?? false,
-			storeHistory: options?.storeHistory ?? !(options?.silent ?? false),
-		});
-
-		try {
-			await this.#writeLine(payload);
-		} catch (err) {
-			pending.cancelled = true;
-			pending.error = {
-				name: "TransportError",
-				value: err instanceof Error ? err.message : String(err),
-				traceback: [],
-			};
-			finalize();
-		}
-
-		return promise;
 	}
 
-	async interrupt(): Promise<void> {
-		if (!this.#proc || this.#disposed) return;
-		try {
-			this.#proc.kill("SIGINT");
-		} catch (err) {
-			logger.warn("Failed to interrupt python runner", { error: err instanceof Error ? err.message : String(err) });
-		}
-	}
-
-	async shutdown(options?: KernelShutdownOptions): Promise<KernelShutdownResult> {
-		if (this.#shutdownConfirmed) return { confirmed: true };
-
-		this.#alive = false;
-		this.#abortPendingExecutions("Python kernel shutdown", { kernelKilled: true });
-
-		const timeoutMs = options?.timeoutMs ?? SHUTDOWN_GRACE_MS;
-		const proc = this.#proc;
-		if (!proc) {
-			this.#shutdownConfirmed = true;
-			this.#disposed = true;
-			return { confirmed: true };
-		}
-
-		try {
-			await this.#writeLine(JSON.stringify({ type: "exit" })).catch(() => {});
-		} catch {
-			/* writer may already be closed */
-		}
-
-		try {
-			this.#stdin?.end();
-		} catch {
-			/* ignore */
-		}
-
-		const exited = this.#waitForExitWithTimeout(timeoutMs);
-		let result = await exited;
-		if (!result) {
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* ignore */
-			}
-			result = await this.#waitForExitWithTimeout(timeoutMs);
-		}
-		if (!result) {
-			try {
-				proc.kill("SIGKILL");
-			} catch {
-				/* ignore */
-			}
-			result = await this.#waitForExitWithTimeout(timeoutMs);
-		}
-
-		const confirmed = !!result;
-		this.#shutdownConfirmed = confirmed;
-		this.#disposed = true;
-		return { confirmed };
-	}
-
-	#abortPendingExecutions(reason: string, options?: { kernelKilled?: boolean }): void {
-		if (this.#pending.size === 0) return;
-		const pending = Array.from(this.#pending.values());
-		this.#pending.clear();
-		const kernelKilledDefault = options?.kernelKilled ?? false;
-		for (const entry of pending) {
-			if (entry.settled) continue;
-			entry.settled = true;
-			void entry.options?.onChunk?.(`[kernel] ${reason}\n`);
-			entry.resolve({
-				status: "error",
-				cancelled: true,
-				timedOut: entry.timedOut,
-				stdinRequested: entry.stdinRequested,
-				executionCount: entry.executionCount,
-				error: entry.error,
-				kernelKilled: entry.kernelKilled || kernelKilledDefault,
-			});
-		}
-	}
-
-	async #writeLine(line: string): Promise<void> {
-		if (!this.#stdin) {
-			throw new Error("Python kernel stdin is not open");
-		}
-		if (TRACE_IPC) {
-			logger.debug("PythonKernel send", { preview: line.slice(0, 120) });
-		}
-		this.#stdin.write(`${line}\n`);
-		this.#stdin.flush();
-	}
-
-	#startReader(stream: ReadableStream<Uint8Array>): void {
-		const reader = stream.getReader();
-		const decoder = new TextDecoder();
-		const loop = async () => {
-			try {
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					this.#readBuffer += decoder.decode(value, { stream: true });
-					await this.#flushFrames();
-				}
-				this.#readBuffer += decoder.decode();
-				await this.#flushFrames();
-			} catch (err) {
-				logger.warn("Python kernel reader failed", { error: err instanceof Error ? err.message : String(err) });
-			} finally {
-				try {
-					reader.releaseLock();
-				} catch {
-					/* ignore */
-				}
-			}
-		};
-		void loop();
-	}
-
-	#startStderrDrain(stream: ReadableStream<Uint8Array>): void {
-		// Wrapper writes its own crashes to stderr; surface them via logger so the
-		// host operator can debug runtime issues without polluting tool output.
-		const reader = stream.getReader();
-		const decoder = new TextDecoder();
-		const loop = async () => {
-			try {
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					const text = decoder.decode(value);
-					if (text.trim()) {
-						logger.warn("Python runner stderr", { text });
-					}
-				}
-			} catch {
-				/* ignore */
-			} finally {
-				try {
-					reader.releaseLock();
-				} catch {
-					/* ignore */
-				}
-			}
-		};
-		void loop();
-	}
-
-	async #flushFrames(): Promise<void> {
-		while (true) {
-			const nl = this.#readBuffer.indexOf("\n");
-			if (nl < 0) return;
-			const line = this.#readBuffer.slice(0, nl);
-			this.#readBuffer = this.#readBuffer.slice(nl + 1);
-			if (!line.trim()) continue;
-			let frame: Frame;
-			try {
-				frame = JSON.parse(line) as Frame;
-			} catch (err) {
-				logger.warn("Python runner emitted invalid JSON", {
-					line: line.slice(0, 200),
-					error: err instanceof Error ? err.message : String(err),
-				});
-				continue;
-			}
-			if (TRACE_IPC) {
-				logger.debug("PythonKernel recv", { type: frame.type, id: frame.id });
-			}
-			await this.#handleFrame(frame);
-		}
-	}
-
-	async #handleFrame(frame: Frame): Promise<void> {
-		const rid = frame.id;
-		if (!rid) return;
-		const pending = this.#pending.get(rid) as (PendingExecution & { finalize?: () => void }) | undefined;
-		if (!pending) return;
-
-		switch (frame.type) {
-			case "started":
-				return;
-			case "stdout":
-			case "stderr": {
-				const text = frame.data ?? "";
-				if (text && pending.options?.onChunk) {
-					await pending.options.onChunk(text);
-				}
-				return;
-			}
-			case "display":
-			case "result": {
-				const bundle = frame.bundle ?? {};
-				const { text, outputs } = await renderKernelDisplay(bundle);
-				if (text && pending.options?.onChunk) {
-					await pending.options.onChunk(text);
-				}
-				if (outputs.length > 0 && pending.options?.onDisplay) {
-					for (const output of outputs) {
-						await pending.options.onDisplay(output);
-					}
-				}
-				return;
-			}
-			case "error": {
-				const traceback = Array.isArray(frame.traceback) ? frame.traceback.map(String) : [];
-				pending.status = "error";
-				pending.error = {
-					name: String(frame.ename ?? "Error"),
-					value: String(frame.evalue ?? ""),
-					traceback,
-				};
-				const message =
-					traceback.length > 0 ? `${traceback.join("\n")}\n` : `${pending.error.name}: ${pending.error.value}\n`;
-				if (pending.options?.onChunk) {
-					await pending.options.onChunk(message);
-				}
-				return;
-			}
-			case "done": {
-				if (typeof frame.executionCount === "number") {
-					pending.executionCount = frame.executionCount;
-				}
-				if (frame.status === "error" && pending.status === "ok") {
-					pending.status = "error";
-				}
-				if (frame.cancelled) {
-					pending.cancelled = true;
-				}
-				pending.finalize?.();
-				return;
-			}
-		}
-	}
-
-	async #executeWithBudget(
+	/** Atomically starts a cell only if its retained shadow snapshot is still current. */
+	async executeIfSnapshotMatches(
 		code: string,
-		signal: AbortSignal | undefined,
-		timeoutMs: number,
-		label: string,
-	): Promise<void> {
-		const controller = new AbortController();
-		const cleanups: Array<() => void> = [];
-		if (signal) {
-			if (signal.aborted) {
-				controller.abort(signal.reason);
-			} else {
-				const onAbort = () => controller.abort(signal.reason);
-				signal.addEventListener("abort", onAbort, { once: true });
-				cleanups.push(() => signal.removeEventListener("abort", onAbort));
-			}
-		}
-		const timer =
-			timeoutMs > 0
-				? setTimeout(() => controller.abort(createAbortError("TimeoutError", `${label} timed out`)), timeoutMs)
-				: undefined;
-		if (timer) cleanups.push(() => clearTimeout(timer));
-		try {
-			throwIfAborted(controller.signal, label);
-			const result = await this.execute(code, {
-				signal: controller.signal,
-				silent: true,
-				storeHistory: false,
-			});
-			if (result.cancelled) {
-				throw createAbortError(result.timedOut ? "TimeoutError" : "AbortError", `${label} cancelled`);
-			}
-			if (result.status === "error") {
-				const reason = result.error?.value ?? "Python kernel init failed";
-				throw new Error(`${label} failed: ${reason}`);
-			}
-		} finally {
-			for (const cleanup of cleanups) cleanup();
-		}
-	}
-
-	#waitForExitWithTimeout(timeoutMs: number): Promise<number | null> {
-		if (!this.#exitedPromise) return Promise.resolve(0);
-		const exitedPromise = this.#exitedPromise;
-		const timeout = new Promise<null>(resolve => {
-			const timer = setTimeout(() => resolve(null), Math.max(0, timeoutMs));
-			timer.unref?.();
+		snapshot: Pick<PythonShadowSnapshot, "revision" | "digest">,
+		options?: KernelExecuteOptions,
+	): Promise<KernelExecuteResult | null> {
+		const result = await this.execute(code, {
+			...options,
+			expectedShadowRevision: snapshot.revision,
+			expectedShadowDigest: snapshot.digest,
 		});
-		return Promise.race([exitedPromise.then(code => code as number | null), timeout]);
+		return result.admissionRejected ? null : result;
 	}
-}
-
-function isTimeoutReason(reason: unknown): boolean {
-	if (reason instanceof DOMException) return reason.name === "TimeoutError";
-	if (reason instanceof Error) return reason.name === "TimeoutError";
-	return false;
 }
 
 function buildInitScript(cwd: string, env?: Record<string, string | undefined>): string {

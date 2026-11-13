@@ -8,7 +8,7 @@
  * This file imports from helpers.ts directly — the native addon IS present in the
  * test environment (verified: `bun run import-helpers.ts` succeeds).
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,7 +16,10 @@ import {
 	clearClaudePluginRootsCache,
 	listClaudePluginRoots,
 	resolveActiveProjectRegistryPath,
+	resolveOrDefaultProjectRegistryPath,
 } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
+import { MarketplaceManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace/manager";
+import { getEnabledPlugins } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/loader";
 import type { InstalledPluginEntry } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
 import {
 	addInstalledPlugin,
@@ -24,6 +27,8 @@ import {
 	readInstalledPluginsRegistry,
 	writeInstalledPluginsRegistry,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
+import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import * as piUtils from "@oh-my-pi/pi-utils";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -47,7 +52,9 @@ describe("resolveActiveProjectRegistryPath", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		clearClaudePluginRootsCache();
+		vi.restoreAllMocks();
+		removeSyncWithRetries(tmpDir);
 	});
 
 	it("walk-up finds nearest .omp/ directory", async () => {
@@ -88,6 +95,146 @@ describe("resolveActiveProjectRegistryPath", () => {
 		expect(result).toBe(path.join(tmpDir, ".omp", "plugins", "installed_plugins.json"));
 	});
 
+	it("does not load a temporary root's .omp/plugins from an unanchored scratch directory", async () => {
+		const tempRoot = path.join(tmpDir, "tmp");
+		const cwd = path.join(tempRoot, "scratch", "work");
+		fs.mkdirSync(path.join(tempRoot, ".omp", "plugins"), { recursive: true });
+		fs.mkdirSync(cwd, { recursive: true });
+		vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "home"));
+
+		expect(await resolveActiveProjectRegistryPath(cwd)).toBeNull();
+	});
+
+	it("does not fall back to a temporary root's .git anchor", async () => {
+		const tempRoot = path.join(tmpDir, "tmp");
+		const cwd = path.join(tempRoot, "scratch", "work");
+		fs.mkdirSync(path.join(tempRoot, ".git"), { recursive: true });
+		fs.mkdirSync(cwd, { recursive: true });
+		vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "home"));
+
+		expect(await resolveActiveProjectRegistryPath(cwd)).toBeNull();
+	});
+
+	it("still finds a project's .omp below the temporary root", async () => {
+		const tempRoot = path.join(tmpDir, "tmp");
+		const project = path.join(tempRoot, "project");
+		const cwd = path.join(project, "sub");
+		fs.mkdirSync(path.join(project, ".omp"), { recursive: true });
+		fs.mkdirSync(cwd, { recursive: true });
+		vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "home"));
+
+		expect(await resolveActiveProjectRegistryPath(cwd)).toBe(
+			path.join(project, ".omp", "plugins", "installed_plugins.json"),
+		);
+	});
+
+	it("does not create a default project registry at an aliased temporary root", async () => {
+		const tempRoot = path.join(tmpDir, "tmp");
+		const alias = path.join(tmpDir, "tmp-link");
+		fs.mkdirSync(path.join(tempRoot, ".omp"), { recursive: true });
+		fs.symlinkSync(tempRoot, alias, "dir");
+		vi.spyOn(os, "tmpdir").mockReturnValue(`${alias}${path.sep}`);
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "home"));
+
+		expect(await resolveActiveProjectRegistryPath(path.join(tempRoot, "scratch"))).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(tempRoot)).toBeUndefined();
+	});
+
+	it.skipIf(process.platform === "win32").each(["/tmp", "/var/tmp"])(
+		"does not create a project registry at the shared %s root even with another tmpdir",
+		async root => {
+			vi.spyOn(os, "tmpdir").mockReturnValue(tmpDir);
+			vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "home"));
+
+			expect(await resolveOrDefaultProjectRegistryPath(root)).toBeUndefined();
+		},
+	);
+
+	it("skips another account's .omp/agent root and falls back to the cwd's git anchor", async () => {
+		const foreignHome = path.join(tmpDir, "other-user");
+		const cwd = path.join(foreignHome, "Development", "project");
+		fs.mkdirSync(path.join(foreignHome, ".omp", "agent"), { recursive: true });
+		fs.mkdirSync(path.join(foreignHome, ".omp", "plugins"), { recursive: true });
+		fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "isolated-home"));
+
+		expect(await resolveActiveProjectRegistryPath(cwd)).toBe(
+			path.join(cwd, ".omp", "plugins", "installed_plugins.json"),
+		);
+		expect(await resolveOrDefaultProjectRegistryPath(foreignHome)).toBeUndefined();
+	});
+
+	it("keeps an active repo-local .omp/agent directory in project scope", async () => {
+		const project = path.join(tmpDir, "project");
+		const agentDir = path.join(project, ".omp", "agent");
+		fs.mkdirSync(agentDir, { recursive: true });
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "isolated-home"));
+		vi.spyOn(piUtils, "getAgentDir").mockReturnValue(`${agentDir}${path.sep}`);
+		const registry = path.join(project, ".omp", "plugins", "installed_plugins.json");
+
+		expect(await resolveActiveProjectRegistryPath(project)).toBe(registry);
+		expect(await resolveOrDefaultProjectRegistryPath(project)).toBe(registry);
+	});
+
+	it.each([".", "nested"])("keeps .omp/agent at or below a git root (%s) in project scope", async subdir => {
+		const project = path.join(tmpDir, "project");
+		const anchor = path.join(project, subdir);
+		const cwd = path.join(anchor, "work");
+		const home = path.join(tmpDir, "isolated-home");
+		const pluginsDir = path.join(anchor, ".omp", "plugins");
+		const pluginDir = path.join(pluginsDir, "node_modules", "omp-project-agent");
+		fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+		fs.mkdirSync(path.join(anchor, ".omp", "agent"), { recursive: true });
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(pluginDir, { recursive: true });
+		await Bun.write(
+			path.join(pluginsDir, "package.json"),
+			JSON.stringify({ dependencies: { "omp-project-agent": "*" } }),
+		);
+		await Bun.write(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({ name: "omp-project-agent", version: "1.0.0", omp: { tools: "tools" } }),
+		);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		vi.spyOn(piUtils, "getAgentDir").mockReturnValue(path.join(home, ".omp", "agent"));
+		const registry = path.join(pluginsDir, "installed_plugins.json");
+
+		expect(await resolveActiveProjectRegistryPath(cwd)).toBe(registry);
+		expect(await resolveOrDefaultProjectRegistryPath(anchor)).toBe(registry);
+		const plugins = await getEnabledPlugins(cwd, { home });
+		expect(plugins.map(plugin => [plugin.name, plugin.scope, plugin.path])).toEqual([
+			["omp-project-agent", "project", pluginDir],
+		]);
+	});
+
+	it("skips an inactive user config root without a git anchor", async () => {
+		const foreignHome = path.join(tmpDir, "other-user");
+		const cwd = path.join(foreignHome, "scratch", "work");
+		fs.mkdirSync(path.join(foreignHome, ".omp", "agent"), { recursive: true });
+		fs.mkdirSync(path.join(foreignHome, ".omp", "plugins"), { recursive: true });
+		fs.mkdirSync(cwd, { recursive: true });
+		vi.spyOn(os, "tmpdir").mockReturnValue(tmpDir);
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "isolated-home"));
+		vi.spyOn(piUtils, "getAgentDir").mockReturnValue(path.join(tmpDir, "isolated-agent"));
+
+		expect(await resolveActiveProjectRegistryPath(cwd)).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(foreignHome)).toBeUndefined();
+	});
+
+	it("still prefers a plain ancestor .omp above the git root", async () => {
+		const cwd = path.join(tmpDir, "project");
+		fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
+		fs.mkdirSync(path.join(cwd, ".git"), { recursive: true });
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(tmpDir, "isolated-home"));
+
+		expect(await resolveActiveProjectRegistryPath(cwd)).toBe(
+			path.join(tmpDir, ".omp", "plugins", "installed_plugins.json"),
+		);
+	});
+
 	it("returns null when neither .omp/ nor .git/ found anywhere in the tree", async () => {
 		// Start at the filesystem root — guaranteed to have no .omp/ or .git/ ancestors.
 		const result = await resolveActiveProjectRegistryPath(path.sep);
@@ -98,23 +245,19 @@ describe("resolveActiveProjectRegistryPath", () => {
 	it("does not treat ~/.git as a project root (pass-2 home-dir guard)", async () => {
 		// Simulate a dotfiles repo managed with a bare-git technique: ~/.git exists.
 		// resolveActiveProjectRegistryPath must NOT return ~/.omp/.../installed_plugins.json.
-		const homeDir = os.homedir();
+		const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-proj-scope-home-"));
+		vi.spyOn(os, "homedir").mockReturnValue(homeDir);
 		const fakeHomeGit = path.join(homeDir, ".git");
-		const hadGit = await fs.promises
-			.stat(fakeHomeGit)
-			.then(() => true)
-			.catch(() => false);
-		if (!hadGit) {
-			await fs.promises.mkdir(fakeHomeGit, { recursive: true });
-		}
+		await fs.promises.mkdir(fakeHomeGit, { recursive: true });
+		const cwd = path.join(homeDir, "work");
+		await fs.promises.mkdir(cwd, { recursive: true });
 		try {
-			// Start from a tmpDir that has no .omp/ or .git/ of its own.
-			const result = await resolveActiveProjectRegistryPath(tmpDir);
-			// Must not resolve to the home-dir OMP registry.
+			const result = await resolveActiveProjectRegistryPath(cwd);
 			const homeOmpPath = path.join(homeDir, ".omp", "plugins", "installed_plugins.json");
 			expect(result).not.toBe(homeOmpPath);
+			expect(result).toBeNull();
 		} finally {
-			if (!hadGit) await fs.promises.rm(fakeHomeGit, { recursive: true, force: true });
+			removeSyncWithRetries(homeDir);
 		}
 	});
 
@@ -129,6 +272,66 @@ describe("resolveActiveProjectRegistryPath", () => {
 
 		expect(fromRoot).not.toBeNull();
 		expect(fromRoot).toBe(fromSrc);
+	});
+
+	it("keeps a user plugin in user scope with trailing-slash or symlinked home", async () => {
+		const home = path.join(tmpDir, "home");
+		const cwd = path.join(home, "work");
+		const link = path.join(tmpDir, "home-link");
+		const registryPath = path.join(home, ".omp", "plugins", "installed_plugins.json");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(path.dirname(registryPath), { recursive: true });
+		fs.symlinkSync(home, link, "dir");
+		await writeInstalledPluginsRegistry(registryPath, {
+			version: 2,
+			plugins: { "sample@local": [makeEntry(path.join(tmpDir, "sample"))] },
+		});
+
+		for (const alias of [`${home}${path.sep}`, link]) {
+			vi.spyOn(os, "homedir").mockReturnValue(alias);
+			expect(await resolveActiveProjectRegistryPath(cwd)).toBeNull();
+			const projectPath = await resolveOrDefaultProjectRegistryPath(cwd);
+			const manager = new MarketplaceManager({
+				marketplacesRegistryPath: path.join(home, ".omp", "plugins", "marketplaces.json"),
+				installedRegistryPath: registryPath,
+				projectInstalledRegistryPath: projectPath,
+				marketplacesCacheDir: path.join(tmpDir, "marketplaces"),
+				pluginsCacheDir: path.join(tmpDir, "plugins"),
+			});
+			expect((await manager.listInstalledPlugins()).map(({ scope }) => scope)).toEqual(["user"]);
+			await manager.uninstallPlugin("sample@local", undefined, { dryRun: true });
+			expect(await resolveOrDefaultProjectRegistryPath(home)).toBeUndefined();
+		}
+	});
+
+	it("does not use an aliased user config as a project registry even at a git root", async () => {
+		const home = path.join(tmpDir, "home");
+		const project = path.join(home, "work");
+		fs.mkdirSync(path.join(home, ".omp"), { recursive: true });
+		fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+		fs.symlinkSync(path.join(home, ".omp"), path.join(project, ".omp"), "dir");
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		expect(await resolveActiveProjectRegistryPath(project)).toBeNull();
+		expect(await resolveOrDefaultProjectRegistryPath(project)).toBeUndefined();
+	});
+
+	it("keeps a custom-home plugin in user scope during discovery", async () => {
+		const home = path.join(tmpDir, "sdk-home");
+		const cwd = path.join(home, "work");
+		const registryPath = path.join(home, ".omp", "plugins", "installed_plugins.json");
+		fs.mkdirSync(cwd, { recursive: true });
+		await writeInstalledPluginsRegistry(registryPath, {
+			version: 2,
+			plugins: { "sample@local": [makeEntry(path.join(tmpDir, "sample"))] },
+		});
+
+		try {
+			const { roots } = await listClaudePluginRoots(home, cwd);
+			expect(roots.filter(root => root.id === "sample@local").map(root => root.scope)).toEqual(["user"]);
+		} finally {
+			clearClaudePluginRootsCache();
+		}
 	});
 });
 
@@ -158,8 +361,8 @@ describe("listClaudePluginRoots — project shadows user", () => {
 	afterEach(() => {
 		// Cache is keyed by home:projectPath — must clear between tests.
 		clearClaudePluginRootsCache();
-		fs.rmSync(tmpHome, { recursive: true, force: true });
-		fs.rmSync(tmpProject, { recursive: true, force: true });
+		removeSyncWithRetries(tmpHome);
+		removeSyncWithRetries(tmpProject);
 	});
 
 	it("project entry shadows user entry when plugin IDs match", async () => {

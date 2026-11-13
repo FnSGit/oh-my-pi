@@ -6,9 +6,10 @@
  * in-process and sharing auth/model infrastructure across tasks.
  */
 import type { AgentEvent, AgentMessage, ResolvedThinkingLevel, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { AgentSession, AgentSessionEvent, AuthStorage, SessionStats } from "@oh-my-pi/pi-coding-agent";
 import {
+	AgentRegistry,
 	type CreateAgentSessionResult,
 	createAgentSession,
 	discoverAuthStorage,
@@ -49,23 +50,21 @@ export interface DiscoverSharedInfraOptions {
 
 /** Discover shared infrastructure once for the entire benchmark run. */
 export async function discoverSharedInfra(options: DiscoverSharedInfraOptions = {}): Promise<SharedInfra> {
-	const authStorage = await discoverAuthStorage();
+	// Initialize global Settings singleton (required by code paths that use the global `settings` proxy)
+	const overrides: Record<string, unknown> = {};
+	if (options.editVariant && options.editVariant !== "auto") {
+		overrides["edit.mode"] = options.editVariant;
+	}
+	if (options.editFuzzy !== undefined && options.editFuzzy !== "auto") {
+		overrides["edit.fuzzyMatch"] = options.editFuzzy;
+	}
+	if (options.editFuzzyThreshold !== undefined && options.editFuzzyThreshold !== "auto") {
+		overrides["edit.fuzzyThreshold"] = options.editFuzzyThreshold;
+	}
+	const settings = await Settings.init({ cwd: options.cwd, overrides });
+	const authStorage = await discoverAuthStorage(undefined, { settings });
 	try {
 		const modelRegistry = new ModelRegistry(authStorage);
-
-		// Initialize global Settings singleton (required by code paths that use the global `settings` proxy)
-		const overrides: Record<string, unknown> = {};
-		if (options.editVariant && options.editVariant !== "auto") {
-			overrides["edit.mode"] = options.editVariant;
-		}
-		if (options.editFuzzy !== undefined && options.editFuzzy !== "auto") {
-			overrides["edit.fuzzyMatch"] = options.editFuzzy;
-		}
-		if (options.editFuzzyThreshold !== undefined && options.editFuzzyThreshold !== "auto") {
-			overrides["edit.fuzzyThreshold"] = options.editFuzzyThreshold;
-		}
-		await Settings.init({ cwd: options.cwd, overrides });
-
 		return { authStorage, modelRegistry };
 	} catch (error) {
 		authStorage.close();
@@ -97,6 +96,11 @@ export class InProcessClient {
 			authStorage: shared?.authStorage,
 			modelRegistry: shared?.modelRegistry,
 			sessionManager: SessionManager.inMemory(this.#options.cwd),
+			// Benchmark tasks run many top-level sessions concurrently in one
+			// process. The global registry admits only one "Main" per process
+			// generation (later registrations replace earlier refs, which then
+			// fail session initialization), so each client gets its own registry.
+			agentRegistry: new AgentRegistry(),
 			systemPrompt: this.#options.appendSystemPrompt
 				? (defaultPrompt: string[]) => [...defaultPrompt, this.#options.appendSystemPrompt!]
 				: undefined,
@@ -169,7 +173,7 @@ export class InProcessClient {
 		systemPrompt?: string[];
 		model?: Model;
 		thinkingLevel?: ThinkingLevel | undefined;
-		dumpTools?: Array<{ name: string; description: string; parameters: unknown }>;
+		dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 	}> {
 		const session = this.#session!;
 		return {
@@ -181,6 +185,7 @@ export class InProcessClient {
 				name: tool.name,
 				description: tool.description,
 				parameters: tool.parameters,
+				examples: tool.examples,
 			})),
 		};
 	}
@@ -217,6 +222,8 @@ const AGENT_EVENT_TYPES = new Set([
 	"tool_execution_end",
 ]);
 
-function isAgentEvent(event: AgentSessionEvent): event is AgentEvent {
+// `queue_changed` is an internal Agent signal that AgentSession turns into
+// `queue_update`; it never reaches session subscribers.
+function isAgentEvent(event: AgentSessionEvent): event is Exclude<AgentEvent, { type: "queue_changed" }> {
 	return AGENT_EVENT_TYPES.has(event.type);
 }

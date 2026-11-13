@@ -1,4 +1,4 @@
-import { getOpenAICodexTransportDetails, type OpenAICodexTransportDetails } from "./providers/openai-codex-responses";
+import { getOpenAICodexTransportDetails, type OpenAICodexTransportDetails } from "./providers/openai-codex-state";
 import type { Api, Model, Provider, ProviderSessionState } from "./types";
 
 export interface ProviderDetailField {
@@ -18,7 +18,7 @@ export interface ProviderDetailsContext {
 	authMode?: string;
 	/**
 	 * Human-readable description of the active credential, e.g.
-	 * `"broker http://can.internal:8765 · oauth #5 (foo@bar.com)"`.
+	 * `"broker http://omp.internal:8765 · oauth #5 (foo@bar.com)"`.
 	 * Rendered as a `Source` field; omitted when undefined.
 	 */
 	credentialSource?: string;

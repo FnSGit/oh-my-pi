@@ -67,7 +67,7 @@ interface CliOptions {
 	noCache: boolean;
 }
 
-export function parseSince(raw: string): number {
+function parseSince(raw: string): number {
 	const m = /^(\d+)?\s*(h|d|w|mo|m)$/.exec(raw.trim());
 	if (!m) throw new Error(`invalid --since "${raw}" (use e.g. 12h, 3d, 1w, 1mo)`);
 	const n = m[1] ? Number.parseInt(m[1], 10) : 1;
@@ -244,7 +244,7 @@ const TRUNCATED_RESULT_RE = /\[Output truncated - (\d+) tokens?\]/;
 
 /** Group key for repeated-read detection: keep `scheme://` URLs intact and
  * strip trailing line/raw selectors (`:50-200`, `:raw`, `:2-4:raw`, …). */
-export function normalizeReadPath(p: string): string {
+function normalizeReadPath(p: string): string {
 	let out = p;
 	for (;;) {
 		const next = out.replace(/:(?:raw|conflicts|[0-9][0-9+\-,]*)$/i, "");
@@ -307,7 +307,7 @@ interface PendingCall {
 	requestIndex: number;
 }
 
-export async function scanFile(filePath: string): Promise<FileScan | undefined> {
+async function scanFile(filePath: string): Promise<FileScan | undefined> {
 	let text: string;
 	try {
 		text = await Bun.file(filePath).text();
@@ -472,7 +472,9 @@ export async function scanFile(filePath: string): Promise<FileScan | undefined> 
 			const name = call?.name ?? (msg.toolName as string) ?? "?";
 			const textBlob = contentText(msg.content);
 			const truncated = TRUNCATED_RESULT_RE.exec(textBlob);
-			const toks = truncated ? Math.max(estTokens(textBlob), Number.parseInt(truncated[1], 10)) : estTokens(textBlob);
+			const toks = truncated
+				? Math.max(estTokens(textBlob), Number.parseInt(truncated[1], 10))
+				: estTokens(textBlob);
 			const agg = tool(name);
 			agg.resultToks += toks;
 			if (msg.isError === true) {
@@ -571,7 +573,7 @@ async function discoverGroups(opts: CliOptions): Promise<DiscoveredGroup[]> {
 			}
 		}
 		for (const [id, main] of mains) {
-			let childPaths: string[] = [];
+			const childPaths: string[] = [];
 			let mtime = main.mtime;
 			if (subdirs.has(id)) {
 				const dirPath = path.join(folderPath, id);
@@ -616,7 +618,12 @@ async function scanGroup(d: DiscoveredGroup): Promise<SessionGroup | undefined> 
 }
 
 /** Run `fn` over `items` with bounded concurrency, preserving order. */
-async function mapPool<T, R>(items: readonly T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+async function mapPool<T, R>(
+	items: readonly T[],
+	limit: number,
+	fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
 	const out = new Array<R>(items.length);
 	let next = 0;
 	const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -756,7 +763,8 @@ function buildDigest(g: SessionGroup): string {
 		.slice(0, 8);
 	if (repeats.length) {
 		lines.push(`\n## Repeated reads of the same file (waste signal)`);
-		for (const [p, r] of repeats) lines.push(`${p} ×${r.count} (~${fmtTok(r.toks)}tok total, ~${fmtTok(r.residency)} residency)`);
+		for (const [p, r] of repeats)
+			lines.push(`${p} ×${r.count} (~${fmtTok(r.toks)}tok total, ~${fmtTok(r.residency)} residency)`);
 	}
 
 	if (m.topResults.length) {
@@ -894,7 +902,16 @@ const SESSION_SCHEMA = {
 		},
 		headline: { type: "string", description: "one-sentence takeaway for this session" },
 	},
-	required: ["score", "multiTopic", "topics", "shouldHaveSplit", "handoffOpportunities", "spawnVerdicts", "waste", "headline"],
+	required: [
+		"score",
+		"multiTopic",
+		"topics",
+		"shouldHaveSplit",
+		"handoffOpportunities",
+		"spawnVerdicts",
+		"waste",
+		"headline",
+	],
 } as const;
 
 interface AggregateFindings {
@@ -990,8 +1007,8 @@ async function openClassifier(modelSpec: string): Promise<Classifier> {
 	if (!model) throw new Error(`unknown model "${modelSpec}" (not in bundled catalog)`);
 	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 	const storage = new AuthStorage(store);
-	await storage.reload();
-	const apiKey = await storage.getApiKey(provider);
+	await storage.credentials.reload();
+	const apiKey = await storage.keys.get(provider);
 	if (!apiKey) {
 		throw new Error(`no credentials for provider "${provider}" (omp login or env var required)`);
 	}
@@ -1215,9 +1232,12 @@ function printVerdicts(res: AuditResult): void {
 	for (const g of ordered) {
 		const v = res.verdicts.get(g.id);
 		if (!v) continue;
-		console.log(`\n[${fmtMoney(g.usage.cost)}] "${clip(g.main.title ?? g.id, 60)}" (${g.folder}) — score ${v.score}/10`);
+		console.log(
+			`\n[${fmtMoney(g.usage.cost)}] "${clip(g.main.title ?? g.id, 60)}" (${g.folder}) — score ${v.score}/10`,
+		);
 		console.log(`  ${v.headline}`);
-		if (v.multiTopic) console.log(`  topics: ${v.topics.join(" | ")}${v.shouldHaveSplit ? "  → should have split" : ""}`);
+		if (v.multiTopic)
+			console.log(`  topics: ${v.topics.join(" | ")}${v.shouldHaveSplit ? "  → should have split" : ""}`);
 		for (const h of v.handoffOpportunities) console.log(`  handoff: ${h}`);
 		for (const s of v.spawnVerdicts) {
 			if (s.verdict === "good") continue;
@@ -1319,7 +1339,9 @@ async function main(): Promise<void> {
 		const sessionFilter = opts.session?.toLowerCase();
 		const matched = sessionFilter
 			? groups.filter(
-					g => g.id.toLowerCase().includes(sessionFilter) || (g.main.title ?? "").toLowerCase().includes(sessionFilter),
+					g =>
+						g.id.toLowerCase().includes(sessionFilter) ||
+						(g.main.title ?? "").toLowerCase().includes(sessionFilter),
 				)
 			: groups.filter(g => g.usage.cost >= opts.minCost);
 		const candidates = matched.sort((a, b) => b.usage.cost - a.usage.cost).slice(0, opts.maxLlm);
@@ -1365,7 +1387,9 @@ async function main(): Promise<void> {
 					addUsage(res.classifierUsage, usage);
 					process.stderr.write(`  ✓ ${clip(g.main.title ?? g.id, 50)} (score ${verdict.score})\n`);
 				} catch (err) {
-					process.stderr.write(`  ✗ ${clip(g.main.title ?? g.id, 50)}: ${err instanceof Error ? err.message : err}\n`);
+					process.stderr.write(
+						`  ✗ ${clip(g.main.title ?? g.id, 50)}: ${err instanceof Error ? err.message : err}\n`,
+					);
 				}
 			});
 			await saveVerdictCache(cache);
@@ -1402,7 +1426,9 @@ async function main(): Promise<void> {
 							headline: v.headline,
 							topics: v.topics,
 							shouldHaveSplit: v.shouldHaveSplit,
-							spawnIssues: v.spawnVerdicts.filter(s => s.verdict !== "good").map(s => ({ label: s.label, verdict: s.verdict })),
+							spawnIssues: v.spawnVerdicts
+								.filter(s => s.verdict !== "good")
+								.map(s => ({ label: s.label, verdict: s.verdict })),
 							waste: v.waste.map(w => ({ source: w.source, estTokens: w.estTokens, estUsd: round2(w.estUsd) })),
 						}),
 					);

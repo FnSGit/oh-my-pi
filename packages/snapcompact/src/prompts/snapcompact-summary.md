@@ -1,24 +1,27 @@
-Prior conversation history has been archived verbatim onto {{frameCount}} snapcompact frame{{#if multipleFrames}}s{{/if}} — the bitmap image{{#if multipleFrames}}s{{/if}} attached below{{#if multipleFrames}}, ordered oldest to newest{{/if}}.
+Resume prior conversation. Earlier turns archived under HISTORY below, oldest→newest. Read HISTORY fully; continue the live conversation following it.
 
-Reading a frame: monospace {{fontCell}} pixel font on a white background, {{#if docColumns}}typeset as two word-wrapped newspaper columns of {{cols}} characters by {{rows}} lines each — read the left column top to bottom, then the right column{{else}}{{cols}} characters per row, {{rows}} text rows per frame; read left to right, top to bottom. Text flows continuously with no word wrap, so words may break across row ends{{/if}}. Horizontal whitespace runs were collapsed to single spaces; line breaks print as a solid black cell (one character wide) — treat each as a newline. {{#if sentenceInk}}Ink color cycles through six colors, advancing at sentence boundaries — a color change marks a new sentence.{{else}}Glyphs are plain black ink.{{/if}}{{#if stopwordDimmed}} Common function words (the, of, and, …) are printed in dim gray; content words carry the full ink.{{/if}}{{#if dimmedToolResults}} Tool output is printed in dim gray ink — gray text is archived tool output, not conversation.{{/if}}{{#if lineRepeated}} Every text line is printed twice in a row — first on the white background, then repeated on a pale yellow band. The copies are identical: read each line once and use the duplicate only to double-check hard glyphs.{{/if}} Roles are tagged inline as [User]:, [Assistant]:, [Assistant thinking]:, [Assistant tool calls]:, and [Tool result]:.
-{{#if mixedShapes}}
-
-Older frames may use a different font, grid, or ink coloring than described above; the reading order is always the same (left to right, top to bottom, oldest frame first).
+Archived transcript scopes:
+{{#if includeThinking}}- `¶user:`, `¶think:`, `¶ai:`, `¶call:`: user, assistant reasoning, assistant reply, tool call.
+{{else}}- `¶user:`, `¶ai:`, `¶call:`: user, assistant reply, tool call.
 {{/if}}
-{{#if includedPreviousSummary}}
+- Unprefixed following lines: current scope. Consecutive same-kind blocks omit repeated prefix.
+- Tool call: `¶call:name(args)//intent`; trailing `//intent` optional. `<out>…</out>`: tool output.
 
-The earliest frame begins with "[Summary of earlier history]" — a condensed digest of context that predates the archived conversation.
-{{/if}}
-{{#if truncatedChars}}
+Reading HISTORY:
+- Plain text: verbatim transcript; rely on it exactly.
+{{#if frameCount}}- Some middle sections: images, not text. Each image: one page of that transcript, in reading order between marked delimiters. Solid black cell: newline; runs of spaces collapse to one.
+{{#if docColumns}}  - Frame: two side-by-side columns, each {{cols}} characters wide, up to {{rows}} rows tall; read left top→bottom, then right.
+{{else}}  - Frame: one grid {{cols}} characters wide, up to {{rows}} rows tall; read left→right, top→bottom. No word wrap; words may break across rows.
+{{/if}}{{#if sentenceInk}}  - Ink: six colors, one per sentence.
+{{/if}}{{#if stopwordDimmed}}  - Function words: dim gray; content words: full ink.
+{{/if}}{{#if lineRepeated}}  - Each line printed twice (white, then pale-yellow band); copies identical.
+{{/if}}{{/if}}{{#if includedPreviousSummary}}- HISTORY opens with a condensed digest of still-older context predating archived turns.
+{{/if}}{{#if truncatedChars}}- About {{truncatedChars}} characters of older middle history dropped to fit archive budget.
+{{/if}}- If an exact earlier detail matters and a section is unclear, re-derive from workspace (re-read files, re-run commands), rather than guess.
 
-{{truncatedChars}} characters of older history were dropped to respect the frame budget. The first frame (session start) is always kept, so the missing span sits between the first frame and the next.
-{{/if}}
-
-Total archived: {{totalChars}} characters. Consult the frames whenever you need exact earlier details (user wording, decisions, file paths, tool output). If a region is hard to read, re-derive the fact from the workspace (re-read files, re-run commands) rather than guessing.
-{{#if textTail}}
-
-The frame budget ran out before the newest part of the archive. That remainder continues below as plain text — it is newer than every frame and ends where the live conversation resumes.
-
-[Archived history, continued as text]
-{{textTail}}
-{{/if}}
+{{!-- viewWithoutFrames (snapcompact.ts) reads this FILES section back out of a rendered summary, and viewSummary tells this template's summaries from others by their closing HISTORY heading: keep FILES_SECTION_HEAD and HISTORY_SECTION_HEAD in step with these headings. --}}
+{{#if files}}FILES
+===================
+{{files}}
+{{/if}}HISTORY
+===================

@@ -2,15 +2,21 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { FileEntry, SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { findMostRecentSession, resolveResumableSession } from "@oh-my-pi/pi-coding-agent/session/session-listing";
+import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
-	type FileEntry,
-	findMostRecentSession,
-	loadEntriesFromFile,
-	resolveResumableSession,
-	type SessionHeader,
-	SessionManager,
-} from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getConfigRootDir, getSessionsDir, Snowflake, setAgentDir } from "@oh-my-pi/pi-utils";
+	getConfigRootDir,
+	getSessionsDir,
+	removeSyncWithRetries,
+	resolveEquivalentPath,
+	Snowflake,
+	setAgentDir,
+} from "@oh-my-pi/pi-utils";
+
+const OLDER_MTIME = new Date("2000-01-01T00:00:00.000Z");
+const NEWER_MTIME = new Date("2000-01-01T00:00:01.000Z");
 
 describe("loadEntriesFromFile", () => {
 	let tempDir: string;
@@ -21,7 +27,7 @@ describe("loadEntriesFromFile", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		removeSyncWithRetries(tempDir);
 	});
 
 	it("loads valid session file", async () => {
@@ -59,13 +65,7 @@ describe("findMostRecentSession", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
-	});
-
-	it("returns single valid session file", async () => {
-		const file = path.join(tempDir, "session.jsonl");
-		fs.writeFileSync(file, '{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
-		expect(await findMostRecentSession(tempDir)).toBe(file);
+		removeSyncWithRetries(tempDir);
 	});
 
 	it("returns most recently modified session", async () => {
@@ -73,9 +73,9 @@ describe("findMostRecentSession", () => {
 		const file2 = path.join(tempDir, "newer.jsonl");
 
 		fs.writeFileSync(file1, '{"type":"session","id":"old","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
-		// Small delay to ensure different mtime
-		await new Promise(r => setTimeout(r, 10));
+		fs.utimesSync(file1, OLDER_MTIME, OLDER_MTIME);
 		fs.writeFileSync(file2, '{"type":"session","id":"new","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
+		fs.utimesSync(file2, NEWER_MTIME, NEWER_MTIME);
 
 		expect(await findMostRecentSession(tempDir)).toBe(file2);
 	});
@@ -85,7 +85,6 @@ describe("findMostRecentSession", () => {
 		const valid = path.join(tempDir, "valid.jsonl");
 
 		fs.writeFileSync(invalid, '{"type":"not-session"}\n');
-		await new Promise(r => setTimeout(r, 10));
 		fs.writeFileSync(valid, '{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
 
 		expect(await findMostRecentSession(tempDir)).toBe(valid);
@@ -103,7 +102,7 @@ describe("resolveResumableSession", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		removeSyncWithRetries(tempDir);
 	});
 
 	function writeSession(fileName: string, headerCwd: string, id: string = Snowflake.next()): string {
@@ -159,6 +158,23 @@ describe("resolveResumableSession", () => {
 		expect(match?.scope).toBe("local");
 		expect(match?.session.path).toBe(path.join(sessionDir, "2025-01-01_moved.jsonl"));
 	});
+
+	it("matches sessions staged into the dir as symlinks", async () => {
+		const id = "sym1234";
+		const stagedDir = path.join(tempDir, "staged");
+		fs.mkdirSync(stagedDir);
+		fs.writeFileSync(
+			path.join(stagedDir, `${id}.jsonl`),
+			JSON.stringify({ type: "session", id, timestamp: "2025-01-01T00:00:00Z", cwd: "/tmp/project" }),
+		);
+		fs.symlinkSync(path.join(stagedDir, `${id}.jsonl`), path.join(sessionDir, `2025-01-01_${id}.jsonl`));
+		fs.symlinkSync(path.join(stagedDir, "missing.jsonl"), path.join(sessionDir, "dangling.jsonl"));
+
+		const match = await resolveResumableSession("sym", "/tmp/project", sessionDir);
+
+		expect(match?.scope).toBe("local");
+		expect(match?.session.id).toBe(id);
+	});
 });
 
 describe("SessionManager temp cwd session dirs", () => {
@@ -189,37 +205,7 @@ describe("SessionManager temp cwd session dirs", () => {
 			setAgentDir(fallbackAgentDir);
 			delete process.env.PI_CODING_AGENT_DIR;
 		}
-		fs.rmSync(testAgentDir, { recursive: true, force: true });
-	});
-
-	it("stores symlink-equivalent home cwd sessions under home-relative directories", () => {
-		if (process.platform === "win32") return;
-
-		const projectsRoot = path.join(os.homedir(), "Projects");
-		fs.mkdirSync(projectsRoot, { recursive: true });
-		const realProjectDir = fs.mkdtempSync(path.join(projectsRoot, "omp-session-home-"));
-		const nestedDir = path.join(realProjectDir, "nested");
-		const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-home-alias-"));
-		const homeAlias = path.join(aliasRoot, "home-link");
-
-		try {
-			fs.mkdirSync(nestedDir, { recursive: true });
-			fs.symlinkSync(os.homedir(), homeAlias, "dir");
-
-			const aliasedCwd = path.join(homeAlias, "Projects", path.basename(realProjectDir), "nested");
-			const session = SessionManager.create(aliasedCwd);
-			const sessionFile = session.getSessionFile();
-			if (!sessionFile) throw new Error("Expected session file path");
-
-			const expectedDir = path.join(
-				getSessionsDir(),
-				`-${path.relative(os.homedir(), fs.realpathSync(aliasedCwd)).replace(/[/\\:]/g, "-")}`,
-			);
-			expect(path.dirname(sessionFile)).toBe(expectedDir);
-		} finally {
-			fs.rmSync(aliasRoot, { recursive: true, force: true });
-			fs.rmSync(realProjectDir, { recursive: true, force: true });
-		}
+		removeSyncWithRetries(testAgentDir);
 	});
 
 	it("stores temp-root cwd sessions under -tmp-prefixed directories", () => {
@@ -251,10 +237,41 @@ describe("SessionManager temp cwd session dirs", () => {
 		expect(path.dirname(sessionFile)).toBe(expectedDir);
 		expect(fs.existsSync(path.join(expectedDir, "carried.jsonl"))).toBe(true);
 	});
+
+	it("migrates hashed-scheme session dirs back into legacy names", () => {
+		const tempCwd = path.join(testAgentDir, `hashed-cwd-${Snowflake.next()}`);
+		fs.mkdirSync(tempCwd, { recursive: true });
+
+		// Reconstruct the 17.2.5-17.2.8 hashed dir name (reverted PR #7397).
+		const canonicalCwd = resolveEquivalentPath(path.resolve(tempCwd));
+		const normalized = canonicalCwd.replaceAll("\\", "/");
+		const readable = path
+			.basename(canonicalCwd)
+			.replace(/[^a-zA-Z0-9._-]+/g, "-")
+			.replace(/^-+|-+$/g, "")
+			.slice(-80);
+		const digest = Bun.SHA256.hash(normalized, "hex");
+		const hashedDir = path.join(getSessionsDir(), `tmp-${readable || "project"}-${digest}`);
+		fs.mkdirSync(hashedDir, { recursive: true });
+		fs.writeFileSync(path.join(hashedDir, "stranded.jsonl"), "stranded\n");
+
+		const session = SessionManager.create(tempCwd);
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file path");
+
+		const expectedDir = path.join(getSessionsDir(), expectedTempSessionDirName(tempCwd));
+		expect(fs.existsSync(hashedDir)).toBe(false);
+		expect(path.dirname(sessionFile)).toBe(expectedDir);
+		expect(fs.existsSync(path.join(expectedDir, "stranded.jsonl"))).toBe(true);
+	});
 });
 
 describe("SessionManager legacy session migration persistence", () => {
 	let tempDir: string;
+	let testAgentDir: string;
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const originalTmuxPane = process.env.TMUX_PANE;
+	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 	function makeAssistantMessage() {
 		return {
@@ -281,11 +298,28 @@ describe("SessionManager legacy session migration persistence", () => {
 	}
 
 	beforeEach(() => {
+		// Deterministic, non-TTY terminal id so the per-terminal breadcrumb
+		// (written by newSession/continueRecent) is scoped to this test and
+		// cannot leak across files in the same suite run. Without it, a real
+		// terminal id (WT_SESSION/TMUX_PANE) points continueRecent at stale
+		// breadcrumb state from earlier tests in this file.
+		process.env.TMUX_PANE = "%legacy-migration-test";
+		testAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-manager-legacy-agent-"));
+		setAgentDir(testAgentDir);
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-session-manager-legacy-"));
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		if (originalTmuxPane === undefined) delete process.env.TMUX_PANE;
+		else process.env.TMUX_PANE = originalTmuxPane;
+		if (originalAgentDir) {
+			setAgentDir(originalAgentDir);
+		} else {
+			setAgentDir(fallbackAgentDir);
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
+		removeSyncWithRetries(tempDir);
+		removeSyncWithRetries(testAgentDir);
 	});
 
 	it("keeps legacy migration in memory until later persisted activity rewrites the file", async () => {
@@ -306,6 +340,7 @@ describe("SessionManager legacy session migration persistence", () => {
 				}),
 			].join("\n")}\n`,
 		);
+		fs.utimesSync(sessionFile, OLDER_MTIME, OLDER_MTIME);
 		const initialMtimeMs = fs.statSync(sessionFile).mtimeMs;
 
 		const session = await SessionManager.open(sessionFile, tempDir);
@@ -318,11 +353,9 @@ describe("SessionManager legacy session migration persistence", () => {
 		expect(migratedEntries[0]?.parentId).toBeNull();
 		expect(migratedEntries[1]?.parentId).toBe(migratedEntries[0]?.id);
 
-		await new Promise(resolve => setTimeout(resolve, 20));
 		await session.flush();
 		expect(fs.statSync(sessionFile).mtimeMs).toBe(initialMtimeMs);
 
-		await new Promise(resolve => setTimeout(resolve, 20));
 		session.appendMessage({ role: "user", content: "follow up", timestamp: Date.now() });
 		await session.flush();
 
@@ -351,10 +384,10 @@ describe("SessionManager legacy session migration persistence", () => {
 				}),
 			].join("\n")}\n`,
 		);
+		fs.utimesSync(sessionFile, OLDER_MTIME, OLDER_MTIME);
 		const initialMtimeMs = fs.statSync(sessionFile).mtimeMs;
 
 		const session = await SessionManager.open(sessionFile, tempDir);
-		await new Promise(resolve => setTimeout(resolve, 20));
 		await session.rewriteEntries();
 
 		const persistedEntries = await loadEntriesFromFile(sessionFile);
@@ -383,10 +416,10 @@ describe("SessionManager legacy session migration persistence", () => {
 				}),
 			].join("\n")}\n`,
 		);
+		fs.utimesSync(sessionFile, OLDER_MTIME, OLDER_MTIME);
 		const initialMtimeMs = fs.statSync(sessionFile).mtimeMs;
 
 		const session = await SessionManager.open(sessionFile, tempDir);
-		await new Promise(resolve => setTimeout(resolve, 20));
 		await session.ensureOnDisk();
 
 		const persistedEntries = await loadEntriesFromFile(sessionFile);
@@ -401,7 +434,7 @@ describe("SessionManager legacy session migration persistence", () => {
 		expect(persistedEntries[1].id).toBeDefined();
 		expect(persistedEntries[1].parentId).toBeNull();
 	});
-	it("keeps the last non-empty session resumable after starting a fresh session", async () => {
+	it("keeps an explicitly started session resumable after its first turn", async () => {
 		const session = SessionManager.create(tempDir, tempDir);
 		session.appendMessage({ role: "user", content: "hello", timestamp: Date.now() - 1 });
 		session.appendMessage(makeAssistantMessage());
@@ -412,11 +445,19 @@ describe("SessionManager legacy session migration persistence", () => {
 
 		const freshSessionFile = await session.newSession();
 		expect(freshSessionFile).toBeDefined();
-		expect(fs.existsSync(freshSessionFile!)).toBe(false);
+		// The boundary itself is durable before the first turn; completed output
+		// then keeps the same session at the head of restart selection (#5730).
+		expect(fs.existsSync(freshSessionFile!)).toBe(true);
+		session.appendMessage({ role: "user", content: "first message of fresh session", timestamp: Date.now() });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		expect(fs.existsSync(freshSessionFile!)).toBe(true);
 
 		const resumed = await SessionManager.continueRecent(tempDir, tempDir);
 		try {
-			expect(resumed.getSessionFile()).toBe(previousSessionFile);
+			// The `/new` boundary is durable: once materialized, relaunch resumes
+			// the fresh session, not the pre-`/new` transcript.
+			expect(resumed.getSessionFile()).toBe(freshSessionFile);
 		} finally {
 			await resumed.close();
 			await session.close();

@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SQL } from "bun";
 
@@ -38,7 +39,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 	it("create() warms the metadata index without selecting full content", async () => {
 		const client = new SQL("sqlite::memory:");
 		await client.unsafe(
-			`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL)`,
+			`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT)`,
 		);
 		await client.unsafe(`INSERT INTO omp_session_files (path, content, mtime_ms) VALUES (?, ?, ?)`, [
 			"/sessions/p/huge.jsonl",
@@ -52,6 +53,9 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 			unsafe(query, values) {
 				queries.push(query);
 				return client.unsafe(query, values);
+			},
+			transaction(callback) {
+				return client.transaction(async transaction => callback(transaction));
 			},
 		};
 
@@ -77,11 +81,11 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
-	it("writer.writeLineSync appends to SQL after drain", async () => {
+	it("writer.append appends to SQL after drain", async () => {
 		const { client, storage } = await createSqlite();
 		const writer = storage.openWriter("/sessions/p/session.jsonl");
-		writer.writeLineSync('{"type":"session"}\n');
-		writer.writeLineSync('{"type":"message"}\n');
+		await writer.append('{"type":"session"}\n');
+		await writer.append('{"type":"message"}\n');
 
 		// Reads await queued appends and fetch content from SQL.
 		expect(await storage.readText("/sessions/p/session.jsonl")).toBe('{"type":"session"}\n{"type":"message"}\n');
@@ -101,7 +105,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await storage.writeText("/sessions/p/keep.jsonl", "old content\n");
 
 		const writer = storage.openWriter("/sessions/p/keep.jsonl", { flags: "w" });
-		writer.writeLineSync("fresh\n");
+		await writer.append("fresh\n");
 		await writer.close();
 
 		expect(await storage.readText("/sessions/p/keep.jsonl")).toBe("fresh\n");
@@ -132,7 +136,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 
 		// Force a SQL error: drop the table so the next append throws.
 		await client.unsafe("DROP TABLE omp_session_files");
-		writer.writeLineSync("doomed\n");
+		void writer.append("doomed\n").catch(() => {});
 
 		await expect(storage.drain()).rejects.toThrow();
 		expect(writer.getError()).toBeDefined();
@@ -186,6 +190,75 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await storage.rename("/sessions/p/a.jsonl", "/sessions/p/b.jsonl");
 		expect(storage.existsSync("/sessions/p/a.jsonl")).toBe(false);
 		expect(await storage.readText("/sessions/p/b.jsonl")).toBe("from-a\n");
+		const rows = (await client.unsafe(`SELECT path, content FROM omp_session_files`)) as Array<{
+			path: string;
+			content: string;
+		}>;
+		expect(rows).toEqual([{ path: "/sessions/p/b.jsonl", content: "from-a\n" }]);
+		await client.end();
+	});
+
+	it("rename to the same path preserves the row", async () => {
+		const { client, storage } = await createSqlite();
+		const sessionPath = "/sessions/p/same.jsonl";
+		await storage.writeText(sessionPath, "keep-me\n");
+
+		await storage.rename(sessionPath, sessionPath);
+
+		expect(storage.existsSync(sessionPath)).toBe(true);
+		expect(await storage.readText(sessionPath)).toBe("keep-me\n");
+
+		await client.unsafe(`DELETE FROM omp_session_files WHERE path = ?`, [sessionPath]);
+		await expect(storage.rename(sessionPath, sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
+		await client.end();
+	});
+
+	it("rename rolls back destination deletion when moving the source fails", async () => {
+		const { client, storage } = await createSqlite();
+		const source = "/sessions/p/source.jsonl";
+		const destination = "/sessions/p/destination.jsonl";
+		await storage.writeText(source, "source\n");
+		await storage.writeText(destination, "destination\n");
+		await client.unsafe(
+			`CREATE TRIGGER reject_session_move BEFORE UPDATE OF path ON omp_session_files ` +
+				`WHEN OLD.path = '${source}' BEGIN SELECT RAISE(ABORT, 'move rejected'); END`,
+		);
+
+		await expect(storage.rename(source, destination)).rejects.toThrow("move rejected");
+
+		expect(await storage.readText(source)).toBe("source\n");
+		expect(await storage.readText(destination)).toBe("destination\n");
+		await client.end();
+	});
+
+	it("rename rejects an externally deleted source without deleting the destination", async () => {
+		const { client, storage } = await createSqlite();
+		const source = "/sessions/p/source.jsonl";
+		const destination = "/sessions/p/destination.jsonl";
+		await storage.writeText(source, "source\n");
+		await storage.writeText(destination, "destination\n");
+		await client.unsafe(`DELETE FROM omp_session_files WHERE path = ?`, [source]);
+
+		await expect(storage.rename(source, destination)).rejects.toMatchObject({ code: "ENOENT" });
+
+		expect(await storage.readText(destination)).toBe("destination\n");
+		const rows = (await client.unsafe(`SELECT path, content FROM omp_session_files`)) as Array<{
+			path: string;
+			content: string;
+		}>;
+		expect(rows).toEqual([{ path: destination, content: "destination\n" }]);
+		await client.end();
+	});
+
+	it("rename rejects a missing source, including a same-path rename", async () => {
+		const { client, storage } = await createSqlite();
+
+		await expect(storage.rename("/sessions/p/missing.jsonl", "/sessions/p/new.jsonl")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		await expect(storage.rename("/sessions/p/missing.jsonl", "/sessions/p/missing.jsonl")).rejects.toMatchObject({
+			code: "ENOENT",
+		});
 		await client.end();
 	});
 
@@ -218,6 +291,47 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
+	it("persists title updates as indexed fields across storage reloads", async () => {
+		const client = new SQL("sqlite::memory:");
+		const storage = await SqlSessionStorage.create({ client });
+		const sessionPath = "/sessions/p/titled.jsonl";
+		const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+		await storage.writeText(
+			sessionPath,
+			`${serializeTitleSlot({ title: "Old", source: "auto", updatedAt: "t1" })}${header}`,
+		);
+
+		await storage.updateSessionTitle(sessionPath, { title: "New", source: "user", updatedAt: "t2" });
+
+		expect(JSON.parse((await storage.readText(sessionPath)).split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
+		expect(JSON.parse((await storage.readTextSlices(sessionPath, 256, 0))[0].split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
+
+		const reloaded = await SqlSessionStorage.create({ client });
+		expect(JSON.parse((await reloaded.readText(sessionPath)).split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
+		expect(JSON.parse((await reloaded.readTextSlices(sessionPath, 256, 0))[0].split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
+		await client.end();
+	});
+
 	it("readTextSlices uses bounded SQL byte substrings instead of a full content select", async () => {
 		const client = new SQL("sqlite::memory:");
 		const queries: string[] = [];
@@ -226,6 +340,9 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 			unsafe(query, values) {
 				queries.push(query);
 				return client.unsafe(query, values);
+			},
+			transaction(callback) {
+				return client.transaction(async transaction => callback(transaction));
 			},
 		};
 		const storage = await SqlSessionStorage.create({ client: wrapped });
@@ -286,7 +403,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		const client = new SQL("sqlite::memory:");
 		// Pre-create the table with the expected schema.
 		await client.unsafe(
-			`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL)`,
+			`CREATE TABLE omp_session_files (path TEXT PRIMARY KEY, content TEXT NOT NULL, mtime_ms INTEGER NOT NULL, title TEXT, title_source TEXT, title_updated_at TEXT)`,
 		);
 		const storage = await SqlSessionStorage.create({ client, createTable: false });
 		await storage.writeText("/s/x.jsonl", "ok");
@@ -319,6 +436,9 @@ function capturingClient(adapter: "postgres" | "mysql"): {
 			queries.push({ sql, values });
 			return [];
 		},
+		async transaction(callback) {
+			return callback(client);
+		},
 	};
 	return { client, queries };
 }
@@ -328,7 +448,7 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		const { client, queries } = capturingClient("postgres");
 		const storage = await SqlSessionStorage.create({ client });
 		const writer = storage.openWriter("/s/p.jsonl");
-		writer.writeLineSync("chunk\n");
+		await writer.append("chunk\n");
 		await writer.close();
 
 		const ddl = queries.find(q => q.sql.startsWith("CREATE TABLE"));
@@ -348,11 +468,12 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		expect(storage.adapter).toBe("postgres");
 	});
 
-	it("MySQL uses `?` placeholders, `ON DUPLICATE KEY UPDATE`, and `CONCAT()`", async () => {
+	it("MySQL uses bound update values with `ON DUPLICATE KEY UPDATE` and `CONCAT()`", async () => {
 		const { client, queries } = capturingClient("mysql");
 		const storage = await SqlSessionStorage.create({ client });
+		await storage.writeText("/s/replace.jsonl", "body\n");
 		const writer = storage.openWriter("/s/m.jsonl");
-		writer.writeLineSync("chunk\n");
+		await writer.append("chunk\n");
 		await writer.close();
 
 		const ddl = queries.find(q => q.sql.startsWith("CREATE TABLE"));
@@ -365,8 +486,25 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 		expect(loadIndex?.sql).toContain("length(content)");
 		expect(loadIndex?.sql).not.toMatch(/SELECT\s+path,\s*content\b/i);
 
-		const append = queries.find(q => q.sql.includes("ON DUPLICATE KEY UPDATE"));
-		expect(append?.sql).toContain("CONCAT(content, VALUES(content))");
+		const upserts = queries.filter(q => q.sql.includes("ON DUPLICATE KEY UPDATE"));
+		expect(upserts).toHaveLength(2);
+		expect(upserts.every(query => !/VALUES\(\w+\)/i.test(query.sql))).toBe(true);
+
+		const replace = upserts.find(q => q.sql.includes("title_updated_at"));
+		expect(replace?.values?.slice(0, 6)).toEqual([
+			"/s/replace.jsonl",
+			"body\n",
+			expect.any(Number),
+			null,
+			null,
+			null,
+		]);
+		expect(replace?.values?.slice(6)).toEqual(["body\n", expect.any(Number), null, null, null]);
+
+		const append = upserts.find(q => q.sql.includes("CONCAT"));
+		expect(append?.sql).toContain("CONCAT(content, ?)");
+		expect(append?.values?.slice(0, 3)).toEqual(["/s/m.jsonl", "chunk\n", expect.any(Number)]);
+		expect(append?.values?.slice(3)).toEqual(["chunk\n", expect.any(Number)]);
 		expect(append?.sql).not.toContain("$1");
 
 		expect(storage.adapter).toBe("mysql");
@@ -378,6 +516,9 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 			async unsafe() {
 				return [];
 			},
+			async transaction(callback) {
+				return callback(client);
+			},
 		};
 		await expect(SqlSessionStorage.create({ client })).rejects.toThrow(/unable to infer adapter/);
 	});
@@ -387,6 +528,9 @@ describe("SqlSessionStorage (dialect-specific SQL)", () => {
 			options: { adapter: "" }, // empty / missing
 			async unsafe() {
 				return [];
+			},
+			async transaction(callback) {
+				return callback(client);
 			},
 		};
 		const storage = await SqlSessionStorage.create({ client, adapter: "postgres" });

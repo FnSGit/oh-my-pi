@@ -56,6 +56,59 @@ def _repo_full_name(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _normalize_bot_login(login: str | None) -> str:
+    if not isinstance(login, str):
+        return ""
+    cleaned = login.strip().removeprefix("@")
+    if cleaned.lower().endswith("[bot]"):
+        cleaned = cleaned[:-5]
+    return cleaned.lower()
+
+
+def _login_matches_bot(login: str | None, bot_login: str) -> bool:
+    normalized_login = _normalize_bot_login(login)
+    return bool(normalized_login) and normalized_login == _normalize_bot_login(bot_login)
+
+
+def _login_matches_personal_repo_owner(
+    login: str | None,
+    repository: Mapping[str, Any] | None,
+    repo: str | None,
+) -> bool:
+    """Return whether `login` owns this personal-account repository."""
+    if not isinstance(login, str) or not login:
+        return False
+    owner_login: str | None = None
+    owner_type: str | None = None
+    if isinstance(repository, Mapping):
+        owner = repository.get("owner")
+        if isinstance(owner, Mapping):
+            raw_login = owner.get("login")
+            if isinstance(raw_login, str) and raw_login:
+                owner_login = raw_login
+            raw_type = owner.get("type")
+            if isinstance(raw_type, str) and raw_type:
+                owner_type = raw_type
+    if owner_type is None or owner_type.lower() != "user":
+        return False
+    if not owner_login:
+        return False
+    return login.lower() == owner_login.lower()
+
+
+def _effective_association(
+    login: str | None,
+    association: str | None,
+    repository: Mapping[str, Any] | None,
+    repo: str | None,
+) -> str | None:
+    if association:
+        return association
+    if _login_matches_personal_repo_owner(login, repository, repo):
+        return "OWNER"
+    return association
+
+
 PrIssueResolver = Callable[[str, int], str | None] | None
 
 
@@ -65,9 +118,9 @@ def _is_bot_account(user: Mapping[str, Any] | None, bot_login: str) -> bool:
     login = str(user.get("login") or "")
     if not login:
         return False
-    if login == bot_login:
+    if _login_matches_bot(login, bot_login):
         return True
-    if login.endswith("[bot]"):
+    if login.lower().endswith("[bot]"):
         return True
     if str(user.get("type") or "") == "Bot":
         return True
@@ -96,11 +149,11 @@ def extract_mention(body: str | None, bot_login: str) -> str | None:
     """
     if not isinstance(body, str) or not body:
         return None
-    login = bot_login.strip()
+    login = _normalize_bot_login(bot_login)
     if not login:
         return None
     pattern = re.compile(
-        rf"(?<![A-Za-z0-9_-])@{re.escape(login)}(?![A-Za-z0-9_-])",
+        rf"(?<![A-Za-z0-9_-])@{re.escape(login)}(?:\[bot\](?![A-Za-z0-9_-])|(?![A-Za-z0-9_\[-]))",
         re.IGNORECASE,
     )
     if not pattern.search(body):
@@ -140,6 +193,29 @@ def is_implementation_authorizer(
     return False
 
 
+def _pr_review_pr(pr: Mapping[str, Any], repo: str, action: str, bot_login: str) -> RouteDecision:
+    """Build a `review_pr` decision for an incoming PR, or the matching skip."""
+    if str(pr.get("state") or "open") != "open":
+        return RouteDecision("skip", None, repo, None, "PR not open")
+    if bool(pr.get("draft")):
+        return RouteDecision("skip", None, repo, None, "draft PR")
+    if _is_bot_account(pr.get("user") or {}, bot_login):
+        return RouteDecision("skip", None, repo, None, "bot-authored PR")
+    number = pr.get("number")
+    if not isinstance(number, int):
+        return RouteDecision("skip", None, repo, None, "PR missing number")
+    login, assoc = _submitter_info(pr)
+    return RouteDecision(
+        "queue",
+        "review_pr",
+        repo,
+        issue_key(repo, number),
+        f"pull_request.{action}",
+        submitter=login,
+        association=assoc,
+    )
+
+
 def route(
     event_type: str,
     payload: Mapping[str, Any],
@@ -150,6 +226,8 @@ def route(
     reviewer_bots: frozenset[str] = frozenset(),
     resolve_issue_from_pr: PrIssueResolver = None,
     pr_review_enabled: bool = True,
+    release_sentinel_enabled: bool = False,
+    release_commit_prefix: str = "chore: bump version to ",
 ) -> RouteDecision:
     """Decide whether and how to handle a webhook event.
 
@@ -164,6 +242,31 @@ def route(
         return RouteDecision("skip", None, repo, None, "repo not on allowlist")
 
     action = str(payload.get("action") or "")
+
+    if event_type == "workflow_run":
+        if action != "completed":
+            return RouteDecision("skip", None, repo, None, f"workflow_run.{action} ignored")
+        if not release_sentinel_enabled:
+            return RouteDecision("skip", None, repo, None, "release sentinel disabled")
+        run = payload.get("workflow_run")
+        repository = payload.get("repository")
+        if not isinstance(run, Mapping) or not isinstance(repository, Mapping):
+            return RouteDecision("skip", None, repo, None, "workflow_run payload incomplete")
+        default_branch = str(repository.get("default_branch") or "")
+        head_branch = str(run.get("head_branch") or "")
+        if head_branch != default_branch and re.match(r"^v[0-9]", head_branch) is None:
+            return RouteDecision("skip", None, repo, None, "not a default-branch/tag run")
+        head_commit = run.get("head_commit")
+        message = str(head_commit.get("message") or "") if isinstance(head_commit, Mapping) else ""
+        if not message.startswith(release_commit_prefix):
+            return RouteDecision("skip", None, repo, None, "not a release commit")
+        return RouteDecision(
+            "queue",
+            "handle_release_ci",
+            repo,
+            f"{repo}#release",
+            f"workflow_run {run.get('name') or ''} {run.get('conclusion') or ''}",
+        )
 
     def _resolve_pr_key(pr_number: int) -> str:
         if resolve_issue_from_pr is not None:
@@ -224,10 +327,13 @@ def route(
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "issue missing number")
         key = issue_key(repo, number)
-        if action == "opened":
+        if action in ("opened", "reopened"):
+            # A reopen is submitter-attributable exactly like an open, and
+            # `finalized_issue_comment.md` promises re-triage on reopen, so it
+            # re-triages from scratch and spends the same per-user rate budget.
             login, assoc = _submitter_info(issue)
             return RouteDecision(
-                "queue", "triage_issue", repo, key, "issues.opened", submitter=login, association=assoc
+                "queue", "triage_issue", repo, key, f"issues.{action}", submitter=login, association=assoc
             )
         if action == "closed":
             # Cleanup is a lifecycle event, not a user submission; no rate-limit subject.
@@ -250,9 +356,10 @@ def route(
             # amend-and-push workflow.
             key = _resolve_pr_key(number)
             login, assoc = _submitter_info(comment)
+            assoc = _effective_association(login, assoc, payload.get("repository"), repo)
             issue_user_raw = issue.get("user")
             issue_user = issue_user_raw if isinstance(issue_user_raw, Mapping) else {}
-            if str(issue_user.get("login") or "") == bot_login:
+            if _login_matches_bot(str(issue_user.get("login") or ""), bot_login):
                 return RouteDecision(
                     "queue",
                     "handle_pr_conversation",
@@ -266,6 +373,7 @@ def route(
             return RouteDecision("skip", None, repo, issue_key(repo, number), "incoming PR comments ignored")
         key = issue_key(repo, number)
         login, assoc = _submitter_info(comment)
+        assoc = _effective_association(login, assoc, payload.get("repository"), repo)
         return RouteDecision(
             "queue",
             "handle_comment",
@@ -281,24 +389,7 @@ def route(
         if not pr_review_enabled:
             return RouteDecision("skip", None, repo, None, "PR review disabled")
         pr = payload.get("pull_request") or {}
-        if bool(pr.get("draft")):
-            return RouteDecision("skip", None, repo, None, "draft PR")
-        pr_user = pr.get("user") or {}
-        if _is_bot_account(pr_user, bot_login):
-            return RouteDecision("skip", None, repo, None, "bot-authored PR")
-        number = pr.get("number")
-        if not isinstance(number, int):
-            return RouteDecision("skip", None, repo, None, "PR missing number")
-        login, assoc = _submitter_info(pr)
-        return RouteDecision(
-            "queue",
-            "review_pr",
-            repo,
-            issue_key(repo, number),
-            f"pull_request.{action}",
-            submitter=login,
-            association=assoc,
-        )
+        return _pr_review_pr(pr, repo, action, bot_login)
 
     if event_type == "pull_request_review_comment" and action == "created":
         comment = payload.get("comment") or {}
@@ -307,13 +398,14 @@ def route(
             return RouteDecision("skip", None, repo, None, "bot/self review comment")
         pr = payload.get("pull_request") or {}
         pr_user = pr.get("user") or {}
-        if str(pr_user.get("login") or "") != bot_login:
+        if not _login_matches_bot(str(pr_user.get("login") or ""), bot_login):
             return RouteDecision("skip", None, repo, None, "PR not authored by bot")
         number = pr.get("number")
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "PR missing number")
         key = _resolve_pr_key(number)
         login, assoc = _submitter_info(comment)
+        assoc = _effective_association(login, assoc, payload.get("repository"), repo)
         return RouteDecision(
             "queue",
             "handle_review",

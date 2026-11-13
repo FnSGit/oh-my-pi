@@ -1,22 +1,30 @@
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { logger, untilAborted } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { logger, prompt, untilAborted, toError } from "@oh-my-pi/pi-utils";
+import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
 import { ensureBankExists } from "../hindsight/bank";
 import reflectDescription from "../prompts/tools/reflect.md" with { type: "text" };
+import { sessionMemoryToolRefs } from "../memory-backend/tool-names";
 import type { ToolSession } from ".";
 
-const memoryReflectSchema = z.object({
-	query: z.string().describe("question to answer"),
-	context: z.string().describe("optional context").optional(),
+import { cfgMemoryBackend } from "../memory-backend/settings";
+
+const memoryReflectSchema = type({
+	query: type("string").describe("question to answer"),
+	"context?": type("string").describe("optional context"),
 });
 
-export type MemoryReflectParams = z.infer<typeof memoryReflectSchema>;
+export type MemoryReflectParams = typeof memoryReflectSchema.infer;
 
 export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> {
 	readonly name = "reflect";
 	readonly approval = "read" as const;
 	readonly label = "Reflect";
-	readonly description = reflectDescription;
+	get description(): string {
+		return prompt.render(reflectDescription, {
+			toolRefs: sessionMemoryToolRefs(this.session),
+		});
+	}
 	readonly parameters = memoryReflectSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable";
@@ -25,14 +33,15 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): MemoryReflectTool | null {
-		const backend = session.settings.get("memory.backend");
+		const backend = cfgMemoryBackend.get(session.settings);
 		if (backend !== "hindsight" && backend !== "mnemopi") return null;
+		if (backend === "hindsight" && !isHindsightConfigured(loadHindsightConfig(session.settings))) return null;
 		return new MemoryReflectTool(session);
 	}
 
 	async execute(_id: string, params: MemoryReflectParams, signal?: AbortSignal): Promise<AgentToolResult> {
 		return untilAborted(signal, async () => {
-			const backend = this.session.settings.get("memory.backend");
+			const backend = cfgMemoryBackend.get(this.session.settings);
 			if (backend === "mnemopi") {
 				const state = this.session.getMnemopiSessionState?.();
 				if (!state) {
@@ -57,7 +66,7 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 					};
 				} catch (err) {
 					logger.warn("reflect failed", { backend: "mnemopi", bank: state.config.bank, error: String(err) });
-					throw err instanceof Error ? err : new Error(String(err));
+					throw toError(err);
 				}
 			}
 
@@ -81,7 +90,7 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 				};
 			} catch (err) {
 				logger.warn("reflect failed", { bankId: state.bankId, error: String(err) });
-				throw err instanceof Error ? err : new Error(String(err));
+				throw toError(err);
 			}
 		});
 	}

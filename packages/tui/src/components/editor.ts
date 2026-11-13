@@ -1,13 +1,37 @@
-import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
-import type { AutocompleteProvider, CombinedAutocompleteProvider } from "../autocomplete";
-import { BracketedPasteHandler } from "../bracketed-paste";
-import { getKeybindings, type KeybindingsManager } from "../keybindings";
-import { extractPrintableText, matchesKey } from "../keys";
+import { getProjectDir } from "@oh-my-pi/pi-utils/dirs";
+import * as logger from "@oh-my-pi/pi-utils/logger";
+import {
+	type AutocompleteItem,
+	type AutocompleteProvider,
+	atCompletionMatches,
+	extractAtFilePrefix,
+	findLeadingSlashCommandStart,
+	findTrailingSlashCommandStart,
+	isDirectoryCompletionValue,
+	midPromptSkillTokenMatches,
+	SKILL_NAMESPACE,
+} from "../autocomplete";
+import { BracketedPasteHandler, decodeReencodedPasteControls } from "../bracketed-paste";
+import { canonicalKeyId, getKeybindings, type KeybindingsManager } from "../keybindings";
+import { extractPrintableText, matchesKey, parseKey } from "../keys";
 import { KillRing } from "../kill-ring";
+import type { TspEditorDecoration, TspEditorProps, TspText, TspTone } from "@oh-my-pi/pi-wire";
+import { col, node } from "../native/describe";
+import { sameItems, sameProps } from "../native/memo";
+import { plainText } from "../native/spans";
+import {
+	type DescribeContext,
+	type NativeChild,
+	type NativeNode,
+	type NativeTextEdit,
+	type NativeUiEvent,
+	resolveTextEdit,
+} from "../native/node";
 import type { SymbolTheme } from "../symbols";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
 import {
 	getSegmenter,
+	getWidthConfigEpoch,
 	getWordNavKind,
 	moveWordLeft,
 	moveWordRight,
@@ -17,17 +41,95 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "../utils";
-import { SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list";
+import {
+	countGraphemes,
+	diffInsertSession,
+	flatten,
+	lastGraphemeStart,
+	nextGraphemeStart,
+	offsetToPos,
+	prevGraphemeStart,
+	stepGraphemes,
+	type VimCommand,
+	type VimInsertRecord,
+	type VimMode,
+	type VimPosition,
+	VimState,
+	visualRange,
+} from "../vim";
+import { scrollbarThumbRange } from "./scroll-viewport";
+import {
+	borderlessComposerStyle,
+	type ComposerChromeContext,
+	type ComposerStyle,
+	type EditorBorderStyle,
+	type EditorTopBorder,
+	getComposerStyle,
+	isFilledComposerStyle,
+} from "./composer";
+
+export type { EditorBorderStyle, EditorTopBorder };
+
+import { type SelectItem, SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list";
+import { editorKey } from "../chrome/keybinding-hints";
+
+/** The TSP root an {@link Editor.describeLayout} hook builds around the `editor` node. */
+export interface NativeEditorLayout {
+	readonly role: string;
+	/** Tone of the root (`pending` while a turn runs). */
+	readonly tone?: TspTone;
+	readonly children: readonly NativeChild[];
+	/** Keypath of the `editor` node inside the root (the autocomplete's caret anchor). */
+	readonly caret: string;
+}
+
+/**
+ * Vim mode as the TSP `editor.mode` label. Insert carries none: Insert edits like a plain field,
+ * and a host such as Tern stops native editing (selection, ⌘A/⌘C/⌘X) for any labelled mode.
+ */
+const VIM_MODE_LABELS: Record<VimMode, string | undefined> = {
+	insert: undefined,
+	normal: "NORMAL",
+	visual: "VISUAL",
+	"visual-line": "VISUAL",
+	replace: "REPLACE",
+};
+
+const PASSTHROUGH_COLOR = (text: string): string => text;
+
+/** Value equality of two decoration lists, so an unchanged set keeps its identity across text edits elsewhere. */
+function sameDecorations(a: readonly TspEditorDecoration[], b: readonly TspEditorDecoration[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		const x = a[i]!;
+		const y = b[i]!;
+		if (x.from !== y.from || x.to !== y.to || x.s !== y.s || x.fx !== y.fx) return false;
+	}
+	return true;
+}
+const MENTION_CONTEXT_RE = /(?:^|\s)\^[^\s]*$/;
 
 const AUTOCOMPLETE_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	overflowSearch: false,
 };
 
+/**
+ * `@` file lists are narrowed in place (`setFilter(liveToken)`) while a fresh
+ * search runs, so a slow walk never leaves entries that contradict the typed
+ * token on screen. An emptied list means the refresh is still pending; the
+ * popup stays open but renders nothing until results arrive.
+ */
+const AT_FILE_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
+	...AUTOCOMPLETE_SELECT_LIST_LAYOUT,
+	filterItems: (items, token) => items.filter(item => atCompletionMatches(token, item.value)),
+};
+
 const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	minPrimaryColumnWidth: 12,
 	maxPrimaryColumnWidth: 32,
-	overflowSearch: false,
 	wrapDescription: true,
+	maxDescriptionRows: 2,
+	overflowSearch: false,
 };
 
 function sanitizeLoadedText(text: string): string {
@@ -39,12 +141,15 @@ const segmenter = getSegmenter();
 
 /**
  * Represents a chunk of text for word-wrap layout.
- * Tracks both the text content and its position in the original line.
+ * Tracks the text content, its position in the original line, and its exact
+ * visible width (`width === visibleWidth(text)`, measured at build time) so
+ * layout/render never re-measure cached chunks.
  */
 interface TextChunk {
 	text: string;
 	startIndex: number;
 	endIndex: number;
+	width: number;
 }
 
 /**
@@ -52,92 +157,121 @@ interface TextChunk {
  * Wraps at word boundaries when possible, falling back to character-level
  * wrapping for words longer than the available width.
  *
+ * Widths are carried, never recomputed: the line is segmented exactly once,
+ * per-grapheme widths are measured lazily at most once each, and every chunk
+ * is a contiguous slice of `line` (no incremental string concatenation).
+ *
  * @param line - The text line to wrap
  * @param maxWidth - Maximum visible width per chunk
- * @returns Array of chunks with text and position information
+ * @param knownLineWidth - Caller-carried exact `visibleWidth(line)`, if already measured
+ * @returns Array of chunks with text, position, and exact visible width
  */
-function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
+function wordWrapLine(line: string, maxWidth: number, knownLineWidth?: number): TextChunk[] {
 	if (!line || maxWidth <= 0) {
-		return [{ text: "", startIndex: 0, endIndex: 0 }];
+		return [{ text: "", startIndex: 0, endIndex: 0, width: 0 }];
 	}
 
-	const lineWidth = visibleWidth(line);
+	const lineWidth = knownLineWidth ?? visibleWidth(line);
 	if (lineWidth <= maxWidth) {
-		return [{ text: line, startIndex: 0, endIndex: line.length }];
+		return [{ text: line, startIndex: 0, endIndex: line.length, width: lineWidth }];
 	}
 
-	const chunks: TextChunk[] = [];
-
-	// Split into tokens (words and whitespace runs)
-	const tokens: { text: string; startIndex: number; endIndex: number; isWhitespace: boolean }[] = [];
-	let currentToken = "";
-	let tokenStart = 0;
+	// Single segmentation pass: grapheme start offsets (with end sentinel),
+	// lazily-filled grapheme widths, and word/whitespace token boundaries.
+	const gStart: number[] = [];
+	const gWidth: number[] = [];
+	interface Token {
+		startG: number;
+		endG: number;
+		startIndex: number;
+		endIndex: number;
+		isWhitespace: boolean;
+	}
+	const tokens: Token[] = [];
 	let inWhitespace = false;
-	let charIndex = 0;
-
+	let tokenStartG = 0;
+	let tokenStartIndex = 0;
+	let gCount = 0;
 	for (const seg of segmenter.segment(line)) {
-		const grapheme = seg.segment;
-		const graphemeIsWhitespace = getWordNavKind(grapheme) === "whitespace";
-
-		if (currentToken === "") {
+		const graphemeIsWhitespace = getWordNavKind(seg.segment) === "whitespace";
+		if (gCount === 0) {
 			inWhitespace = graphemeIsWhitespace;
-			tokenStart = charIndex;
 		} else if (graphemeIsWhitespace !== inWhitespace) {
-			// Token type changed - save current token
+			// Token type changed - close the current token
 			tokens.push({
-				text: currentToken,
-				startIndex: tokenStart,
-				endIndex: charIndex,
+				startG: tokenStartG,
+				endG: gCount,
+				startIndex: tokenStartIndex,
+				endIndex: seg.index,
 				isWhitespace: inWhitespace,
 			});
-			currentToken = "";
-			tokenStart = charIndex;
+			tokenStartG = gCount;
+			tokenStartIndex = seg.index;
 			inWhitespace = graphemeIsWhitespace;
 		}
-
-		currentToken += grapheme;
-		charIndex += grapheme.length;
+		gStart.push(seg.index);
+		gWidth.push(-1);
+		gCount++;
 	}
-
-	// Push final token
-	if (currentToken) {
+	gStart.push(line.length);
+	if (gCount > tokenStartG) {
 		tokens.push({
-			text: currentToken,
-			startIndex: tokenStart,
-			endIndex: charIndex,
+			startG: tokenStartG,
+			endG: gCount,
+			startIndex: tokenStartIndex,
+			endIndex: line.length,
 			isWhitespace: inWhitespace,
 		});
 	}
 
-	// Build chunks using word wrapping
-	let currentChunk = "";
-	let currentWidth = 0;
-	let chunkStartIndex = 0;
-	let atLineStart = true; // Track if we're at the start of a line (for skipping whitespace)
+	/** Exact `visibleWidth` of grapheme `g`, measured at most once. */
+	const graphemeWidth = (g: number): number => {
+		let w = gWidth[g] ?? -1;
+		if (w < 0) {
+			w = visibleWidth(line.slice(gStart[g] ?? 0, gStart[g + 1] ?? line.length));
+			gWidth[g] = w;
+		}
+		return w;
+	};
 
-	function consumePrefixToWidth(text: string, availableWidth: number): { text: string; len: number } {
-		let prefix = "";
+	const chunks: TextChunk[] = [];
+	const pushChunk = (text: string, startIndex: number, endIndex: number): void => {
+		chunks.push({ text, startIndex, endIndex, width: visibleWidth(text) });
+	};
+
+	/** Widest grapheme prefix of [startG, endG) that fits `availableWidth`. */
+	const consumePrefixToWidth = (
+		startG: number,
+		endG: number,
+		availableWidth: number,
+	): { endG: number; len: number } => {
 		let prefixWidth = 0;
-		let len = 0;
-		for (const seg of segmenter.segment(text)) {
-			const grapheme = seg.segment;
-			const graphemeWidth = visibleWidth(grapheme);
-			if (prefixWidth + graphemeWidth > availableWidth) break;
-			prefix += grapheme;
-			prefixWidth += graphemeWidth;
-			len += grapheme.length;
+		let g = startG;
+		while (g < endG) {
+			const w = graphemeWidth(g);
+			if (prefixWidth + w > availableWidth) break;
+			prefixWidth += w;
+			g++;
 			if (prefixWidth === availableWidth) break;
 		}
-		return { text: prefix, len };
-	}
-	function hasWideGrapheme(text: string): boolean {
-		for (const seg of segmenter.segment(text)) {
-			if (visibleWidth(seg.segment) > 1) return true;
+		return { endG: g, len: (gStart[g] ?? 0) - (gStart[startG] ?? 0) };
+	};
+	const hasWideGrapheme = (startG: number, endG: number): boolean => {
+		for (let g = startG; g < endG; g++) {
+			if (graphemeWidth(g) > 1) return true;
 		}
 		return false;
-	}
+	};
+
+	// Build chunks using word wrapping. The pending chunk is always the
+	// contiguous slice line[chunkStart, chunkEnd) with visible width currentWidth.
+	let chunkStart = 0;
+	let chunkEnd = 0;
+	let currentWidth = 0;
+	let atLineStart = true; // Track if we're at the start of a line (for skipping whitespace)
+
 	for (const token of tokens) {
-		const tokenWidth = visibleWidth(token.text);
+		const tokenWidth = visibleWidth(line.slice(token.startIndex, token.endIndex));
 
 		// Skip leading whitespace at line start. Keep the skipped run mapped onto the
 		// preceding chunk (when one exists) so every cursor position resolves to a
@@ -145,7 +279,8 @@ function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
 		if (atLineStart && token.isWhitespace) {
 			const prev = chunks[chunks.length - 1];
 			if (prev) prev.endIndex = token.endIndex;
-			chunkStartIndex = token.endIndex;
+			chunkStart = token.endIndex;
+			chunkEnd = token.endIndex;
 			continue;
 		}
 		atLineStart = false;
@@ -153,65 +288,49 @@ function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
 		// If this single token is wider than maxWidth, we need to break it
 		if (tokenWidth > maxWidth) {
 			// If we're mid-line, try to use the remaining width by consuming a prefix of this long token.
-			let consumedPrefix = "";
-			let consumedPrefixLen = 0; // JS string index (code units) consumed from token.text
-			if (currentChunk && currentWidth < maxWidth) {
+			let consumedPrefixLen = 0; // JS string index (code units) consumed from the token
+			let consumedPrefixEndG = token.startG;
+			if (chunkEnd > chunkStart && currentWidth < maxWidth) {
 				const remainingWidth = maxWidth - currentWidth;
-				const consumed = consumePrefixToWidth(token.text, remainingWidth);
-				consumedPrefix = consumed.text;
+				const consumed = consumePrefixToWidth(token.startG, token.endG, remainingWidth);
+				consumedPrefixEndG = consumed.endG;
 				consumedPrefixLen = consumed.len;
 			}
 			// First, push any accumulated chunk (optionally filled with the prefix).
-			if (currentChunk) {
-				if (consumedPrefix) {
-					chunks.push({
-						text: currentChunk + consumedPrefix,
-						startIndex: chunkStartIndex,
-						endIndex: token.startIndex + consumedPrefixLen,
-					});
-					currentChunk = "";
-					currentWidth = 0;
-					chunkStartIndex = token.startIndex + consumedPrefixLen;
+			if (chunkEnd > chunkStart) {
+				if (consumedPrefixLen > 0) {
+					const endIndex = token.startIndex + consumedPrefixLen;
+					pushChunk(line.slice(chunkStart, endIndex), chunkStart, endIndex);
+					chunkStart = endIndex;
+					chunkEnd = endIndex;
 				} else {
-					chunks.push({
-						text: currentChunk,
-						startIndex: chunkStartIndex,
-						endIndex: token.startIndex,
-					});
-					currentChunk = "";
-					currentWidth = 0;
-					chunkStartIndex = token.startIndex;
+					pushChunk(line.slice(chunkStart, chunkEnd), chunkStart, token.startIndex);
+					chunkStart = token.startIndex;
+					chunkEnd = token.startIndex;
 				}
+				currentWidth = 0;
 			}
 			// Break the remaining long token by grapheme
-			const remainingText = consumedPrefixLen > 0 ? token.text.slice(consumedPrefixLen) : token.text;
-			let tokenChunk = "";
-			let tokenChunkWidth = 0;
-			let tokenChunkStart = token.startIndex + consumedPrefixLen;
-			let tokenCharIndex = token.startIndex + consumedPrefixLen;
-			for (const seg of segmenter.segment(remainingText)) {
-				const grapheme = seg.segment;
-				const graphemeWidth = visibleWidth(grapheme);
-				if (tokenChunkWidth + graphemeWidth > maxWidth && tokenChunk) {
-					chunks.push({
-						text: tokenChunk,
-						startIndex: tokenChunkStart,
-						endIndex: tokenCharIndex,
-					});
-					tokenChunk = grapheme;
-					tokenChunkWidth = graphemeWidth;
-					tokenChunkStart = tokenCharIndex;
+			let tcStart = token.startIndex + consumedPrefixLen;
+			let tcEnd = tcStart;
+			let tcWidth = 0;
+			for (let g = consumedPrefixEndG; g < token.endG; g++) {
+				const w = graphemeWidth(g);
+				const gEnd = gStart[g + 1] ?? line.length;
+				if (tcWidth + w > maxWidth && tcEnd > tcStart) {
+					pushChunk(line.slice(tcStart, tcEnd), tcStart, tcEnd);
+					tcStart = tcEnd;
+					tcWidth = w;
 				} else {
-					tokenChunk += grapheme;
-					tokenChunkWidth += graphemeWidth;
+					tcWidth += w;
 				}
-				tokenCharIndex += grapheme.length;
+				tcEnd = gEnd;
 			}
 			// Keep remainder as start of next chunk
-			if (tokenChunk) {
-				currentChunk = tokenChunk;
-				currentWidth = tokenChunkWidth;
-				chunkStartIndex = tokenChunkStart;
+			if (tcEnd > tcStart) {
+				chunkStart = tcStart;
+				chunkEnd = tcEnd;
+				currentWidth = tcWidth;
 			}
 			continue;
 		}
@@ -220,36 +339,34 @@ function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
 		if (currentWidth + tokenWidth > maxWidth) {
 			// For wide-character tokens (e.g., CJK runs), prefer using remaining width before wrapping
 			// the whole token to the next line. This avoids leaving a short ASCII word alone.
-			if (currentChunk && !token.isWhitespace && currentWidth < maxWidth && hasWideGrapheme(token.text)) {
+			if (
+				chunkEnd > chunkStart &&
+				!token.isWhitespace &&
+				currentWidth < maxWidth &&
+				hasWideGrapheme(token.startG, token.endG)
+			) {
 				const remainingWidth = maxWidth - currentWidth;
-				const consumed = consumePrefixToWidth(token.text, remainingWidth);
-				if (consumed.text) {
-					chunks.push({
-						text: currentChunk + consumed.text,
-						startIndex: chunkStartIndex,
-						endIndex: token.startIndex + consumed.len,
-					});
-					const remainder = token.text.slice(consumed.len);
-					currentChunk = remainder;
+				const consumed = consumePrefixToWidth(token.startG, token.endG, remainingWidth);
+				if (consumed.len > 0) {
+					const endIndex = token.startIndex + consumed.len;
+					pushChunk(line.slice(chunkStart, endIndex), chunkStart, endIndex);
+					const remainder = line.slice(endIndex, token.endIndex);
+					chunkStart = endIndex;
+					chunkEnd = token.endIndex;
 					currentWidth = visibleWidth(remainder);
-					chunkStartIndex = token.startIndex + consumed.len;
 					atLineStart = false;
 					continue;
 				}
 			}
 			// Push current chunk (trimming trailing whitespace for display)
-			const trimmedChunk = currentChunk.trimEnd();
+			const trimmedChunk = line.slice(chunkStart, chunkEnd).trimEnd();
 			if (trimmedChunk || chunks.length === 0) {
-				chunks.push({
-					text: trimmedChunk,
-					startIndex: chunkStartIndex,
-					endIndex: chunkStartIndex + currentChunk.length,
-				});
+				pushChunk(trimmedChunk, chunkStart, chunkEnd);
 			} else {
 				// All-whitespace chunk collapsed away: keep its span mapped on the
 				// previous chunk so cursor positions inside it stay addressable.
 				const prev = chunks[chunks.length - 1];
-				if (prev) prev.endIndex = chunkStartIndex + currentChunk.length;
+				if (prev) prev.endIndex = chunkEnd;
 			}
 			// Start new line - skip leading whitespace
 			atLineStart = true;
@@ -258,32 +375,29 @@ function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
 				// point; otherwise cursor positions inside it map to no layout line.
 				const prev = chunks[chunks.length - 1];
 				if (prev) prev.endIndex = token.endIndex;
-				currentChunk = "";
+				chunkStart = token.endIndex;
+				chunkEnd = token.endIndex;
 				currentWidth = 0;
-				chunkStartIndex = token.endIndex;
 			} else {
-				currentChunk = token.text;
+				chunkStart = token.startIndex;
+				chunkEnd = token.endIndex;
 				currentWidth = tokenWidth;
-				chunkStartIndex = token.startIndex;
 				atLineStart = false;
 			}
 		} else {
 			// Add token to current chunk
-			currentChunk += token.text;
+			if (chunkEnd === chunkStart) chunkStart = token.startIndex;
+			chunkEnd = token.endIndex;
 			currentWidth += tokenWidth;
 		}
 	}
 
 	// Push final chunk
-	if (currentChunk) {
-		chunks.push({
-			text: currentChunk,
-			startIndex: chunkStartIndex,
-			endIndex: line.length,
-		});
+	if (chunkEnd > chunkStart) {
+		pushChunk(line.slice(chunkStart, chunkEnd), chunkStart, line.length);
 	}
 
-	return chunks.length > 0 ? chunks : [{ text: "", startIndex: 0, endIndex: 0 }];
+	return chunks.length > 0 ? chunks : [{ text: "", startIndex: 0, endIndex: 0, width: 0 }];
 }
 
 /** Visual cell column of code-unit `offset` within `text`, counted by grapheme walk. */
@@ -323,9 +437,192 @@ function maxSegmentVisualCol(text: string, isLastSegment: boolean): number {
 	return isLastSegment ? total : Math.max(0, total - lastWidth);
 }
 
+/** True when every code unit is plain printable text: no C0 controls (so no
+ *  ESC/CR/LF/TAB), no DEL, no C1 range — the same set `extractPrintableText`
+ *  rejects. Such a run can never encode a key sequence. */
+function isPlainTextRun(data: string): boolean {
+	for (let i = 0; i < data.length; i++) {
+		const code = data.charCodeAt(i);
+		if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return false;
+	}
+	return true;
+}
+
+/** Named keys Vim's Normal/Visual modes reinterpret as motions instead of letting them edit. */
+const VIM_NAV_KEYS: Record<string, string | undefined> = {
+	up: "k",
+	down: "j",
+	left: "h",
+	right: "l",
+	home: "0",
+	end: "$",
+	backspace: "h",
+	delete: "x",
+	space: "l",
+};
+
+/** Minimum free cells between an end-of-line cursor and a right-aligned placeholder. */
+const PLACEHOLDER_MIN_GAP = 2;
+
 const DEFAULT_PAGE_SCROLL_LINES = 10;
 
 const MAX_UNDO_STACK = 100;
+
+/** Undo-stack position to fold later snapshots back to; `shifts` tracks MAX_UNDO_STACK eviction. */
+interface UndoMark {
+	depth: number;
+	shifts: number;
+}
+
+/**
+ * Tracked Insert/Replace session: `[0, leftEnd)` is surviving pre-session text on the left and
+ * `[rightStart, len)` on the right (flat-buffer offsets), so the gap is what the session typed.
+ * `delBefore`/`delAfter` count pre-session graphemes deleted around the anchor — tracked
+ * incrementally because a final-text diff cannot see a delete that was retyped identically.
+ */
+interface VimSessionState {
+	mark: UndoMark;
+	replace: boolean;
+	/** Flat text at segment start (diff fallback and arrowed-split baseline). */
+	text: string;
+	/** Flat cursor at segment start. */
+	cursor: number;
+	arrowed: boolean;
+	leftEnd: number;
+	rightStart: number;
+	delBefore: number;
+	delAfter: number;
+	/** False after an edit path we cannot classify (native host edits); falls back to a final diff. */
+	tracked: boolean;
+}
+
+/** Length of `lines.join("\n")` without building it. */
+function flatLength(lines: readonly string[]): number {
+	let length = lines.length - 1;
+	for (const line of lines) length += line.length;
+	return length;
+}
+
+/** `lines.join("\n").slice(start, end)` without joining the whole buffer. */
+function sliceFlat(lines: readonly string[], start: number, end: number): string {
+	let out = "";
+	let offset = 0;
+	for (let i = 0; i < lines.length && offset < end; i++) {
+		const line = lines[i]!;
+		const lineEnd = offset + line.length;
+		if (lineEnd >= start) {
+			out += line.slice(Math.max(0, start - offset), end - offset);
+			if (i < lines.length - 1 && lineEnd < end) out += "\n";
+		}
+		offset = lineEnd + 1;
+	}
+	return out;
+}
+
+/**
+ * Common prefix and non-overlapping common suffix of `before.join("\n")` and `after.join("\n")` —
+ * the split a flat char scan gives — without joining either buffer. Lines an edit left alone keep
+ * their string identity, so they are skipped whole and a keystroke costs O(lines), not O(chars).
+ */
+function diffFlatLines(
+	before: readonly string[],
+	after: readonly string[],
+	beforeLength: number,
+	afterLength: number,
+): { prefix: number; suffix: number } {
+	const prefixMax = Math.min(beforeLength, afterLength);
+	let prefix = 0;
+	let bl = 0;
+	let bc = 0;
+	let al = 0;
+	let ac = 0;
+	// `prefix < prefixMax` guarantees both sides still have a character; past a line's end it is "\n".
+	while (prefix < prefixMax) {
+		const bLine = before[bl]!;
+		const aLine = after[al]!;
+		if (
+			bc === 0 &&
+			ac === 0 &&
+			bl < before.length - 1 &&
+			al < after.length - 1 &&
+			prefix + bLine.length + 1 <= prefixMax &&
+			bLine === aLine
+		) {
+			prefix += bLine.length + 1;
+			bl++;
+			al++;
+			continue;
+		}
+		const b = bc < bLine.length ? bLine.charCodeAt(bc) : 10;
+		const a = ac < aLine.length ? aLine.charCodeAt(ac) : 10;
+		if (a !== b) break;
+		prefix++;
+		if (bc < bLine.length) {
+			bc++;
+		} else {
+			bl++;
+			bc = 0;
+		}
+		if (ac < aLine.length) {
+			ac++;
+		} else {
+			al++;
+			ac = 0;
+		}
+	}
+
+	const suffixMax = Math.min(beforeLength - prefix, afterLength - prefix);
+	let suffix = 0;
+	bl = before.length - 1;
+	al = after.length - 1;
+	bc = before[bl]!.length;
+	ac = after[al]!.length;
+	// Positions sit just past the next character to compare; before a line's start it is "\n".
+	while (suffix < suffixMax) {
+		const bLine = before[bl]!;
+		const aLine = after[al]!;
+		if (
+			bc === bLine.length &&
+			ac === aLine.length &&
+			bl > 0 &&
+			al > 0 &&
+			suffix + bLine.length + 1 <= suffixMax &&
+			bLine === aLine
+		) {
+			suffix += bLine.length + 1;
+			bl--;
+			al--;
+			bc = before[bl]!.length;
+			ac = after[al]!.length;
+			continue;
+		}
+		const b = bc > 0 ? bLine.charCodeAt(bc - 1) : 10;
+		const a = ac > 0 ? aLine.charCodeAt(ac - 1) : 10;
+		if (a !== b) break;
+		suffix++;
+		if (bc > 0) {
+			bc--;
+		} else {
+			bl--;
+			bc = before[bl]!.length;
+		}
+		if (ac > 0) {
+			ac--;
+		} else {
+			al--;
+			ac = after[al]!.length;
+		}
+	}
+	return { prefix, suffix };
+}
+
+/**
+ * Typed characters that replace the provisional space a Tab word accept adds, so
+ * they attach to the accepted word: closing punctuation, and `-` for compounds
+ * (`cross-platform`; a spaced dash is still space, then `-`). Quotes are
+ * excluded: they may open a quote.
+ */
+const PROVISIONAL_SPACE_ABSORBERS = /^[-.,;:!?)\]}]/;
 
 interface EditorState {
 	lines: string[];
@@ -335,24 +632,38 @@ interface EditorState {
 
 interface LayoutLine {
 	text: string;
+	/** Exact `visibleWidth(text)` carried from wrap/layout, never re-derived. */
+	width: number;
+	sourceLine: number;
+	sourceStartCol: number;
 	hasCursor: boolean;
 	cursorPos?: number;
+	/** Logical buffer line this row came from, and the offset of `text[0]` within it. Populated
+	 *  only while a Vim visual selection is active, to map the selection span onto wrapped rows. */
+	logicalLine?: number;
+	startIndex?: number;
+}
+
+/** Per-line measurement carried across renders: exact visible width plus
+ *  lazily-built wrap chunks (only populated once the line needs wrapping). */
+interface WrapEntry {
+	width: number;
+	chunks: TextChunk[] | null;
 }
 
 export interface EditorTheme {
 	borderColor: (str: string) => string;
+	/** Stable accent for composer chrome that should not follow the mutable border state. */
+	accentColor?: (str: string) => string;
+	/** Background fill used by filled composer styles. */
+	surfaceColor?: (str: string) => string;
+	/** Foreground used when the composer shape leaves its text surface transparent. */
+	textColor?: (str: string) => string;
 	selectList: SelectListTheme;
 	symbols: SymbolTheme;
 	editorPaddingX?: number;
 	/** Style function for inline hint/ghost text (dim text after cursor) */
 	hintStyle?: (text: string) => string;
-}
-
-export interface EditorTopBorder {
-	/** The status content (already styled) */
-	content: string;
-	/** Visible width of the content */
-	width: number;
 }
 
 interface HistoryEntry {
@@ -364,7 +675,80 @@ interface HistoryStorage {
 	getRecent(limit: number): HistoryEntry[];
 }
 
+interface LocalHistoryEntry {
+	text: string;
+	draft?: {
+		pastes: Map<number, string>;
+		atoms: Map<string, string>;
+		pasteCounter: number;
+		restore?: () => void;
+	};
+}
+
+/** A synchronous replacement immediately before the editor cursor. */
+export interface EditorInlineReplacement {
+	/** UTF-16 code units to remove immediately before the cursor. */
+	replaceLen: number;
+	/** Literal text inserted where the removed suffix started. */
+	insert: string;
+}
+
+/** Replacement candidates and the current-line span they replace. */
+export interface EditorWordReplacements {
+	line: number;
+	startCol: number;
+	endCol: number;
+	items: readonly string[];
+}
+
+/** Source location for one visual text segment passed to `decorateText`. */
+export interface EditorTextDecorationContext {
+	line: number;
+	startCol: number;
+	endCol: number;
+}
+
+/**
+ * Optional prose assistance kept separate from command/file autocomplete.
+ * Hosts independently decide whether word completion and autocorrection are enabled.
+ */
+export interface EditorTextAssistProvider {
+	/** Return ghost-text suffix for the partial word at the cursor, or `null`. */
+	getWordCompletion?(lines: string[], cursorLine: number, cursorCol: number): string | null;
+	/**
+	 * Report the fate of the ghost-text `suggestion` shown at the cursor:
+	 * `accepted` (Tab/→) or typed past (a typed character diverged from it).
+	 * Called with the editor state the suggestion was shown for.
+	 */
+	wordCompletionFeedback?(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		suggestion: string,
+		accepted: boolean,
+	): void;
+	/** Return a correction after one single-character insertion, or `null`. */
+	tryAutocorrect?(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+	): EditorInlineReplacement | null | Promise<EditorInlineReplacement | null>;
+	/** Return replacement candidates for the misspelled word at the cursor. */
+	getWordReplacements?(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+	): EditorWordReplacements | null | Promise<EditorWordReplacements | null>;
+}
+
 type HistoryCursorAnchor = "start" | "end";
+type AutocompleteRequest = { kind: "regular"; explicitTab: boolean } | { kind: "force" };
+
+/** What the paste transport knew about the input burst before the editor inserts the payload. */
+export interface PasteOptions {
+	/** A submit keypress arrived in the same input burst and will be dispatched right after the paste. */
+	submitAfterPaste?: boolean;
+}
 
 export class Editor implements Component, Focusable {
 	#state: EditorState = {
@@ -372,40 +756,104 @@ export class Editor implements Component, Focusable {
 		cursorLine: 0,
 		cursorCol: 0,
 	};
-
 	/** Focusable interface - set by TUI when focus changes */
 	focused: boolean = false;
 
 	#theme: EditorTheme;
 	#useTerminalCursor = false;
+	#imeSafeCursorLayout = false;
 
 	/** When set, replaces the normal cursor glyph at end-of-text with this ANSI-styled string. */
 	cursorOverride: string | undefined;
-	/** Display width of the cursorOverride glyph (needed because override may contain ANSI escapes). */
-	cursorOverrideWidth: number | undefined;
-	/** Optional hook that styles displayed input text with zero-width ANSI escapes.
-	 *  MUST preserve visible width (may only add SGR codes, never glyphs). Applied per
-	 *  layout line to the user-text segments — never to the cursor glyph or inline hint. */
-	decorateText: ((text: string) => string) | undefined;
+	/** Optional hook that decorates displayed user text after source-text layout.
+	 *  Width-changing output is allowed on lines without the cursor; it is truncated
+	 *  to the content width rather than reflowed. Cursor glyphs and inline hints are excluded. */
+	decorateText: ((text: string, context: EditorTextDecorationContext) => string) | undefined;
+	/**
+	 * TSP counterpart of {@link decorateText}: styled ranges over the buffer
+	 * (UTF-16 offsets into the lines joined by `\n`). Called only when the text
+	 * changed or the editor was invalidated since the last description.
+	 */
+	describeDecorations: ((lines: readonly string[]) => readonly TspEditorDecoration[]) | undefined;
+	/** TSP code language of the buffer (`python`, `bash`): the terminal highlights it in the mono face. */
+	describeLanguage: (() => string | undefined) | undefined;
+	/** Label the TSP field to disable host-side editing while another input owner handles raw keys. */
+	nativeKeyPassthrough = false;
+	/**
+	 * Ask the TSP terminal to keep what is typed into this field and draw it at
+	 * the caret until this clears, then send it: set while startup cannot read
+	 * input yet (the prompt composer's deferred-input start).
+	 */
+	nativeTypeahead = false;
+	/**
+	 * TSP chrome around the `editor` node (the prompt composer's chips, mode
+	 * chip, send/stop): the root role, the children with `input` placed where
+	 * the layout wants it, and the input's keypath for the caret-anchored
+	 * autocomplete. Unset: a plain `omp.field` column over the input (a
+	 * dialog's text field; only the prompt composer claims `omp.editor`).
+	 */
+	describeLayout: ((input: NativeNode, cx: DescribeContext) => NativeEditorLayout) | undefined;
+	/**
+	 * TSP placeholder for the empty buffer; natively it replaces the rotating ANSI {@link placeholder} hints.
+	 * Return a stable value (the same spans array) while it is unchanged: the editor node is reused by identity.
+	 */
+	describePlaceholder: (() => TspText) | undefined;
 	#promptGutter: string | undefined;
+	/** Bumped by {@link invalidate}: host-side decoration inputs (spelling results, settings) changed. */
+	#nativeGeneration = 0;
+	#nativeDecor?: { text: string; generation: number; decor: readonly TspEditorDecoration[] | undefined };
+	#nativeEditor?: { props: TspEditorProps; node: NativeNode };
+	#nativeOverlay?: { list: SelectList; caret: string; node: NativeNode };
+	#nativeRoot?: { role: string; tone: TspTone | undefined; children: readonly NativeChild[]; node: NativeNode };
 
 	// Store last layout width for cursor navigation
 	#lastLayoutWidth: number = 80;
-	// Word-wrap result cache shared by #layoutText, #buildVisualLineMap, and key
-	// handlers within a frame. Line text is a sound key (strings are immutable);
-	// cleared on width change and size-bounded so stale lines don't accumulate.
-	#wrapCache = new Map<string, TextChunk[]>();
+	/**
+	 * Width the caret's rows wrap at for Up/Down and paging: the painted layout width in
+	 * text mode. Natively it is unbounded (rows are logical lines): the terminal wraps with
+	 * its own font and moves the caret between the rows it drew itself, handing over only
+	 * Up on the first row and Down on the last (TSP §8.5, native editing), which are then
+	 * on the first and last logical line.
+	 */
+	#caretRowWidth: number = 80;
+	// Line measurement + word-wrap cache shared by #layoutText,
+	// #buildVisualLineMap, and key handlers within a frame. Line text is a
+	// sound key (strings are immutable); cleared on layout-width or
+	// width-config (Hangul jamo setting) change and size-bounded so stale
+	// lines don't accumulate.
+	#wrapCache = new Map<string, WrapEntry>();
 	#wrapCacheWidth = -1;
+	#wrapCacheEpoch = -1;
+	/** Last `#getPromptGutter` result, keyed by (gutter string, clamped gutter width). */
+	#promptGutterCache: { source: string; firstLine: string; continuation: string; width: number } | undefined;
 	#paddingXOverride: number | undefined;
 	#maxHeight?: number;
 	#scrollOffset: number = 0;
+	/** When true, the right border shows a scrollbar track/thumb when content
+	 *  overflows {@link #maxHeight}. Enabled by {@link HookEditorComponent} and
+	 *  other multi-line consumers; single-line consumers are unaffected. */
+	#scrollbarVisible = false;
 
 	// Emacs-style kill ring
 	#killRing = new KillRing();
-	#lastAction: "kill" | "yank" | "type-word" | null = null;
+	/** Previous edit, for kill/yank chaining, undo coalescing, and the provisional space after a Tab word accept. */
+	#lastAction: "kill" | "yank" | "type-word" | "accept-word" | "replace" | null = null;
+	/** Graphemes overwritten in the current `R` session, so Backspace can restore them. */
+	#replaceLog: { line: number; col: number; removed: string; text: string }[] = [];
+	/** Insert/Replace session a Vim command opened; Escape hands its text to `.` and folds its undo steps into one. */
+	#vimSession: VimSessionState | null = null;
 
 	// Character jump mode
 	#jumpMode: "forward" | "backward" | null = null;
+
+	/** Vim-style modal editing (opt-in, see the `tui.vimMode` setting). `null` when disabled, in
+	 *  which case every code path below behaves exactly as it did before the mode existed. */
+	#vim: VimState | null = null;
+	/** Called with the selected text when Visual mode yanks, so hosts can reach the system
+	 *  clipboard — `packages/tui` deliberately has no clipboard dependency of its own. */
+	onYank?: (text: string) => void;
+	/** Fired when the modal state changes, so hosts can restyle their chrome (border, status). */
+	onVimModeChange?: (mode: VimMode) => void;
 
 	// Preferred visual column for vertical cursor movement (sticky column)
 	#preferredVisualCol: number | null = null;
@@ -415,16 +863,44 @@ export class Editor implements Component, Focusable {
 
 	// Autocomplete support
 	#autocompleteProvider?: AutocompleteProvider;
+	#textAssistProvider?: EditorTextAssistProvider;
 	#autocompleteList?: SelectList;
-	#autocompleteState: "regular" | "force" | null = null;
+	#autocompleteState: "regular" | "force" | "assist" | null = null;
+	#textAssistReplacement:
+		| {
+				line: number;
+				startCol: number;
+				endCol: number;
+				original: string;
+				cursorOffset: number;
+				/** The list offers {@link predictions} for the whole line rather than spelling replacements. */
+				prediction?: boolean;
+		  }
+		| undefined;
 	#autocompletePrefix: string = "";
+	/** The line a prediction insert (Tab, Right, or the alternatives list) left in the buffer; any later edit clears it. */
+	#insertedPrediction: string | undefined;
+	/** False while the popup's untouched top row is a description-only slash hit ({@link AutocompleteItem.descriptionMatch}): Enter then submits the typed text. */
+	#enterAcceptsSelection = true;
 	#autocompleteRequestId: number = 0;
-	#autocompleteMaxVisible: number = 5;
+	#autocompletePendingRequest: AutocompleteRequest | undefined;
+	#autocompleteRequestRunning = false;
+	#autocompleteAbortController: AbortController | undefined;
+	#autocompleteWaiters: Array<() => void> = [];
+	#autocompleteMaxVisible: number = 10;
 	onAutocompleteUpdate?: () => void;
+	/** Called after an async text-assist result mutates the document outside an input event, so hosts can schedule a repaint. */
+	onTextAssistApplied?: () => void;
+	/** Terminal height source for clamping the autocomplete dropdown. Hosts wire this to their Terminal's rows. */
+	viewportRowsProvider?: () => number;
 
 	// Paste tracking for large pastes
 	#pastes: Map<number, string> = new Map();
 	#pasteCounter: number = 0;
+
+	// Host-registered atomic chip tokens: exact buffer label → expansion emitted on submit.
+	#atoms: Map<string, string> = new Map();
+	#atomsRevision = 0;
 
 	/** Optional pattern matching atomic placeholder tokens (e.g. `[Image #1, 800x600]` or
 	 *  `[Paste #2, +30 lines]`) that the editor treats as indivisible: a backspace or forward-delete
@@ -439,28 +915,105 @@ export class Editor implements Component, Focusable {
 	#pasteHandler = new BracketedPasteHandler();
 
 	// Prompt history for up/down navigation
-	#history: string[] = [];
+	#history: LocalHistoryEntry[] = [];
 	#historyIndex: number = -1; // -1 = not browsing, 0 = most recent, 1 = older, etc.
 	#historyStorage?: HistoryStorage;
+	// Recalled payloads outlive browsing when an edit resets #historyIndex.
+	#historyDraftActive = false;
 
 	// Undo stack for editor state changes
 	#undoStack: EditorState[] = [];
 	#suspendUndo = false;
-
-	// Debounce timer for autocomplete updates
-	#autocompleteTimeout?: NodeJS.Timeout;
+	/** Snapshots evicted from the front of {@link #undoStack}, so {@link UndoMark}s stay aligned. */
+	#undoShifts = 0;
+	/**
+	 * Undo mark whose first snapshot `u` must still reach: the open Insert/Replace segment, or the
+	 * Normal-mode key being applied (so a counted `.` stays one undo step past the stack cap).
+	 */
+	#pinnedUndo: UndoMark | null = null;
 
 	onSubmit?: (text: string) => void | Promise<void>;
 	onAltEnter?: (text: string) => void;
 	onChange?: (text: string) => void;
+	#textRevision = 0;
+	/** Called for a "marker-sized" paste — the point where the editor would otherwise collapse it
+	 *  into a `[Paste #N]` token (> 10 lines or > 1000 characters). Return `true` to intercept:
+	 *  the editor inserts nothing and records no undo state, leaving insertion to the host (e.g. a
+	 *  "wrap in a code block / XML / attach as file" menu for very large pastes), which re-inserts
+	 *  via {@link insertPaste} or {@link insertText}. Return `false` (or leave unset) for the
+	 *  default collapse-to-marker behavior. `lineCount` is the sanitized paste's line count;
+	 *  `options` carries what the paste transport knew about the burst. */
+	onLargePaste?: (text: string, lineCount: number, options: PasteOptions) => boolean;
 	onAutocompleteCancel?: () => void;
 	disableSubmit: boolean = false;
+	/** Base editors accept native edits, not atomic sends. Implementations that
+	 *  handle `send` override this readiness check for their submission path. */
+	protected get nativeSendable(): boolean {
+		return false;
+	}
+	/** Placeholder painted right-aligned on the cursor row while the editor is empty and no
+	 *  autocomplete is open; hidden when it can't keep {@link PLACEHOLDER_MIN_GAP} cells from the
+	 *  cursor. The host styles it (ANSI allowed). Re-evaluated on every render, so hosts can derive
+	 *  it from live state. */
+	placeholder?: () => string | undefined;
+	/** Whole-message predictions for the next prompt, most likely first. The first one the single-line
+	 *  buffer is a strict prefix of is painted as ghost text after the cursor while the cursor sits at
+	 *  its end and no autocomplete is open. A shown prediction replaces the {@link placeholder}; Tab or
+	 *  Right inserts the rest without submitting. A buffer the user typed keeps the ghost even when it
+	 *  equals a shorter prediction; once Tab, Right, or the list has inserted one of two or more
+	 *  predictions, no ghost extends it to a longer one, and Tab instead opens a list of all of them
+	 *  that swaps the whole line, also without submitting. Each must be a single line. Re-evaluated on
+	 *  every render, so hosts can derive them from live state. */
+	predictions?: () => readonly string[] | undefined;
+	/** Called with the prediction's index in {@link predictions} after Tab or Right inserts the rest of
+	 *  a shown prediction, or the alternatives list swaps a different one into the buffer. */
+	onPredictionAccepted?: (index: number) => void;
+	/** Called for each frame that paints a prediction as ghost text: a terminal frame that draws at
+	 *  least one cell of it, or a native frame that carries it as the editor's ghost. */
+	onPredictionShown?: () => void;
 
-	// Custom top border (for status line integration)
+	// Custom top border (for status line integration). Either an eager `content`
+	// (set once, reused every frame) or a `provider` that recomputes lazily just
+	// before the editor paints — the second form lets the host coalesce
+	// per-event rebuilds down to one per rendered frame (see #4145).
 	#topBorderContent?: EditorTopBorder;
+	#topBorderProvider?: (availableWidth: number) => EditorTopBorder | undefined;
 	#borderVisible = true;
-
+	#borderStyle: EditorBorderStyle = "box";
 	constructor(theme: EditorTheme) {
+		this.#theme = theme;
+		this.borderColor = theme.borderColor;
+	}
+	/** Return bounded editor content, cursor, and transient child state for debug inspection. */
+	debugState(): Record<string, unknown> {
+		const lines = this.#state.lines;
+		let textLength = Math.max(0, lines.length - 1);
+		let textPreview = "";
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i] ?? "";
+			textLength += line.length;
+			if (textPreview.length >= 120) continue;
+			if (i > 0) textPreview += "\n";
+			textPreview += line.slice(0, 120 - textPreview.length);
+		}
+		return {
+			textPreview,
+			textLength,
+			previewTruncated: textLength > 120,
+			cursorLine: this.#state.cursorLine,
+			cursorCol: this.#state.cursorCol,
+			lineCount: lines.length,
+			selection: null,
+			placeholderActive: this.#getPlaceholder() !== undefined,
+		};
+	}
+
+	/** Expose the active autocomplete list to the debug tree walker. */
+	get debugChildren(): readonly Component[] {
+		return this.#autocompleteList ? [this.#autocompleteList] : [];
+	}
+
+	setTheme(theme: EditorTheme): void {
 		this.#theme = theme;
 		this.borderColor = theme.borderColor;
 	}
@@ -469,23 +1022,63 @@ export class Editor implements Component, Focusable {
 		this.#autocompleteProvider = provider;
 	}
 
+	/** Install prose assistance without changing command/file autocomplete. */
+	setTextAssistProvider(provider: EditorTextAssistProvider | undefined): void {
+		this.#textAssistProvider = provider;
+	}
+
 	/**
 	 * Set custom content for the top border (e.g., status line).
 	 * Pass undefined to use the default plain border.
+	 *
+	 * Eager: the passed value is cached and reused every frame. Callers that
+	 * mutate status upstream must recompute and call this again. Prefer
+	 * {@link setTopBorderProvider} for high-frequency updates — it collapses
+	 * per-event rebuilds to one per painted frame.
 	 */
 	setTopBorder(content: EditorTopBorder | undefined): void {
+		if (this.#topBorderContent?.content === content?.content && this.#topBorderContent?.width === content?.width)
+			return;
 		this.#topBorderContent = content;
+	}
+
+	/**
+	 * Install a lazy provider invoked once per editor render with the current
+	 * `availableWidth`. Overrides any eager content set via {@link setTopBorder}
+	 * — pass `undefined` to detach and fall back to the eager slot.
+	 *
+	 * Use this when the top border derives from state that mutates far faster
+	 * than the render cadence (session events, streaming, subagent updates).
+	 * The TUI already throttles renders, so a provider is invoked exactly once
+	 * per frame and does no work between paints. 	 */
+	setTopBorderProvider(provider: ((availableWidth: number) => EditorTopBorder | undefined) | undefined): void {
+		if (this.#topBorderProvider === provider) return;
+		this.#topBorderProvider = provider;
 	}
 
 	/**
 	 * Show or hide the editor border chrome.
 	 */
 	setBorderVisible(borderVisible: boolean): void {
+		if (this.#borderVisible === borderVisible) return;
 		this.#borderVisible = borderVisible;
 	}
 
 	setPromptGutter(promptGutter: string | undefined): void {
 		this.#promptGutter = promptGutter;
+	}
+	getBorderStyle(): EditorBorderStyle {
+		return this.#borderStyle;
+	}
+
+	setBorderStyle(style: EditorBorderStyle): void {
+		if (this.#borderStyle === style) return;
+		this.#borderStyle = style;
+	}
+
+	/** True while the autocomplete/slash-command menu is open below the editor. */
+	isAutocompleteActive(): boolean {
+		return this.#autocompleteState !== null;
 	}
 
 	/**
@@ -502,7 +1095,63 @@ export class Editor implements Component, Focusable {
 	 * Use the real terminal cursor instead of rendering a cursor glyph.
 	 */
 	setUseTerminalCursor(useTerminalCursor: boolean): void {
+		if (this.#useTerminalCursor === useTerminalCursor) return;
 		this.#useTerminalCursor = useTerminalCursor;
+	}
+
+	/** Render a dedicated bottom border so terminal-local IME preedit cannot shift editor chrome. */
+	setImeSafeCursorLayout(enabled: boolean): void {
+		if (this.#imeSafeCursorLayout === enabled) return;
+		this.#imeSafeCursorLayout = enabled;
+	}
+
+	/** Enable Vim-style modal editing. Toggling always drops back to Insert mode so the editor is
+	 *  never left in a state where ordinary typing does nothing. */
+	setVimMode(enabled: boolean): void {
+		if (enabled === (this.#vim !== null)) return;
+		this.#vimSession = null;
+		this.#pinnedUndo = null;
+		this.#vim = enabled ? new VimState() : null;
+		if (this.#vim) {
+			this.#vim.mode = "insert";
+			const mark = this.#undoMark();
+			this.#pinnedUndo = mark;
+			this.#startVimSession(mark, false);
+		}
+		this.invalidate();
+	}
+
+	/** Current modal state; always `"insert"` when Vim mode is off. */
+	get vimMode(): VimMode {
+		return this.#vim?.mode ?? "insert";
+	}
+
+	/** True when modal editing is active, regardless of which mode is current. */
+	get vimEnabled(): boolean {
+		return this.#vim !== null;
+	}
+
+	/** Half-typed Vim command (`"2d"`, `"g"`), or `""` when nothing is pending. */
+	get vimPending(): string {
+		return this.#vim?.pendingText ?? "";
+	}
+
+	/** Lines spanned by the active Visual selection; 0 outside Visual modes. */
+	get vimSelectedLines(): number {
+		const selection = this.#vimSelection();
+		return selection === null ? 0 : selection.to.line - selection.from.line + 1;
+	}
+
+	/**
+	 * Whether Escape belongs to the editor right now rather than to the app.
+	 *
+	 * Hosts bind Escape to interrupt/clear; in Vim mode it first has to mean "leave Insert mode" and
+	 * "cancel a half-typed operator". Only a quiet Normal mode gives Escape back to the app.
+	 */
+	vimConsumesEscape(): boolean {
+		const vim = this.#vim;
+		if (vim === null) return false;
+		return vim.mode !== "normal" || vim.pending;
 	}
 
 	getUseTerminalCursor(): boolean {
@@ -515,6 +1164,11 @@ export class Editor implements Component, Focusable {
 		// Don't reset scrollOffset — #updateScrollOffset will clamp it on next render
 	}
 
+	/** Enable/disable the right-border scrollbar. Only shown when content overflows. */
+	setScrollbarVisible(visible: boolean): void {
+		this.#scrollbarVisible = visible;
+	}
+
 	setPaddingX(paddingX: number): void {
 		this.#paddingXOverride = Math.max(0, paddingX);
 	}
@@ -524,16 +1178,20 @@ export class Editor implements Component, Focusable {
 	}
 
 	setAutocompleteMaxVisible(maxVisible: number): void {
-		const newMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
+		const newMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 10;
 		if (this.#autocompleteMaxVisible !== newMaxVisible) {
 			this.#autocompleteMaxVisible = newMaxVisible;
+			if (this.#autocompleteState !== null) {
+				this.#autocompleteList?.setMaxVisible(newMaxVisible);
+			}
 		}
 	}
 
+	/** Loads persistent prompts for navigation and enables future persistence. */
 	setHistoryStorage(storage: HistoryStorage): void {
 		this.#historyStorage = storage;
 		const recent = storage.getRecent(100);
-		this.#history = recent.map(entry => entry.prompt);
+		this.#history = recent.map(entry => ({ text: entry.prompt }));
 		this.#historyIndex = -1;
 	}
 
@@ -544,13 +1202,6 @@ export class Editor implements Component, Focusable {
 	addToHistory(text: string): void {
 		const trimmed = text.trim();
 		if (!trimmed) return;
-		// Don't add consecutive duplicates
-		if (this.#history.length > 0 && this.#history[0] === trimmed) return;
-		this.#history.unshift(trimmed);
-		// Limit history size
-		if (this.#history.length > 100) {
-			this.#history.pop();
-		}
 
 		const stor = this.#historyStorage;
 		if (stor) {
@@ -558,6 +1209,51 @@ export class Editor implements Component, Focusable {
 				logger.error("HistoryStorage add failed", { error: String(error) });
 			});
 		}
+
+		// Don't add consecutive submitted duplicates; a draft owns separate state.
+		const previous = this.#history[0];
+		if (previous?.text === trimmed && !previous.draft) return;
+		this.#pushHistory({ text: trimmed });
+	}
+
+	/** Retain the current draft for local recall only, never persistent history. */
+	rememberDraft(restore?: () => void): void {
+		const text = this.getText();
+		if (!text.trim()) return;
+		const pastes = new Map<number, string>();
+		for (const match of text.matchAll(/\[Paste #(\d+)(?:, (?:\+\d+ lines|\d+ chars))?\]/g)) {
+			const id = Number(match[1]);
+			const value = this.#pastes.get(id);
+			if (value !== undefined) pastes.set(id, value);
+		}
+		this.#pushHistory({
+			text,
+			draft: {
+				pastes,
+				atoms: new Map([...this.#atoms].filter(([label]) => text.includes(label))),
+				pasteCounter: this.#pasteCounter,
+				restore,
+			},
+		});
+	}
+
+	/** Release the current draft's expansion payloads without touching history. */
+	clearPasteState(): void {
+		this.#pastes.clear();
+		this.#pasteCounter = 0;
+		this.#atoms.clear();
+		this.#atomsRevision++;
+		this.#historyDraftActive = false;
+	}
+
+	/** Restore host-owned draft state before history text triggers onChange. */
+	restoreHistoryState(restore?: () => void): void {
+		restore?.();
+	}
+
+	#pushHistory(entry: LocalHistoryEntry): void {
+		this.#history.unshift(entry);
+		if (this.#history.length > 100) this.#history.pop();
 	}
 
 	#isEditorEmpty(): boolean {
@@ -565,13 +1261,13 @@ export class Editor implements Component, Focusable {
 	}
 
 	#isOnFirstVisualLine(): boolean {
-		const visualLines = this.#buildVisualLineMap(this.#lastLayoutWidth);
+		const visualLines = this.#buildVisualLineMap(this.#caretRowWidth);
 		const currentVisualLine = this.#findCurrentVisualLine(visualLines);
 		return currentVisualLine === 0;
 	}
 
 	#isOnLastVisualLine(): boolean {
-		const visualLines = this.#buildVisualLineMap(this.#lastLayoutWidth);
+		const visualLines = this.#buildVisualLineMap(this.#caretRowWidth);
 		const currentVisualLine = this.#findCurrentVisualLine(visualLines);
 		return currentVisualLine === visualLines.length - 1;
 	}
@@ -582,63 +1278,115 @@ export class Editor implements Component, Focusable {
 		const newIndex = this.#historyIndex - direction; // Up(-1) increases index, Down(1) decreases
 		if (newIndex < -1 || newIndex >= this.#history.length) return;
 		this.#historyIndex = newIndex;
-		if (this.#historyIndex === -1) {
-			// Returned to "current" state - clear editor
-			this.#setTextInternal("", "end");
-		} else {
-			const cursorAnchor: HistoryCursorAnchor = direction === -1 ? "start" : "end";
-			this.#setTextInternal(this.#history[this.#historyIndex] || "", cursorAnchor);
+		const entry = this.#history[this.#historyIndex];
+		if (entry?.draft || this.#historyDraftActive) {
+			this.#pastes = new Map(entry?.draft?.pastes);
+			this.#atoms = new Map(entry?.draft?.atoms);
+			this.#atomsRevision++;
+			this.#pasteCounter = entry?.draft?.pasteCounter ?? 0;
+			this.restoreHistoryState(entry?.draft?.restore);
+			this.#historyDraftActive = entry?.draft !== undefined;
 		}
+		// Browsing asks for the edge the key came from, so one press still steps one
+		// entry: Up opens a multi-row entry at its top, Down at its bottom (#99).
+		// #setTextInternal drops that request for single-row entries — see there.
+		const cursorAnchor: HistoryCursorAnchor = direction === -1 ? "start" : "end";
+		this.#setTextInternal(entry?.text ?? "", cursorAnchor);
 	}
 	/** Internal setText that doesn't reset history state - used by navigateHistory */
 	#setTextInternal(text: string, cursorAnchor: HistoryCursorAnchor = "end"): void {
+		this.#endVimSession();
 		this.#undoStack.length = 0;
 		const lines = sanitizeLoadedText(text).split("\n");
 		this.#state.lines = lines.length === 0 ? [""] : lines;
-		if (cursorAnchor === "start") {
+		// A single-row entry's top and bottom are the same row, so the directional
+		// anchor degenerates to a bare column choice: the caret would sit at the start
+		// when Up recalled the entry and at the end when Down reached the same entry,
+		// leaving delete/yank commands aimed at column 0 on one path and at the tail on
+		// the other. Single-row entries always open at the end — matching what
+		// wholesale text replacement (`setText`) and the first-edit anchor do.
+		if (cursorAnchor === "start" && this.#spansMultipleVisualRows()) {
 			this.#state.cursorLine = 0;
 			this.#setCursorCol(0);
 		} else {
 			this.#state.cursorLine = this.#state.lines.length - 1;
 			this.#setCursorCol(this.#state.lines[this.#state.cursorLine]?.length || 0);
 		}
-		if (this.onChange) {
-			this.onChange(this.getText());
+		if (this.#vim !== null && (this.#vim.mode === "insert" || this.#vim.mode === "replace")) {
+			const mark = this.#undoMark();
+			this.#pinnedUndo = mark;
+			this.#startVimSession(mark, this.#vim.mode === "replace");
 		}
+		this.#notifyChange();
+	}
+
+	/** Whether the buffer needs more than one visual row at the last painted layout
+	 *  width. The directional history anchors are load-bearing only for such entries —
+	 *  they keep one keypress stepping one entry instead of walking inside it — so a
+	 *  newline-free line that wraps past the editor width counts as multi-row too. */
+	#spansMultipleVisualRows(): boolean {
+		if (this.#state.lines.length > 1) return true;
+		const width = this.#lastLayoutWidth;
+		if (width <= 0) return false;
+		return this.#layoutText(width).length > 1;
 	}
 
 	invalidate(): void {
-		// No cached state to invalidate currently
+		this.#nativeGeneration++;
+	}
+
+	/** Active chrome style; a hidden border collapses every shape to borderless. */
+	#effectiveStyle(): ComposerStyle {
+		return this.#borderVisible ? getComposerStyle(this.#borderStyle) : borderlessComposerStyle;
+	}
+
+	#getEffectivePromptGutter(): string | undefined {
+		const style = this.#effectiveStyle();
+		// The box frame never renders a gutter; hosts that set one expect it only
+		// in borderless contexts (hook editors, agents hub).
+		if (style.sideBorders) return undefined;
+		if (this.#promptGutter !== undefined) return this.#promptGutter;
+		// Legacy `setBorderVisible(false)` callers control the gutter themselves;
+		// only an explicitly selected composer shape gets the style default.
+		if (!this.#borderVisible) return undefined;
+		return style.defaultPromptGutter;
 	}
 
 	#getEditorPaddingX(): number {
-		const padding = this.#paddingXOverride ?? this.#theme.editorPaddingX ?? 2;
-		return Math.max(0, padding);
+		if (this.#paddingXOverride !== undefined) return Math.max(0, this.#paddingXOverride);
+		return this.#effectiveStyle().defaultPaddingX(this.#theme.editorPaddingX);
 	}
 
 	#getHorizontalChromeWidth(paddingX: number): number {
-		return this.#borderVisible ? paddingX + 1 : 0;
+		return this.#effectiveStyle().sideChromeWidth(paddingX);
 	}
 
 	#getPromptGutterWidth(width: number, paddingX: number): number {
-		if (this.#borderVisible || !this.#promptGutter) return 0;
+		const gutter = this.#getEffectivePromptGutter();
+		if (!gutter) return 0;
 		const chromeWidth = 2 * this.#getHorizontalChromeWidth(paddingX);
 		const availableWidth = Math.max(0, width - chromeWidth);
-		return Math.min(visibleWidth(this.#promptGutter), availableWidth);
+		return Math.min(visibleWidth(gutter), availableWidth);
 	}
 
 	#getPromptGutter(
 		width: number,
 		paddingX: number,
 	): { firstLine: string; continuation: string; width: number } | undefined {
-		if (this.#borderVisible || !this.#promptGutter) return undefined;
+		const gutter = this.#getEffectivePromptGutter();
+		if (!gutter) return undefined;
 		const gutterWidth = this.#getPromptGutterWidth(width, paddingX);
 		if (gutterWidth === 0) return undefined;
-		return {
-			firstLine: sliceByColumn(this.#promptGutter, 0, gutterWidth, true),
+		const cached = this.#promptGutterCache;
+		if (cached !== undefined && cached.source === gutter && cached.width === gutterWidth) return cached;
+		const next = {
+			source: gutter,
+			firstLine: sliceByColumn(gutter, 0, gutterWidth, true),
 			continuation: padding(gutterWidth),
 			width: gutterWidth,
 		};
+		this.#promptGutterCache = next;
+		return next;
 	}
 
 	#getContentWidth(width: number, paddingX: number): number {
@@ -648,25 +1396,75 @@ export class Editor implements Component, Focusable {
 
 	#getLayoutWidth(width: number, paddingX: number): number {
 		const contentWidth = this.#getContentWidth(width, paddingX);
-		const cursorReserve = this.#borderVisible && paddingX === 0 ? 1 : 0;
+		const cursorReserve = this.#effectiveStyle().sideBorders && paddingX === 0 ? 1 : 0;
 		// Keep cursor/scroll layout addressable even when a borderless prompt gutter consumes every visible column.
 		return Math.max(1, contentWidth - cursorReserve);
 	}
 
 	#getVisibleContentHeight(contentLines: number): number {
 		if (this.#maxHeight === undefined) return contentLines;
-		const verticalChrome = this.#borderVisible ? 2 : 0;
-		return Math.max(1, this.#maxHeight - verticalChrome);
+		return Math.max(1, this.#maxHeight - this.#effectiveStyle().verticalChrome);
+	}
+	/** Apply the optional input decorator to a plain (ANSI-free) text segment.
+	 *  Decoration only adds zero-width SGR codes, so visible width is unchanged.
+	 *  Splits around CURSOR_MARKER so each user-text segment is decorated in
+	 *  isolation: the marker begins with ESC, and a keyword regex that pins
+	 *  the right boundary with `(?!\S)` would otherwise reject an otherwise-
+	 *  valid match at the cursor seam (e.g. `ultrathink` immediately followed
+	 *  by the marker stops glowing until a trailing character is typed). */
+	#decorate(text: string, context: EditorTextDecorationContext): string {
+		const decorate = this.decorateText;
+		if (decorate === undefined || text.length === 0) return text;
+		const idx = text.indexOf(CURSOR_MARKER);
+		const sourceLength = Math.max(0, context.endCol - context.startCol);
+		if (idx === -1) {
+			const decoratedLength = Math.min(text.length, sourceLength);
+			return (
+				decorate(text.slice(0, decoratedLength), {
+					...context,
+					endCol: context.startCol + decoratedLength,
+				}) + text.slice(decoratedLength)
+			);
+		}
+		const before = text.slice(0, idx);
+		const after = text.slice(idx + CURSOR_MARKER.length);
+		const beforeLength = Math.min(before.length, sourceLength);
+		const afterLength = Math.min(after.length, sourceLength - beforeLength);
+		const cursorCol = context.startCol + beforeLength;
+		return (
+			(beforeLength > 0 ? decorate(before.slice(0, beforeLength), { ...context, endCol: cursorCol }) : "") +
+			before.slice(beforeLength) +
+			CURSOR_MARKER +
+			(afterLength > 0
+				? decorate(after.slice(0, afterLength), {
+						...context,
+						startCol: cursorCol,
+						endCol: cursorCol + afterLength,
+					})
+				: "") +
+			after.slice(afterLength)
+		);
 	}
 
-	/** Apply the optional input decorator to a plain (ANSI-free) text segment.
-	 *  Decoration only adds zero-width SGR codes, so visible width is unchanged. */
-	#decorate(text: string): string {
-		const decorate = this.decorateText;
-		return decorate !== undefined && text.length > 0 ? decorate(text) : text;
+	/**
+	 * SGR wrapper for the cursor cell drawn *over* a grapheme.
+	 *
+	 * Vim's block-vs-bar distinction has to survive in a cell grid, so Insert mode underlines the
+	 * cell instead of reversing it: both occupy exactly one column, which keeps every width
+	 * calculation below untouched, and terminals render SGR 4 far more consistently than a
+	 * half-cell bar glyph. Non-Vim editors keep the reverse-video block they always had.
+	 */
+	#cursorCell(text: string): string {
+		const insertShape = this.#vim !== null && this.#vim.mode === "insert";
+		return insertShape ? `\x1b[4m${text}\x1b[0m` : `\x1b[7m${text}\x1b[0m`;
 	}
 
 	#getStyledInputCursor(): { text: string; width: number } {
+		// Normal/Visual rest *on* a grapheme, so past end-of-line they need a full block to look
+		// like Vim; the thin bar glyph stays the Insert/non-Vim caret.
+		if (this.#vim !== null && this.#vim.mode !== "insert") {
+			return { text: "\x1b[7m \x1b[0m", width: 1 };
+		}
 		const cursorChar = this.#theme.symbols.inputCursor;
 		// Keep the software cursor steady. Ghostty/cmux can leave visual
 		// afterimages for SGR blink cells during rapid input-row repaints.
@@ -683,8 +1481,12 @@ export class Editor implements Component, Focusable {
 		const lastGrapheme = beforeGraphemes[beforeGraphemes.length - 1]?.segment;
 		const lastGraphemeWidth = lastGrapheme ? visibleWidth(lastGrapheme) : 0;
 		const builtInCursor = this.#getStyledInputCursor();
+		// The end-of-line cursor borrows the last grapheme's cell, which the
+		// on-character cursor also highlights with reverse video. Underline the
+		// borrowed cell instead so insertion after the last character stays
+		// visually distinct from insertion before it.
 		const fallbackReplacement = lastGrapheme
-			? { text: `\x1b[7m${lastGrapheme}\x1b[0m`, width: lastGraphemeWidth }
+			? { text: `\x1b[4m${lastGrapheme}\x1b[0m`, width: lastGraphemeWidth }
 			: builtInCursor;
 		const clampReplacement = (candidate: { text: string; width: number }): { text: string; width: number } => {
 			let text = sliceByColumn(candidate.text, 0, maxWidth, true);
@@ -705,7 +1507,6 @@ export class Editor implements Component, Focusable {
 			// If even the highlighted trailing grapheme cannot fit, show the built-in single-column cursor.
 			clampedReplacement = clampReplacement(builtInCursor);
 		}
-
 		const replacedSpanWidth = Math.min(maxWidth, Math.max(lastGraphemeWidth, clampedReplacement.width));
 		const prefixWidth = Math.max(0, maxWidth - replacedSpanWidth);
 		const beforePrefix = sliceByColumn(before, 0, prefixWidth, true);
@@ -721,17 +1522,14 @@ export class Editor implements Component, Focusable {
 		if (visibleWidth(text) < maxWidth) {
 			return text + marker;
 		}
-
-		let insertAt = text.length;
-		let offset = 0;
-		for (const seg of segmenter.segment(text)) {
-			if (visibleWidth(seg.segment) > 0) {
-				insertAt = offset;
-			}
-			offset += seg.segment.length;
-		}
-
-		return `${text.slice(0, insertAt)}${marker}${text.slice(insertAt)}`;
+		// The row is exactly full, so the marker lands before the last visible
+		// grapheme instead of after it. The mirrored on-character position renders
+		// the identical string; underline the final grapheme at end-of-line so the
+		// two insertion points stay visually distinct.
+		const graphemes = [...segmenter.segment(text)];
+		const lastGrapheme = graphemes[graphemes.length - 1]?.segment;
+		if (lastGrapheme === undefined) return text + marker;
+		return `${text.slice(0, text.length - lastGrapheme.length)}\x1b[4m${lastGrapheme}\x1b[0m${marker}`;
 	}
 
 	#getPageScrollStep(totalVisualLines: number): number {
@@ -759,20 +1557,17 @@ export class Editor implements Component, Focusable {
 	}
 
 	render(width: number): readonly string[] {
+		const style = this.#effectiveStyle();
 		const paddingX = this.#getEditorPaddingX();
-		const borderVisible = this.#borderVisible;
+		const isSideBordered = style.sideBorders;
 		const promptGutter = this.#getPromptGutter(width, paddingX);
 		const contentAreaWidth = this.#getContentWidth(width, paddingX);
 		const layoutWidth = this.#getLayoutWidth(width, paddingX);
 		this.#lastLayoutWidth = layoutWidth;
+		this.#caretRowWidth = layoutWidth;
 
-		// Box-drawing characters for rounded corners
 		const box = this.#theme.symbols.boxRound;
 		const borderWidth = this.#getHorizontalChromeWidth(paddingX);
-		const topLeft = this.borderColor(`${box.topLeft}${box.horizontal.repeat(paddingX)}`);
-		const topRight = this.borderColor(`${box.horizontal.repeat(paddingX)}${box.topRight}`);
-		const bottomLeft = this.borderColor(`${box.bottomLeft}${box.horizontal}${padding(Math.max(0, paddingX - 1))}`);
-		const horizontal = this.borderColor(box.horizontal);
 
 		// Layout the text
 		const layoutLines = this.#layoutText(layoutWidth);
@@ -781,43 +1576,82 @@ export class Editor implements Component, Focusable {
 		const visibleLayoutLines = layoutLines.slice(this.#scrollOffset, this.#scrollOffset + visibleContentHeight);
 
 		const result: string[] = [];
+		// Scrollbar: shown only when content overflows and the caller opted in.
+		const needsScrollbar = this.#scrollbarVisible && layoutLines.length > visibleContentHeight;
+		let scrollbarThumb: { start: number; end: number } | null = null;
+		if (needsScrollbar && visibleContentHeight > 0) {
+			scrollbarThumb = scrollbarThumbRange(visibleContentHeight, layoutLines.length, this.#scrollOffset);
+		}
 
-		if (borderVisible) {
-			// Render top border: ╭─ [status content] ────────────────╮
-			const topFillWidth = Math.max(0, width - borderWidth * 2);
-			if (this.#topBorderContent) {
-				const { content, width: statusWidth } = this.#topBorderContent;
-				if (statusWidth <= topFillWidth) {
-					// Status fits - add fill after it
-					const fillWidth = topFillWidth - statusWidth;
-					result.push(topLeft + content + this.borderColor(box.horizontal.repeat(fillWidth)) + topRight);
-				} else {
-					// Status too long - truncate it
-					const truncated = truncateToWidth(content, Math.max(0, topFillWidth - 1));
-					const truncatedWidth = visibleWidth(truncated);
-					const fillWidth = Math.max(0, topFillWidth - truncatedWidth);
-					result.push(topLeft + truncated + this.borderColor(box.horizontal.repeat(fillWidth)) + topRight);
-				}
+		// Resolve the custom top-border content once per frame; the style decides
+		// how (and whether) to draw it. Provider evaluation stays editor-owned,
+		// coalescing per-event rebuilds to one per painted frame.
+		const topFillWidth = Math.max(0, width - borderWidth * 2);
+		let topBorder: EditorTopBorder | undefined;
+		if (style.statusAttachment !== "none") {
+			if (this.#topBorderProvider) {
+				topBorder = this.#topBorderProvider(topFillWidth);
 			} else {
-				result.push(topLeft + horizontal.repeat(topFillWidth) + topRight);
+				topBorder = this.#topBorderContent;
 			}
 		}
 
+		const chromeCtx: ComposerChromeContext = {
+			width,
+			paddingX,
+			borderColor: (str: string) => this.borderColor(str),
+			accentColor: this.#theme.accentColor ?? this.borderColor,
+			surfaceColor: this.#theme.surfaceColor ?? PASSTHROUGH_COLOR,
+			box,
+			topBorder,
+		};
+
+		const topRow = style.renderTop(chromeCtx);
+		if (topRow !== undefined) result.push(topRow);
+
 		// Render each layout line
-		// Emit hardware cursor marker only when focused and not showing autocomplete
-		const emitCursorMarker = this.focused && !this.#autocompleteState;
+		// Keep the hardware cursor at the text insertion point while autocomplete
+		// rows render below it; terminals use that position to anchor IME candidates.
+		const emitCursorMarker = this.focused;
 		const lineContentWidth = contentAreaWidth;
 
-		// Compute inline hint text (dim ghost text after cursor)
-		const inlineHint = this.#getInlineHint();
+		// Text painted after an end-of-line cursor with `avail` free cells: dim ghost text
+		// against the cursor, or the placeholder flush right.
+		const placeholder = this.#getPlaceholder();
+		const inlineHint = placeholder ? null : this.#getInlineHint();
+		// Whether the hint is the prediction, and how many of its cells this frame draws: a full row,
+		// an unfocused hardware-cursor row, or the IME-safe layout can leave it unpainted.
+		const hintIsPrediction = inlineHint !== null && inlineHint === this.#getPredictionSuffix();
+		let hintCellsPainted = 0;
 		const hintStyle = this.#theme.hintStyle ?? ((t: string) => `\x1b[2m${t}\x1b[0m`);
+		const hintTail = (avail: number): { text: string; width: number } | undefined => {
+			if (placeholder) {
+				const gap = avail - visibleWidth(placeholder);
+				return gap >= PLACEHOLDER_MIN_GAP ? { text: padding(gap) + placeholder, width: avail } : undefined;
+			}
+			if (!inlineHint) return undefined;
+			return {
+				text: hintStyle(truncateToWidth(inlineHint, avail)),
+				width: Math.min(visibleWidth(inlineHint), avail),
+			};
+		};
+
+		// Active Vim visual selection, if any. The cursor always sits inside it, so selected rows
+		// skip the normal cursor-glyph branches: the reverse-video span already marks the spot.
+		const vimSelection = this.#vimSelection();
 
 		for (let visibleIndex = 0; visibleIndex < visibleLayoutLines.length; visibleIndex++) {
 			const layoutLine = visibleLayoutLines[visibleIndex]!;
 			let displayText = layoutLine.text;
-			let displayWidth = visibleWidth(layoutLine.text);
-			let cursorInPadding = false;
+			let displayWidth = layoutLine.width;
+			const decorationContext: EditorTextDecorationContext = {
+				line: layoutLine.sourceLine,
+				startCol: layoutLine.sourceStartCol,
+				endCol: layoutLine.sourceStartCol + layoutLine.text.length,
+			};
+			let cursorPaddingOverflow = 0;
 			let decorated = false;
+			let imeSafeCursorTail = false;
 			const showPromptGutter = promptGutter !== undefined && visibleIndex === 0;
 			const gutterText =
 				promptGutter === undefined ? "" : showPromptGutter ? promptGutter.firstLine : promptGutter.continuation;
@@ -826,16 +1660,16 @@ export class Editor implements Component, Focusable {
 			const hasCursor = layoutLine.hasCursor && layoutLine.cursorPos !== undefined;
 			const marker = emitCursorMarker ? CURSOR_MARKER : "";
 
-			if (!borderVisible && displayWidth > lineContentWidth) {
+			if (!isSideBordered && displayWidth > lineContentWidth) {
 				displayText = sliceByColumn(displayText, 0, lineContentWidth, true);
 				displayWidth = visibleWidth(displayText);
 			}
 
-			if (!borderVisible && lineContentWidth === 0) {
+			if (!isSideBordered && lineContentWidth === 0) {
 				if (hasCursor && !this.#useTerminalCursor) {
 					const zeroWidthCursorBudget = visibleWidth(gutterText);
 					const zeroWidthCursorReplacement = this.cursorOverride
-						? { text: this.cursorOverride, width: this.cursorOverrideWidth ?? 1 }
+						? { text: this.cursorOverride, width: visibleWidth(this.cursorOverride) }
 						: this.#getStyledInputCursor();
 					if (showPromptGutter && zeroWidthCursorBudget > 0) {
 						// Keep the leading prompt glyph visible when the gutter consumes the whole row.
@@ -843,7 +1677,7 @@ export class Editor implements Component, Focusable {
 						const promptGlyphWidth = visibleWidth(promptGlyph);
 						const remainingCursorWidth = Math.max(0, zeroWidthCursorBudget - promptGlyphWidth);
 						if (remainingCursorWidth === 0) {
-							result.push(`\x1b[7m${promptGlyph}\x1b[0m${marker}`);
+							result.push(`${this.#cursorCell(promptGlyph)}${marker}`);
 						} else {
 							const widthLimitedCursor = this.#renderEndOfLineCursorAtWidthLimit(
 								"",
@@ -870,16 +1704,41 @@ export class Editor implements Component, Focusable {
 				continue;
 			}
 
-			if (hasCursor && this.#useTerminalCursor) {
+			const selectionSpan =
+				vimSelection === null
+					? null
+					: this.#selectionSpanFor(
+							layoutLine,
+							vimSelection,
+							layoutLines[this.#scrollOffset + visibleIndex + 1]?.logicalLine !== layoutLine.logicalLine,
+						);
+
+			if (selectionSpan !== null) {
+				displayText = this.#renderSelectedLine(
+					displayText,
+					selectionSpan,
+					hasCursor ? layoutLine.cursorPos : undefined,
+					marker,
+					decorationContext,
+				);
+				decorated = true;
+				if (selectionSpan.trailingNewline) displayWidth += 1;
+			} else if (hasCursor && this.#useTerminalCursor) {
 				if (marker) {
 					const before = displayText.slice(0, layoutLine.cursorPos);
 					const after = displayText.slice(layoutLine.cursorPos);
-					if (after.length === 0 && inlineHint) {
-						const availWidth = Math.max(0, lineContentWidth - displayWidth);
-						const hintText = hintStyle(truncateToWidth(inlineHint, availWidth));
-						displayText = before + marker + hintText;
-						displayWidth += Math.min(visibleWidth(inlineHint), availWidth);
-					} else if (after.length === 0 && !borderVisible && displayWidth >= lineContentWidth) {
+					const tail = after.length === 0 ? hintTail(Math.max(0, lineContentWidth - displayWidth)) : undefined;
+					if (this.#imeSafeCursorLayout && after.length === 0 && isSideBordered) {
+						// Terminal frontends render IME marked text locally before committed bytes
+						// reach the application. Keep the end-of-input cursor row empty to its
+						// right so that insertion cannot shift box chrome onto the next row.
+						displayText = before + marker;
+						imeSafeCursorTail = true;
+					} else if (tail) {
+						displayText = before + marker + tail.text;
+						displayWidth += tail.width;
+						hintCellsPainted += tail.width;
+					} else if (after.length === 0 && !isSideBordered && displayWidth >= lineContentWidth) {
 						displayText = this.#renderTerminalCursorMarker(before, marker, lineContentWidth);
 					} else {
 						displayText = before + marker + after;
@@ -895,17 +1754,24 @@ export class Editor implements Component, Focusable {
 					const afterGraphemes = [...segmenter.segment(after)];
 					const firstGrapheme = afterGraphemes[0]?.segment || "";
 					const restAfter = after.slice(firstGrapheme.length);
-					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
+					const cursor = this.#cursorCell(firstGrapheme);
 					// Decorate the plain text on each side of the cursor glyph. The reverse-video
 					// reset (\x1b[0m) ends in "m" (a word char), so a boundary match on restAfter
 					// would fail in the whole-line fallback below — decorate the segments here.
-					displayText = this.#decorate(before) + marker + cursor + this.#decorate(restAfter);
+					displayText =
+						this.#decorate(before, { ...decorationContext, endCol: decorationContext.startCol + before.length }) +
+						marker +
+						cursor +
+						this.#decorate(restAfter, {
+							...decorationContext,
+							startCol: decorationContext.startCol + before.length + firstGrapheme.length,
+						});
 					decorated = true;
 					// displayWidth stays the same - we're replacing, not adding
 				} else if (this.cursorOverride) {
 					// Cursor override replaces the normal end-of-text cursor glyph
-					const overrideWidth = this.cursorOverrideWidth ?? 1;
-					if (!borderVisible && displayWidth + overrideWidth > lineContentWidth) {
+					const overrideWidth = visibleWidth(this.cursorOverride);
+					if (!isSideBordered && displayWidth + overrideWidth > lineContentWidth) {
 						// Borderless editors have no spare padding cell for an end-of-line cursor glyph.
 						// Preserve cursorOverride by replacing the tail of the line with it.
 						const widthLimitedCursor = this.#renderEndOfLineCursorAtWidthLimit(before, marker, lineContentWidth, {
@@ -914,85 +1780,297 @@ export class Editor implements Component, Focusable {
 						});
 						displayText = widthLimitedCursor.text;
 						displayWidth = widthLimitedCursor.width;
-					} else if (inlineHint) {
-						const availWidth = Math.max(0, lineContentWidth - displayWidth - overrideWidth);
-						const hintText = hintStyle(truncateToWidth(inlineHint, availWidth));
-						displayText = before + marker + this.cursorOverride + hintText;
-						displayWidth += overrideWidth + Math.min(visibleWidth(inlineHint), availWidth);
 					} else {
-						displayText = before + marker + this.cursorOverride;
-						displayWidth += overrideWidth;
+						const tail = hintTail(Math.max(0, lineContentWidth - displayWidth - overrideWidth));
+						displayText = before + marker + this.cursorOverride + (tail?.text ?? "");
+						displayWidth += overrideWidth + (tail?.width ?? 0);
+						hintCellsPainted += tail?.width ?? 0;
 					}
 				} else {
 					// Cursor is at the end - add thin cursor glyph
 					const { text: cursor, width: cursorWidth } = this.#getStyledInputCursor();
-					if (!borderVisible && displayWidth + cursorWidth > lineContentWidth) {
+					if (!isSideBordered && displayWidth + cursorWidth > lineContentWidth) {
 						// Borderless editors have no spare padding cell for an end-of-line cursor glyph.
 						// Highlight the last grapheme so the cursor stays visible without consuming width.
 						const widthLimitedCursor = this.#renderEndOfLineCursorAtWidthLimit(before, marker, lineContentWidth);
 						displayText = widthLimitedCursor.text;
 						displayWidth = widthLimitedCursor.width;
-					} else if (inlineHint) {
-						const availWidth = Math.max(0, lineContentWidth - displayWidth - cursorWidth);
-						const hintText = hintStyle(truncateToWidth(inlineHint, availWidth));
-						displayText = before + marker + cursor + hintText;
-						displayWidth += cursorWidth + Math.min(visibleWidth(inlineHint), availWidth);
 					} else {
-						displayText = before + marker + cursor;
-						displayWidth += cursorWidth;
+						const tail = hintTail(Math.max(0, lineContentWidth - displayWidth - cursorWidth));
+						displayText = before + marker + cursor + (tail?.text ?? "");
+						displayWidth += cursorWidth + (tail?.width ?? 0);
+						hintCellsPainted += tail?.width ?? 0;
 					}
 					if (displayWidth > lineContentWidth && paddingX > 0) {
-						cursorInPadding = true;
+						cursorPaddingOverflow = displayWidth - lineContentWidth;
 					}
 				}
 			}
 
-			// No cursor on this line, or a branch that left the user text intact: decorate the
-			// whole line. CURSOR_MARKER and cursor glyphs begin with ESC, so word boundaries
-			// around a decorated keyword stay intact when matched against the assembled line.
+			// No cursor on this line, or a branch that left the user text intact: decorate
+			// the whole line. `#decorate` splits around CURSOR_MARKER so a keyword glued to
+			// the cursor still satisfies its right-boundary lookahead.
 			if (!decorated) {
-				displayText = this.#decorate(displayText);
+				displayText = this.#decorate(displayText, decorationContext);
 			}
+			if (!hasCursor) {
+				// Undecorated, unsliced lines keep their carried width; any
+				// transform above produced a new string and must be re-measured.
+				displayWidth = displayText === layoutLine.text ? layoutLine.width : visibleWidth(displayText);
+				if (displayWidth > lineContentWidth) {
+					displayText = truncateToWidth(displayText, lineContentWidth);
+					displayWidth = visibleWidth(displayText);
+				}
+			}
+			const renderedText = isFilledComposerStyle(style)
+				? displayText
+				: (this.#theme.textColor ?? PASSTHROUGH_COLOR)(displayText);
 
 			const linePad = padding(Math.max(0, lineContentWidth - displayWidth));
 
-			if (!borderVisible) {
-				result.push(gutterText + displayText + linePad);
-				continue;
-			}
-
-			// All lines have consistent borders based on padding
-			const isLastLine = visibleIndex === visibleLayoutLines.length - 1;
-			const rightPaddingWidth = Math.max(0, paddingX - (cursorInPadding ? 1 : 0));
-			if (isLastLine) {
-				const bottomRightPadding = Math.max(0, paddingX - 1 - (cursorInPadding ? 1 : 0));
-				const bottomRightAdjusted = this.borderColor(
-					`${padding(bottomRightPadding)}${box.horizontal}${box.bottomRight}`,
-				);
-				result.push(`${bottomLeft}${displayText}${linePad}${bottomRightAdjusted}`);
-			} else {
-				const leftBorder = this.borderColor(`${box.vertical}${padding(paddingX)}`);
-				const rightBorder = this.borderColor(`${padding(rightPaddingWidth)}${box.vertical}`);
-				result.push(leftBorder + displayText + linePad + rightBorder);
-			}
+			result.push(
+				...style.renderRow({
+					...chromeCtx,
+					text: renderedText,
+					pad: linePad,
+					gutter: gutterText,
+					isLastRow: visibleIndex === visibleLayoutLines.length - 1,
+					cursorOverflow: cursorPaddingOverflow,
+					imeSafeCursorTail,
+					scrollbarThumb:
+						scrollbarThumb !== null && visibleIndex >= scrollbarThumb.start && visibleIndex < scrollbarThumb.end,
+				}),
+			);
 		}
+		if (hintIsPrediction && hintCellsPainted > 0) this.onPredictionShown?.();
+
+		const bottomRow = style.renderBottom(chromeCtx);
+		if (bottomRow !== undefined) result.push(bottomRow);
 
 		// Add autocomplete list if active
-		if (this.#autocompleteState && this.#autocompleteList) {
-			const autocompleteResult = this.#autocompleteList.render(width);
-			result.push(...autocompleteResult);
+		const autocompleteList = this.#visibleAutocompleteList();
+		if (autocompleteList) {
+			// Clamp the dropdown to the terminal viewport: the editor rows already
+			// rendered above plus a small reserve must stay visible.
+			const viewportRows = this.viewportRowsProvider?.() || process.stdout.rows || Number(Bun.env.LINES) || 24;
+			autocompleteList.setMaxVisible(
+				Math.max(3, Math.min(this.#autocompleteMaxVisible, viewportRows - result.length - 2)),
+			);
+			result.push(...autocompleteList.render(width));
 		}
 
 		return result;
 	}
 
+	/**
+	 * An `editor` node (key `input`) carrying the buffer, caret, Vim selection
+	 * anchor and mode, decorations, ghost completion, placeholder, prompt and
+	 * height cap; the frame, wrapping, scrolling and caret are the terminal's,
+	 * so composer shapes play no part. An open autocomplete popup follows as an
+	 * `overlay` anchored to the caret around the completion list. Typing and
+	 * caret moves change only `text` and `cursor` on the same node.
+	 */
+	describe(cx: DescribeContext): NativeNode {
+		// The terminal owns the wrap: the surface width only estimates whether a
+		// recalled history entry spans rows, and caret rows are logical lines.
+		this.#lastLayoutWidth = Math.max(1, cx.cols);
+		this.#caretRowWidth = Number.POSITIVE_INFINITY;
+		const { lines, cursorLine, cursorCol } = this.#state;
+		const text = lines.join("\n");
+		let offset = 0;
+		for (let i = 0; i < cursorLine; i++) offset += (lines[i]?.length ?? 0) + 1;
+		const cursor = offset + cursorCol;
+
+		let decor = this.#nativeDecor;
+		if (decor?.text !== text || decor.generation !== this.#nativeGeneration) {
+			const next = this.describeDecorations?.(lines);
+			decor = {
+				text,
+				generation: this.#nativeGeneration,
+				decor:
+					next && next.length > 0
+						? decor?.decor && sameDecorations(decor.decor, next)
+							? decor.decor
+							: next
+						: undefined,
+			};
+			this.#nativeDecor = decor;
+		}
+
+		const placeholder = this.#getPlaceholder();
+		const nativePlaceholder =
+			this.describePlaceholder !== undefined &&
+			!this.#autocompleteState &&
+			this.#isEditorEmpty() &&
+			!this.#getPredictionSuffix()
+				? this.describePlaceholder()
+				: placeholder && plainText(placeholder).trim();
+		const atLineEnd = cursorCol >= (lines[cursorLine]?.length ?? 0);
+		const ghost = nativePlaceholder || !atLineEnd ? null : this.#getInlineHint();
+		if (ghost && ghost === this.#getPredictionSuffix()) this.onPredictionShown?.();
+		const vim = this.#vim;
+		let anchor: number | null = null;
+		if (vim?.visual && vim.anchor !== null) {
+			let anchorOffset = 0;
+			for (let i = 0; i < vim.anchor.line; i++) anchorOffset += (lines[i]?.length ?? 0) + 1;
+			if (vim.mode === "visual-line") {
+				// Linewise: stretch the anchor to the far edge of its line.
+				const before =
+					vim.anchor.line < cursorLine || (vim.anchor.line === cursorLine && vim.anchor.col <= cursorCol);
+				anchor = before ? anchorOffset : anchorOffset + (lines[vim.anchor.line]?.length ?? 0);
+			} else {
+				anchor = anchorOffset + vim.anchor.col;
+			}
+		}
+		// The prompt gutter (`> `) is terminal chrome: native hosts draw their own field, so it stays out.
+		const props: TspEditorProps = {
+			text,
+			cursor,
+			sendable: this.nativeSendable,
+			anchor: anchor ?? undefined,
+			decor: decor.decor,
+			ghost: ghost ? plainText(ghost) : undefined,
+			placeholder: nativePlaceholder || undefined,
+			mode: this.nativeKeyPassthrough ? "PTY" : vim ? VIM_MODE_LABELS[vim.mode] : undefined,
+			lang: this.describeLanguage?.(),
+			maxLines: this.#maxHeight,
+			typeahead: this.nativeTypeahead || undefined,
+		};
+		let editor = this.#nativeEditor;
+		if (!editor || !sameProps(editor.props, props)) {
+			editor = { props, node: node("editor", props, undefined, "input") };
+			this.#nativeEditor = editor;
+		}
+
+		const layout = this.describeLayout?.(editor.node, cx) ?? {
+			role: "omp.field",
+			children: [editor.node],
+			caret: "input",
+		};
+		const children: NativeChild[] = [...layout.children];
+		const list = this.#visibleAutocompleteList();
+		if (list) {
+			list.setNativeMark(this.#autocompleteMark());
+			const overlay = this.#nativeOverlay;
+			if (overlay?.list !== list || overlay.caret !== layout.caret) {
+				this.#nativeOverlay = {
+					list,
+					caret: layout.caret,
+					node: node("overlay", { anchor: { caret: layout.caret }, role: "omp.autocomplete" }, [list], "complete"),
+				};
+			}
+			children.push(this.#nativeOverlay!.node);
+		} else {
+			this.#nativeOverlay = undefined;
+		}
+		const root = this.#nativeRoot;
+		if (root && root.role === layout.role && root.tone === layout.tone && sameItems(root.children, children)) {
+			return root.node;
+		}
+		const described = col(children, layout.tone ? { role: layout.role, tone: layout.tone } : { role: layout.role });
+		this.#nativeRoot = { role: layout.role, tone: layout.tone, children, node: described };
+		return described;
+	}
+
+	/**
+	 * The typed text the open popup matches item labels against, for the TSP
+	 * `mark`: the completion prefix (the live `@` token while a file list
+	 * narrows in place) without its sigil, from its last path segment on.
+	 */
+	#autocompleteMark(): string {
+		let typed = this.#autocompletePrefix;
+		if (typed.startsWith("@")) {
+			const line = this.#state.lines[this.#state.cursorLine] ?? "";
+			typed = extractAtFilePrefix(line.slice(0, this.#state.cursorCol)) ?? typed;
+		}
+		typed = typed.replace(/^[/@:#$^]"?/, "");
+		return typed.slice(typed.lastIndexOf("/") + 1);
+	}
+
 	handleInput(data: string): void {
+		// Iterative, not recursive: the bytes trailing a completed bracketed
+		// paste (which may themselves contain further pastes) loop back here,
+		// so a fragmented paste stream can never grow the call stack.
+		let next: string | undefined = data;
+		while (next !== undefined && next.length > 0) {
+			const session = this.#vimSession;
+			const revision = this.#textRevision;
+			const line = this.#state.cursorLine;
+			const col = this.#state.cursorCol;
+			// A line-array copy is pointer-sized per line; the edit diff below skips unchanged lines whole.
+			const linesBefore =
+				session !== null && session.tracked && !session.replace ? this.#state.lines.slice() : undefined;
+			next = this.#handleInputChunk(next);
+			// A bare cursor move inside one Insert/Replace session splits it, like Vim's arrow keys.
+			if (
+				session !== null &&
+				session === this.#vimSession &&
+				this.#textRevision === revision &&
+				(line !== this.#state.cursorLine || col !== this.#state.cursorCol)
+			) {
+				this.#breakVimSession();
+			} else if (
+				session !== null &&
+				session === this.#vimSession &&
+				session.tracked &&
+				!session.replace &&
+				linesBefore !== undefined &&
+				this.#textRevision !== revision
+			) {
+				this.#trackVimSessionEdit(session, linesBefore);
+			}
+		}
+	}
+
+	/**
+	 * Fold one chunk's buffer change into the session window. Counting original deletions here keeps
+	 * `deleteBefore`/`deleteAfter` exact even when typed text coincides with what was deleted
+	 * (Backspace then retyping the same grapheme), which a final-text diff cannot recover.
+	 */
+	#trackVimSessionEdit(session: VimSessionState, linesBefore: readonly string[]): void {
+		const linesAfter = this.#state.lines;
+		const beforeLength = flatLength(linesBefore);
+		const afterLength = flatLength(linesAfter);
+		const { prefix: p, suffix: q } = diffFlatLines(linesBefore, linesAfter, beforeLength, afterLength);
+		const removedEnd = beforeLength - q;
+		const insLen = afterLength - p - q;
+		const leftCut = Math.max(0, Math.min(removedEnd, session.leftEnd) - p);
+		const rightCut = Math.max(0, removedEnd - Math.max(p, session.rightStart));
+		const typedCut = removedEnd - p - leftCut - rightCut;
+		if (insLen > 0 && p < session.leftEnd - leftCut) {
+			// Insertion inside surviving original text can't be told apart from typed text; the
+			// finalize diff still produces a bounded record.
+			session.tracked = false;
+			return;
+		}
+		if (leftCut > 0) session.delBefore += countGraphemes(sliceFlat(linesBefore, p, p + leftCut));
+		if (rightCut > 0) {
+			session.delAfter += countGraphemes(sliceFlat(linesBefore, removedEnd - rightCut, removedEnd));
+		}
+		session.leftEnd -= leftCut;
+		session.rightStart = session.rightStart - leftCut - typedCut + insLen;
+	}
+
+	/** Process one input chunk. Returns the unconsumed tail of a completed paste, if any. */
+	#handleInputChunk(data: string): string | undefined {
 		const kb = getKeybindings();
+		// Parse the sequence once; every binding probe below is then a set
+		// lookup instead of re-parsing `data` per probe (~35 probes per key).
+		const parsedKey = parseKey(data);
+		const canonical = parsedKey === undefined ? undefined : canonicalKeyId(parsedKey);
+		// Input wins over a pending provider lookup. The next completable edit
+		// queues one fresh request after the stale request acknowledges abort.
+		if (this.#autocompleteRequestRunning && this.#autocompleteState === null) {
+			this.#invalidateAutocompleteRequests();
+		}
 
 		// Handle character jump mode (awaiting next character to jump to)
 		if (this.#jumpMode !== null) {
 			// Cancel if the hotkey is pressed again
-			if (kb.matches(data, "tui.editor.jumpForward") || kb.matches(data, "tui.editor.jumpBackward")) {
+			if (
+				kb.matchesCanonical(canonical, "tui.editor.jumpForward") ||
+				kb.matchesCanonical(canonical, "tui.editor.jumpBackward")
+			) {
 				this.#jumpMode = null;
 				return;
 			}
@@ -1015,9 +2093,27 @@ export class Editor implements Component, Focusable {
 			if (paste.pasteContent !== undefined) {
 				this.#handlePaste(paste.pasteContent);
 				if (paste.remaining.length > 0) {
-					this.handleInput(paste.remaining);
+					return paste.remaining;
 				}
 			}
+			return;
+		}
+
+		// Vim modal editing. Placed after paste handling so bracketed pastes still land as text, and
+		// before the bulk fast path below because in Normal mode a multi-grapheme run is a sequence
+		// of commands, not something to insert.
+		if (this.#vim !== null && this.#handleVimInput(data, canonical)) {
+			return;
+		}
+
+		// Bulk printable fast path: a multi-scalar run of plain text (paste
+		// remainder, batched stdin) parses to no key, so no binding probe or
+		// special-key branch below can consume it — it always falls through to
+		// one #insertCharacter call. Take that path directly and skip the
+		// dispatch cascade. Runs containing ESC or control bytes (including
+		// \r/\n) keep the full path: those bytes carry key semantics.
+		if (canonical === undefined && data.length > 1 && isPlainTextRun(data)) {
+			this.#insertCharacter(data);
 			return;
 		}
 
@@ -1031,83 +2127,118 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Undo
-		if (kb.matches(data, "tui.editor.undo")) {
+		if (kb.matchesCanonical(canonical, "tui.editor.undo")) {
 			this.#applyUndo();
+			return;
+		}
+
+		if (kb.matchesCanonical(canonical, "tui.editor.spellingSuggestions")) {
+			void this.#showSpellingSuggestions();
 			return;
 		}
 
 		// Handle autocomplete special keys first (but don't block other input)
 		if (this.#autocompleteState && this.#autocompleteList) {
-			// Escape - cancel autocomplete
-			if (kb.matches(data, "tui.select.cancel")) {
+			// Escape - cancel autocomplete. A hidden popup (empty narrowed `@` list) is
+			// dropped too, so its pending refresh cannot pop up afterward, but the key
+			// falls through: the user never saw anything to dismiss.
+			if (kb.matchesCanonical(canonical, "tui.select.cancel")) {
+				const visible = this.isShowingAutocomplete();
 				this.#cancelAutocomplete(true);
+				if (visible) return;
+			}
+			// Right arrow at end of line accepts the selection like Tab (fish-style).
+			// Mid-line, right arrow keeps its cursor-movement role and falls through.
+			const rightArrowAccepts =
+				kb.matchesCanonical(canonical, "tui.editor.cursorRight") &&
+				this.#state.cursorCol >= (this.#state.lines[this.#state.cursorLine] ?? "").length;
+			if (
+				this.#autocompleteState === "assist" &&
+				(kb.matchesCanonical(canonical, "tui.input.submit") ||
+					data === "\n" ||
+					kb.matchesCanonical(canonical, "tui.input.tab") ||
+					rightArrowAccepts)
+			) {
+				this.#applyAssistReplacement();
 				return;
 			}
 			// Let the autocomplete list handle navigation and selection
 			else if (
-				kb.matches(data, "tui.select.up") ||
-				kb.matches(data, "tui.select.down") ||
-				kb.matches(data, "tui.select.pageUp") ||
-				kb.matches(data, "tui.select.pageDown") ||
-				kb.matches(data, "tui.input.submit") ||
+				kb.matchesCanonical(canonical, "tui.select.up") ||
+				kb.matchesCanonical(canonical, "tui.select.down") ||
+				kb.matchesCanonical(canonical, "tui.select.pageUp") ||
+				kb.matchesCanonical(canonical, "tui.select.pageDown") ||
+				kb.matchesCanonical(canonical, "tui.input.submit") ||
 				data === "\n" ||
-				kb.matches(data, "tui.input.tab")
+				kb.matchesCanonical(canonical, "tui.input.tab") ||
+				rightArrowAccepts
 			) {
 				// Only pass navigation keys to the list, not Enter/Tab (we handle those directly)
 				if (
-					kb.matches(data, "tui.select.up") ||
-					kb.matches(data, "tui.select.down") ||
-					kb.matches(data, "tui.select.pageUp") ||
-					kb.matches(data, "tui.select.pageDown")
+					kb.matchesCanonical(canonical, "tui.select.up") ||
+					kb.matchesCanonical(canonical, "tui.select.down") ||
+					kb.matchesCanonical(canonical, "tui.select.pageUp") ||
+					kb.matchesCanonical(canonical, "tui.select.pageDown")
 				) {
-					this.#autocompleteList.handleInput(data);
-					this.onAutocompleteUpdate?.();
-					return;
+					// An `@` popup whose narrowing filter matched nothing holds no candidate;
+					// let the key fall through instead of swallowing it.
+					if (!this.#autocompleteList.getSelectedItem()) {
+						this.#cancelAutocomplete();
+						this.onAutocompleteUpdate?.();
+					} else {
+						this.#autocompleteList.handleInput(data);
+						this.#enterAcceptsSelection = true;
+						this.onAutocompleteUpdate?.();
+						return;
+					}
 				}
 
 				// If Tab was pressed, always apply the selection
-				if (kb.matches(data, "tui.input.tab")) {
+				if (kb.matchesCanonical(canonical, "tui.input.tab") || rightArrowAccepts) {
 					const selected = this.#autocompleteList.getSelectedItem();
-					if (selected && this.#autocompleteProvider) {
-						const shouldChainSlashCommandAutocomplete = this.#isSlashCommandNameAutocompleteSelection();
-						const result = this.#autocompleteProvider.applyCompletion(
-							this.#state.lines,
-							this.#state.cursorLine,
-							this.#state.cursorCol,
-							selected,
-							this.#autocompletePrefix,
-						);
-
-						this.#state.lines = result.lines;
-						this.#state.cursorLine = result.cursorLine;
-						this.#setCursorCol(result.cursorCol);
-
-						this.#cancelAutocomplete();
-						this.onAutocompleteUpdate?.();
-
-						if (this.onChange) {
-							this.onChange(this.getText());
-						}
-
-						result.onApplied?.();
-
-						if (shouldChainSlashCommandAutocomplete && this.#isCompletedSlashCommandAtCursor()) {
-							void this.#tryTriggerAutocomplete();
-						}
-					}
-					return;
-				}
-
-				// If Enter was pressed on a slash command, apply completion and submit
-				if ((kb.matches(data, "tui.input.submit") || data === "\n") && this.#autocompletePrefix.startsWith("/")) {
-					// Check for stale autocomplete state due to debounce
+					// Check for stale autocomplete state due to buffer edits since last refresh
+					// (destructive keys or paste can outrun the async refresh).
 					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
 					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-					if (currentTextBeforeCursor !== this.#autocompletePrefix) {
-						// Autocomplete is stale - cancel and fall through to normal submission
+					if (!this.#autocompletePrefixMatchesCursorText(currentTextBeforeCursor, selected)) {
+						// Autocomplete is stale - silently cancel; Tab has no fallback action here.
+						this.#cancelAutocomplete();
+						return;
+					}
+					if (!selected) {
+						// An `@` popup whose narrowing filter matched nothing stays open with no
+						// candidate (see #refreshAutocomplete). Nothing to accept: cancel the
+						// popup and fall through so Tab keeps its normal completion role and a right
+						// arrow at end of line moves the cursor.
+						this.#cancelAutocomplete();
+						this.onAutocompleteUpdate?.();
+					} else {
+						this.#acceptAutocompleteSelection(selected);
+					}
+					// Only an accepted candidate consumes the key; an empty list falls through.
+					if (selected) return;
+				}
+
+				// If Enter was pressed on a submitted slash command (not an absolute-path
+				// completion sharing the leading-slash prefix), apply and submit.
+				if (
+					(kb.matchesCanonical(canonical, "tui.input.submit") || data === "\n") &&
+					findLeadingSlashCommandStart(this.#autocompletePrefix) !== null &&
+					this.#isInSubmittedSlashCommandContext() &&
+					!this.#selectedCompletionIsPath() &&
+					!this.#selectedCompletionIsSkillNamespace()
+				) {
+					const selected = this.#autocompleteList.getSelectedItem();
+					// Check for stale autocomplete state while an async refresh is pending
+					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
+					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+					if (
+						!this.#autocompletePrefixMatchesCursorText(currentTextBeforeCursor, selected) ||
+						!this.#enterAcceptsSelection
+					) {
+						// Stale, or a description-only hit the user never selected: submit the typed text.
 						this.#cancelAutocomplete();
 					} else {
-						const selected = this.#autocompleteList.getSelectedItem();
 						if (selected && this.#autocompleteProvider) {
 							const result = this.#autocompleteProvider.applyCompletion(
 								this.#state.lines,
@@ -1126,77 +2257,105 @@ export class Editor implements Component, Focusable {
 					}
 					// Don't return - fall through to submission logic
 				}
-				// If Enter was pressed on a file path, apply completion
-				else if (kb.matches(data, "tui.input.submit") || data === "\n") {
+				// Otherwise, apply the completion without submitting the surrounding draft.
+				else if (kb.matchesCanonical(canonical, "tui.input.submit") || data === "\n") {
 					const selected = this.#autocompleteList.getSelectedItem();
-					if (selected && this.#autocompleteProvider) {
-						const result = this.#autocompleteProvider.applyCompletion(
-							this.#state.lines,
-							this.#state.cursorLine,
-							this.#state.cursorCol,
-							selected,
-							this.#autocompletePrefix,
-						);
-
-						this.#state.lines = result.lines;
-						this.#state.cursorLine = result.cursorLine;
-						this.#setCursorCol(result.cursorCol);
-
+					// Check for stale autocomplete state due to buffer edits since last refresh.
+					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
+					const currentTextBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+					// A narrowed `@` list can be empty while its refresh is pending; Enter
+					// then submits instead of waiting on the search.
+					if (
+						!selected ||
+						!this.#autocompletePrefixMatchesCursorText(currentTextBeforeCursor, selected) ||
+						this.#selectedSlashArgumentIsAlreadyTyped(selected) ||
+						!this.#enterAcceptsSelection
+					) {
+						// Stale, accepting would only append whitespace to an already fully
+						// typed slash-command argument (`/mcp list` + Enter), or the row is a
+						// description-only hit the user never selected: cancel and fall
+						// through to normal submission instead of swallowing the keypress.
 						this.#cancelAutocomplete();
-						this.onAutocompleteUpdate?.();
+					} else {
+						if (selected && this.#autocompleteProvider) {
+							const shouldChainSlashCommandAutocomplete = this.#isSlashCommandNameAutocompleteSelection();
+							// Directory chaining exists so an @ mention can be browsed deeper
+							// without retyping the path. It must not apply to a slash
+							// command's directory argument: there the accepted value is the
+							// whole argument, so chaining reopens the popup on the directory's
+							// children, the command never submits, and every further Enter
+							// descends another level (#12107).
+							const shouldChainDirectoryCompletion =
+								this.#autocompletePrefix.startsWith("@") && isDirectoryCompletionValue(selected.value);
+							const result = this.#autocompleteProvider.applyCompletion(
+								this.#state.lines,
+								this.#state.cursorLine,
+								this.#state.cursorCol,
+								selected,
+								this.#autocompletePrefix,
+							);
 
-						if (this.onChange) {
-							this.onChange(this.getText());
+							this.#state.lines = result.lines;
+							this.#state.cursorLine = result.cursorLine;
+							this.#setCursorCol(result.cursorCol);
+
+							this.#cancelAutocomplete();
+							this.onAutocompleteUpdate?.();
+
+							this.#notifyChange();
+
+							result.onApplied?.();
+							if (shouldChainDirectoryCompletion) {
+								queueMicrotask(() => void this.#tryTriggerAutocomplete());
+							} else if (shouldChainSlashCommandAutocomplete && this.#isCompletedSlashCommandAtCursor()) {
+								void this.#tryTriggerAutocomplete();
+							}
 						}
-
-						result.onApplied?.();
+						return;
 					}
-					return;
 				}
 			}
 			// For other keys (like regular typing), DON'T return here
 			// Let them fall through to normal character handling
 		}
 
+		if (this.#autocompleteState === "assist") {
+			this.#cancelAutocomplete();
+			this.onAutocompleteUpdate?.();
+		}
+
 		// Tab key - context-aware completion (but not when already autocompleting)
-		if (kb.matches(data, "tui.input.tab") && !this.#autocompleteState) {
-			this.#handleTabCompletion();
+		if (kb.matchesCanonical(canonical, "tui.input.tab") && !this.#autocompleteState) {
+			void this.#handleTabCompletion();
 			return;
 		}
 
 		// Continue with rest of input handling
-		// Ctrl+K - Delete to end of line
-		if (matchesKey(data, "ctrl+k")) {
+		// Delete to end of line
+		if (kb.matchesCanonical(canonical, "tui.editor.deleteToLineEnd")) {
 			this.#deleteToEndOfLine();
 		}
-		// Ctrl+U - Delete to start of line
-		else if (matchesKey(data, "ctrl+u")) {
+		// Delete to start of line
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteToLineStart")) {
 			this.#deleteToStartOfLine();
 		}
-		// Ctrl+W - Delete word backwards
-		else if (matchesKey(data, "ctrl+w")) {
+		// Delete word backward. Registry defaults cover ctrl+w, alt+backspace,
+		// ctrl+backspace, and super+alt+backspace (Ghostty on macOS reports
+		// Option+Backspace as super+alt — kitty mod 11, see #2064).
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteWordBackward")) {
 			this.#deleteWordBackwards();
 		}
-		// Option/Alt+Backspace - Delete word backwards.
-		// Ghostty on macOS reports Option+Backspace as super+alt (kitty mod 11) — see #2064.
-		else if (matchesKey(data, "alt+backspace") || matchesKey(data, "super+alt+backspace")) {
-			this.#deleteWordBackwards();
-		}
-		// Option/Alt+D and Option+Delete - Delete word forwards. Same Ghostty quirk applies.
-		else if (
-			matchesKey(data, "alt+d") ||
-			matchesKey(data, "alt+delete") ||
-			matchesKey(data, "super+alt+d") ||
-			matchesKey(data, "super+alt+delete")
-		) {
+		// Delete word forward. Registry defaults cover alt+d/alt+delete and their
+		// super+alt variants for the same Ghostty quirk.
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteWordForward")) {
 			this.#deleteWordForwards();
 		}
-		// Ctrl+Y - Yank from kill ring
-		else if (matchesKey(data, "ctrl+y")) {
+		// Yank from kill ring
+		else if (kb.matchesCanonical(canonical, "tui.editor.yank")) {
 			this.#yankFromKillRing();
 		}
-		// Alt+Y - Yank-pop (cycle kill ring)
-		else if (matchesKey(data, "alt+y")) {
+		// Yank-pop (cycle kill ring)
+		else if (kb.matchesCanonical(canonical, "tui.editor.yankPop")) {
 			this.#yankPop();
 		}
 		// Ctrl+A - Move to start of line
@@ -1215,14 +2374,19 @@ export class Editor implements Component, Focusable {
 				this.#addNewLine();
 			}
 		}
-		// New line
+		// New line. A key the user explicitly bound to `tui.input.submit` wins
+		// over these hardcoded newline fallbacks, so Ctrl/Shift+Enter can be
+		// remapped to submit (#8906). The bare-LF case is exempt: its canonical
+		// form is "enter" (indistinguishable from plain Enter), so gating it
+		// would hijack the default Enter=submit binding.
 		else if (
-			(data.charCodeAt(0) === 10 && data.length > 1) || // Ctrl+Enter with modifiers
-			matchesKey(data, "ctrl+enter") || // Ctrl+Enter (Kitty/modifyOtherKeys, including lock bits/keypad Enter)
-			data === "\x1b\r" || // Option+Enter in some terminals (legacy)
-			data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
-			kb.matches(data, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
-			(data.length > 1 && data.includes("\x1b") && data.includes("\r")) ||
+			(!kb.matchesCanonical(canonical, "tui.input.submit") &&
+				((data.charCodeAt(0) === 10 && data.length > 1) || // Ctrl+Enter with modifiers
+					matchesKey(data, "ctrl+enter") || // Ctrl+Enter (Kitty/modifyOtherKeys, including lock bits/keypad Enter)
+					data === "\x1b\r" || // Option+Enter in some terminals (legacy)
+					data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
+					kb.matchesCanonical(canonical, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
+					(data.length > 1 && data.includes("\x1b") && data.includes("\r")))) ||
 			(data === "\n" && data.length === 1) // Shift+Enter from iTerm2 mapping
 		) {
 			if (this.#shouldSubmitOnBackslashEnter(data, kb)) {
@@ -1233,7 +2397,7 @@ export class Editor implements Component, Focusable {
 			this.#addNewLine();
 		}
 		// Plain Enter - submit (handles both legacy \r and Kitty protocol with lock bits)
-		else if (kb.matches(data, "tui.input.submit") || data === "\n") {
+		else if (kb.matchesCanonical(canonical, "tui.input.submit") || data === "\n") {
 			// If submit is disabled, do nothing
 			if (this.disableSubmit) {
 				return;
@@ -1246,16 +2410,20 @@ export class Editor implements Component, Focusable {
 				const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
 				if (
-					textBeforeCursor.startsWith("/") &&
+					findLeadingSlashCommandStart(textBeforeCursor) !== null &&
+					textBeforeCursor.trim() !== "/" &&
 					this.#isInSubmittedSlashCommandContext() &&
 					this.#autocompleteProvider?.trySyncSlashCompletion
 				) {
 					const syncResult = this.#autocompleteProvider.trySyncSlashCompletion(textBeforeCursor);
-					if (syncResult && syncResult.items.length > 0) {
+					// The collapsed `/skill:` namespace row is not a runnable command; Enter submits
+					// immediately after applying, so only a real command may be completed here, and
+					// only one whose name matches: a description-only hit would run an unrelated command.
+					const selected = syncResult?.items.find(item => item.value !== SKILL_NAMESPACE);
+					if (syncResult && selected && !selected.descriptionMatch) {
 						// Invalidate any pending async autocomplete so its stale results are discarded
 						this.#autocompleteRequestId += 1;
 						// Apply the best match and submit the completed command
-						const selected = syncResult.items[0]!;
 						const result = this.#autocompleteProvider.applyCompletion(
 							this.#state.lines,
 							this.#state.cursorLine,
@@ -1274,47 +2442,42 @@ export class Editor implements Component, Focusable {
 			this.#submitValue();
 		}
 		// Backspace (including Shift+Backspace)
-		else if (kb.matches(data, "tui.editor.deleteCharBackward") || matchesKey(data, "shift+backspace")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteCharBackward") || matchesKey(data, "shift+backspace")) {
 			this.#handleBackspace();
 		}
 		// Line navigation shortcuts (Home/End keys)
-		else if (kb.matches(data, "tui.editor.cursorLineStart")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.cursorLineStart")) {
 			this.#moveToLineStart();
-		} else if (kb.matches(data, "tui.editor.cursorLineEnd")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorLineEnd")) {
 			this.#moveToLineEnd();
 		}
-		// Page navigation (PageUp/PageDown)
-		else if (kb.matches(data, "tui.editor.pageUp")) {
-			if (this.#isEditorEmpty()) {
-				this.#navigateHistory(-1);
-			} else if (this.#historyIndex > -1 && this.#isOnFirstVisualLine()) {
-				this.#navigateHistory(-1);
-			} else {
-				this.#pageScroll(-1);
-			}
-		} else if (kb.matches(data, "tui.editor.pageDown")) {
-			if (this.#historyIndex > -1 && this.#isOnLastVisualLine()) {
-				this.#navigateHistory(1);
-			} else {
-				this.#pageScroll(1);
-			}
+		// Page navigation (PageUp/PageDown): page the editor viewport only. On a
+		// short draft this is a no-op — it never steps prompt history (that stays
+		// on Up/Down), so an idle empty editor swallows the keys instead of
+		// surprising the user by loading the previous prompt (#4754).
+		else if (kb.matchesCanonical(canonical, "tui.editor.pageUp")) {
+			this.#pageScroll(-1);
+		} else if (kb.matchesCanonical(canonical, "tui.editor.pageDown")) {
+			this.#pageScroll(1);
 		}
 		// Forward delete (Fn+Backspace or Delete key, including Shift+Delete)
-		else if (kb.matches(data, "tui.editor.deleteCharForward") || matchesKey(data, "shift+delete")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteCharForward") || matchesKey(data, "shift+delete")) {
 			this.#handleForwardDelete();
 		}
 		// Word navigation (Option/Alt + Arrow or Ctrl + Arrow)
-		else if (kb.matches(data, "tui.editor.cursorWordLeft")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.cursorWordLeft")) {
 			// Word left
 			this.#resetKillSequence();
 			this.#moveWordBackwards();
-		} else if (kb.matches(data, "tui.editor.cursorWordRight")) {
+			this.#dismissAutocomplete();
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorWordRight")) {
 			// Word right
 			this.#resetKillSequence();
 			this.#moveWordForwards();
+			this.#dismissAutocomplete();
 		}
 		// Arrow keys
-		else if (kb.matches(data, "tui.editor.cursorUp")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.cursorUp")) {
 			// Up - history navigation or cursor movement
 			if (this.#isEditorEmpty()) {
 				this.#navigateHistory(-1); // Start browsing history
@@ -1326,7 +2489,7 @@ export class Editor implements Component, Focusable {
 			} else {
 				this.#moveCursor(-1, 0); // Cursor movement (within text or history entry)
 			}
-		} else if (kb.matches(data, "tui.editor.cursorDown")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorDown")) {
 			// Down - history navigation or cursor movement
 			if (this.#historyIndex > -1 && this.#isOnLastVisualLine()) {
 				this.#navigateHistory(1); // Navigate to newer history entry or clear
@@ -1336,10 +2499,11 @@ export class Editor implements Component, Focusable {
 			} else {
 				this.#moveCursor(1, 0); // Cursor movement (within text or history entry)
 			}
-		} else if (kb.matches(data, "tui.editor.cursorRight")) {
-			// Right
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorRight")) {
+			// Right walks over the ghost prediction or word completion as if it were typed: no trailing space.
+			if (this.#acceptPrediction() || this.#acceptWordCompletion({ space: false })) return;
 			this.#moveCursor(0, 1);
-		} else if (kb.matches(data, "tui.editor.cursorLeft")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorLeft")) {
 			// Left
 			this.#moveCursor(0, -1);
 		}
@@ -1348,9 +2512,9 @@ export class Editor implements Component, Focusable {
 			this.#insertCharacter(" ");
 		}
 		// Character jump mode triggers
-		else if (kb.matches(data, "tui.editor.jumpForward")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.jumpForward")) {
 			this.#jumpMode = "forward";
-		} else if (kb.matches(data, "tui.editor.jumpBackward")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.jumpBackward")) {
 			this.#jumpMode = "backward";
 		}
 		// Printable keystrokes, including Kitty CSI-u text-producing sequences.
@@ -1362,20 +2526,635 @@ export class Editor implements Component, Focusable {
 		}
 	}
 
-	#wrapLine(line: string, width: number): TextChunk[] {
-		if (width !== this.#wrapCacheWidth) {
+	/**
+	 * Route one input chunk through the Vim state machine. Returns true when it was consumed.
+	 *
+	 * Anything the state machine declines — control chords, Enter, Tab — falls through to the
+	 * regular dispatch below, so app-level bindings keep working in Normal mode.
+	 */
+	#handleVimInput(data: string, canonical: string | undefined): boolean {
+		const vim = this.#vim;
+		if (vim === null) return false;
+
+		// Escape is the one key Vim owns in every mode: Insert → Normal, Visual → Normal, and
+		// cancelling a half-typed operator. A quiet Normal mode hands it back to the host.
+		// An open autocomplete popup still gets the first Escape though — dismissing it is what
+		// the user means, and a second Escape then switches modes.
+		if (canonical === "escape") {
+			return this.isShowingAutocomplete() ? false : this.#runVimKey("escape", vim);
+		}
+		if (vim.mode === "insert") return false;
+		if (vim.mode === "replace") {
+			if (canonical === "backspace" || matchesKey(data, "backspace") || matchesKey(data, "shift+backspace")) {
+				this.#replaceBackspace();
+				return true;
+			}
+			const replacing = extractPrintableText(data);
+			if (replacing) {
+				for (const seg of segmenter.segment(replacing)) this.#overwriteReplaceGrapheme(seg.segment);
+				return true;
+			}
+		}
+
+		// `f`/`t`/`r` are waiting for a character. Space is that character; arrows and other named
+		// keys cancel, instead of being rewritten to `h`/`l` and inserted or searched for.
+		const awaitingTarget = /[fFtTr]$/.test(vim.pendingText);
+		if (awaitingTarget && (canonical === "space" || data === " ")) return this.#runVimKey(" ", vim);
+		const mapped = canonical === undefined ? undefined : VIM_NAV_KEYS[canonical];
+		if (awaitingTarget && mapped !== undefined) return this.#runVimKey("escape", vim);
+		if (mapped !== undefined) return this.#runVimKey(mapped, vim);
+
+		// Control chords, Enter, and Tab carry no printable text and stay with the host. A half-typed
+		// command (`r`, `f`, `d`) is cancelled first, like character-jump mode, so it cannot outlive a
+		// submit and swallow the first key of the next prompt.
+		const printable = extractPrintableText(data);
+		if (!printable) {
+			if (vim.pending) this.#runVimKey("escape", vim);
+			return false;
+		}
+
+		// Batched stdin can deliver several keystrokes at once, so replay the run one grapheme at a
+		// time. A command that drops out of Normal mode part-way (`iabc`, `Rxx`) turns the rest of
+		// the run into literal text or replace-mode overwrites rather than more Normal commands.
+		for (const seg of segmenter.segment(printable)) {
+			if (vim.mode === "replace") {
+				this.#overwriteReplaceGrapheme(seg.segment);
+				continue;
+			}
+			if (this.#runVimKey(seg.segment, vim)) continue;
+			this.#insertCharacter(printable.slice(seg.index));
+			return true;
+		}
+		return true;
+	}
+
+	#runVimKey(key: string, vim: VimState): boolean {
+		const before = vim.mode;
+		const pendingBefore = vim.pendingText;
+		const selectedLinesBefore = this.vimSelectedLines;
+		const mark = this.#undoMark();
+		const pinHere = this.#vimSession === null;
+		if (pinHere) this.#pinnedUndo = mark;
+		const revisionBefore = this.#textRevision;
+		const commands = vim.handleKey(key, this.#state);
+		if (commands === null) {
+			if (pinHere) this.#pinnedUndo = null;
+			return false;
+		}
+		const editing = (mode: VimMode) => mode === "insert" || mode === "replace";
+		// Before applying: Escape's commands would otherwise clear the replace log this reads.
+		if (editing(before) && !editing(vim.mode)) this.#endVimSession();
+		this.#applyVimCommands(commands);
+		if (this.#textRevision !== revisionBefore) {
+			vim.commitChange();
+		} else {
+			vim.discardChange();
+		}
+		// The session baseline follows `cw`'s delete or `o`'s new line, but its undo mark precedes them,
+		// so one `u` restores the whole change. Every other key (`.` too) is a single undo step.
+		if (!editing(before) && editing(vim.mode)) this.#startVimSession(mark, vim.mode === "replace");
+		else if (this.#vimSession === null) {
+			this.#collapseUndoSince(mark);
+			this.#pinnedUndo = null;
+		}
+		// Pending and selection size are mode chrome too: hosts echo `2d` and the Visual line count
+		// beside the mode name, and extending a selection changes neither the mode nor the pending
+		// command — so all three have to be compared or the indicator goes stale mid-selection.
+		if (vim.mode !== before || vim.pendingText !== pendingBefore || this.vimSelectedLines !== selectedLinesBefore) {
+			this.onVimModeChange?.(vim.mode);
+		}
+		if (before === "replace" && vim.mode !== "replace") this.#replaceLog.length = 0;
+		if (vim.mode === "replace" && before !== "replace") this.#replaceLog.length = 0;
+		return true;
+	}
+
+	#undoMark(): UndoMark {
+		return { depth: this.#undoStack.length, shifts: this.#undoShifts };
+	}
+
+	/** Keep only the first snapshot pushed since `mark`, folding everything after it into one undo step. */
+	#collapseUndoSince(mark: UndoMark): void {
+		const keep = Math.max(0, mark.depth - (this.#undoShifts - mark.shifts)) + 1;
+		if (this.#undoStack.length > keep) this.#undoStack.length = keep;
+	}
+
+	#startVimSession(mark: UndoMark, replace: boolean): void {
+		// A stale "type-word" would coalesce the session's first keystroke into the pre-session
+		// undo step, so `u` would swallow text the session never touched.
+		this.#resetKillSequence();
+		const { text, cursor } = flatten(this.#state);
+		this.#vimSession = {
+			mark,
+			replace,
+			text,
+			cursor,
+			arrowed: false,
+			leftEnd: cursor,
+			rightStart: cursor,
+			delBefore: 0,
+			delAfter: 0,
+			tracked: true,
+		};
+	}
+
+	/** Hand the current session segment's text to `.` and fold its undo steps. */
+	#finalizeVimSegment(): void {
+		const session = this.#vimSession;
+		const vim = this.#vim;
+		if (session === null || vim === null) return;
+		const record: VimInsertRecord = session.replace
+			? { deleteBefore: 0, deleteAfter: 0, text: this.#replaceLog.map(entry => entry.text).join("") }
+			: session.tracked
+				? {
+						deleteBefore: session.delBefore,
+						deleteAfter: session.delAfter,
+						text: this.#state.lines.join("\n").slice(session.leftEnd, session.rightStart),
+					}
+				: diffInsertSession(session.text, session.cursor, this.#state.lines.join("\n"));
+		if (!session.arrowed) vim.recordInsert(record, false);
+		// An empty segment after an arrow keeps the earlier change, as Vim does.
+		else if (record.text !== "" || record.deleteBefore > 0 || record.deleteAfter > 0) vim.recordInsert(record, true);
+		this.#collapseUndoSince(session.mark);
+	}
+
+	#endVimSession(): void {
+		this.#finalizeVimSegment();
+		this.#vimSession = null;
+		this.#pinnedUndo = null;
+		// A spent log would otherwise leak into the next Replace session's record.
+		this.#replaceLog.length = 0;
+	}
+
+	/** An arrow key inside Insert/Replace: close the segment and start a fresh one at the new cursor. */
+	#breakVimSession(): void {
+		const session = this.#vimSession;
+		if (session === null) return;
+		this.#finalizeVimSegment();
+		this.#resetKillSequence();
+		// Replace-mode Backspace cannot restore across a cursor move, and old overwrites must not leak
+		// into the next segment's record.
+		this.#replaceLog.length = 0;
+		const { text, cursor } = flatten(this.#state);
+		const mark = this.#undoMark();
+		this.#vimSession = {
+			...session,
+			mark,
+			text,
+			cursor,
+			arrowed: true,
+			leftEnd: cursor,
+			rightStart: cursor,
+			delBefore: 0,
+			delAfter: 0,
+			tracked: true,
+		};
+		this.#pinnedUndo = mark;
+	}
+
+	#applyVimCommands(commands: readonly VimCommand[]): void {
+		for (const command of commands) {
+			// A delete or other edit in replace mode invalidates Backspace restores. Motions do not.
+			if (
+				this.#vim?.mode === "replace" &&
+				command.kind !== "move" &&
+				command.kind !== "mode" &&
+				command.kind !== "yank"
+			) {
+				this.#replaceLog.length = 0;
+			}
+			switch (command.kind) {
+				case "move":
+					this.#moveVimCursor(command.to);
+					break;
+				case "mode":
+					this.#resetKillSequence();
+					this.#preferredVisualCol = null;
+					break;
+				case "yank": {
+					const body = this.#sliceRange(command.from, command.to, command.linewise);
+					// The trailing newline is what marks a register linewise, so `p` puts it back as
+					// whole lines rather than splicing it mid-line.
+					const text = command.linewise ? `${body}\n` : body;
+					if (text) {
+						this.#killRing.push(text, { prepend: false });
+						this.onYank?.(text);
+					}
+					break;
+				}
+				case "delete":
+					this.#deleteVimRange(command.from, command.to, command.linewise);
+					break;
+				case "openLine":
+					this.#openVimLine(command.below);
+					break;
+				case "paste":
+					this.#pasteVimRegister(command.after, command.count);
+					break;
+				case "undo":
+					this.#applyUndo();
+					break;
+				case "replace":
+					this.#replaceVimSpan(command.from, command.to, command.text);
+					break;
+				case "join":
+					this.#joinVimLines(command.fromLine, command.lines);
+					break;
+				case "indent":
+					this.#indentVimLines(command.fromLine, command.toLine, command.out);
+					break;
+				case "retype":
+					this.#retypeVimInsert(command);
+					break;
+			}
+		}
+		this.#clampVimCursor();
+		this.invalidate();
+	}
+
+	#replaceVimSpan(from: VimPosition, to: VimPosition, text: string): void {
+		const line = this.#state.lines[from.line] ?? "";
+		if (this.#spanCutsAtomicToken(line, from.col, to.col)) return;
+		this.#recordUndoState();
+		this.#lastAction = null;
+		this.#state.lines[from.line] = line.slice(0, from.col) + text + line.slice(to.col);
+		this.#state.cursorLine = from.line;
+		let last = from.col;
+		for (const seg of segmenter.segment(text)) last = from.col + seg.index;
+		this.#setCursorCol(last);
+		this.#afterVimEdit();
+	}
+
+	#overwriteReplaceGrapheme(grapheme: string): void {
+		const lineIdx = this.#state.cursorLine;
+		const line = this.#state.lines[lineIdx] ?? "";
+		const col = this.#state.cursorCol;
+		if (this.#atomicTokenAt(line, col)) return;
+		// Any other edit since the last overwrite (setText, `x`, paste) resets `#lastAction`, which
+		// makes the logged columns meaningless; start a fresh undo step and a fresh log.
+		if (this.#lastAction !== "replace") {
+			this.#recordUndoState();
+			if (!this.#vimSession?.replace) this.#replaceLog.length = 0;
+		}
+		this.#lastAction = "replace";
+		// Editing a recalled prompt makes it a draft, so Up/Down at an edge move the cursor again
+		// instead of navigating history over the overwritten text (same as `#afterVimEdit`).
+		this.#historyIndex = -1;
+		const end = col >= line.length ? col : nextGraphemeStart(line, col);
+		const removed = line.slice(col, end);
+		this.#state.lines[lineIdx] = line.slice(0, col) + grapheme + line.slice(end);
+		this.#replaceLog.push({ line: lineIdx, col, removed, text: grapheme });
+		this.#setCursorCol(col + grapheme.length);
+		this.#notifyChange();
+	}
+
+	#replaceBackspace(): void {
+		if (this.#lastAction !== "replace") {
+			this.#replaceLog.length = 0;
+			return;
+		}
+		const entry = this.#replaceLog.pop();
+		if (!entry) return;
+		const line = this.#state.lines[entry.line] ?? "";
+		const stillThere = line.slice(entry.col, entry.col + entry.text.length) === entry.text;
+		const atCursor = this.#state.cursorLine === entry.line && this.#state.cursorCol === entry.col + entry.text.length;
+		if (!stillThere) return;
+		if (!atCursor) {
+			this.#replaceLog.push(entry);
+			return;
+		}
+		this.#state.lines[entry.line] =
+			line.slice(0, entry.col) + entry.removed + line.slice(entry.col + entry.text.length);
+		this.#setCursorCol(entry.col);
+		this.#notifyChange();
+	}
+
+	#joinVimLines(fromLine: number, span: number): void {
+		const start = Math.max(0, Math.min(fromLine, this.#state.lines.length - 1));
+		const last = Math.min(start + Math.max(span, 2) - 1, this.#state.lines.length - 1);
+		if (last <= start) return;
+		this.#recordUndoState();
+		let text = this.#state.lines[start] ?? "";
+		let cursor = text.length;
+		for (let i = start + 1; i <= last; i++) {
+			const raw = this.#state.lines[i] ?? "";
+			let trim = /^[ \t]*/.exec(raw)?.[0].length ?? 0;
+			const token = this.#atomicTokenAt(raw, 0);
+			if (token && token.start < trim) trim = token.start;
+			const next = raw.slice(trim);
+			const at = text.length;
+			if (i === start + 1) cursor = at;
+			// Vim join: no extra space after whitespace, before `)`, or for an empty line; two spaces after `.!?`.
+			const gap =
+				text.length === 0 || next.length === 0 || /[ \t]$/.test(text) || next.startsWith(")")
+					? ""
+					: /[.!?]$/.test(text)
+						? "  "
+						: " ";
+			text += gap + next;
+		}
+		this.#state.lines.splice(start, last - start + 1, text);
+		this.#state.cursorLine = start;
+		this.#setCursorCol(cursor);
+		this.#lastAction = null;
+		this.#afterVimEdit();
+	}
+
+	#indentVimLines(fromLine: number, toLine: number, out: boolean): void {
+		const first = Math.max(0, Math.min(fromLine, this.#state.lines.length - 1));
+		const last = Math.max(first, Math.min(toLine, this.#state.lines.length - 1));
+		// Two spaces, not Vim's shiftwidth of 8: a prompt draft should not jump a tab stop. A leading tab shifts by one tab so the line keeps its own indent style.
+		// Empty lines stay empty, as in Vim, so shifting a paragraph never leaves trailing blanks.
+		const next = this.#state.lines.slice(first, last + 1).map(line => {
+			const text = line ?? "";
+			if (!out) return text.length === 0 ? text : (text.startsWith("\t") ? "\t" : "  ") + text;
+			if (text.startsWith("\t")) return text.slice(1);
+			const spaces = /^ */.exec(text)?.[0].length ?? 0;
+			return text.slice(Math.min(2, spaces));
+		});
+		if (next.every((line, i) => line === (this.#state.lines[first + i] ?? ""))) return;
+		this.#recordUndoState();
+		for (let i = first; i <= last; i++) this.#state.lines[i] = next[i - first] ?? "";
+		this.#state.cursorLine = first;
+		const landed = this.#state.lines[first] ?? "";
+		let col = 0;
+		while (col < landed.length && /\s/.test(landed.charAt(col))) col++;
+		this.#setCursorCol(col);
+		this.#lastAction = null;
+		this.#afterVimEdit();
+	}
+
+	#moveVimCursor(to: VimPosition): void {
+		this.#state.cursorLine = Math.max(0, Math.min(to.line, this.#state.lines.length - 1));
+		const line = this.#state.lines[this.#state.cursorLine] ?? "";
+		this.#setCursorCol(Math.max(0, Math.min(to.col, line.length)));
+	}
+
+	/** Normal mode rests the cursor *on* a grapheme; Insert and Visual may sit one past the end. */
+	#clampVimCursor(): void {
+		if (this.#vim?.mode !== "normal") return;
+		const line = this.#state.lines[this.#state.cursorLine] ?? "";
+		if (this.#state.cursorCol > lastGraphemeStart(line)) {
+			this.#state.cursorCol = lastGraphemeStart(line);
+		}
+	}
+
+	/** Text covered by a half-open `[from, to)` buffer range. Linewise ranges take whole lines. */
+	#sliceRange(from: VimPosition, to: VimPosition, linewise: boolean): string {
+		const lines = this.#state.lines;
+		if (linewise) {
+			return lines.slice(from.line, Math.min(to.line, lines.length - 1) + 1).join("\n");
+		}
+		if (from.line === to.line) {
+			return (lines[from.line] ?? "").slice(from.col, to.col);
+		}
+		const parts = [(lines[from.line] ?? "").slice(from.col)];
+		for (let i = from.line + 1; i < to.line; i++) parts.push(lines[i] ?? "");
+		parts.push((lines[to.line] ?? "").slice(0, to.col));
+		return parts.join("\n");
+	}
+
+	#deleteVimRange(from: VimPosition, to: VimPosition, linewise: boolean): void {
+		const lines = this.#state.lines;
+		if (linewise) {
+			const last = Math.min(to.line, lines.length - 1);
+			const removed = this.#sliceRange(from, to, true);
+			if (!removed && from.line === last && lines.length === 1) return;
+			this.#recordUndoState();
+			this.#killRing.push(`${removed}\n`, { prepend: false });
+			lines.splice(from.line, last - from.line + 1);
+			if (lines.length === 0) lines.push("");
+			this.#state.cursorLine = Math.min(from.line, lines.length - 1);
+			this.#setCursorCol(0);
+			this.#afterVimEdit();
+			return;
+		}
+
+		// A range that cuts through an atomic placeholder (`[Image #1, 800x600]`) swallows the whole
+		// token instead of leaving a corrupt fragment — the same rule backspace follows.
+		const { start, end } = this.#expandVimRange(from, to);
+
+		const removed = this.#sliceRange(start, end, false);
+		if (!removed) return;
+		this.#recordUndoState();
+		this.#killRing.push(removed, { prepend: false });
+		const head = (lines[start.line] ?? "").slice(0, start.col);
+		const tail = (lines[Math.min(end.line, lines.length - 1)] ?? "").slice(end.col);
+		lines.splice(start.line, Math.min(end.line, lines.length - 1) - start.line + 1, head + tail);
+		this.#state.cursorLine = start.line;
+		this.#setCursorCol(start.col);
+		this.#afterVimEdit();
+	}
+
+	/** Widen a charwise range so it never cuts through an atomic placeholder token. */
+	#expandVimRange(from: VimPosition, to: VimPosition): { start: VimPosition; end: VimPosition } {
+		const lines = this.#state.lines;
+		let start = from;
+		let end = to;
+		if (start.line === end.line) {
+			const line = lines[start.line] ?? "";
+			const expanded = this.#expandRangeOverAtomicTokens(line, start.col, end.col);
+			start = { line: start.line, col: expanded.start };
+			end = { line: end.line, col: expanded.end };
+		} else {
+			const startLine = lines[start.line] ?? "";
+			const startToken = this.#atomicTokenAt(startLine, start.col);
+			if (startToken !== undefined) start = { line: start.line, col: startToken.start };
+			const endLine = lines[end.line] ?? "";
+			if (end.col > 0) {
+				const endToken = this.#atomicTokenAt(endLine, end.col - 1);
+				if (endToken !== undefined && endToken.end > end.col) end = { line: end.line, col: endToken.end };
+			}
+		}
+		return { start, end };
+	}
+
+	/** `.` after an Insert/Replace session: type its text again, `times` copies, then Escape's step back. */
+	#retypeVimInsert(command: Extract<VimCommand, { kind: "retype" }>): void {
+		for (let n = 0; n < command.times; n++) {
+			// `3.` after `ofoo`: one new line per copy, stacking downward (Vim's `3Ofoo` does too).
+			if (n > 0 && command.newline) this.#openVimLine(true);
+			if (command.overwrite) {
+				for (const seg of segmenter.segment(command.record.text)) {
+					if (seg.segment === "\n" || seg.segment === "\r\n") this.#addNewLine();
+					else this.#overwriteReplaceGrapheme(seg.segment);
+				}
+			} else {
+				this.#spliceVimInsert(command.record);
+			}
+		}
+		if (command.overwrite) {
+			this.#replaceLog.length = 0;
+			this.#resetKillSequence();
+		}
+		const line = this.#state.lines[this.#state.cursorLine] ?? "";
+		this.#setCursorCol(prevGraphemeStart(line, this.#state.cursorCol));
+	}
+
+	/**
+	 * Replay one Insert session at the cursor. Built directly rather than through the typing path,
+	 * which would pop autocomplete from Normal mode and feed the kill ring.
+	 */
+	#spliceVimInsert(record: VimInsertRecord): void {
+		const lines = this.#state.lines;
+		const { text: flat, cursor } = flatten(this.#state);
+		const { start, end } = this.#expandVimRange(
+			offsetToPos(lines, stepGraphemes(flat, cursor, record.deleteBefore, false)),
+			offsetToPos(lines, stepGraphemes(flat, cursor, record.deleteAfter, true)),
+		);
+		if (record.text === "" && start.line === end.line && start.col === end.col) return;
+		this.#recordUndoState();
+		const head = (lines[start.line] ?? "").slice(0, start.col);
+		const tail = (lines[end.line] ?? "").slice(end.col);
+		const parts = record.text.split("\n");
+		const rows = parts.slice();
+		rows[0] = head + rows[0];
+		rows[rows.length - 1] += tail;
+		lines.splice(start.line, end.line - start.line + 1, ...rows);
+		this.#state.cursorLine = start.line + parts.length - 1;
+		this.#setCursorCol((parts.length === 1 ? head.length : 0) + (parts.at(-1) ?? "").length);
+		this.#lastAction = null;
+		this.#afterVimEdit();
+	}
+
+	#openVimLine(below: boolean): void {
+		this.#recordUndoState();
+		const at = below ? this.#state.cursorLine + 1 : this.#state.cursorLine;
+		this.#state.lines.splice(at, 0, "");
+		this.#state.cursorLine = at;
+		this.#setCursorCol(0);
+		this.#afterVimEdit();
+	}
+
+	#pasteVimRegister(after: boolean, count: number): void {
+		const entry = this.#killRing.peek();
+		if (!entry) return;
+		this.#recordUndoState();
+		const linewise = entry.endsWith("\n");
+		if (linewise) {
+			const body = entry.slice(0, -1).split("\n");
+			const at = after ? this.#state.cursorLine + 1 : this.#state.cursorLine;
+			const payload: string[] = [];
+			for (let i = 0; i < count; i++) payload.push(...body);
+			this.#state.lines.splice(at, 0, ...payload);
+			this.#state.cursorLine = at;
+			this.#setCursorCol(0);
+		} else {
+			const line = this.#state.lines[this.#state.cursorLine] ?? "";
+			const at = after ? nextGraphemeStart(line, this.#state.cursorCol) : this.#state.cursorCol;
+			const payload = entry.repeat(count);
+			this.#state.lines[this.#state.cursorLine] = line.slice(0, at) + payload + line.slice(at);
+			this.#setCursorCol(at + payload.length - 1);
+		}
+		this.#afterVimEdit();
+	}
+
+	#afterVimEdit(): void {
+		this.#historyIndex = -1;
+		this.#resetKillSequence();
+		this.#notifyChange();
+	}
+
+	/**
+	 * Buffer span highlighted by the active Visual selection, or null when there is none.
+	 * Exposed to the render path only; `to` is exclusive.
+	 */
+	#vimSelection(): { from: VimPosition; to: VimPosition; linewise: boolean } | null {
+		const vim = this.#vim;
+		if (vim === null || !vim.visual || vim.anchor === null) return null;
+		const linewise = vim.mode === "visual-line";
+		const { from, to } = visualRange(this.#state, vim.anchor, linewise);
+		return { from, to, linewise };
+	}
+
+	/**
+	 * Map the active selection onto one layout row, as offsets into that row's `text`.
+	 * Returns null when the row is outside the selection.
+	 */
+	#selectionSpanFor(
+		layoutLine: LayoutLine,
+		selection: { from: VimPosition; to: VimPosition; linewise: boolean },
+		isLastRowOfLine: boolean,
+	): { start: number; end: number; trailingNewline: boolean } | null {
+		const logical = layoutLine.logicalLine;
+		if (logical === undefined || logical < selection.from.line || logical > selection.to.line) return null;
+
+		const rowStart = layoutLine.startIndex ?? 0;
+		const rowEnd = rowStart + layoutLine.text.length;
+		const lineStart = logical === selection.from.line ? selection.from.col : 0;
+		const lineEnd = logical === selection.to.line ? selection.to.col : (this.#state.lines[logical] ?? "").length;
+		const start = Math.max(lineStart, rowStart);
+		const end = Math.min(lineEnd, rowEnd);
+		// Vim highlights the newline itself when the selection runs on into the next line.
+		const trailingNewline = isLastRowOfLine && logical < selection.to.line;
+		if (end <= start && !trailingNewline) return null;
+		return { start: start - rowStart, end: Math.max(start, end) - rowStart, trailingNewline };
+	}
+
+	/**
+	 * Reverse-video the selected span of one row while keeping the cursor marker at its exact
+	 * offset. Unselected fragments are decorated individually, the same way the cursor branch
+	 * splits `#decorate` around the cursor glyph.
+	 */
+	#renderSelectedLine(
+		text: string,
+		span: { start: number; end: number; trailingNewline: boolean },
+		cursorPos: number | undefined,
+		marker: string,
+		context: EditorTextDecorationContext,
+	): string {
+		const start = Math.max(0, Math.min(span.start, text.length));
+		const end = Math.max(start, Math.min(span.end, text.length));
+		// Only cut for the marker when there is one to emit: an unfocused editor would otherwise
+		// split the highlight into two identical spans for nothing.
+		const markerPos = !marker || cursorPos === undefined ? undefined : Math.max(0, Math.min(cursorPos, text.length));
+
+		const cuts = new Set<number>([0, start, end, text.length]);
+		if (markerPos !== undefined) cuts.add(markerPos);
+		const points = [...cuts].sort((left, right) => left - right);
+
+		let out = "";
+		for (let i = 0; i < points.length - 1; i++) {
+			const from = points[i]!;
+			const to = points[i + 1]!;
+			if (marker && from === markerPos) out += marker;
+			const segment = text.slice(from, to);
+			out +=
+				from >= start && from < end
+					? `\x1b[7m${segment}\x1b[27m`
+					: this.#decorate(segment, {
+							...context,
+							startCol: context.startCol + from,
+							endCol: context.startCol + to,
+						});
+		}
+		if (marker && markerPos !== undefined && markerPos >= text.length) out += marker;
+		if (span.trailingNewline) out += "\x1b[7m \x1b[27m";
+		return out;
+	}
+
+	/** Cached per-line measurement: exact visible width now, wrap chunks on demand. */
+	#lineEntry(line: string, width: number): WrapEntry {
+		const epoch = getWidthConfigEpoch();
+		if (width !== this.#wrapCacheWidth || epoch !== this.#wrapCacheEpoch) {
 			this.#wrapCache.clear();
 			this.#wrapCacheWidth = width;
+			this.#wrapCacheEpoch = epoch;
 		}
-		let chunks = this.#wrapCache.get(line);
-		if (chunks === undefined) {
+		let entry = this.#wrapCache.get(line);
+		if (entry === undefined) {
 			if (this.#wrapCache.size >= 256) {
 				this.#wrapCache.clear();
 			}
-			chunks = wordWrapLine(line, width);
-			this.#wrapCache.set(line, chunks);
+			entry = { width: visibleWidth(line), chunks: null };
+			this.#wrapCache.set(line, entry);
 		}
-		return chunks;
+		return entry;
+	}
+
+	#wrapLine(line: string, width: number): TextChunk[] {
+		const entry = this.#lineEntry(line, width);
+		entry.chunks ??= wordWrapLine(line, width, entry.width);
+		return entry.chunks;
 	}
 
 	#layoutText(contentWidth: number): LayoutLine[] {
@@ -1385,8 +3164,13 @@ export class Editor implements Component, Focusable {
 			// Empty editor
 			layoutLines.push({
 				text: "",
+				width: 0,
+				sourceLine: 0,
+				sourceStartCol: 0,
 				hasCursor: true,
 				cursorPos: 0,
+				logicalLine: 0,
+				startIndex: 0,
 			});
 			return layoutLines;
 		}
@@ -1395,20 +3179,30 @@ export class Editor implements Component, Focusable {
 		for (let i = 0; i < this.#state.lines.length; i++) {
 			const line = this.#state.lines[i] || "";
 			const isCurrentLine = i === this.#state.cursorLine;
-			const lineVisibleWidth = visibleWidth(line);
+			const lineVisibleWidth = this.#lineEntry(line, contentWidth).width;
 
 			if (lineVisibleWidth <= contentWidth) {
 				// Line fits in one layout line
 				if (isCurrentLine) {
 					layoutLines.push({
 						text: line,
+						width: lineVisibleWidth,
+						sourceLine: i,
+						sourceStartCol: 0,
 						hasCursor: true,
 						cursorPos: this.#state.cursorCol,
+						logicalLine: i,
+						startIndex: 0,
 					});
 				} else {
 					layoutLines.push({
 						text: line,
+						width: lineVisibleWidth,
+						sourceLine: i,
+						sourceStartCol: 0,
 						hasCursor: false,
+						logicalLine: i,
+						startIndex: 0,
 					});
 				}
 			} else {
@@ -1448,13 +3242,23 @@ export class Editor implements Component, Focusable {
 					if (hasCursorInChunk) {
 						layoutLines.push({
 							text: chunk.text,
+							width: chunk.width,
+							sourceLine: i,
+							sourceStartCol: chunk.startIndex,
 							hasCursor: true,
 							cursorPos: adjustedCursorPos,
+							logicalLine: i,
+							startIndex: chunk.startIndex,
 						});
 					} else {
 						layoutLines.push({
 							text: chunk.text,
+							width: chunk.width,
+							sourceLine: i,
+							sourceStartCol: chunk.startIndex,
 							hasCursor: false,
+							logicalLine: i,
+							startIndex: chunk.startIndex,
 						});
 					}
 				}
@@ -1468,13 +3272,98 @@ export class Editor implements Component, Focusable {
 		return this.#state.lines.join("\n");
 	}
 
+	/** Host-registered atomic chip labels mapped to their submit-time expansions. */
+	get atoms(): ReadonlyMap<string, string> {
+		return this.#atoms;
+	}
+
+	/** Monotonic buffer-content revision for render caches. Cursor-only movement does not advance it. */
+	get textRevision(): number {
+		return this.#textRevision;
+	}
+
+	/** Monotonic atom-table revision for render caches: advances whenever {@link atoms} is mutated or replaced. */
+	get atomsRevision(): number {
+		return this.#atomsRevision;
+	}
+
+	#notifyChange(text?: string): void {
+		this.#textRevision++;
+		this.#insertedPrediction = undefined;
+		this.onChange?.(text ?? this.getText());
+	}
+
+	/** Whether the buffer text equals `value`, without `getText()`'s full join —
+	 *  O(1) for the hot per-keystroke probes against short single-line values. */
+	textEquals(value: string): boolean {
+		const lines = this.#state.lines;
+		if (lines.length === 1) return lines[0] === value;
+		if (value.indexOf("\n") === -1) return false;
+		return this.getText() === value;
+	}
+
+	/** Expand collapsed markers — `[Paste #N]` tokens and registered atom labels — into their
+	 *  stored content. Single pass so replaced content is never rescanned (a pasted body that
+	 *  happens to contain another token's label must survive verbatim). Longer atom labels are
+	 *  tried first so `#1` never shadows `#10`. */
 	#expandPasteMarkers(text: string): string {
-		let result = text;
-		for (const [pasteId, pasteContent] of this.#pastes) {
-			const markerRegex = new RegExp(`\\[Paste #${pasteId}(?:, (?:\\+\\d+ lines|\\d+ chars))?\\]`, "g");
-			result = result.replace(markerRegex, () => pasteContent);
+		const sources: string[] = [];
+		for (const pasteId of this.#pastes.keys()) {
+			sources.push(`\\[Paste #${pasteId}(?:, (?:\\+\\d+ lines|\\d+ chars))?\\]`);
 		}
-		return result;
+		const labels = [...this.#atoms.keys()].sort((a, b) => b.length - a.length);
+		for (const label of labels) sources.push(RegExp.escape(label));
+		if (sources.length === 0) return text;
+		const markerRegex = new RegExp(sources.join("|"), "g");
+		return text.replace(markerRegex, match => {
+			const paste = /^\[Paste #(\d+)/.exec(match);
+			if (paste) return this.#pastes.get(Number(paste[1])) ?? match;
+			return this.#atoms.get(match) ?? match;
+		});
+	}
+
+	/** Register `label` as a collapsed atom expanding to `expansion` on submit, without inserting
+	 *  it — for hosts that re-collapse restored draft text via {@link setText}. */
+	registerAtom(label: string, expansion: string): void {
+		this.#atoms.set(label, expansion);
+		this.#atomsRevision++;
+	}
+
+	/** Insert `label` (plus a trailing space) at the cursor and register it as an atom expanding
+	 *  to `expansion` on submit. Pair with {@link atomicTokenPattern} so the label deletes as a
+	 *  unit. */
+	insertAtom(label: string, expansion: string): void {
+		this.#historyIndex = -1;
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.registerAtom(label, expansion);
+		this.#withUndoSuspended(() => {
+			this.#insertTextAtCursor(`${label} `);
+		});
+	}
+
+	/** Collapse the typed span `[start, end)` on `line` into the atom `label` (expanding back
+	 *  to `expansion` on submit). A cursor at or past the span keeps its position relative to
+	 *  the span end; a cursor inside it lands after the label. */
+	collapseToAtom(line: number, start: number, end: number, label: string, expansion: string): void {
+		const text = this.#state.lines[line];
+		if (text === undefined || start < 0 || end > text.length || start >= end) return;
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.registerAtom(label, expansion);
+		this.#state.lines[line] = text.slice(0, start) + label + text.slice(end);
+		if (this.#state.cursorLine === line && this.#state.cursorCol > start) {
+			const col = this.#state.cursorCol;
+			this.#setCursorCol(col >= end ? col - (end - start) + label.length : start + label.length);
+		}
+		this.#lastAction = null;
+		this.#notifyChange();
+	}
+
+	/** Drop every registered atom expansion (draft cleared or replaced by the host). */
+	clearAtoms(): void {
+		this.#atoms.clear();
+		this.#atomsRevision++;
 	}
 
 	/**
@@ -1507,6 +3396,29 @@ export class Editor implements Component, Focusable {
 
 	moveToMessageEnd(): void {
 		this.#moveToMessageEnd();
+	}
+
+	/** The `tui.editor.deleteCharForward` operation, callable by hosts that resolve the chord
+	 *  themselves rather than redispatching the raw key (see CustomEditor's exit-chord overlap).
+	 *  Mirrors the transient state the key dispatch tears down before this action so the two
+	 *  cannot diverge: a pending character jump is cancelled by any other key, and an open
+	 *  spelling-assist popup is dismissed by anything that is not one of its accept keys (its
+	 *  refresh skips assist mode, so a surviving list would hang around forever).
+	 *  While Vim owns the buffer (Normal or Visual) the operation is Vim's `x` — deleting the
+	 *  selection and returning to Normal in Visual mode, the grapheme under the cursor
+	 *  otherwise. Only Insert mode and Vim-off editors delete straight through. */
+	deleteCharForward(): void {
+		this.#jumpMode = null;
+		if (this.#autocompleteState === "assist") {
+			this.#cancelAutocomplete();
+			this.onAutocompleteUpdate?.();
+		}
+		const vim = this.#vim;
+		if (vim !== null && vim.mode !== "insert") {
+			this.#runVimKey("x", vim);
+			return;
+		}
+		this.#handleForwardDelete();
 	}
 
 	/**
@@ -1552,19 +3464,22 @@ export class Editor implements Component, Focusable {
 		}
 
 		if (this.#undoStack.length === 0) {
-			if (this.onChange) {
-				this.onChange(this.getText());
-			}
+			this.#notifyChange();
 			return;
 		}
 
 		this.#applyUndo();
 	}
 
-	setText(text: string): void {
+	/** Replace the buffer; the caret lands at the end unless `cursor: "start"` (multi-row text only). */
+	setText(text: string, options: { cursor?: "start" | "end" } = {}): void {
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#resetKillSequence();
-		this.#setTextInternal(text);
+		this.#setTextInternal(text, options.cursor);
+	}
+	submit(): void {
+		if (this.disableSubmit) return;
+		this.#submitValue();
 	}
 
 	#exitHistoryForEditing(): void {
@@ -1583,23 +3498,226 @@ export class Editor implements Component, Focusable {
 		this.#insertTextAtCursor(text);
 	}
 
+	/** Terminal-side selection edits and undo on the `editor` node (see {@link applyHostEdit}). */
+	handleNativeEvent(event: NativeUiEvent): void {
+		if (event.type === "edit") this.applyHostEdit(event);
+		else if (event.type === "undo") this.#applyUndo();
+	}
+
+	/**
+	 * Apply an edit the terminal made over its own selection (TSP `edit`):
+	 * replace `[from, to)` of the described text with `text` and put the caret
+	 * at `cursor`, as one undo unit that leaves history browsing and updates
+	 * autocomplete like typing. A range cutting through an atomic placeholder
+	 * token takes the whole token. Stale edits (`len` no longer the text's
+	 * length) are dropped; a pure caret move only moves the caret.
+	 */
+	applyHostEdit(edit: NativeTextEdit): void {
+		const current = this.getText();
+		const resolved = resolveTextEdit(
+			current,
+			edit,
+			text => this.#sanitizePastedText(text),
+			(from, to) => this.#widenOverAtomicTokens(current, from, to),
+		);
+		if (!resolved) return;
+		this.#resetKillSequence();
+		if (resolved.changed) {
+			if (this.#vimSession) this.#vimSession.tracked = false;
+			this.#historyIndex = -1;
+			this.#recordUndoState();
+			this.#state.lines = resolved.text.split("\n");
+		}
+		const lines = this.#state.lines;
+		const priorLine = this.#state.cursorLine;
+		const priorCol = this.#state.cursorCol;
+		let line = 0;
+		let col = resolved.cursor;
+		while (line < lines.length - 1 && col > lines[line]!.length) col -= lines[line++]!.length + 1;
+		this.#state.cursorLine = line;
+		this.#setCursorCol(col);
+		if (!resolved.changed) {
+			if (this.#vimSession !== null && (priorLine !== line || priorCol !== col)) {
+				this.#breakVimSession();
+			}
+			return;
+		}
+		this.#notifyChange(resolved.text);
+		this.#retriggerAutocompleteAtCursor();
+	}
+
+	/** Widen `[from, to)` of `text` so neither end cuts through an atomic placeholder token. */
+	#widenOverAtomicTokens(text: string, from: number, to: number): { from: number; to: number } {
+		const fromLine = from === 0 ? 0 : text.lastIndexOf("\n", from - 1) + 1;
+		const fromEnd = text.indexOf("\n", from);
+		const fromToken = this.#atomicTokenAt(
+			text.slice(fromLine, fromEnd === -1 ? text.length : fromEnd),
+			from - fromLine,
+		);
+		if (fromToken !== undefined) from = fromLine + fromToken.start;
+		const toLine = to === 0 ? 0 : text.lastIndexOf("\n", to - 1) + 1;
+		if (to > toLine) {
+			const toEnd = text.indexOf("\n", to);
+			const toToken = this.#atomicTokenAt(text.slice(toLine, toEnd === -1 ? text.length : toEnd), to - toLine - 1);
+			if (toToken !== undefined) to = toLine + toToken.end;
+		}
+		return { from, to };
+	}
+
+	/** Delete up to `count` characters immediately before the cursor on the current line.
+	 *  Used to "track back" the auto-repeat spaces that the space-hold push-to-talk gesture
+	 *  optimistically inserts before it recognizes the hold. Capped at the cursor column so it
+	 *  never crosses a line boundary or under-runs the line. */
+	deleteBeforeCursor(count: number): void {
+		const removable = Math.min(count, this.#state.cursorCol);
+		if (removable <= 0) return;
+		this.#exitHistoryForEditing();
+		this.#recordUndoState();
+		const line = this.#state.lines[this.#state.cursorLine] ?? "";
+		this.#state.lines[this.#state.cursorLine] =
+			line.slice(0, this.#state.cursorCol - removable) + line.slice(this.#state.cursorCol);
+		this.#setCursorCol(this.#state.cursorCol - removable);
+		this.#lastAction = null;
+		this.#notifyChange();
+	}
+
+	/** Code units of the current volatile speech-to-text preview (see {@link setVolatileText}). */
+	#volatileTextLen = 0;
+
+	/** Show or replace a volatile speech-to-text preview at the cursor. The text is
+	 *  inserted with undo suspended so a long live dictation never floods the undo
+	 *  stack; finalize it with {@link commitVolatileText} or drop it with
+	 *  {@link clearVolatileText}. Newlines are allowed. */
+	setVolatileText(text: string): void {
+		this.#exitHistoryForEditing();
+		this.#withUndoSuspended(() => {
+			this.#deleteCharsBeforeCursor(this.#volatileTextLen);
+			if (text) this.#insertTextAtCursor(text);
+		});
+		this.#volatileTextLen = text.length;
+		if (!text) this.#notifyChange();
+	}
+
+	/** Remove the current volatile preview without committing it. */
+	clearVolatileText(): void {
+		if (this.#volatileTextLen === 0) return;
+		this.#withUndoSuspended(() => this.#deleteCharsBeforeCursor(this.#volatileTextLen));
+		this.#volatileTextLen = 0;
+		this.#notifyChange();
+	}
+
+	/** Drop any volatile preview, then insert `text` as a single undoable edit. */
+	commitVolatileText(text: string): void {
+		this.#exitHistoryForEditing();
+		this.#withUndoSuspended(() => this.#deleteCharsBeforeCursor(this.#volatileTextLen));
+		this.#volatileTextLen = 0;
+		if (text) this.#insertTextAtCursor(text);
+		else this.#notifyChange();
+	}
+
+	/** Delete `count` UTF-16 code units immediately before the cursor, crossing line
+	 *  boundaries (each consumed newline counts as one). Undo is the caller's concern. */
+	#deleteCharsBeforeCursor(count: number): void {
+		let remaining = count;
+		while (remaining > 0) {
+			if (this.#state.cursorCol > 0) {
+				const removable = Math.min(remaining, this.#state.cursorCol);
+				const line = this.#state.lines[this.#state.cursorLine] ?? "";
+				this.#state.lines[this.#state.cursorLine] =
+					line.slice(0, this.#state.cursorCol - removable) + line.slice(this.#state.cursorCol);
+				this.#setCursorCol(this.#state.cursorCol - removable);
+				remaining -= removable;
+			} else if (this.#state.cursorLine > 0) {
+				const prev = this.#state.lines[this.#state.cursorLine - 1] ?? "";
+				const cur = this.#state.lines[this.#state.cursorLine] ?? "";
+				this.#state.lines[this.#state.cursorLine - 1] = prev + cur;
+				this.#state.lines.splice(this.#state.cursorLine, 1);
+				this.#state.cursorLine -= 1;
+				this.#setCursorCol(prev.length);
+				remaining -= 1;
+			} else {
+				break;
+			}
+		}
+	}
+
 	/** Apply terminal paste semantics to text from non-bracketed paste transports. */
-	pasteText(text: string): void {
-		this.#handlePaste(text);
+	pasteText(text: string, options: PasteOptions = {}): void {
+		this.#handlePaste(text, options);
+	}
+
+	/** Insert `content` as a collapsed `[Paste #N]` marker (stored for expansion on submit via
+	 *  {@link getExpandedText}). Hosts that intercept large pastes through {@link onLargePaste} use
+	 *  this to re-insert a (possibly transformed) paste without re-triggering the interception hook. */
+	insertPaste(content: string): void {
+		this.#historyIndex = -1;
+		this.#resetKillSequence();
+		this.#recordUndoState();
+		this.#withUndoSuspended(() => {
+			this.#storePasteMarker(content, content.split("\n").length);
+		});
 	}
 
 	// All the editor methods from before...
+	#applyInlineReplacement(replacement: EditorInlineReplacement): boolean {
+		if (
+			!Number.isInteger(replacement.replaceLen) ||
+			replacement.replaceLen < 0 ||
+			replacement.replaceLen > this.#state.cursorCol
+		) {
+			return false;
+		}
+		const line = this.#state.lines[this.#state.cursorLine] || "";
+		const before = line.slice(0, this.#state.cursorCol - replacement.replaceLen);
+		const after = line.slice(this.#state.cursorCol);
+		this.#state.lines[this.#state.cursorLine] = before + replacement.insert + after;
+		this.#setCursorCol(before.length + replacement.insert.length);
+		this.#notifyChange();
+		if (this.#autocompleteState) {
+			this.#cancelAutocomplete();
+			this.onAutocompleteUpdate?.();
+		}
+		return true;
+	}
+
+	/** Whether a character-jump hotkey is waiting for its target character. */
+	get isJumpPending(): boolean {
+		return this.#jumpMode !== null;
+	}
+
+	/** Type literal text through the character-editing pipeline without keybinding dispatch. */
+	typeCharacter(text: string): void {
+		// Same as #handleInputChunk: typed input wins over a stale in-flight provider lookup.
+		if (this.#autocompleteRequestRunning && this.#autocompleteState === null) {
+			this.#invalidateAutocompleteRequests();
+		}
+		this.#insertCharacter(text);
+	}
+
 	#insertCharacter(char: string): void {
 		this.#exitHistoryForEditing();
 		// Undo coalescing: consecutive word typing collapses into one undo unit
 		// (mirrors Input); any other action resets the run via #lastAction.
 		const isWordChunk = [...segmenter.segment(char)].every(seg => getWordNavKind(seg.segment) !== "whitespace");
+		let line = this.#state.lines[this.#state.cursorLine] || "";
+		// The space a Tab word accept added is provisional until the next keystroke:
+		// a typed space is swallowed, closing punctuation or a hyphen replaces it,
+		// anything else keeps it (a newline drops it too, see #addNewLine).
+		const provisionalSpace = this.#hasProvisionalSpace();
+		if (provisionalSpace && char === " ") {
+			this.#lastAction = null;
+			return;
+		}
 		if (!isWordChunk || this.#lastAction !== "type-word") {
 			this.#recordUndoState();
 		}
 		this.#lastAction = isWordChunk ? "type-word" : null;
-
-		const line = this.#state.lines[this.#state.cursorLine] || "";
+		this.#reportTypedPastWordCompletion(char);
+		if (provisionalSpace && PROVISIONAL_SPACE_ABSORBERS.test(char)) {
+			line = line.slice(0, this.#state.cursorCol - 1) + line.slice(this.#state.cursorCol);
+			this.#state.lines[this.#state.cursorLine] = line;
+			this.#setCursorCol(this.#state.cursorCol - 1);
+		}
 
 		const before = line.slice(0, this.#state.cursorCol);
 		const after = line.slice(this.#state.cursorCol);
@@ -1607,37 +3725,43 @@ export class Editor implements Component, Focusable {
 		this.#state.lines[this.#state.cursorLine] = before + char + after;
 		this.#setCursorCol(this.#state.cursorCol + char.length);
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
 
 		// Synchronous inline replacement (e.g. emoji shortcodes `:joy:` → 😂).
 		// Runs before autocomplete trigger so the popup doesn't briefly chase a
 		// prefix that's about to be rewritten.
-		if (char.length === 1 && this.#autocompleteProvider?.trySyncInlineReplace) {
+		if (char.length === 1) {
 			const replaceLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = replaceLine.slice(0, this.#state.cursorCol);
-			const replacement = this.#autocompleteProvider.trySyncInlineReplace(textBeforeCursor);
-			if (replacement) {
-				const before = replaceLine.slice(0, this.#state.cursorCol - replacement.replaceLen);
-				const after = replaceLine.slice(this.#state.cursorCol);
-				this.#state.lines[this.#state.cursorLine] = before + replacement.insert + after;
-				this.#setCursorCol(before.length + replacement.insert.length);
-				if (this.onChange) {
-					this.onChange(this.getText());
-				}
-				if (this.#autocompleteState) {
-					this.#cancelAutocomplete();
-					this.onAutocompleteUpdate?.();
-				}
+			const inlineReplacement = this.#autocompleteProvider?.trySyncInlineReplace?.(textBeforeCursor);
+			if (inlineReplacement && this.#applyInlineReplacement(inlineReplacement)) return;
+			const cursorLine = this.#state.cursorLine;
+			const cursorCol = this.#state.cursorCol;
+			const currentLine = this.#state.lines[cursorLine] ?? "";
+			const autocorrection = this.#textAssistProvider?.tryAutocorrect?.(this.#state.lines, cursorLine, cursorCol);
+			if (autocorrection instanceof Promise) {
+				autocorrection
+					.then(replacement => {
+						if (
+							replacement &&
+							this.#state.cursorLine === cursorLine &&
+							this.#state.cursorCol === cursorCol &&
+							this.#state.lines[cursorLine] === currentLine &&
+							this.#applyInlineReplacement(replacement)
+						) {
+							this.onTextAssistApplied?.();
+						}
+					})
+					.catch(() => {});
+			} else if (autocorrection && this.#applyInlineReplacement(autocorrection)) {
 				return;
 			}
 		}
 
 		// Check if we should trigger or update autocomplete
 		if (!this.#autocompleteState) {
-			// Auto-trigger for "/" at the start of a line (slash commands)
-			if (char === "/" && this.#isAtStartOfSubmittedMessage()) {
+			// Auto-trigger for "/" at the start of a submitted command or a mid-prompt skill lookup.
+			if (char === "/" && (this.#isAtStartOfSubmittedMessage() || this.#isInMidPromptSkillSlashContext())) {
 				this.#tryTriggerAutocomplete();
 			}
 			// Auto-trigger for "@" file reference (fuzzy search)
@@ -1650,20 +3774,43 @@ export class Editor implements Component, Focusable {
 					this.#tryTriggerAutocomplete();
 				}
 			}
+			// Auto-trigger for "^" model mentions
+			else if (char === "^") {
+				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+				// Only trigger if ^ is after whitespace or at start of line
+				const charBeforeCaret = textBeforeCursor[textBeforeCursor.length - 2];
+				if (textBeforeCursor.length === 1 || charBeforeCaret === " " || charBeforeCaret === "\t") {
+					this.#tryTriggerAutocomplete();
+				}
+			}
 			// Auto-trigger for "#" prompt actions anywhere in the current token
 			else if (char === "#") {
+				this.#tryTriggerAutocomplete();
+			} else if (
+				char === ":" &&
+				MENTION_CONTEXT_RE.test((this.#state.lines[this.#state.cursorLine] || "").slice(0, this.#state.cursorCol))
+			) {
+				this.#tryTriggerAutocomplete();
+			}
+			// Argument providers may expose candidates only after a separator.
+			else if (char === " " && this.#isInSubmittedSlashCommandContext()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// Also auto-trigger when typing letters/path chars in a completable context
 			else if (/[a-zA-Z0-9.\-_/]/.test(char)) {
 				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-				// Check if we're in a slash command (with or without space for arguments)
-				if (this.#isInSubmittedSlashCommandContext()) {
+				// Check if we're in a slash command or mid-prompt skill lookup.
+				if (this.#isInSlashAutocompleteContext()) {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in an @ file reference context
-				else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+				else if (extractAtFilePrefix(textBeforeCursor)) {
+					this.#tryTriggerAutocomplete();
+				}
+				// Check if we're in a model mention context
+				else if (MENTION_CONTEXT_RE.test(textBeforeCursor)) {
 					this.#tryTriggerAutocomplete();
 				}
 				// Check if we're in a # prompt action context
@@ -1680,73 +3827,43 @@ export class Editor implements Component, Focusable {
 				}
 			}
 		} else {
-			this.#debouncedUpdateAutocomplete();
+			this.#refreshAutocomplete();
 		}
 	}
 
-	#handlePaste(pastedText: string): void {
+	#handlePaste(pastedText: string, options: PasteOptions = {}): void {
+		let filteredText = this.#sanitizePastedText(pastedText);
+
+		// If pasting a file path (starts with /, ~, or .) and the character before
+		// the cursor is a word character, prepend a space for better readability.
+		if (/^[/~.]/.test(filteredText)) {
+			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+			const charBeforeCursor = this.#state.cursorCol > 0 ? currentLine[this.#state.cursorCol - 1] : "";
+			if (charBeforeCursor && /\w/.test(charBeforeCursor)) {
+				filteredText = ` ${filteredText}`;
+			}
+		}
+
+		const pastedLines = filteredText.split("\n");
+		const totalChars = filteredText.length;
+		// "Marker-sized": large enough to collapse into a `[Paste #N]` token (> 10 lines or
+		// > 1000 characters) instead of flooding the buffer.
+		const isMarkerSized = pastedLines.length > 10 || totalChars > 1000;
+
+		// Let the host intercept marker-sized pastes (e.g. the large-paste menu). When it takes
+		// over, the editor inserts nothing and records no undo state — the host re-inserts via
+		// `insertPaste`/`insertText` once the user chooses.
+		if (isMarkerSized && this.onLargePaste?.(filteredText, pastedLines.length, options)) {
+			return;
+		}
+
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#resetKillSequence();
 		this.#recordUndoState();
 
 		this.#withUndoSuspended(() => {
-			// Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode
-			// control bytes inside bracketed paste as CSI-u Ctrl+<letter> sequences
-			// (ESC [ <codepoint> ; 5 u). Decode those back to their literal byte so the
-			// per-char filter below preserves newlines instead of stripping ESC and
-			// leaking the printable tail (e.g. "[106;5u") into the editor.
-			const decodedText = pastedText.replace(/\x1b\[(\d+);5u/g, (match, code) => {
-				const cp = Number(code);
-				if (cp >= 97 && cp <= 122) return String.fromCharCode(cp - 96);
-				if (cp >= 65 && cp <= 90) return String.fromCharCode(cp - 64);
-				return match;
-			});
-
-			// Clean the pasted text. NFC-normalize so macOS Finder drag-drops of
-			// Korean filenames (which arrive as NFD: e.g. `ᄒ`+`ᅪ` instead of `화`)
-			// land in the buffer as the same precomposed syllables a terminal
-			// renders — without this, cursor column accounting drifts by
-			// `(NFD cells − NFC cells)` and the visible glyph desyncs from the
-			// hardware cursor. Matches the `Input` component's prior fix; this
-			// is the same fix on the real OMP prompt component (`Editor`).
-			const cleanText = decodedText.replace(/\r\n?/g, "\n").normalize("NFC");
-
-			// Convert tabs to spaces (4 spaces per tab)
-			const tabExpandedText = cleanText.replace(/\t/g, "    ");
-
-			// Strip control characters except newline (tabs already expanded above,
-			// CRs already normalized). Single regex pass instead of split/filter/join
-			// to avoid allocating a per-code-unit array for large pastes.
-			let filteredText = tabExpandedText.replace(/[\x00-\x09\x0B-\x1F]/g, "");
-
-			// If pasting a file path (starts with /, ~, or .) and the character before
-			// the cursor is a word character, prepend a space for better readability
-			if (/^[/~.]/.test(filteredText)) {
-				const currentLine = this.#state.lines[this.#state.cursorLine] || "";
-				const charBeforeCursor = this.#state.cursorCol > 0 ? currentLine[this.#state.cursorCol - 1] : "";
-				if (charBeforeCursor && /\w/.test(charBeforeCursor)) {
-					filteredText = ` ${filteredText}`;
-				}
-			}
-
-			// Split into lines
-			const pastedLines = filteredText.split("\n");
-
-			// Check if this is a large paste (> 10 lines or > 1000 characters)
-			const totalChars = filteredText.length;
-			if (pastedLines.length > 10 || totalChars > 1000) {
-				// Store the paste and insert a marker
-				this.#pasteCounter++;
-				const pasteId = this.#pasteCounter;
-				this.#pastes.set(pasteId, filteredText);
-
-				// Insert marker like "[Paste #1, +123 lines]" or "[Paste #1, 1234 chars]"
-				const marker =
-					pastedLines.length > 10
-						? `[Paste #${pasteId}, +${pastedLines.length} lines]`
-						: `[Paste #${pasteId}, ${totalChars} chars]`;
-				this.#insertTextAtCursor(marker);
-
+			if (isMarkerSized) {
+				this.#storePasteMarker(filteredText, pastedLines.length);
 				return;
 			}
 
@@ -1755,7 +3872,6 @@ export class Editor implements Component, Focusable {
 				// then evaluate autocomplete triggers once at the final cursor position.
 				if (filteredText) {
 					this.#insertTextAtCursor(filteredText);
-					this.#retriggerAutocompleteAtCursor();
 				}
 				return;
 			}
@@ -1765,17 +3881,58 @@ export class Editor implements Component, Focusable {
 		});
 	}
 
+	/** Normalize raw pasted text: decode tmux re-encoded control bytes (both extended-keys formats),
+	 *  normalize CRLF and
+	 *  NFC (macOS NFD filename drag-drops), expand tabs, and strip control characters except newline. */
+	#sanitizePastedText(pastedText: string): string {
+		// Decode tmux's re-encoded control bytes (both extended-keys formats) back to
+		// their literal byte so the per-char filter below preserves newlines instead of
+		// stripping ESC and leaking the printable tail into the editor. See the decoder.
+		const decodedText = decodeReencodedPasteControls(pastedText);
+
+		// Clean the pasted text. NFC-normalize so macOS Finder drag-drops of
+		// Korean filenames (which arrive as NFD: e.g. `ᄒ`+`ᅪ` instead of `화`)
+		// land in the buffer as the same precomposed syllables a terminal
+		// renders — without this, cursor column accounting drifts by
+		// `(NFD cells − NFC cells)` and the visible glyph desyncs from the
+		// hardware cursor.
+		const cleanText = decodedText.replace(/\r\n?/g, "\n").normalize("NFC");
+
+		// Convert tabs to spaces (4 spaces per tab).
+		const tabExpandedText = cleanText.replace(/\t/g, "   ");
+
+		// Strip control characters except newline (tabs already expanded above, CRs already
+		// normalized). Single regex pass instead of split/filter/join to avoid allocating a
+		// per-code-unit array for large pastes.
+		return tabExpandedText.replace(/[\x00-\x09\x0B-\x1F]/g, "");
+	}
+
+	/** Store `content` in the paste buffer and insert a collapsed `[Paste #N]` marker that expands
+	 *  back to `content` on submit. `lineCount` is the content's line count. */
+	#storePasteMarker(content: string, lineCount: number): void {
+		this.#pasteCounter++;
+		const pasteId = this.#pasteCounter;
+		this.#pastes.set(pasteId, content);
+
+		// Insert marker like "[Paste #1, +123 lines]" or "[Paste #1, 1234 chars]".
+		const marker =
+			lineCount > 10 ? `[Paste #${pasteId}, +${lineCount} lines]` : `[Paste #${pasteId}, ${content.length} chars]`;
+		this.#insertTextAtCursor(marker);
+	}
+
 	/** Re-evaluate autocomplete triggers for the text ending at the cursor (used after bulk edits). */
 	#retriggerAutocompleteAtCursor(): void {
 		if (this.#autocompleteState) {
-			this.#debouncedUpdateAutocomplete();
+			this.#refreshAutocomplete();
 			return;
 		}
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-		if (this.#isInSubmittedSlashCommandContext()) {
+		if (this.#isInSlashAutocompleteContext()) {
 			this.#tryTriggerAutocomplete();
-		} else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+		} else if (extractAtFilePrefix(textBeforeCursor)) {
+			this.#tryTriggerAutocomplete();
+		} else if (MENTION_CONTEXT_RE.test(textBeforeCursor)) {
 			this.#tryTriggerAutocomplete();
 		} else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 			this.#tryTriggerAutocomplete();
@@ -1785,13 +3942,20 @@ export class Editor implements Component, Focusable {
 	}
 
 	#addNewLine(): void {
+		// A provisional space from a Tab word accept would become trailing whitespace.
+		// Read before #resetKillSequence clears the accept marker.
+		const dropSpace = this.#hasProvisionalSpace();
 		this.#historyIndex = -1; // Exit history browsing mode
 		this.#resetKillSequence();
+		// The cursor leaves the trigger token's line, so any open popup is stale:
+		// keeping it would float on the new line and Enter would submit past it.
+		this.#dismissAutocomplete();
 		this.#recordUndoState();
 
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const splitCol = dropSpace ? this.#state.cursorCol - 1 : this.#state.cursorCol;
 
-		const before = currentLine.slice(0, this.#state.cursorCol);
+		const before = currentLine.slice(0, splitCol);
 		const after = currentLine.slice(this.#state.cursorCol);
 
 		// Split current line
@@ -1801,10 +3965,17 @@ export class Editor implements Component, Focusable {
 		// Move cursor to start of new line
 		this.#state.cursorLine++;
 		this.#setCursorCol(0);
-
-		if (this.onChange) {
-			this.onChange(this.getText());
+		if (this.#vimSession?.replace) {
+			this.#replaceLog.push({ line: this.#state.cursorLine - 1, col: splitCol, removed: "", text: "\n" });
 		}
+
+		this.#notifyChange();
+	}
+
+	/** Whether the character before the cursor is the still-provisional space a Tab word accept inserted. */
+	#hasProvisionalSpace(): boolean {
+		const line = this.#state.lines[this.#state.cursorLine] ?? "";
+		return this.#lastAction === "accept-word" && line[this.#state.cursorCol - 1] === " ";
 	}
 
 	#shouldSubmitOnBackslashEnter(data: string, kb: KeybindingsManager): boolean {
@@ -1819,18 +3990,23 @@ export class Editor implements Component, Focusable {
 	}
 
 	#submitValue(): void {
+		this.#endVimSession();
 		this.#resetKillSequence();
 
 		const result = this.#expandPasteMarkers(this.#state.lines.join("\n")).trim();
 
 		this.#state = { lines: [""], cursorLine: 0, cursorCol: 0 };
-		this.#pastes.clear();
-		this.#pasteCounter = 0;
+		this.clearPasteState();
 		this.#historyIndex = -1;
 		this.#scrollOffset = 0;
 		this.#undoStack.length = 0;
 
-		if (this.onChange) this.onChange("");
+		if (this.#vim !== null && (this.#vim.mode === "insert" || this.#vim.mode === "replace")) {
+			const mark = this.#undoMark();
+			this.#pinnedUndo = mark;
+			this.#startVimSession(mark, this.#vim.mode === "replace");
+		}
+		this.#notifyChange("");
 		if (this.onSubmit) this.onSubmit(result);
 	}
 
@@ -1872,6 +4048,23 @@ export class Editor implements Component, Focusable {
 		return undefined;
 	}
 
+	/** True when `[from, to)` overlaps a placeholder. Counted `r` must no-op rather than split it.
+	 *  One pass over the line's matches, so a long counted replace stays linear. */
+	#spanCutsAtomicToken(line: string, from: number, to: number): boolean {
+		const re = this.#getAtomicTokenRe();
+		if (re === undefined) return false;
+		re.lastIndex = 0;
+		for (;;) {
+			const match = re.exec(line);
+			if (match === null || match.index >= to) return false;
+			if (match[0].length === 0) {
+				re.lastIndex = match.index + 1;
+				continue;
+			}
+			if (match.index + match[0].length > from) return true;
+		}
+	}
+
 	/** Expand the half-open range [start, end) so it never cuts through an atomic
 	 *  placeholder token: a boundary landing inside a token pulls the whole token in. */
 	#expandRangeOverAtomicTokens(line: string, start: number, end: number): { start: number; end: number } {
@@ -1893,8 +4086,13 @@ export class Editor implements Component, Focusable {
 		this.#resetKillSequence();
 		this.#recordUndoState();
 
+		let removedSlashTrigger = false;
+
 		if (this.#state.cursorCol > 0) {
 			const line = this.#state.lines[this.#state.cursorLine] || "";
+			const textBeforeCursor = line.slice(0, this.#state.cursorCol);
+			const trailingSlashStart = findTrailingSlashCommandStart(textBeforeCursor);
+			removedSlashTrigger = trailingSlashStart === this.#state.cursorCol - 1;
 			// An atomic placeholder token (image/paste marker) deletes as a unit, so a single
 			// backspace never leaves a half-eaten `[Paste #1, +30 lines` behind as stray text.
 			const token = this.#atomicTokenAt(line, this.#state.cursorCol - 1);
@@ -1928,23 +4126,30 @@ export class Editor implements Component, Focusable {
 			this.#setCursorCol(previousLine.length);
 		}
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
 
 		// Update or re-trigger autocomplete after backspace
 		if (this.#autocompleteState) {
-			this.#debouncedUpdateAutocomplete();
+			if (removedSlashTrigger) {
+				this.#cancelAutocomplete();
+				this.onAutocompleteUpdate?.();
+			} else {
+				this.#refreshAutocomplete();
+			}
 		} else {
 			// If autocomplete was cancelled (no matches), re-trigger if we're in a completable context
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			// Slash command context
-			if (this.#isInSubmittedSlashCommandContext()) {
+			// Slash command or mid-prompt skill lookup context
+			if (this.#isInSlashAutocompleteContext()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			else if (extractAtFilePrefix(textBeforeCursor)) {
+				this.#tryTriggerAutocomplete();
+			}
+			// model mention context
+			else if (MENTION_CONTEXT_RE.test(textBeforeCursor)) {
 				this.#tryTriggerAutocomplete();
 			}
 			// # prompt action context
@@ -2046,23 +4251,27 @@ export class Editor implements Component, Focusable {
 
 	#moveToLineStart(): void {
 		this.#resetKillSequence();
+		this.#dismissAutocomplete();
 		this.#setCursorCol(0);
 	}
 
 	#moveToLineEnd(): void {
 		this.#resetKillSequence();
+		this.#dismissAutocomplete();
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		this.#setCursorCol(currentLine.length);
 	}
 
 	#moveToMessageStart(): void {
 		this.#resetKillSequence();
+		this.#dismissAutocomplete();
 		this.#state.cursorLine = 0;
 		this.#setCursorCol(0);
 	}
 
 	#moveToMessageEnd(): void {
 		this.#resetKillSequence();
+		this.#dismissAutocomplete();
 		this.#state.cursorLine = this.#state.lines.length - 1;
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		this.#setCursorCol(currentLine.length);
@@ -2084,10 +4293,25 @@ export class Editor implements Component, Focusable {
 
 	#recordUndoState(): void {
 		if (this.#suspendUndo) return;
-		this.#undoStack.push(structuredClone(this.#state));
-		if (this.#undoStack.length > MAX_UNDO_STACK) {
-			this.#undoStack.shift();
+		// EditorState holds only primitives plus an array of immutable strings:
+		// a shallow array copy is a complete snapshot. structuredClone pays for
+		// general-case dispatch per element on every edit keystroke.
+		this.#undoStack.push({
+			lines: this.#state.lines.slice(),
+			cursorLine: this.#state.cursorLine,
+			cursorCol: this.#state.cursorCol,
+		});
+		if (this.#undoStack.length <= MAX_UNDO_STACK) return;
+		const pin = this.#pinnedUndo;
+		const anchorIndex = pin === null ? -1 : pin.depth - (this.#undoShifts - pin.shifts);
+		if (anchorIndex === 0 && this.#undoStack.length > 1) {
+			// Front entry is the open change's restore point. Drop the snapshot after it, and don't
+			// bump #undoShifts: index 0 did not move, so the mark still points at it.
+			this.#undoStack.splice(1, 1);
+			return;
 		}
+		this.#undoStack.shift();
+		this.#undoShifts++;
 	}
 
 	#applyUndo(): void {
@@ -2099,18 +4323,18 @@ export class Editor implements Component, Focusable {
 		this.#preferredVisualCol = null;
 		Object.assign(this.#state, snapshot);
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
 
 		if (this.#autocompleteState) {
-			this.#debouncedUpdateAutocomplete();
+			this.#refreshAutocomplete();
 		} else {
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			if (this.#isInSubmittedSlashCommandContext()) {
+			if (this.#isInSlashAutocompleteContext()) {
 				this.#tryTriggerAutocomplete();
-			} else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			} else if (extractAtFilePrefix(textBeforeCursor)) {
+				this.#tryTriggerAutocomplete();
+			} else if (MENTION_CONTEXT_RE.test(textBeforeCursor)) {
 				this.#tryTriggerAutocomplete();
 			} else if (textBeforeCursor.match(/#[^\s#]*$/)) {
 				this.#tryTriggerAutocomplete();
@@ -2189,9 +4413,8 @@ export class Editor implements Component, Focusable {
 			this.#setCursorCol((lines[lines.length - 1] || "").length);
 		}
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#yankFromKillRing(): void {
@@ -2295,9 +4518,8 @@ export class Editor implements Component, Focusable {
 
 		this.#recordKill(deletedText, "backward");
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#deleteToEndOfLine(): void {
@@ -2326,9 +4548,8 @@ export class Editor implements Component, Focusable {
 
 		this.#recordKill(deletedText, "forward");
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#deleteWordBackwards(): void {
@@ -2360,9 +4581,8 @@ export class Editor implements Component, Focusable {
 			this.#recordKill(deletedText, "backward");
 		}
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#deleteWordForwards(): void {
@@ -2391,9 +4611,8 @@ export class Editor implements Component, Focusable {
 			this.#recordKill(deletedText, "forward");
 		}
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		this.#notifyChange();
+		this.#retriggerAutocompleteAtCursor();
 	}
 
 	#handleForwardDelete(): void {
@@ -2430,22 +4649,31 @@ export class Editor implements Component, Focusable {
 			this.#state.lines.splice(this.#state.cursorLine + 1, 1);
 		}
 
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		// Deleting the final grapheme can leave the cursor one past the end of the line, which
+		// Normal mode never allows (it rests *on* a grapheme). Vim's own `x` clamps via
+		// #applyVimCommands; callers that invoke this operation directly — hosts resolving a
+		// chord themselves, or a key bound to deleteCharForward that Vim does not map — get the
+		// same treatment here so the cursor can't sit off the buffer.
+		this.#clampVimCursor();
+
+		this.#notifyChange();
 
 		// Update or re-trigger autocomplete after forward delete
 		if (this.#autocompleteState) {
-			this.#debouncedUpdateAutocomplete();
+			this.#refreshAutocomplete();
 		} else {
 			const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
-			// Slash command context
-			if (this.#isInSubmittedSlashCommandContext()) {
+			// Slash command or mid-prompt skill lookup context
+			if (this.#isInSlashAutocompleteContext()) {
 				this.#tryTriggerAutocomplete();
 			}
 			// @ file reference context
-			else if (textBeforeCursor.match(/(?:^|[\s])@[^\s]*$/)) {
+			else if (extractAtFilePrefix(textBeforeCursor)) {
+				this.#tryTriggerAutocomplete();
+			}
+			// model mention context
+			else if (MENTION_CONTEXT_RE.test(textBeforeCursor)) {
 				this.#tryTriggerAutocomplete();
 			}
 			// # prompt action context
@@ -2471,7 +4699,7 @@ export class Editor implements Component, Focusable {
 
 		for (let i = 0; i < this.#state.lines.length; i++) {
 			const line = this.#state.lines[i] || "";
-			const lineVisWidth = visibleWidth(line);
+			const lineVisWidth = this.#lineEntry(line, width).width;
 			if (line.length === 0) {
 				// Empty line still takes one visual line
 				visualLines.push({ logicalLine: i, startCol: 0, length: 0 });
@@ -2523,7 +4751,8 @@ export class Editor implements Component, Focusable {
 
 	#moveCursor(deltaLine: number, deltaCol: number): void {
 		this.#resetKillSequence();
-		const visualLines = this.#buildVisualLineMap(this.#lastLayoutWidth);
+		this.#dismissAutocomplete();
+		const visualLines = this.#buildVisualLineMap(this.#caretRowWidth);
 		const currentVisualLine = this.#findCurrentVisualLine(visualLines);
 
 		if (deltaLine !== 0) {
@@ -2575,7 +4804,8 @@ export class Editor implements Component, Focusable {
 
 	#pageScroll(direction: -1 | 1): void {
 		this.#resetKillSequence();
-		const visualLines = this.#buildVisualLineMap(this.#lastLayoutWidth);
+		this.#dismissAutocomplete();
+		const visualLines = this.#buildVisualLineMap(this.#caretRowWidth);
 		const currentVisualLine = this.#findCurrentVisualLine(visualLines);
 		const step = this.#getPageScrollStep(visualLines.length);
 		const targetVisualLine = Math.max(0, Math.min(visualLines.length - 1, currentVisualLine + direction * step));
@@ -2605,6 +4835,7 @@ export class Editor implements Component, Focusable {
 	 */
 	#jumpToChar(char: string, direction: "forward" | "backward"): void {
 		this.#resetKillSequence();
+		this.#dismissAutocomplete();
 		const isForward = direction === "forward";
 		const lines = this.#state.lines;
 
@@ -2671,6 +4902,123 @@ export class Editor implements Component, Focusable {
 		return this.#hasOnlyWhitespaceBeforeCursorLine() && beforeCursor.trimStart().startsWith("/");
 	}
 
+	#isInMidPromptSkillSlashContext(): boolean {
+		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
+		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
+		const slashStart = findTrailingSlashCommandStart(beforeCursor);
+		if (slashStart === null) return false;
+		if (this.#hasOnlyWhitespaceBeforeCursorLine() && findLeadingSlashCommandStart(beforeCursor) !== null)
+			return false;
+		return !this.#hasOnlyWhitespaceBeforeCursorLine() || beforeCursor.slice(0, slashStart).trim() !== "";
+	}
+
+	#isInSlashAutocompleteContext(): boolean {
+		return this.#isInSubmittedSlashCommandContext() || this.#isInMidPromptSkillSlashContext();
+	}
+
+	/**
+	 * Decide whether the popup's `#autocompletePrefix` still safely maps onto the current
+	 * text before the cursor for an accept-time (`applyCompletion`) call. Mirrors the
+	 * re-anchoring branches in `CombinedAutocompleteProvider.applyCompletion`:
+	 *
+	 * - Exact match → always safe.
+	 * - Path branch is safe when the prefix is still a live suffix of the text; the
+	 *   provider's default slice at `cursorCol - prefix.length` then hits the right span.
+	 * - Slash branch re-anchors when both the prefix and the current text carry a
+	 *   leading slash command and the current slash token is clean (no whitespace or
+	 *   inner slash), matching `applyCompletion`'s slash-branch guard. It only
+	 *   engages for command-shaped selections: absolute-path completions (`/tmp/fo`
+	 *   via the no-command-match fall-through) share the leading-slash prefix shape
+	 *   but must use the live-suffix path rule so the apply slice stays anchored.
+	 * - Mid-prompt skill branch re-anchors when the popup item is a skill and the
+	 *   current text still ends in a matching trailing slash token, preventing a
+	 *   stale selection from replacing a newer skill prefix.
+	 * - `@`-file branch re-anchors via `extractAtFilePrefix`; safe when the current text
+	 *   still ends in a whitespace-anchored or double-quoted `@` token.
+	 * - Everything else is stale — accepting it would corrupt the buffer (issue #4295).
+	 */
+	#autocompletePrefixMatchesCursorText(currentTextBeforeCursor: string, item?: SelectItem | null): boolean {
+		if (currentTextBeforeCursor === this.#autocompletePrefix) return true;
+
+		if (item?.value.startsWith("skill:") && findTrailingSlashCommandStart(this.#autocompletePrefix) !== null) {
+			const currentTrailingStart = findTrailingSlashCommandStart(currentTextBeforeCursor);
+			if (currentTrailingStart !== null) {
+				const token = currentTextBeforeCursor.slice(currentTrailingStart);
+				if (!token.includes(" ") && !token.slice(1).includes("/")) {
+					// Guard the timing window where the popup was built for an earlier
+					// query (e.g. bare `/`) and the user typed further characters before
+					// the async refresh landed: accept the stale skill only
+					// when the refreshed popup would still surface it (same gate as
+					// buildMidPromptSkillCompletions). `tmp` after a bare slash
+					// therefore falls through to file completion instead of rewriting
+					// the user's `/tmp` to `/skill:…`.
+					const lowerToken = token.slice(1).toLowerCase();
+					if (midPromptSkillTokenMatches(lowerToken, item.value, item.description)) return true;
+				}
+			}
+			return false;
+		}
+
+		if (findLeadingSlashCommandStart(this.#autocompletePrefix) !== null && !this.#selectedCompletionIsPath()) {
+			const currentLeadingStart = findLeadingSlashCommandStart(currentTextBeforeCursor);
+			if (currentLeadingStart !== null) {
+				const token = currentTextBeforeCursor.slice(currentLeadingStart);
+				if (!token.includes(" ") && !token.slice(1).includes("/")) return true;
+			}
+			return false;
+		}
+
+		if (this.#autocompletePrefix.startsWith("@")) {
+			return extractAtFilePrefix(currentTextBeforeCursor) !== null;
+		}
+
+		if (this.#autocompletePrefix.startsWith("^")) {
+			return MENTION_CONTEXT_RE.test(currentTextBeforeCursor);
+		}
+
+		return currentTextBeforeCursor.endsWith(this.#autocompletePrefix);
+	}
+
+	/**
+	 * Whether the current popup selection inserts a file path rather than a
+	 * slash command. Leading-slash prefixes are ambiguous: the provider falls
+	 * through to absolute-path completion when no command matches, and those
+	 * item values start with `/` (or `"` when quoted) while command values are
+	 * bare names.
+	 */
+	#selectedCompletionIsPath(): boolean {
+		const selected = this.#autocompleteList?.getSelectedItem();
+		if (!selected) return false;
+		return selected.value.startsWith("/") || selected.value.startsWith('"');
+	}
+	/**
+	 * Whether the current popup selection is the collapsed `/skill:` namespace
+	 * row. Accepting it expands the namespace (insert `/skill:`, reopen the
+	 * popup) instead of submitting, since the bare namespace is not a command.
+	 */
+	#selectedCompletionIsSkillNamespace(): boolean {
+		return this.#autocompleteList?.getSelectedItem()?.value === SKILL_NAMESPACE;
+	}
+
+	/**
+	 * Whether the selected completion for a submitted slash command's argument
+	 * only restates what the user already typed (e.g. `list ` for `/mcp list`).
+	 * Accepting it would change nothing visible, so Enter should submit.
+	 *
+	 * A selection whose usage hint still names a required `<arg>` outside any
+	 * optional `[...]` group (e.g. `test` with `<name>`) keeps Enter's accept
+	 * role, so the user continues into the argument instead of submitting a
+	 * command the handler can only reject.
+	 */
+	#selectedSlashArgumentIsAlreadyTyped(selected: AutocompleteItem): boolean {
+		if (!this.#isInSubmittedSlashCommandContext()) return false;
+		const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
+		if (this.#state.cursorCol !== currentLine.length) return false;
+		if (selected.hint?.replace(/\[[^\]]*\]/g, "").includes("<")) return false;
+		const typed = this.#autocompletePrefix.trimEnd();
+		return typed.length > 0 && selected.value.trimEnd() === typed;
+	}
+
 	#isSlashCommandNameAutocompleteSelection(): boolean {
 		if (this.#autocompleteState !== "regular") {
 			return false;
@@ -2690,7 +5038,10 @@ export class Editor implements Component, Focusable {
 		}
 
 		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol).trimStart();
-		return this.#isInSubmittedSlashCommandContext() && /^\/\S+ $/.test(textBeforeCursor);
+		return (
+			this.#isInSubmittedSlashCommandContext() &&
+			(/^\/\S+ $/.test(textBeforeCursor) || textBeforeCursor === `/${SKILL_NAMESPACE}`)
+		);
 	}
 
 	// Autocomplete methods
@@ -2707,184 +5058,437 @@ export class Editor implements Component, Focusable {
 
 	async #tryTriggerAutocomplete(explicitTab: boolean = false): Promise<void> {
 		if (!this.#autocompleteProvider) return;
-		// Check if we should trigger file completion on Tab
-		if (explicitTab) {
-			const provider = this.#autocompleteProvider as CombinedAutocompleteProvider;
-			const shouldTrigger =
-				!provider.shouldTriggerFileCompletion ||
-				provider.shouldTriggerFileCompletion(this.#state.lines, this.#state.cursorLine, this.#state.cursorCol);
-			if (!shouldTrigger) {
-				return;
-			}
+		if (
+			explicitTab &&
+			this.#autocompleteProvider.shouldTriggerFileCompletion &&
+			!this.#autocompleteProvider.shouldTriggerFileCompletion(
+				this.#state.lines,
+				this.#state.cursorLine,
+				this.#state.cursorCol,
+			)
+		) {
+			return;
 		}
-
-		const requestId = ++this.#autocompleteRequestId;
-
-		const suggestions = await this.#autocompleteProvider.getSuggestions(
+		await this.#queueAutocompleteRequest({ kind: "regular", explicitTab });
+	}
+	/** Apply `selected` the way Tab does: complete it in place and chain into directories/commands. */
+	#acceptAutocompleteSelection(selected: SelectItem): void {
+		if (!this.#autocompleteProvider) return;
+		const shouldChainAutocomplete =
+			this.#isSlashCommandNameAutocompleteSelection() || isDirectoryCompletionValue(selected.value);
+		const result = this.#autocompleteProvider.applyCompletion(
 			this.#state.lines,
 			this.#state.cursorLine,
 			this.#state.cursorCol,
+			selected,
+			this.#autocompletePrefix,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
 
-		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
-			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
-			this.#autocompleteState = "regular";
-			this.onAutocompleteUpdate?.();
-		} else {
-			this.#cancelAutocomplete();
-			this.onAutocompleteUpdate?.();
+		this.#state.lines = result.lines;
+		this.#state.cursorLine = result.cursorLine;
+		this.#setCursorCol(result.cursorCol);
+
+		this.#cancelAutocomplete();
+		this.onAutocompleteUpdate?.();
+
+		this.#notifyChange();
+
+		result.onApplied?.();
+
+		if (shouldChainAutocomplete) {
+			queueMicrotask(() => void this.#tryTriggerAutocomplete());
 		}
 	}
+
 	#createAutocompleteList(
 		prefix: string,
 		items: Array<{ value: string; label: string; description?: string }>,
 	): SelectList {
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : AUTOCOMPLETE_SELECT_LIST_LAYOUT;
-		return new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
+		const layout = prefix.startsWith("/")
+			? SLASH_COMMAND_SELECT_LIST_LAYOUT
+			: prefix.startsWith("@")
+				? AT_FILE_SELECT_LIST_LAYOUT
+				: AUTOCOMPLETE_SELECT_LIST_LAYOUT;
+		const list = new SelectList(items, this.#autocompleteMaxVisible, this.#theme.selectList, layout);
+		// A pointer pick on the popup (TSP `select`/`activate`) accepts it like Tab.
+		list.onSelect = item => {
+			if (this.#autocompleteList !== list) return;
+			if (this.#autocompleteState === "assist") this.#applyAssistReplacement();
+			else this.#acceptAutocompleteSelection(item);
+		};
+		return list;
 	}
 
-	#handleTabCompletion(): void {
+	async #handleTabCompletion(): Promise<void> {
+		if (this.#acceptPrediction()) return;
+		if (this.#showPredictionAlternatives()) return;
+		if (this.#acceptWordCompletion({ space: true })) return;
 		if (!this.#autocompleteProvider) return;
 
 		const currentLine = this.#state.lines[this.#state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.#state.cursorCol);
 
-		// Check if we're in a slash command context
 		if (this.#isInSubmittedSlashCommandContext() && !beforeCursor.trimStart().includes(" ")) {
-			this.#handleSlashCommandCompletion();
+			await this.#handleSlashCommandCompletion();
+		} else if (this.#isInMidPromptSkillSlashContext()) {
+			await this.#handleSlashCommandCompletion();
+			if (!this.#autocompleteState) {
+				await this.#forceFileAutocomplete();
+			}
 		} else {
-			this.#forceFileAutocomplete(true);
+			await this.#forceFileAutocomplete();
 		}
 	}
-
-	#handleSlashCommandCompletion(): void {
-		this.#tryTriggerAutocomplete(true);
-	}
-
-	/*
-https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/559322883
-17 this job fails with https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19
-536643416/job/55932288317 havea  look at .gi
-    */
-	async #forceFileAutocomplete(explicitTab: boolean = false): Promise<void> {
-		if (!this.#autocompleteProvider) return;
-
-		// Check if provider supports force file suggestions via runtime check
-		const provider = this.#autocompleteProvider as {
-			getForceFileSuggestions?: CombinedAutocompleteProvider["getForceFileSuggestions"];
-		};
-		if (typeof provider.getForceFileSuggestions !== "function") {
-			await this.#tryTriggerAutocomplete(true);
-			return;
-		}
-
-		const requestId = ++this.#autocompleteRequestId;
-		const suggestions = await provider.getForceFileSuggestions(
+	/**
+	 * Insert the shown ghost word completion at the cursor, if any. Tab passes
+	 * `space: true` for a trailing space that stays provisional until the next
+	 * keystroke (see `#insertCharacter`); right arrow passes `false` so a suffix
+	 * can follow the word directly.
+	 */
+	#acceptWordCompletion({ space }: { space: boolean }): boolean {
+		const wordCompletion = this.#getShownWordCompletion();
+		if (!wordCompletion) return false;
+		this.#textAssistProvider?.wordCompletionFeedback?.(
 			this.#state.lines,
 			this.#state.cursorLine,
 			this.#state.cursorCol,
+			wordCompletion,
+			true,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
+		this.#insertTextAtCursor(space ? `${wordCompletion} ` : wordCompletion);
+		if (space) this.#lastAction = "accept-word";
+		return true;
+	}
+	/** Insert the rest of the shown prediction, if any. Never submits. */
+	#acceptPrediction(): boolean {
+		const shown = this.#getShownPrediction();
+		if (!shown) return false;
+		this.#insertTextAtCursor(shown.suffix);
+		this.#insertedPrediction = this.#state.lines[0];
+		this.onPredictionAccepted?.(shown.index);
+		return true;
+	}
 
-		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
-			// If there's exactly one suggestion and this was an explicit Tab press, apply it immediately
-			if (explicitTab && suggestions.items.length === 1) {
-				const item = suggestions.items[0]!;
-				const result = this.#autocompleteProvider.applyCompletion(
-					this.#state.lines,
-					this.#state.cursorLine,
-					this.#state.cursorCol,
-					item,
-					suggestions.prefix,
-				);
+	/** Open the list of every prediction over a buffer that equals one of them, that one selected. */
+	#showPredictionAlternatives(): boolean {
+		const alternatives = this.#getPredictionAlternatives();
+		if (!alternatives) return false;
+		const original = this.#state.lines[0] ?? "";
+		this.#autocompletePrefix = original;
+		this.#autocompleteList = this.#createAutocompleteList(
+			"",
+			alternatives.choices.map(value => ({ value, label: value })),
+		);
+		this.#autocompleteList.setSelectedIndex(alternatives.index);
+		this.#autocompleteState = "assist";
+		this.#textAssistReplacement = {
+			line: 0,
+			startCol: 0,
+			endCol: original.length,
+			original,
+			cursorOffset: 0,
+			prediction: true,
+		};
+		this.onAutocompleteUpdate?.();
+		return true;
+	}
 
-				this.#state.lines = result.lines;
-				this.#state.cursorLine = result.cursorLine;
-				this.#setCursorCol(result.cursorCol);
+	async #showSpellingSuggestions(): Promise<void> {
+		const cursorLine = this.#state.cursorLine;
+		const cursorCol = this.#state.cursorCol;
+		const lines = [...this.#state.lines];
+		const result = this.#textAssistProvider?.getWordReplacements?.(lines, cursorLine, cursorCol);
+		const replacements = result instanceof Promise ? await result.catch(() => null) : result;
+		if (
+			!replacements ||
+			this.#state.cursorLine !== cursorLine ||
+			this.#state.cursorCol !== cursorCol ||
+			this.#state.lines[replacements.line] !== lines[replacements.line] ||
+			replacements.line < 0 ||
+			replacements.line >= this.#state.lines.length ||
+			replacements.startCol < 0 ||
+			replacements.endCol <= replacements.startCol ||
+			replacements.items.length === 0
+		) {
+			return;
+		}
+		const line = this.#state.lines[replacements.line] ?? "";
+		if (replacements.endCol > line.length) return;
+		const original = line.slice(replacements.startCol, replacements.endCol);
+		this.#autocompletePrefix = original;
+		this.#autocompleteList = this.#createAutocompleteList(
+			original,
+			replacements.items.map(value => ({ value, label: value })),
+		);
+		this.#autocompleteState = "assist";
+		this.#textAssistReplacement = {
+			line: replacements.line,
+			startCol: replacements.startCol,
+			endCol: replacements.endCol,
+			original,
+			cursorOffset:
+				replacements.line === this.#state.cursorLine ? Math.max(0, this.#state.cursorCol - replacements.endCol) : 0,
+		};
+		this.onAutocompleteUpdate?.();
+	}
 
-				if (this.onChange) {
-					this.onChange(this.getText());
-				}
-				return;
-			}
-
-			this.#autocompletePrefix = suggestions.prefix;
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
-			this.#autocompleteState = "force";
-			this.onAutocompleteUpdate?.();
-		} else {
+	#applyAssistReplacement(): void {
+		const replacement = this.#textAssistReplacement;
+		const selected = this.#autocompleteList?.getSelectedItem();
+		if (!replacement || !selected) {
+			this.#cancelAutocomplete();
+			return;
+		}
+		const line = this.#state.lines[replacement.line] ?? "";
+		// A mismatch means the list went stale; picking the prediction already in the buffer changes nothing.
+		if (
+			line.slice(replacement.startCol, replacement.endCol) !== replacement.original ||
+			(replacement.prediction && selected.value === replacement.original)
+		) {
 			this.#cancelAutocomplete();
 			this.onAutocompleteUpdate?.();
+			return;
 		}
+		this.#recordUndoState();
+		this.#state.lines[replacement.line] =
+			line.slice(0, replacement.startCol) + selected.value + line.slice(replacement.endCol);
+		this.#state.cursorLine = replacement.line;
+		this.#setCursorCol(replacement.startCol + selected.value.length + replacement.cursorOffset);
+		this.#lastAction = null;
+		this.#cancelAutocomplete();
+		this.onAutocompleteUpdate?.();
+		this.#notifyChange();
+		if (replacement.prediction) {
+			this.#insertedPrediction = selected.value;
+			const index = this.predictions?.()?.indexOf(selected.value) ?? -1;
+			if (index >= 0) this.onPredictionAccepted?.(index);
+		}
+	}
+	async #handleSlashCommandCompletion(): Promise<void> {
+		await this.#tryTriggerAutocomplete();
+	}
+
+	async #forceFileAutocomplete(): Promise<void> {
+		if (!this.#autocompleteProvider) return;
+		if (typeof this.#autocompleteProvider.getForceFileSuggestions !== "function") {
+			await this.#tryTriggerAutocomplete(true);
+			return;
+		}
+		await this.#queueAutocompleteRequest({ kind: "force" });
 	}
 
 	#cancelAutocomplete(notifyCancel: boolean = false): void {
 		const wasAutocompleting = this.#autocompleteState !== null;
-		this.#clearAutocompleteTimeout();
-		this.#autocompleteRequestId += 1;
+		this.#invalidateAutocompleteRequests();
 		this.#autocompleteState = null;
 		this.#autocompleteList = undefined;
+		this.#textAssistReplacement = undefined;
 		this.#autocompletePrefix = "";
 		if (notifyCancel && wasAutocompleting) {
 			this.onAutocompleteCancel?.();
 		}
 	}
 
+	/**
+	 * Close the popup when the cursor leaves the token it was opened for (newline,
+	 * pure cursor motion). Its prefix no longer matches the text before the cursor,
+	 * so it could neither accept nor refresh and would linger stale.
+	 */
+	#dismissAutocomplete(): void {
+		if (this.#autocompleteState === null) return;
+		this.#cancelAutocomplete();
+		this.onAutocompleteUpdate?.();
+	}
+
+	/**
+	 * Whether an autocomplete popup is on screen. An `@` list narrowed to no match
+	 * while its refresh is pending stays open internally but is hidden, so it does
+	 * not claim keys (Escape, Vim mode switches) meant for the editor or app.
+	 */
 	isShowingAutocomplete(): boolean {
-		return this.#autocompleteState !== null;
+		return this.#visibleAutocompleteList() !== undefined;
+	}
+
+	/** The open autocomplete list, unless it has no candidate to show. */
+	#visibleAutocompleteList(): SelectList | undefined {
+		if (this.#autocompleteState === null) return undefined;
+		return this.#autocompleteList?.getSelectedItem() ? this.#autocompleteList : undefined;
 	}
 
 	async #updateAutocomplete(): Promise<void> {
-		if (!this.#autocompleteState || !this.#autocompleteProvider) return;
-
-		// In force mode, use forceFileAutocomplete to get suggestions
+		if (!this.#autocompleteState || !this.#autocompleteProvider || this.#autocompleteState === "assist") return;
 		if (this.#autocompleteState === "force") {
-			this.#forceFileAutocomplete();
+			await this.#forceFileAutocomplete();
 			return;
 		}
+		await this.#queueAutocompleteRequest({ kind: "regular", explicitTab: false });
+	}
 
-		const requestId = ++this.#autocompleteRequestId;
+	#queueAutocompleteRequest(request: AutocompleteRequest): Promise<void> {
+		const waiter = Promise.withResolvers<void>();
+		this.#autocompleteWaiters.push(waiter.resolve);
+		this.#autocompletePendingRequest = request;
+		this.#autocompleteRequestId++;
+		this.#autocompleteAbortController?.abort();
+		if (!this.#autocompleteRequestRunning) void this.#drainAutocompleteRequests();
+		return waiter.promise;
+	}
 
-		const suggestions = await this.#autocompleteProvider.getSuggestions(
+	async #drainAutocompleteRequests(): Promise<void> {
+		if (this.#autocompleteRequestRunning) return;
+		this.#autocompleteRequestRunning = true;
+		try {
+			while (this.#autocompletePendingRequest) {
+				const request = this.#autocompletePendingRequest;
+				this.#autocompletePendingRequest = undefined;
+				const requestId = this.#autocompleteRequestId;
+				const controller = new AbortController();
+				this.#autocompleteAbortController = controller;
+				await this.#runAutocompleteRequest(request, requestId, controller.signal);
+				if (this.#autocompleteAbortController === controller) {
+					this.#autocompleteAbortController = undefined;
+				}
+			}
+		} finally {
+			this.#autocompleteRequestRunning = false;
+			const waiters = this.#autocompleteWaiters.splice(0);
+			for (const resolve of waiters) resolve();
+		}
+	}
+
+	async #runAutocompleteRequest(request: AutocompleteRequest, requestId: number, signal: AbortSignal): Promise<void> {
+		const provider = this.#autocompleteProvider;
+		if (!provider) return;
+		const lines = [...this.#state.lines];
+		const cursorLine = this.#state.cursorLine;
+		const cursorCol = this.#state.cursorCol;
+		const isCurrent = () =>
+			!signal.aborted &&
+			requestId === this.#autocompleteRequestId &&
+			cursorLine === this.#state.cursorLine &&
+			cursorCol === this.#state.cursorCol &&
+			lines.length === this.#state.lines.length &&
+			lines.every((line, index) => line === this.#state.lines[index]);
+		let suggestions: { items: AutocompleteItem[]; prefix: string } | null;
+		try {
+			if (request.kind === "force") {
+				const getForceFileSuggestions = provider.getForceFileSuggestions;
+				if (!getForceFileSuggestions) return;
+				suggestions = await getForceFileSuggestions.call(provider, lines, cursorLine, cursorCol, signal);
+			} else {
+				suggestions = await provider.getSuggestions(lines, cursorLine, cursorCol, signal, partial => {
+					if (partial.items.length > 0 && isCurrent()) this.#showAutocompleteSuggestions(partial, "regular");
+				});
+			}
+		} catch (error) {
+			if (!signal.aborted && requestId === this.#autocompleteRequestId) {
+				logger.debug("Autocomplete provider failed", { error: String(error) });
+				this.#cancelAutocomplete();
+				this.onAutocompleteUpdate?.();
+			}
+			return;
+		}
+		if (!isCurrent()) return;
+
+		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
+			this.#showAutocompleteSuggestions(suggestions, request.kind === "force" ? "force" : "regular");
+			return;
+		}
+		this.#cancelAutocomplete();
+		this.onAutocompleteUpdate?.();
+	}
+
+	#showAutocompleteSuggestions(
+		suggestions: { items: AutocompleteItem[]; prefix: string },
+		state: "regular" | "force",
+	): void {
+		this.#autocompletePrefix = suggestions.prefix;
+		this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+		this.#enterAcceptsSelection = !suggestions.items[0]?.descriptionMatch;
+		this.#autocompleteState = state;
+		this.onAutocompleteUpdate?.();
+	}
+
+	/** Filter a shown `@` file list to the live `@` token until the async refresh replaces it. */
+	#narrowAtFileList(): void {
+		if (!this.#autocompleteList || !this.#autocompletePrefix.startsWith("@")) return;
+		const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
+		const token = extractAtFilePrefix(currentLine.slice(0, this.#state.cursorCol));
+		if (token !== null) this.#autocompleteList.setFilter(token);
+	}
+
+	#invalidateAutocompleteRequests(): void {
+		this.#autocompletePendingRequest = undefined;
+		this.#autocompleteRequestId++;
+		this.#autocompleteAbortController?.abort();
+		const waiters = this.#autocompleteWaiters.splice(0);
+		for (const resolve of waiters) resolve();
+	}
+
+	/**
+	 * Re-query suggestions for the live text after an edit while the popup is open. Runs on
+	 * every edit; the request queue coalesces bursts (a newer request replaces the pending one
+	 * and aborts the in-flight one), so no timer delays the popup behind the typing.
+	 */
+	#refreshAutocomplete(): void {
+		if (this.#autocompleteState === "assist") return;
+		if (this.#refreshSlashCommandListSync() || this.#refreshModelMentionListSync()) return;
+		this.#narrowAtFileList();
+		void this.#updateAutocomplete();
+	}
+
+	/**
+	 * Rebuild a shown slash command-name popup from the live token synchronously. An async
+	 * refresh resolves a microtask later at best, so Enter/Tab arriving in the same input
+	 * batch would accept a row computed for an earlier query (`/` → `mod` → Enter ran `/login`).
+	 * Returns false when the async refresh must handle the edit (arguments, mid-prompt
+	 * skills, absolute-path fall-through).
+	 */
+	#refreshSlashCommandListSync(): boolean {
+		const provider = this.#autocompleteProvider;
+		if (this.#autocompleteState !== "regular" || !provider?.trySyncSlashCompletion) return false;
+		if (!this.#isInSubmittedSlashCommandContext()) return false;
+		const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
+		const textBeforeCursor = currentLine.slice(0, this.#state.cursorCol);
+		const token = textBeforeCursor.trimStart();
+		if (token.includes(" ")) return false;
+		const suggestions = provider.trySyncSlashCompletion(textBeforeCursor);
+		if (suggestions) {
+			this.#invalidateAutocompleteRequests();
+			this.#showAutocompleteSuggestions(suggestions, "regular");
+			return true;
+		}
+		// No command matches: an inner slash may still be an absolute path, which needs the
+		// async file lookup. Otherwise the async refresh would only close the popup.
+		if (token.slice(1).includes("/")) return false;
+		this.#cancelAutocomplete();
+		this.onAutocompleteUpdate?.();
+		return true;
+	}
+
+	#refreshModelMentionListSync(): boolean {
+		const provider = this.#autocompleteProvider;
+		if (this.#autocompleteState !== "regular" || !provider?.trySyncModelMentionCompletion) return false;
+		const completion = provider.trySyncModelMentionCompletion(
 			this.#state.lines,
 			this.#state.cursorLine,
 			this.#state.cursorCol,
 		);
-		if (requestId !== this.#autocompleteRequestId) return;
-
-		if (suggestions && Array.isArray(suggestions.items) && suggestions.items.length > 0) {
-			this.#autocompletePrefix = suggestions.prefix;
-			// Always create new SelectList to ensure update
-			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
-			this.onAutocompleteUpdate?.();
+		if (completion.kind === "unhandled") return false;
+		this.#invalidateAutocompleteRequests();
+		if (completion.kind === "matched") {
+			this.#showAutocompleteSuggestions(completion.suggestions, "regular");
 		} else {
 			this.#cancelAutocomplete();
 			this.onAutocompleteUpdate?.();
 		}
-	}
-
-	#debouncedUpdateAutocomplete(): void {
-		if (this.#autocompleteTimeout) {
-			clearTimeout(this.#autocompleteTimeout);
-		}
-		this.#autocompleteTimeout = setTimeout(() => {
-			this.#updateAutocomplete();
-			this.#autocompleteTimeout = undefined;
-		}, 100);
-	}
-
-	#clearAutocompleteTimeout(): void {
-		if (this.#autocompleteTimeout) {
-			clearTimeout(this.#autocompleteTimeout);
-			this.#autocompleteTimeout = undefined;
-		}
+		return true;
 	}
 
 	/**
 	 * Get inline hint text to show as dim ghost text after the cursor.
-	 * Checks selected autocomplete item's hint first, then falls back to provider.
+	 * Checks the selected autocomplete item's hint first, then the prediction and its alternatives,
+	 * then the provider.
 	 */
 	#getInlineHint(): string | null {
 		// Check selected autocomplete item for a hint
@@ -2893,15 +5497,98 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 			return selected?.hint ?? null;
 		}
 
+		const prediction = this.#getPredictionSuffix();
+		if (prediction) return prediction;
+		const alternatives = this.#getPredictionAlternatives();
+		if (alternatives) {
+			// Tab opens the alternatives list from here; without a bound key there is nothing to hint.
+			const tab = editorKey("tui.input.tab");
+			if (tab) return ` ${tab} ${alternatives.choices.length - 1} more`;
+		}
 		// Fall back to provider's getInlineHint
 		if (this.#autocompleteProvider?.getInlineHint) {
-			return this.#autocompleteProvider.getInlineHint(
+			const hint = this.#autocompleteProvider.getInlineHint(
 				this.#state.lines,
 				this.#state.cursorLine,
 				this.#state.cursorCol,
 			);
+			if (hint) return hint;
 		}
 
-		return null;
+		return this.#getWordCompletion();
+	}
+	#getPlaceholder(): string | undefined {
+		if (this.#autocompleteState || !this.#isEditorEmpty() || this.#getPredictionSuffix()) return undefined;
+		return this.placeholder?.() || undefined;
+	}
+	/** The part of the shown prediction not yet typed, or `null` when no prediction is shown. */
+	#getPredictionSuffix(): string | null {
+		return this.#getShownPrediction()?.suffix ?? null;
+	}
+	/**
+	 * The prediction painted as ghost text: the first one the single-line buffer is a strict prefix of,
+	 * with the cursor at its end and no autocomplete open. None while the buffer is a prediction insert
+	 * that equals one of two or more predictions, so Tab opens their list rather than extending to a
+	 * longer one; a buffer the user typed keeps its ghost.
+	 */
+	#getShownPrediction(): { index: number; suffix: string } | null {
+		if (this.#autocompleteState) return null;
+		const predictions = this.predictions?.();
+		if (!predictions?.length) return null;
+		const { lines, cursorCol } = this.#state;
+		if (lines.length !== 1) return null;
+		const typed = lines[0] ?? "";
+		if (cursorCol !== typed.length) return null;
+		if (predictions.length > 1 && typed === this.#insertedPrediction && predictions.includes(typed)) return null;
+		const index = predictions.findIndex(
+			prediction => typed.length < prediction.length && prediction.startsWith(typed),
+		);
+		return index < 0 ? null : { index, suffix: predictions[index]!.slice(typed.length) };
+	}
+	/**
+	 * Two or more predictions, and which one the single-line buffer equals with the cursor at its end:
+	 * Tab then opens the list of all of them.
+	 */
+	#getPredictionAlternatives(): { choices: readonly string[]; index: number } | null {
+		if (this.#autocompleteState) return null;
+		const choices = this.predictions?.();
+		if (!choices || choices.length < 2) return null;
+		const { lines, cursorCol } = this.#state;
+		if (lines.length !== 1) return null;
+		const typed = lines[0] ?? "";
+		if (cursorCol !== typed.length) return null;
+		const index = choices.indexOf(typed);
+		return index < 0 ? null : { choices, index };
+	}
+	/** Typing `typed` where it diverges from the shown ghost completion rejects that ghost. */
+	#reportTypedPastWordCompletion(typed: string): void {
+		if (!this.#textAssistProvider?.wordCompletionFeedback) return;
+		const ghost = this.#getShownWordCompletion();
+		if (!ghost) return;
+		const overlap = Math.min(ghost.length, typed.length);
+		if (ghost.slice(0, overlap).toLocaleLowerCase() === typed.slice(0, overlap).toLocaleLowerCase()) return;
+		this.#textAssistProvider.wordCompletionFeedback(
+			this.#state.lines,
+			this.#state.cursorLine,
+			this.#state.cursorCol,
+			ghost,
+			false,
+		);
+	}
+	/** Word completion for the cursor; only offered at end of line, the only place ghost text renders. */
+	#getWordCompletion(): string | null {
+		if (this.#state.cursorCol < (this.#state.lines[this.#state.cursorLine] ?? "").length) return null;
+		return (
+			this.#textAssistProvider?.getWordCompletion?.(
+				this.#state.lines,
+				this.#state.cursorLine,
+				this.#state.cursorCol,
+			) ?? null
+		);
+	}
+	/** Word completion currently painted as ghost text: none while an autocomplete hint holds the slot. */
+	#getShownWordCompletion(): string | null {
+		const ghost = this.#getWordCompletion();
+		return ghost && this.#getInlineHint() === ghost ? ghost : null;
 	}
 }

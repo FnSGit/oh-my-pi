@@ -12,13 +12,15 @@
  * carry subsystem-specific message types — lives in the per-subsystem
  * `types.ts` files and is documented there.
  */
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, isNonBlankContext, joinAdditionalContext } from "@oh-my-pi/pi-agent-core";
 import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantRetryRecovery, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
-import type { Goal, GoalModeState } from "../goals/state";
-import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-manager";
-import type { TodoItem } from "../tools/todo";
+import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
+import type { GoalModeState } from "../goals/state";
+import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-entries";
+import type { CacheWarmingAction } from "../session/cache-warmer";
+import type { TodoItem } from "@oh-my-pi/pi-tui/tools/todo";
 
 // ============================================================================
 // Session Events
@@ -47,16 +49,27 @@ export interface SessionSwitchEvent {
 	previousSessionFile: string | undefined;
 }
 
+/**
+ * What a branch transition does with {@link SessionBeforeBranchEvent.entryId}:
+ * - `"branch"`: rewinds to a user message; `entryId` and everything after it are dropped.
+ * - `"fork"`: forks at a transcript entry; `entryId` is the last entry kept.
+ * - `"btw"`: promotes a `/btw` answer; `entryId` is the last entry kept before it.
+ */
+export type SessionBranchReason = "branch" | "fork" | "btw";
+
 /** Fired before branching a session (can be cancelled) */
 export interface SessionBeforeBranchEvent {
 	type: "session_before_branch";
-	/** ID of the entry to branch from */
+	/** Which transition is running; it decides whether `entryId` is kept or dropped. */
+	reason: SessionBranchReason;
+	/** The entry the transition cuts at; see {@link SessionBranchReason}. */
 	entryId: string;
 }
 
 /** Fired after branching a session */
 export interface SessionBranchEvent {
 	type: "session_branch";
+	reason: SessionBranchReason;
 	previousSessionFile: string | undefined;
 }
 
@@ -88,9 +101,29 @@ export interface SessionCompactEvent {
 	fromExtension: boolean;
 }
 
+/** Fired before the operator ends the session through a close the host can still refuse (can be cancelled). */
+export interface SessionBeforeShutdownEvent {
+	type: "session_before_shutdown";
+	/** Aborted when the close stops waiting: another close request, a signal, or the UI stopping. */
+	signal: AbortSignal;
+}
+
 /** Fired on process exit (SIGINT/SIGTERM) */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
+}
+
+/** Fired when a main-agent turn is about to settle; handlers may request one continuation turn. */
+export interface SessionStopEvent {
+	type: "session_stop";
+	messages: AgentMessage[];
+	turn_id: number;
+	last_assistant_message?: AgentMessage;
+	session_id: string;
+	session_file?: string;
+	stop_hook_active: boolean;
+	/** Cancels handler waiting when the active settle pass is aborted. */
+	signal: AbortSignal;
 }
 
 /** Preparation data for tree navigation (used by session_before_tree event) */
@@ -145,6 +178,8 @@ export type SessionEvent =
 	| SessionBeforeCompactEvent
 	| SessionCompactingEvent
 	| SessionCompactEvent
+	| SessionStopEvent
+	| SessionBeforeShutdownEvent
 	| SessionShutdownEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent
@@ -179,6 +214,18 @@ export interface AgentStartEvent {
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
+	/**
+	 * When true, this is not a terminal settle: an automatic continuation is
+	 * scheduled, or background work may resume the session. See
+	 * `awaitingAsyncWork` to distinguish the latter.
+	 */
+	willContinue?: boolean;
+	/**
+	 * True when this settle is awaiting background work rather than an
+	 * agent-owned continuation. Prompt unwinding may still be in progress,
+	 * and a background result may already be queued.
+	 */
+	awaitingAsyncWork?: boolean;
 }
 
 /** Fired at the start of each turn */
@@ -204,13 +251,13 @@ export interface TurnEndEvent {
 export interface AutoCompactionStartEvent {
 	type: "auto_compaction_start";
 	reason: "threshold" | "overflow" | "idle" | "incomplete";
-	action: "context-full" | "handoff" | "shake" | "snapcompact";
+	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
 }
 
 /** Fired when auto-compaction ends */
 export interface AutoCompactionEndEvent {
 	type: "auto_compaction_end";
-	action: "context-full" | "handoff" | "shake" | "snapcompact";
+	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
 	result: CompactionResult | undefined;
 	aborted: boolean;
 	willRetry: boolean;
@@ -226,6 +273,15 @@ export interface AutoRetryStartEvent {
 	maxAttempts: number;
 	delayMs: number;
 	errorMessage: string;
+	errorId?: number;
+}
+
+/** Persisted retry error whose transcript presentation changed when the retry saga settled. */
+export interface RetryErrorUpdate {
+	entryId: string;
+	persistenceKey?: string;
+	note: string;
+	retryRecovery: AssistantRetryRecovery;
 }
 
 /** Fired when auto-retry ends */
@@ -234,6 +290,24 @@ export interface AutoRetryEndEvent {
 	success: boolean;
 	attempt: number;
 	finalError?: string;
+	retryErrors?: RetryErrorUpdate[];
+}
+
+/** Fired when auto-retry switches to a configured fallback model/provider. */
+export interface RetryFallbackAppliedEvent {
+	type: "retry_fallback_applied";
+	from: string;
+	to: string;
+	role: string;
+	/** Decision-time cause, including whether the source request was skipped. */
+	reason?: string;
+}
+
+/** Fired when a request succeeds on the fallback model applied by auto-retry. */
+export interface RetryFallbackSucceededEvent {
+	type: "retry_fallback_succeeded";
+	model: string;
+	role: string;
 }
 
 // ============================================================================
@@ -260,18 +334,80 @@ export interface TodoReminderEvent {
 
 /**
  * Return type for `tool_call` handlers.
- * Allows handlers to block tool execution.
+ * Allows handlers to block tool execution or revise the input the tool runs with.
  */
 export interface ToolCallEventResult {
 	/** If true, block the tool from executing */
 	block?: boolean;
 	/** Reason for blocking (returned to LLM as error) */
 	reason?: string;
+	/**
+	 * Replacement input the tool executes with, instead of the original arguments. Ignored when
+	 * `block` is true. This is the raw execution input passed to the tool's `execute` (the handler
+	 * owns its correctness) — not the normalized `event.input` view, which may carry derived
+	 * gate-only fields (e.g. hashline `edit` `path`/`paths`) that are not real parameters. When
+	 * multiple handlers set `input`, the last one wins; handlers do not observe each other's
+	 * revisions (each sees the original `event.input`). Not applied to `computer` tool calls.
+	 *
+	 * For model-issued tool calls the event fires at arg-prep time in the agent loop, before
+	 * concurrency scheduling, `tool_execution_start`, and the approval gate: the revision is
+	 * revalidated against the tool schema and becomes what the loop schedules, displays, persists,
+	 * and executes — the user always approves what actually runs. For dispatches the loop never
+	 * sees (nested `write xd://` device calls, Cursor direct execution) the tool wrapper applies
+	 * the revision before its own approval gate; a revised nested xd:// input forfeits the outer
+	 * write gate's approval and faces the full prompt again.
+	 */
+	input?: Record<string, unknown>;
+	/**
+	 * Trusted handler-authored instructions for the next provider request. The
+	 * host emits them after tool results with developer/system priority where
+	 * supported. Raw tool output and other untrusted data must stay in the tool
+	 * result. Distinct non-empty values from every non-blocking handler are preserved in
+	 * registration order; ignored when this or a later handler blocks the call.
+	 */
+	additionalContext?: string;
+}
+
+/**
+ * Merge one handler's `tool_call` result into the running aggregation.
+ * Non-blank `additionalContext` values accumulate in registration order and
+ * join (repeats dropped) at the end; `input` stays last-wins. A `block`
+ * result short-circuits the caller, discarding everything collected so far.
+ */
+export function accumulateToolCallResult(
+	aggregated: { input?: Record<string, unknown>; additionalContext: string[] },
+	handlerResult: ToolCallEventResult,
+): void {
+	if (isNonBlankContext(handlerResult.additionalContext)) {
+		aggregated.additionalContext.push(handlerResult.additionalContext);
+	}
+	if (handlerResult.input !== undefined) {
+		aggregated.input = handlerResult.input;
+	}
+}
+
+/**
+ * Build the aggregated `tool_call` result from collected context and input.
+ * Returns undefined when there is nothing to carry beyond the control result.
+ */
+export function buildAggregatedToolCallResult(
+	result: ToolCallEventResult | undefined,
+	aggregated: { input?: Record<string, unknown>; additionalContext: string[] },
+): ToolCallEventResult | undefined {
+	const { input } = aggregated;
+	const additionalContext = joinAdditionalContext(aggregated.additionalContext);
+	if (additionalContext === undefined && input === undefined) return result;
+	const { additionalContext: _dropped, input: _droppedInput, ...controlResult } = result ?? {};
+	return {
+		...controlResult,
+		...(input !== undefined ? { input } : {}),
+		...(additionalContext !== undefined ? { additionalContext } : {}),
+	};
 }
 
 /**
  * Return type for `tool_result` handlers.
- * Allows handlers to modify tool results.
+ * Allows handlers to modify tool results and attach passive context.
  */
 export interface ToolResultEventResult {
 	/** Replacement content array (text and images) */
@@ -280,12 +416,44 @@ export interface ToolResultEventResult {
 	details?: unknown;
 	/** Override isError flag */
 	isError?: boolean;
+	/**
+	 * Trusted handler-authored instructions for the next provider request,
+	 * delivered like `ToolCallEventResult.additionalContext` but outside the tool
+	 * result. Unlike `tool_call` context it is also delivered when the call
+	 * failed: the handler sees the outcome (`event.isError`) and decides, which is
+	 * how failure-specific guidance reaches the model. Distinct non-blank values from
+	 * every handler are preserved in registration order (repeats are dropped) and precede the call's
+	 * `tool_call` context. Dropped only when the loop skips the call.
+	 */
+	additionalContext?: string;
 }
 
 /** Return type for `session_before_switch` handlers */
 export interface SessionBeforeSwitchResult {
 	/** If true, cancel the switch */
 	cancel?: boolean;
+}
+
+/**
+ * Fired before each prompt-cache warming refresh with the warmer's economics
+ * filled in. Return `{ action }` to override whether the refresh is sent.
+ */
+export interface CacheWarmingDecisionEvent {
+	type: "cache_warming_decision";
+	/** Price of this refresh: a cache read of the prompt plus one output token. */
+	warmCost: number;
+	/** Extra price of the next real request if the cache entry is lost. */
+	missCost: number;
+	/** Estimated chance that a real request arrives before the entry expires. */
+	continuationProbability: number;
+	/** The warmer's own decision. */
+	action: CacheWarmingAction;
+}
+
+/** Return type for `cache_warming_decision` handlers. */
+export interface CacheWarmingDecisionEventResult {
+	/** Override whether this refresh is sent. "stop" ends warming until the next real request. */
+	action?: CacheWarmingAction;
 }
 
 /** Return type for `session_before_branch` handlers */
@@ -326,6 +494,24 @@ export interface SessionCompactingResult {
 	prompt?: string;
 	/** Custom data to store in compaction entry */
 	preserveData?: Record<string, unknown>;
+}
+
+/** Return type for `session_before_shutdown` handlers */
+export interface SessionBeforeShutdownResult {
+	/** If true, cancel this shutdown attempt. */
+	cancel?: boolean;
+}
+
+/** Return type for `session_stop` handlers */
+export interface SessionStopEventResult {
+	/** Continue the main session with additional context before settling */
+	continue?: boolean;
+	/** OMP-native model-visible context for the continuation */
+	additionalContext?: string;
+	/** Claude/Codex-compatible block decision; maps to a continuation */
+	decision?: "block";
+	/** Claude/Codex-compatible model-visible continuation reason */
+	reason?: string;
 }
 
 /** Return type for `session_before_tree` handlers */

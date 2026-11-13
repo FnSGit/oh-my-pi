@@ -1,5 +1,8 @@
 import { mkdirSync } from "node:fs";
-import { type ApiKey, ProviderHttpError, withAuth } from "@oh-my-pi/pi-ai";
+import * as fsp from "node:fs/promises";
+import * as nodePath from "node:path";
+import { type ApiKey, getOpenRouterHeaders, withAuth } from "@oh-my-pi/pi-ai";
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	$env,
@@ -8,17 +11,18 @@ import {
 	fetchWithRetry,
 	getFastembedCacheDir,
 	logger,
+	withLoopPhase,
 } from "@oh-my-pi/pi-utils";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { EmbeddingModel } from "fastembed";
-import { LRUCache } from "lru-cache/raw";
-import packageJson from "../../package.json" with { type: "json" };
-import { loadFastembed } from "./fastembed-runtime";
+import { loadFastembed, withEmbedSessionBudget } from "./fastembed-runtime";
 import {
 	type EmbeddingOutput,
 	getMnemopiRuntimeOptions,
 	mnemopiDebugEnabled,
 	resolveEmbeddingProvider,
 } from "./runtime-options";
+import { clipToWindow, DEFAULT_INPUT_CHARS } from "./text-window";
 
 export type { EmbeddingOutput } from "./runtime-options";
 export { cosineSimilarity } from "./vector-math";
@@ -31,24 +35,28 @@ export interface EmbeddingProvider {
 	available?(): boolean | Promise<boolean>;
 }
 
-type StandardEmbeddingModel = Exclude<EmbeddingModel, EmbeddingModel.CUSTOM>;
+export type StandardEmbeddingModel = Exclude<EmbeddingModel, EmbeddingModel.CUSTOM>;
 
-interface LocalEmbeddingModel {
+export interface LocalEmbeddingModel {
 	embed(texts: string[], batchSize?: number): EmbeddingOutput;
 	queryEmbed?(query: string): Promise<number[]>;
 }
 
-type LocalModelInitOptions = {
+export type LocalModelInitOptions = {
 	model: StandardEmbeddingModel;
 	cacheDir?: string;
 	showDownloadProgress?: boolean;
 };
-type LocalModelInitializer = (options: LocalModelInitOptions) => Promise<LocalEmbeddingModel>;
+export type LocalModelInitializer = (options: LocalModelInitOptions) => Promise<LocalEmbeddingModel>;
 
 const QUERY_CACHE_MAX = 512;
 
 let providerOverride: EmbeddingProvider | null = null;
-let localModelPromise: Promise<LocalEmbeddingModel> | null = null;
+// Local encoders are cached per resolved fastembed model id: two Mnemopi instances
+// in one process configured with different local models must each load their own
+// encoder instead of reusing whichever model happened to initialize first. A failed
+// init evicts only that model's entry so other models' encoders stay warm.
+const localModelPromises = new Map<string, Promise<LocalEmbeddingModel>>();
 let localModelInitializer: LocalModelInitializer = defaultLocalModelInitializer;
 let apiCallCount = 0;
 const queryCache = new LRUCache<string, Vector>({ max: QUERY_CACHE_MAX });
@@ -61,9 +69,61 @@ const queryCache = new LRUCache<string, Vector>({ max: QUERY_CACHE_MAX });
 const providerIds = new WeakMap<object, number>();
 let nextProviderId = 1;
 
-async function defaultLocalModelInitializer(options: LocalModelInitOptions): Promise<LocalEmbeddingModel> {
+/**
+ * Quarantine the exact ONNX file named by a "Protobuf parsing failed" init
+ * error. A truncated cached model blocks local embeddings forever: the
+ * downloader treats the existing file as complete, so every init re-parses
+ * the same broken bytes. The extracted path is error-message CONTENT, so it
+ * is only honored when it resolves inside the fastembed cache directory —
+ * never rename an arbitrary file a dependency happens to mention. Atomic
+ * rename; losing a concurrent-heal race (file already renamed/removed)
+ * still returns true because a retry is safe either way.
+ * @internal exported for tests
+ */
+export async function quarantineCorruptModelFile(message: string, cacheDir?: string): Promise<boolean> {
+	const match = /Load model from (.+?\.onnx) failed:.*Protobuf parsing failed/i.exec(message);
+	if (!match) return false;
+	const modelFile = nodePath.resolve(match[1]);
+	const cacheRoot = nodePath.resolve(cacheDir ?? getFastembedCacheDir());
+	if (!modelFile.startsWith(cacheRoot + nodePath.sep)) return false;
+	try {
+		await fsp.rename(modelFile, `${modelFile}.corrupt-${Date.now()}`);
+		logger.warn("mnemopi: quarantined corrupt local embedding model; retrying init", { modelFile });
+	} catch {
+		// Concurrent heal or vanished file: the single retry stays safe. A
+		// rename that failed with the file still in place just makes the
+		// retry surface the original error again.
+	}
+	return true;
+}
+
+/**
+ * Shared local-model initializer: FlagEmbedding.init with a corrupt-cache heal.
+ * A corrupt model blob (Protobuf parse failure) quarantines the file and
+ * retries once; fastembed re-downloads any file missing from the model's
+ * cache directory. Also the initializer the embed worker uses in its
+ * subprocess; the in-process seam stays {@link setLocalModelInitializer}.
+ *
+ * The ONNX sessions fastembed builds here from the model cache carry the
+ * embedding thread budget ({@link withEmbedSessionBudget}); it is off again by
+ * the time this returns, and never touches a session built from anywhere else,
+ * so a consumer sharing the same onnxruntime copy keeps its own defaults.
+ */
+export async function defaultLocalModelInitializer(options: LocalModelInitOptions): Promise<LocalEmbeddingModel> {
+	const cacheDir = options.cacheDir ?? getFastembedCacheDir();
+	const initOptions = options.cacheDir === undefined ? { ...options, cacheDir } : options;
 	const { FlagEmbedding } = await loadFastembed();
-	return FlagEmbedding.init(options);
+	return withEmbedSessionBudget(cacheDir, async () => {
+		try {
+			return await FlagEmbedding.init(initOptions);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "";
+			if (/Protobuf parsing failed/i.test(message) && (await quarantineCorruptModelFile(message, cacheDir))) {
+				return FlagEmbedding.init(initOptions);
+			}
+			throw error;
+		}
+	});
 }
 
 function activeEmbeddingOptions() {
@@ -99,12 +159,63 @@ function inTestRuntime(): boolean {
 	return $env.NODE_ENV === "test" || $env.BUN_ENV === "test";
 }
 
-function embeddingsDisabled(): boolean {
+export function embeddingsDisabled(): boolean {
 	const active = activeEmbeddingOptions();
 	if (active?.disabled !== undefined) {
 		return active.disabled;
 	}
 	return $flag("MNEMOPI_NO_EMBEDDINGS");
+}
+
+/**
+ * Resolved per-input character cap for {@link embed}.
+ *
+ * Reads (in order): the active runtime scope's `embeddings.maxInputChars`, then
+ * `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS`, then the bundled `8192` default. `0`
+ * disables the cap entirely.
+ */
+function effectiveMaxInputChars(): number {
+	const override = activeEmbeddingOptions()?.maxInputChars;
+	if (override !== undefined) return Math.max(0, Math.trunc(override));
+	const envValue = Number.parseInt($env.MNEMOPI_EMBEDDING_MAX_INPUT_CHARS ?? "", 10);
+	if (Number.isFinite(envValue) && envValue >= 0) return envValue;
+	return DEFAULT_INPUT_CHARS;
+}
+
+/**
+ * Clip every input to {@link effectiveMaxInputChars} so a runaway retention
+ * transcript can't blow past the embedding model's context window. Uses a
+ * head/tail split via {@link clipToWindow} so the embedding still sees the
+ * tail of the conversation (where the latest topic shifts live) and not just
+ * the stale prefix. Returns the original array when no input needs trimming
+ * (the common case); the new array is allocated only when at least one input
+ * is oversized so we don't churn arrays for the typical short-query path
+ * through `embedQuery`. Emits one debug-or-warn log per call summarizing how
+ * many inputs were trimmed and by how much — silent truncation was the
+ * original bug (#3126).
+ */
+function capInputs(texts: readonly string[]): readonly string[] {
+	const max = effectiveMaxInputChars();
+	if (max === 0) return texts;
+	let trimmed: string[] | null = null;
+	let trimmedCount = 0;
+	let maxOriginalLen = 0;
+	for (let i = 0; i < texts.length; i++) {
+		const text = texts[i] ?? "";
+		if (text.length <= max) continue;
+		if (trimmed === null) trimmed = texts.slice() as string[];
+		trimmed[i] = clipToWindow(text, max);
+		trimmedCount++;
+		if (text.length > maxOriginalLen) maxOriginalLen = text.length;
+	}
+	if (trimmed === null) return texts;
+	logger[mnemopiDebugEnabled() ? "warn" : "debug"]("mnemopi: embedding input truncated", {
+		inputCount: texts.length,
+		trimmedCount,
+		maxOriginalLen,
+		maxInputChars: max,
+	});
+	return trimmed;
 }
 
 function embeddingApiKey(): ApiKey {
@@ -195,9 +306,11 @@ export function embeddingDimFor(modelName: string): number {
 async function collectMatrix(batches: EmbeddingOutput): Promise<EmbeddingMatrix> {
 	const rows: Vector[] = [];
 	for await (const batch of batches) {
-		for (const row of batch) {
-			rows.push(new Float32Array(row));
-		}
+		withLoopPhase("mnemopi.embed", () => {
+			for (const row of batch) {
+				rows.push(new Float32Array(row));
+			}
+		});
 	}
 	return rows;
 }
@@ -211,7 +324,8 @@ const KNOWN_MODEL_NAMES: Record<string, string> = {
 	"intfloat/multilingual-e5-large": "fast-multilingual-e5-large",
 	"sentence-transformers/all-MiniLM-L6-v2": "fast-all-MiniLM-L6-v2",
 };
-function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
+/** The bundled fastembed model id for a model name, or `null` when fastembed has no local model for it. */
+export function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
 	// Fastembed `EmbeddingModel` enum string values, inlined so resolving a model name
 	// (and `available()`) never imports `fastembed` — its module eagerly loads the
 	// `onnxruntime-node` native addon, which segfaults in some runtimes.
@@ -220,17 +334,20 @@ function fastembedModelName(modelName: string): StandardEmbeddingModel | null {
 }
 
 async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
-	if (isApiModel(defaultModel()) || embeddingsDisabled() || inTestRuntime()) {
+	const configuredModel = defaultModel();
+	if (isApiModel(configuredModel) || embeddingsDisabled() || inTestRuntime()) {
 		return null;
 	}
-	if (localModelPromise !== null) {
-		return localModelPromise;
-	}
 
-	const modelName = fastembedModelName(defaultModel());
+	const modelName = fastembedModelName(configuredModel);
 	if (modelName === null) {
 		return null;
 	}
+	const cached = localModelPromises.get(modelName);
+	if (cached !== undefined) {
+		return cached;
+	}
+
 	const cacheDir = getFastembedCacheDir();
 	mkdirSync(cacheDir, { recursive: true });
 	const loading = localModelInitializer({
@@ -238,7 +355,7 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 		cacheDir,
 		showDownloadProgress: false,
 	});
-	localModelPromise = loading;
+	localModelPromises.set(modelName, loading);
 	try {
 		return await loading;
 	} catch (error) {
@@ -246,12 +363,58 @@ async function getLocalModel(): Promise<LocalEmbeddingModel | null> {
 			model: modelName,
 			error: String(error),
 		});
-		if (localModelPromise === loading) localModelPromise = null;
+		if (localModelPromises.get(modelName) === loading) localModelPromises.delete(modelName);
 		return null;
 	}
 }
 
+const DEFAULT_EMBEDDING_BATCH_SIZE = 64;
+
+/**
+ * Max texts per `/embeddings` request. Some hosted providers cap the inputs per
+ * request (DashScope: 10), and a rejected request fails the whole call. Reads the
+ * runtime scope's `embeddings.batchSize`, then `MNEMOPI_EMBEDDING_BATCH_SIZE`, then 64.
+ */
+function embeddingBatchSize(): number {
+	return (
+		positiveBatchSize(activeEmbeddingOptions()?.batchSize) ??
+		positiveBatchSize(Number.parseInt($env.MNEMOPI_EMBEDDING_BATCH_SIZE ?? "", 10)) ??
+		DEFAULT_EMBEDDING_BATCH_SIZE
+	);
+}
+
+/** Floors a configured size to a whole request cap; undefined unless it is at least 1. */
+function positiveBatchSize(value: number | undefined): number | undefined {
+	if (value === undefined || !Number.isFinite(value)) return undefined;
+	const size = Math.floor(value);
+	return size >= 1 ? size : undefined;
+}
+
+// Same level policy as the local-model failures: debug, or warn when runtime debug is on.
+function logEmbeddingRejection(status: number, body: string): void {
+	logger[mnemopiDebugEnabled() ? "warn" : "debug"]("mnemopi embedding request rejected", {
+		status,
+		body: body.slice(0, 300),
+	});
+}
+
 async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | null> {
+	const size = embeddingBatchSize();
+	if (texts.length <= size) {
+		return embedApiBatch(texts);
+	}
+	const matrix: EmbeddingMatrix = [];
+	for (let offset = 0; offset < texts.length; offset += size) {
+		const part = await embedApiBatch(texts.slice(offset, offset + size));
+		if (part === null) {
+			return null;
+		}
+		matrix.push(...part);
+	}
+	return matrix;
+}
+
+async function embedApiBatch(texts: readonly string[]): Promise<EmbeddingMatrix | null> {
 	const baseUrl = embeddingBaseUrl();
 	const isCustom = !hostMatchesUrl(baseUrl, "openrouter");
 	const apiKey = embeddingApiKey();
@@ -268,10 +431,7 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 		const response = await withAuth(apiKey, async key => {
 			const headers: Record<string, string> = {
 				"Content-Type": "application/json",
-				"User-Agent": `Oh-My-Pi/${packageJson.version}`,
-				"HTTP-Referer": "https://omp.sh/",
-				"X-OpenRouter-Title": "Oh-My-Pi",
-				"X-OpenRouter-Categories": "cli-agent",
+				...getOpenRouterHeaders(),
 			};
 			if (key !== "") {
 				headers.Authorization = `Bearer ${key}`;
@@ -285,21 +445,35 @@ async function embedApi(texts: readonly string[]): Promise<EmbeddingMatrix | nul
 				defaultDelayMs: attempt => 2 ** attempt * 1000,
 			});
 			if (res.status === 401) {
-				throw new ProviderHttpError("mnemopi embedding request unauthorized (401)", 401, { headers: res.headers });
+				// Keep the provider's denial text: the log can only show what the error carries.
+				const detail = (await res.text().catch(() => "")).trim();
+				throw new ProviderHttpError(detail || "mnemopi embedding request unauthorized (401)", 401, {
+					headers: res.headers,
+				});
 			}
 			return res;
 		});
 		if (!response.ok) {
+			logEmbeddingRejection(response.status, await response.text().catch(() => ""));
 			return null;
 		}
-		const { data: rows } = (await response.json()) as { data?: Array<{ embedding: number[] }> };
-		if (rows === undefined) {
-			return null;
-		}
-		apiCallCount += 1;
-		return rows.map(row => new Float32Array(row.embedding));
+		const data = (await response.json()) as { data?: Array<{ embedding: number[] }> };
+		return withLoopPhase("mnemopi.embed", () => {
+			const { data: rows } = data;
+			// A short or long matrix would stamp vectors onto the wrong memories.
+			if (rows === undefined || rows.length !== texts.length) {
+				return null;
+			}
+			apiCallCount += 1;
+			return rows.map(row => new Float32Array(row.embedding));
+		});
 	} catch (error) {
-		logger.debug("mnemopi embedding request failed", { status: extractHttpStatusFromError(error) });
+		const status = extractHttpStatusFromError(error);
+		if (status === undefined) {
+			logger.debug("mnemopi embedding request failed", { error: String(error) });
+		} else {
+			logEmbeddingRejection(status, error instanceof Error ? error.message : "");
+		}
 		return null;
 	}
 }
@@ -324,13 +498,23 @@ export const setEmbeddingProvider = setEmbeddingProviderForTests;
 
 export function setLocalModelInitializerForTests(initializer: LocalModelInitializer | null | undefined): void {
 	localModelInitializer = initializer ?? defaultLocalModelInitializer;
-	localModelPromise = null;
+	localModelPromises.clear();
 	queryCache.clear();
 }
 
+/**
+ * Override the function used to construct the local fastembed model the next
+ * time `embed()` is called. Lets a host (e.g. the agent CLI) keep
+ * `onnxruntime-node` out of its own address space by routing every fastembed
+ * load + inference through a dedicated subprocess. Same wipe semantics as the
+ * `*ForTests` form: clears the cached model promise and the query cache so
+ * subsequent embeds run through the new initializer immediately.
+ */
+export const setLocalModelInitializer = setLocalModelInitializerForTests;
+
 export function resetEmbeddingProviderForTests(): void {
 	providerOverride = null;
-	localModelPromise = null;
+	localModelPromises.clear();
 	localModelInitializer = defaultLocalModelInitializer;
 	apiCallCount = 0;
 	queryCache.clear();
@@ -388,6 +572,7 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 	if (texts.length === 0 || embeddingsDisabled()) {
 		return null;
 	}
+	texts = capInputs(texts);
 	const activeProvider = resolveEmbeddingProvider(activeEmbeddingOptions()?.provider);
 	if (activeProvider !== undefined) {
 		try {
@@ -418,7 +603,7 @@ export async function embed(texts: readonly string[]): Promise<EmbeddingMatrix |
 		return null;
 	}
 	try {
-		const vectors = await collectMatrix(model.embed([...texts]));
+		const vectors = await withLoopPhase("mnemopi.embed", () => collectMatrix(model.embed([...texts])));
 		if (vectors.length === 1) {
 			const vector = vectors[0];
 			if (vector !== undefined) {

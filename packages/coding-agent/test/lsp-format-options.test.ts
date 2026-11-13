@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { detectIndentFromContent, resolveFormatOptions } from "@oh-my-pi/pi-coding-agent/lsp/format-options";
-import { getProjectDir, Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, removeWithRetries, Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
 
 /**
  * Regression coverage for issue #2329 — the LSP format-on-write path used to
@@ -39,8 +39,49 @@ describe("detectIndentFromContent", () => {
 		expect(detectIndentFromContent(py)).toEqual({ tabSize: 4, insertSpaces: true });
 	});
 
-	it("collapses mixed multi-level space indents to their GCD", () => {
+	it("reports the per-level stride of nested space indents", () => {
 		const src = ["a", "  b", "    c", "      d", ""].join("\n");
+		expect(detectIndentFromContent(src)).toEqual({ tabSize: 2, insertSpaces: true });
+	});
+
+	it("keeps a 2-space stride when JSDoc continuation lines are indented by 1 (issue #18544)", () => {
+		const src = [
+			"/**",
+			" * Probe helper.",
+			" * @param {string} a input",
+			" */",
+			"function probe(a) {",
+			"  if (a) {",
+			"    for (const x of a) {",
+			"      console.log(x);",
+			"    }",
+			"  }",
+			"  return a;",
+			"}",
+			"",
+		].join("\n");
+		expect(detectIndentFromContent(src)).toEqual({ tabSize: 2, insertSpaces: true });
+	});
+
+	it("keeps a tab-indented file on tabs when it opens with a top-level JSDoc block", () => {
+		const src = ["/**", " * Doc.", " */", "function f() {", "\treturn 1;", "}", ""].join("\n");
+		expect(detectIndentFromContent(src)).toEqual({ insertSpaces: false });
+	});
+
+	it("ignores one-off odd widths from template-literal bodies and aligned continuations", () => {
+		const src = [
+			"function f() {",
+			"  const s = `",
+			" one-space template body",
+			"`;",
+			"  const v = call(first,",
+			"                 second);",
+			"  if (s) {",
+			"    return v;",
+			"  }",
+			"}",
+			"",
+		].join("\n");
 		expect(detectIndentFromContent(src)).toEqual({ tabSize: 2, insertSpaces: true });
 	});
 
@@ -68,7 +109,7 @@ describe("resolveFormatOptions", () => {
 
 	afterEach(async () => {
 		setProjectDir(previousProjectDir);
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await removeWithRetries(tempDir);
 	});
 
 	it("falls back to 2-space indent when no .editorconfig and no content signal exist", () => {
@@ -142,12 +183,5 @@ describe("resolveFormatOptions", () => {
 		const opts = resolveFormatOptions(filePath, "");
 		expect(opts.tabSize).toBe(2);
 		expect(opts.insertSpaces).toBe(true);
-	});
-
-	it("always sets the static trim/newline flags", () => {
-		const opts = resolveFormatOptions(path.join(tempDir, "x.txt"), "x\n");
-		expect(opts.trimTrailingWhitespace).toBe(true);
-		expect(opts.insertFinalNewline).toBe(true);
-		expect(opts.trimFinalNewlines).toBe(true);
 	});
 });

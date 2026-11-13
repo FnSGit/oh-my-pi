@@ -1,7 +1,6 @@
-import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getProjectDir, normalizePathForComparison, setProjectDir } from "@oh-my-pi/pi-utils";
+import { directoryExists, getProjectDir, normalizePathForComparison, setProjectDir } from "@oh-my-pi/pi-utils";
 import type { Args } from "./args";
 
 async function maybeAutoChdir(parsed: Args): Promise<void> {
@@ -22,19 +21,11 @@ async function maybeAutoChdir(parsed: Args): Promise<void> {
 		return;
 	}
 
-	const isDirectory = async (p: string) => {
-		try {
-			const s = await fs.stat(p);
-			return s.isDirectory();
-		} catch {
-			return false;
-		}
-	};
-
-	const candidates = [path.join(home, "tmp"), "/tmp", "/var/tmp"];
+	const candidates =
+		process.platform === "win32" ? [path.join(home, "tmp")] : [path.join(home, "tmp"), "/tmp", "/var/tmp"];
 	for (const candidate of candidates) {
 		try {
-			if (!(await isDirectory(candidate))) {
+			if (!(await directoryExists(candidate))) {
 				continue;
 			}
 			setProjectDir(candidate);
@@ -46,7 +37,7 @@ async function maybeAutoChdir(parsed: Args): Promise<void> {
 
 	try {
 		const fallback = os.tmpdir();
-		if (fallback && normalizePath(fallback) !== cwd && (await isDirectory(fallback))) {
+		if (fallback && normalizePath(fallback) !== cwd && (await directoryExists(fallback))) {
 			setProjectDir(fallback);
 		}
 	} catch {
@@ -56,7 +47,19 @@ async function maybeAutoChdir(parsed: Args): Promise<void> {
 
 export async function applyStartupCwd(parsed: Args): Promise<void> {
 	if (parsed.cwd) {
-		setProjectDir(parsed.cwd);
+		try {
+			setProjectDir(parsed.cwd);
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			// Permission denials are the macOS TCC case; a plain ENOENT typo
+			// should not be told to grant Full Disk Access.
+			const code = (error as NodeJS.ErrnoException | null)?.code;
+			const hint =
+				code === "EACCES" || code === "EPERM"
+					? " On macOS, grant omp Files & Folders or Full Disk Access permission for the target directory."
+					: "";
+			throw new Error(`Cannot change working directory to ${parsed.cwd}: ${reason}.${hint}`);
+		}
 		// setProjectDir resolves the (possibly relative) target against the launch
 		// cwd and chdirs into it. Re-sync parsed.cwd to the resolved absolute path
 		// so downstream consumers (buildSessionOptions, settings/discovery, session

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { isProviderRetryableError } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { isProviderRetryableError } from "@oh-my-pi/pi-ai/error";
 
 describe("isProviderRetryableError", () => {
 	it("retries known transient rate-limit errors", () => {
@@ -17,6 +17,18 @@ describe("isProviderRetryableError", () => {
 		).toBe(true);
 		expect(
 			isProviderRetryableError(new Error("Anthropic stream envelope error: stream ended before message_start")),
+		).toBe(true);
+		expect(
+			isProviderRetryableError(new Error("Anthropic stream envelope error: stream ended before message_delta")),
+		).toBe(true);
+	});
+
+	it("retries gateway stream drops before message_delta", () => {
+		expect(
+			isProviderRetryableError(new Error("Claude upstream stream ended before message_delta, reason=scanner_error")),
+		).toBe(true);
+		expect(
+			isProviderRetryableError(new Error("Claude upstream stream ended before message_start, reason=scanner_error")),
 		).toBe(true);
 	});
 
@@ -68,16 +80,48 @@ describe("isProviderRetryableError", () => {
 		).toBe(false);
 		expect(isProviderRetryableError(new Error("usage_limit_reached"))).toBe(false);
 		expect(isProviderRetryableError(new Error("You have hit your ChatGPT usage limit"))).toBe(false);
+		// Anthropic monthly spend-cap 429 (issue #4787): must not retry, or the
+		// provider loop burns its budget on minutes-long retry-after backoff and
+		// surfaces "Deadline exceeded" instead of the quota error.
+		expect(
+			isProviderRetryableError(
+				new Error(
+					'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s monthly spend limit. Please try again later."}}',
+				),
+			),
+		).toBe(false);
 		// A generic transient rate limit (no account/usage framing) still retries.
 		expect(isProviderRetryableError(new Error("Rate limit exceeded"))).toBe(true);
 	});
 
-	it("retries Copilot transient model_not_supported only for github-copilot provider", () => {
-		const err = new Error("400 The requested model is not supported.");
-		(err as unknown as { status: number; code: string }).status = 400;
-		(err as unknown as { status: number; code: string }).code = "model_not_supported";
-		expect(isProviderRetryableError(err, "github-copilot")).toBe(true);
-		expect(isProviderRetryableError(err, "anthropic")).toBe(false);
-		expect(isProviderRetryableError(err)).toBe(false);
+	it("does not retry Copilot 400 model rejections", () => {
+		// Both codes are deterministic: GitHub gates models per integrator and
+		// per account, so a replay of the same request fails identically.
+		for (const code of ["model_not_supported", "model_not_available_for_integrator"]) {
+			const body = {
+				error: {
+					message: "The requested model is not supported.",
+					code,
+					param: "model",
+					type: "invalid_request_error",
+				},
+			};
+			const err = Object.assign(new Error(`400 ${JSON.stringify(body)}`), { status: 400, code, error: body });
+			expect(isProviderRetryableError(err)).toBe(false);
+		}
+	});
+
+	it("retries Aliyun multimodal-gateway 400s (flaky, byte-identical replay succeeds)", () => {
+		for (const text of [
+			"The provided URL does not appear to be valid. Ensure it is correctly formatted.",
+			"Download multimodal file timed out",
+		]) {
+			const message = `400 <400> InternalError.Algo.InvalidParameter: ${text}\n<400> InternalError.Algo.InvalidParameter: ${text} (type=invalid_request_error param=invalid_parameter_error)`;
+			const err = Object.assign(new Error(message), { status: 400 });
+			expect(isProviderRetryableError(err)).toBe(true);
+		}
+		// A genuine validation 400 stays terminal.
+		const bad = Object.assign(new Error("400 invalid_request_error: unknown field 'temperaturee'"), { status: 400 });
+		expect(isProviderRetryableError(bad)).toBe(false);
 	});
 });

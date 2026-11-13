@@ -1,18 +1,23 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	AuthBrokerClient,
+	AuthBrokerError,
 	type AuthBrokerServerHandle,
 	AuthBrokerStreamUnsupportedError,
-	AuthStorage,
-	REMOTE_REFRESH_SENTINEL,
+	type SnapshotResponse,
 	type SnapshotStreamEvent,
-	SqliteAuthCredentialStore,
 	startAuthBroker,
-} from "@oh-my-pi/pi-ai";
+} from "@oh-my-pi/pi-ai/auth-broker";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
+import { logger } from "@oh-my-pi/pi-utils";
+import { removeWithRetries } from "../../utils/src/temp";
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
@@ -28,6 +33,37 @@ function mintOAuthCredential(suffix: string, expires: number) {
 	};
 }
 
+function fetchWithoutAuthBrokerCapabilities(): typeof fetch {
+	return Object.assign(
+		async (input: string | URL | Request, init?: RequestInit) => {
+			const headers = new Headers(init?.headers);
+			headers.delete(AUTH_BROKER_CAPABILITIES_HEADER);
+			return fetch(input, { ...init, headers });
+		},
+		{ preconnect: fetch.preconnect },
+	);
+}
+
+function credentialBlocks(snapshot: SnapshotResponse, credentialId: number) {
+	return snapshot.credentials.find(entry => entry.id === credentialId)?.blocks ?? [];
+}
+
+function readRawCodexCredentialBlocks(
+	dbPath: string,
+	credentialId: number,
+): Array<{ block_scope: string; blocked_until_ms: number; updated_at: number }> {
+	const db = new Database(dbPath, { readonly: true });
+	try {
+		return db
+			.prepare(
+				"SELECT block_scope, blocked_until_ms, updated_at FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = 'openai-codex:oauth' ORDER BY block_scope",
+			)
+			.all(credentialId) as Array<{ block_scope: string; blocked_until_ms: number; updated_at: number }>;
+	} finally {
+		db.close();
+	}
+}
+
 describe("auth-broker wire surface", () => {
 	let tempDir = "";
 	let store: SqliteAuthCredentialStore | undefined;
@@ -35,31 +71,56 @@ describe("auth-broker wire surface", () => {
 	let handle: AuthBrokerServerHandle | undefined;
 	let token = "";
 
-	beforeEach(async () => {
-		for (const key of ANTHROPIC_ENV) {
-			savedEnv[key] = process.env[key];
-			delete process.env[key];
-		}
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-wire-"));
-		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
-		store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
+	async function startFixture(nextStore: SqliteAuthCredentialStore): Promise<void> {
+		store = nextStore;
+		await store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
 		storage = new AuthStorage(store);
-		await storage.reload();
-		token = "test-bearer";
+		await storage.credentials.reload();
 		handle = startAuthBroker({
 			storage,
 			bind: "127.0.0.1:0",
 			bearerTokens: [token],
 			disableRefresher: true,
 		});
+	}
+
+	async function closeFixture(): Promise<void> {
+		await handle?.close();
+		handle = undefined;
+		storage?.close();
+		storage = undefined;
+		store?.close();
+		store = undefined;
+	}
+
+	/**
+	 * Swaps the in-memory fixture for a file-backed one so a test can open a second
+	 * `Database` connection on the same file (external writer / `data_version`).
+	 */
+	async function useFileBackedFixture(): Promise<string> {
+		await closeFixture();
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-wire-"));
+		const dbPath = path.join(tempDir, "agent.db");
+		await startFixture(await SqliteAuthCredentialStore.open(dbPath));
+		return dbPath;
+	}
+
+	beforeEach(async () => {
+		for (const key of ANTHROPIC_ENV) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		token = "test-bearer";
+		await startFixture(new SqliteAuthCredentialStore(new Database(":memory:")));
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		await handle?.close();
-		storage?.close();
-		store?.close();
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await closeFixture();
+		if (tempDir) {
+			await removeWithRetries(tempDir);
+			tempDir = "";
+		}
 		for (const key of ANTHROPIC_ENV) {
 			if (savedEnv[key] === undefined) delete process.env[key];
 			else process.env[key] = savedEnv[key];
@@ -92,6 +153,94 @@ describe("auth-broker wire surface", () => {
 		}
 	});
 
+	test("GET /v1/snapshot orders tied credential blocks by updatedAtMs", async () => {
+		const credentialId = storage!.credentials.snapshot().credentials[0]!.id;
+		const blockedUntilMs = Date.now() + 60_000;
+		const block = { credentialId, providerKey: "anthropic:oauth", blockScope: "", blockedUntilMs };
+		// SQLite's primary key cannot hold this tie, so feed it straight to the
+		// snapshot builder: only the server's sort decides the wire order, and it
+		// must match the client store's canonical order (oldest update first).
+		vi.spyOn(storage!.blocks, "list").mockReturnValue([
+			{ ...block, updatedAtMs: 2_000 },
+			{ ...block, updatedAtMs: 1_000 },
+		]);
+
+		const result = await new AuthBrokerClient({ url: handle!.url, token }).fetchSnapshot();
+		if (result.status !== 200) throw new Error("expected snapshot");
+		expect(credentialBlocks(result.snapshot, credentialId).map(entry => entry.updatedAtMs)).toEqual([1_000, 2_000]);
+	});
+
+	test("preserves an HTTP rejection when the caller aborts while reading its body", async () => {
+		const client = new AuthBrokerClient({
+			url: "http://broker.invalid",
+			token,
+			maxRetries: 0,
+			fetchImpl: (async (_input, init) => {
+				const signal = init?.signal;
+				const body = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode("forbidden"));
+						signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+					},
+				});
+				return new Response(body, { status: 401 });
+			}) as typeof fetch,
+		});
+
+		try {
+			await client.fetchSnapshot({ signal: AbortSignal.timeout(10) });
+			throw new Error("expected auth rejection");
+		} catch (error) {
+			expect(error).toBeInstanceOf(AuthBrokerError);
+			expect(error).toMatchObject({ status: 401 });
+		}
+	});
+
+	test("GET /v1/usage forwards an encoded provider filter and keeps aggregate requests unfiltered", async () => {
+		const reports = vi.spyOn(storage!.usage, "reports").mockResolvedValue([]);
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		await client.fetchUsage({ provider: "custom/provider + alias" });
+		expect(reports.mock.calls[0]?.[0]?.provider).toBe("custom/provider + alias");
+		await client.fetchUsage();
+		expect(reports.mock.calls[1]?.[0]?.provider).toBeUndefined();
+	});
+
+	test("GET /v1/usage outlives the base timeout for a serialized account batch", async () => {
+		vi.useFakeTimers();
+		const response = Promise.withResolvers<Response>();
+		let usageSignal: AbortSignal | undefined;
+		const fetchImpl: typeof fetch = Object.assign(
+			async (_input: string | URL | Request, init?: RequestInit) => {
+				const signal = init?.signal;
+				if (signal) usageSignal = signal;
+				return response.promise;
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const client = new AuthBrokerClient({
+			url: "http://broker.invalid",
+			token,
+			timeoutMs: 10_000,
+			maxRetries: 0,
+			fetchImpl,
+		});
+		try {
+			const usage = client.fetchUsage({ maxAccountsPerProvider: 3 });
+			await Promise.resolve();
+			const baseTimeout = AbortSignal.timeout(10_000);
+			vi.advanceTimersByTime(10_001);
+			await Promise.resolve();
+			expect(baseTimeout.aborted).toBe(true);
+			expect(usageSignal?.aborted).toBe(false);
+
+			const generatedAt = Date.now();
+			response.resolve(Response.json({ generatedAt, reports: [] }));
+			expect(await usage).toEqual({ generatedAt, reports: [] });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("GET /v1/snapshot returns generation headers and 304 for unchanged long-poll", async () => {
 		const res = await fetch(`${handle!.url}/v1/snapshot`, {
 			headers: { Authorization: `Bearer ${token}` },
@@ -100,14 +249,224 @@ describe("auth-broker wire surface", () => {
 		const body = (await res.json()) as { generation: number; serverNowMs: number; refresher: { enabled: boolean } };
 		expect(res.headers.get("etag")).toBe(`"${body.generation}"`);
 		expect(res.headers.get("cache-control")).toBe("no-store");
+		expect(res.headers.get("vary")).toBe(AUTH_BROKER_CAPABILITIES_HEADER);
 		expect(body.generation).toBeGreaterThan(0);
 		expect(body.serverNowMs).toBeGreaterThan(0);
 		expect(body.refresher.enabled).toBe(false);
 
-		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const observedCapabilities: Array<string | null> = [];
+		const fetchImpl: typeof fetch = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit) => {
+				observedCapabilities.push(new Headers(init?.headers).get(AUTH_BROKER_CAPABILITIES_HEADER));
+				return fetch(input, init);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const client = new AuthBrokerClient({ url: handle!.url, token, fetchImpl });
 		const unchanged = await client.fetchSnapshot({ ifGenerationGt: body.generation, waitMs: 10 });
 		expect(unchanged.status).toBe(304);
 		expect(unchanged.generation).toBe(body.generation);
+		expect(observedCapabilities).toEqual([AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES]);
+
+		const rawUnchanged = await fetch(`${handle!.url}/v1/snapshot?wait=10`, {
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"If-None-Match": `"${body.generation}"`,
+			},
+		});
+		expect(rawUnchanged.status).toBe(304);
+		expect(rawUnchanged.headers.get("vary")).toBe(AUTH_BROKER_CAPABILITIES_HEADER);
+	});
+
+	test("ignores external SQLite commits outside auth tables", async () => {
+		const dbPath = await useFileBackedFixture();
+		const generation = storage!.credentials.generation;
+		const db = new Database(dbPath);
+		try {
+			db.run("CREATE TABLE unrelated_state (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+			db.run("INSERT INTO unrelated_state (value) VALUES ('changed')");
+		} finally {
+			db.close();
+		}
+
+		expect(await storage!.credentials.poll()).toBe(false);
+		expect(storage!.credentials.generation).toBe(generation);
+	});
+
+	test("does not double-bump after a local auth write with an unrelated external commit pending", async () => {
+		const dbPath = await useFileBackedFixture();
+		const db = new Database(dbPath);
+		try {
+			db.run("CREATE TABLE unrelated_state (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+			db.run("INSERT INTO unrelated_state (value) VALUES ('changed')");
+		} finally {
+			db.close();
+		}
+		await storage!.credentials.upsert("unit-local", { type: "api_key", key: "local-key" });
+		const generation = storage!.credentials.generation;
+
+		expect(await storage!.credentials.poll()).toBe(false);
+		expect(storage!.credentials.generation).toBe(generation);
+	});
+
+	test("preserves a pending external auth commit while acknowledging local changes", async () => {
+		const dbPath = await useFileBackedFixture();
+		const generation = storage!.credentials.generation;
+		const db = new Database(dbPath);
+		try {
+			db.run("UPDATE auth_credentials SET updated_at = updated_at + 1 WHERE provider = 'anthropic'");
+		} finally {
+			db.close();
+		}
+
+		store!.acknowledgeLocalChanges();
+		expect(await storage!.credentials.poll()).toBe(true);
+		expect(storage!.credentials.generation).toBeGreaterThan(generation);
+	});
+
+	test("projects Codex meter blocks for legacy clients and observes writes from another connection", async () => {
+		const dbPath = await useFileBackedFixture();
+		await handle!.close();
+		handle = undefined;
+		const credential = (
+			await storage!.credentials.upsert("openai-codex", {
+				...mintOAuthCredential("codex-scopes", Date.now() + 60_000),
+			})
+		)[0];
+		if (!credential) throw new Error("expected Codex credential");
+		const chatBlockedUntilMs = Date.now() + 60_000;
+		const sparkBlockedUntilMs = Date.now() + 120_000;
+		storage!.blocks.upsert({
+			credentialId: credential.id,
+			providerKey: "openai-codex:oauth",
+			blockScope: "chat",
+			blockedUntilMs: chatBlockedUntilMs,
+		});
+		storage!.blocks.upsert({
+			credentialId: credential.id,
+			providerKey: "openai-codex:oauth",
+			blockScope: "spark",
+			blockedUntilMs: sparkBlockedUntilMs,
+		});
+		expect(readRawCodexCredentialBlocks(dbPath, credential.id).map(row => row.block_scope)).toEqual([
+			"chat",
+			"shared",
+			"spark",
+		]);
+
+		const sparkUpdatedAtSec = Math.floor(Date.now() / 1000) - 20;
+		const chatUpdatedAtSec = sparkUpdatedAtSec + 10;
+		const db = new Database(dbPath);
+		try {
+			const updateTimestamp = db.prepare(
+				"UPDATE auth_credential_blocks SET updated_at = ? WHERE credential_id = ? AND provider_key = ? AND block_scope = ?",
+			);
+			updateTimestamp.run(chatUpdatedAtSec, credential.id, "openai-codex:oauth", "chat");
+			updateTimestamp.run(sparkUpdatedAtSec, credential.id, "openai-codex:oauth", "spark");
+		} finally {
+			db.close();
+		}
+		await storage!.credentials.poll();
+		expect(readRawCodexCredentialBlocks(dbPath, credential.id)).toEqual([
+			{
+				block_scope: "chat",
+				blocked_until_ms: chatBlockedUntilMs,
+				updated_at: chatUpdatedAtSec,
+			},
+			{
+				block_scope: "shared",
+				blocked_until_ms: sparkBlockedUntilMs,
+				updated_at: chatUpdatedAtSec,
+			},
+			{
+				block_scope: "spark",
+				blocked_until_ms: sparkBlockedUntilMs,
+				updated_at: sparkUpdatedAtSec,
+			},
+		]);
+
+		handle = startAuthBroker({
+			storage: storage!,
+			bind: "127.0.0.1:0",
+			bearerTokens: [token],
+			disableRefresher: true,
+			externalChangePollMs: 10,
+			// This integration exercises the real server poll; fake timers do not
+			// drive Bun's HTTP stream lifecycle.
+		});
+
+		const currentClient = new AuthBrokerClient({ url: handle!.url, token });
+		const currentResult = await currentClient.fetchSnapshot();
+		if (currentResult.status !== 200) throw new Error("expected current-client snapshot");
+		const currentBlocks = credentialBlocks(currentResult.snapshot, credential.id);
+		expect(currentBlocks).toEqual([
+			{
+				providerKey: "openai-codex:oauth",
+				blockScope: "chat",
+				blockedUntilMs: chatBlockedUntilMs,
+				updatedAtMs: chatUpdatedAtSec * 1000,
+			},
+			{
+				providerKey: "openai-codex:oauth",
+				blockScope: "spark",
+				blockedUntilMs: sparkBlockedUntilMs,
+				updatedAtMs: sparkUpdatedAtSec * 1000,
+			},
+		]);
+		const maxUpdatedAtMs = Math.max(...currentBlocks.map(block => block.updatedAtMs ?? 0));
+		expect(maxUpdatedAtMs).toBe(chatUpdatedAtSec * 1000);
+
+		const legacyClient = new AuthBrokerClient({
+			url: handle!.url,
+			token,
+			fetchImpl: fetchWithoutAuthBrokerCapabilities(),
+		});
+		const legacyResult = await legacyClient.fetchSnapshot();
+		if (legacyResult.status !== 200) throw new Error("expected legacy-client snapshot");
+		expect(credentialBlocks(legacyResult.snapshot, credential.id)).toEqual([
+			{
+				providerKey: "openai-codex:oauth",
+				blockScope: "shared",
+				blockedUntilMs: sparkBlockedUntilMs,
+				updatedAtMs: maxUpdatedAtMs,
+			},
+		]);
+
+		expect(
+			storage!.blocks
+				.list([credential.id])
+				.map(block => block.blockScope)
+				.sort(),
+		).toEqual(["chat", "spark"]);
+
+		const pendingLegacySnapshot = legacyClient.fetchSnapshot({
+			ifGenerationGt: legacyResult.generation,
+			waitMs: 1000,
+		});
+		const updatedChatBlockedUntilMs = sparkBlockedUntilMs + 60_000;
+		const legacyWriter = new Database(dbPath);
+		try {
+			legacyWriter
+				.prepare(
+					`INSERT INTO auth_credential_blocks (
+						credential_id, provider_key, block_scope, blocked_until_ms, updated_at
+					) VALUES (?, 'openai-codex:oauth', 'shared', ?, ?)
+					ON CONFLICT(credential_id, provider_key, block_scope) DO UPDATE SET
+						blocked_until_ms = MAX(auth_credential_blocks.blocked_until_ms, excluded.blocked_until_ms),
+						updated_at = excluded.updated_at`,
+				)
+				.run(credential.id, updatedChatBlockedUntilMs, Math.floor(Date.now() / 1000));
+		} finally {
+			legacyWriter.close();
+		}
+		const changedLegacyResult = await pendingLegacySnapshot;
+		if (changedLegacyResult.status !== 200) throw new Error("expected legacy-client long-poll snapshot");
+		expect(
+			credentialBlocks(changedLegacyResult.snapshot, credential.id).map(block => [
+				block.blockScope,
+				block.blockedUntilMs,
+			]),
+		).toEqual([["shared", updatedChatBlockedUntilMs]]);
 	});
 
 	test("GET /v1/snapshot long-poll wakes when generation changes", async () => {
@@ -116,8 +475,8 @@ describe("auth-broker wire surface", () => {
 		if (initial.status !== 200) throw new Error("expected snapshot");
 
 		const pending = client.fetchSnapshot({ ifGenerationGt: initial.generation, waitMs: 1000 });
-		setTimeout(() => {
-			storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		setTimeout(async () => {
+			await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 		}, 10);
 
 		const changed = await pending;
@@ -175,11 +534,204 @@ describe("auth-broker wire surface", () => {
 		await expect(client.refreshCredential(id)).rejects.toThrow();
 	});
 
+	test("GET /v1/usage/history serves recorded snapshots with sinceMs/provider filters and requires auth", async () => {
+		const hourMs = 60 * 60 * 1000;
+		const now = Date.now();
+		// Hours apart so the store's per-bucket dedupe keeps distinct rows.
+		store!.recordUsageSnapshots!([
+			{
+				recordedAt: now - 3 * hourMs,
+				provider: "anthropic",
+				accountKey: "acct-a",
+				email: "a@example.com",
+				limitId: "5h",
+				label: "Claude 5 Hour",
+				windowLabel: "5h",
+				usedFraction: 0.2,
+				status: "ok",
+			},
+			{
+				recordedAt: now - hourMs,
+				provider: "anthropic",
+				accountKey: "acct-a",
+				email: "a@example.com",
+				limitId: "5h",
+				label: "Claude 5 Hour",
+				windowLabel: "5h",
+				usedFraction: 0.9,
+				status: "warning",
+			},
+			{
+				recordedAt: now - hourMs,
+				provider: "openai-codex",
+				accountKey: "acct-b",
+				limitId: "weekly",
+				label: "Weekly",
+				usedFraction: 0.5,
+			},
+		]);
+
+		const unauthorized = await fetch(`${handle!.url}/v1/usage/history`);
+		expect(unauthorized.status).toBe(401);
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const all = await client.fetchUsageHistory();
+		expect(all.entries).toHaveLength(3);
+		expect(all.entries[0].recordedAt).toBeLessThanOrEqual(all.entries[1].recordedAt);
+
+		const recent = await client.fetchUsageHistory({ sinceMs: now - 2 * hourMs });
+		expect(recent.entries.map(e => e.usedFraction).sort()).toEqual([0.5, 0.9]);
+
+		const anthropicOnly = await client.fetchUsageHistory({ provider: "anthropic" });
+		expect(anthropicOnly.entries).toHaveLength(2);
+		expect(anthropicOnly.entries.every(e => e.provider === "anthropic")).toBe(true);
+		expect(anthropicOnly.entries[1]).toMatchObject({
+			accountKey: "acct-a",
+			email: "a@example.com",
+			windowLabel: "5h",
+			usedFraction: 0.9,
+			status: "warning",
+		});
+	});
+
+	test("POST /v1/usage/observed persists per-client usage served by GET /v1/usage/clients", async () => {
+		const unauthorized = await fetch(`${handle!.url}/v1/usage/observed`, { method: "POST" });
+		expect(unauthorized.status).toBe(401);
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const now = Date.now();
+		const entry = {
+			at: now,
+			provider: "anthropic",
+			model: "claude-x",
+			requests: 2,
+			inputTokens: 1000,
+			outputTokens: 400,
+			cacheReadTokens: 50,
+			cacheWriteTokens: 25,
+			costUsd: 3.25,
+		};
+		const ack = await client.reportClientUsage({ installId: "install-1", hostname: "mbp.local", entries: [entry] });
+		expect(ack.ok).toBe(true);
+		await client.reportClientUsage({
+			installId: "install-2",
+			entries: [{ ...entry, provider: "openai-codex", model: "gpt-y", requests: 1, costUsd: 0 }],
+		});
+
+		const summary = await client.fetchClientUsageSummary();
+		expect(summary.clients).toHaveLength(2);
+		const first = summary.clients.find(c => c.installId === "install-1");
+		expect(first).toMatchObject({ hostname: "mbp.local" });
+		expect(first?.lastSeen).toBeGreaterThan(0);
+		expect(first?.providers).toEqual([
+			{
+				provider: "anthropic",
+				requests: 2,
+				inputTokens: 1000,
+				outputTokens: 400,
+				cacheReadTokens: 50,
+				cacheWriteTokens: 25,
+				costUsd: 3.25,
+			},
+		]);
+		const second = summary.clients.find(c => c.installId === "install-2");
+		expect(second?.hostname).toBeUndefined();
+		expect(second?.providers[0]).toMatchObject({ provider: "openai-codex", requests: 1 });
+
+		// App-labeled usage lands in its own (install, app, provider) aggregate
+		// row — "what did robomp spend" must not fold into the unlabeled bucket.
+		await client.reportClientUsage({
+			installId: "install-2",
+			app: "robomp",
+			entries: [{ ...entry, provider: "openai-codex", model: "gpt-y", requests: 4, costUsd: 1.5 }],
+		});
+		const withApps = await client.fetchClientUsageSummary();
+		const labeled = withApps.clients.find(c => c.installId === "install-2");
+		expect(labeled?.providers).toHaveLength(2);
+		expect(labeled?.providers.find(p => p.app === "robomp")).toMatchObject({
+			provider: "openai-codex",
+			requests: 4,
+			costUsd: 1.5,
+		});
+		expect(labeled?.providers.find(p => p.app === undefined)).toMatchObject({
+			provider: "openai-codex",
+			requests: 1,
+		});
+
+		// sinceMs beyond the recorded timestamps returns clients with no aggregates.
+		const future = await client.fetchClientUsageSummary({ sinceMs: now + 60_000 });
+		expect(future.clients.every(c => c.providers.length === 0)).toBe(true);
+
+		// Malformed body is rejected by schema validation.
+		const bad = await fetch(`${handle!.url}/v1/usage/observed`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ installId: "x", entries: [{ at: "not-a-number" }] }),
+		});
+		expect(bad.status).toBe(400);
+	});
+
 	test("Unknown route returns 404", async () => {
 		const res = await fetch(`${handle!.url}/v1/nope`, {
 			headers: { Authorization: `Bearer ${token}` },
 		});
 		expect(res.status).toBe(404);
+	});
+
+	test("logs the socket peer and never header-supplied peers or unknown paths", async () => {
+		const events: logger.LogEvent[] = [];
+		const dispose = logger.registerLogSink(event => {
+			if (
+				event.message === "auth-broker request unauthorized" ||
+				event.message === "auth-broker usage history served"
+			)
+				events.push(event);
+		});
+		try {
+			const spoofed = { "x-forwarded-for": "leaked-secret", "x-real-ip": "leaked-secret" };
+			for (const pathname of ["/v1/leaked-secret", "/v1/usage/history"]) {
+				const res = await fetch(`${handle!.url}${pathname}`, {
+					headers: { Authorization: "Bearer wrong", ...spoofed },
+				});
+				expect(res.status).toBe(401);
+			}
+			const ok = await fetch(`${handle!.url}/v1/usage/history`, {
+				headers: { Authorization: `Bearer ${token}`, ...spoofed },
+			});
+			expect(ok.status).toBe(200);
+			expect(events.map(event => [event.message, event.context?.path, event.context?.peer])).toEqual([
+				["auth-broker request unauthorized", "<unrouted>", "127.0.0.1"],
+				["auth-broker request unauthorized", "/v1/usage/history", "127.0.0.1"],
+				["auth-broker usage history served", undefined, "127.0.0.1"],
+			]);
+			expect(JSON.stringify(events)).not.toContain("leaked-secret");
+		} finally {
+			dispose();
+		}
+	});
+
+	test("logs the forwarded peer when trustProxyHeaders is set", async () => {
+		const proxied = startAuthBroker({
+			storage: storage!,
+			bind: "127.0.0.1:0",
+			bearerTokens: [token],
+			disableRefresher: true,
+			trustProxyHeaders: true,
+		});
+		const peers: unknown[] = [];
+		const dispose = logger.registerLogSink(event => {
+			if (event.message === "auth-broker usage history served") peers.push(event.context?.peer);
+		});
+		try {
+			const res = await fetch(`${proxied.url}/v1/usage/history`, {
+				headers: { Authorization: `Bearer ${token}`, "x-forwarded-for": "203.0.113.7, 10.0.0.1" },
+			});
+			expect(res.status).toBe(200);
+			expect(peers).toEqual(["203.0.113.7"]);
+		} finally {
+			dispose();
+			await proxied.close();
+		}
 	});
 
 	test("GET /v1/snapshot/stream requires bearer", async () => {
@@ -200,7 +752,7 @@ describe("auth-broker wire surface", () => {
 				expect(first.value.credentials[0].provider).toBe("anthropic");
 			}
 
-			storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+			await storage!.credentials.upsert("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 
 			const next = await nextMatching(iter, event => event.kind === "entry");
 			if (next.kind !== "entry") throw new Error("expected entry frame");
@@ -213,6 +765,103 @@ describe("auth-broker wire surface", () => {
 		} finally {
 			controller.abort();
 			await iter.return(undefined).catch(() => {});
+		}
+	});
+
+	test("SSE stream projects Codex meter blocks only for clients without the capability", async () => {
+		const credential = (
+			await storage!.credentials.upsert("openai-codex", {
+				...mintOAuthCredential("codex-stream-scopes", Date.now() + 60_000),
+			})
+		)[0];
+		if (!credential) throw new Error("expected Codex credential");
+		const chatBlockedUntilMs = Date.now() + 60_000;
+		const sparkBlockedUntilMs = Date.now() + 120_000;
+		storage!.blocks.upsert({
+			credentialId: credential.id,
+			providerKey: "openai-codex:oauth",
+			blockScope: "chat",
+			blockedUntilMs: chatBlockedUntilMs,
+		});
+		storage!.blocks.upsert({
+			credentialId: credential.id,
+			providerKey: "openai-codex:oauth",
+			blockScope: "spark",
+			blockedUntilMs: sparkBlockedUntilMs,
+		});
+
+		const currentController = new AbortController();
+		const legacyController = new AbortController();
+		const currentIter = new AuthBrokerClient({ url: handle!.url, token }).openSnapshotStream({
+			signal: currentController.signal,
+		});
+		const legacyIter = new AuthBrokerClient({
+			url: handle!.url,
+			token,
+			fetchImpl: fetchWithoutAuthBrokerCapabilities(),
+		}).openSnapshotStream({ signal: legacyController.signal });
+		try {
+			const [currentInitial, legacyInitial] = await Promise.all([currentIter.next(), legacyIter.next()]);
+			if (currentInitial.done || currentInitial.value.kind !== "snapshot") {
+				throw new Error("expected current-client snapshot frame");
+			}
+			if (legacyInitial.done || legacyInitial.value.kind !== "snapshot") {
+				throw new Error("expected legacy-client snapshot frame");
+			}
+			expect(
+				credentialBlocks(currentInitial.value, credential.id).map(block => [
+					block.blockScope,
+					block.blockedUntilMs,
+				]),
+			).toEqual([
+				["chat", chatBlockedUntilMs],
+				["spark", sparkBlockedUntilMs],
+			]);
+			const initialCurrentBlocks = credentialBlocks(currentInitial.value, credential.id);
+			expect(credentialBlocks(legacyInitial.value, credential.id)).toEqual([
+				{
+					providerKey: "openai-codex:oauth",
+					blockScope: "shared",
+					blockedUntilMs: sparkBlockedUntilMs,
+					updatedAtMs: Math.max(...initialCurrentBlocks.map(block => block.updatedAtMs ?? 0)),
+				},
+			]);
+
+			const updatedChatBlockedUntilMs = sparkBlockedUntilMs + 60_000;
+			storage!.blocks.upsert({
+				credentialId: credential.id,
+				providerKey: "openai-codex:oauth",
+				blockScope: "chat",
+				blockedUntilMs: updatedChatBlockedUntilMs,
+			});
+
+			const [currentDelta, legacyDelta] = await Promise.all([
+				nextMatching(currentIter, event => event.kind === "entry" && event.entry.id === credential.id),
+				nextMatching(legacyIter, event => event.kind === "entry" && event.entry.id === credential.id),
+			]);
+			if (currentDelta.kind !== "entry" || legacyDelta.kind !== "entry") {
+				throw new Error("expected entry frames");
+			}
+			const currentDeltaBlocks = currentDelta.entry.blocks ?? [];
+			expect(currentDeltaBlocks.map(block => [block.blockScope, block.blockedUntilMs])).toEqual([
+				["chat", updatedChatBlockedUntilMs],
+				["spark", sparkBlockedUntilMs],
+			]);
+			expect(legacyDelta.entry.blocks).toEqual([
+				{
+					providerKey: "openai-codex:oauth",
+					blockScope: "shared",
+					blockedUntilMs: updatedChatBlockedUntilMs,
+					updatedAtMs: Math.max(...currentDeltaBlocks.map(block => block.updatedAtMs ?? 0)),
+				},
+			]);
+		} finally {
+			currentController.abort();
+			legacyController.abort();
+			await Promise.all([
+				currentIter.return(undefined).catch(() => {}),
+				legacyIter.return(undefined).catch(() => {}),
+			]);
 		}
 	});
 
@@ -237,7 +886,7 @@ describe("auth-broker wire surface", () => {
 			const first = await iter.next();
 			if (first.done) throw new Error("expected snapshot frame");
 
-			await storage!.refreshCredentialById(id);
+			await storage!.oauth.refresh(id);
 
 			const next = await nextMatching(
 				iter,
@@ -265,7 +914,7 @@ describe("auth-broker wire surface", () => {
 			const first = await iter.next();
 			if (first.done) throw new Error("expected snapshot frame");
 
-			const disabled = storage!.disableCredentialById(id, "revoked by test");
+			const disabled = await storage!.credentials.disable(id, "revoked by test");
 			expect(disabled).toBe(true);
 
 			const next = await nextMatching(iter, event => event.kind === "removed");
@@ -278,10 +927,10 @@ describe("auth-broker wire surface", () => {
 	});
 
 	test("SSE stream keepalive comment arrives on cadence", async () => {
-		const localStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "keepalive.db"));
-		localStore.saveOAuth("anthropic", mintOAuthCredential("k", Date.now() + 60_000));
+		const localStore = new SqliteAuthCredentialStore(new Database(":memory:"));
+		await localStore.saveOAuth("anthropic", mintOAuthCredential("k", Date.now() + 60_000));
 		const localStorage = new AuthStorage(localStore);
-		await localStorage.reload();
+		await localStorage.credentials.reload();
 		const localToken = "keepalive-bearer";
 		const localHandle = startAuthBroker({
 			storage: localStorage,
@@ -298,6 +947,7 @@ describe("auth-broker wire surface", () => {
 			});
 			expect(res.status).toBe(200);
 			expect(res.headers.get("content-type") ?? "").toContain("text/event-stream");
+			expect(res.headers.get("vary")).toBe(AUTH_BROKER_CAPABILITIES_HEADER);
 			expect(res.body).not.toBeNull();
 			const reader = (res.body as ReadableStream<Uint8Array>).getReader();
 			const decoder = new TextDecoder();
@@ -369,6 +1019,83 @@ describe("auth-broker wire surface", () => {
 			await expect(iter.next()).rejects.toThrow(/initial snapshot/);
 		} finally {
 			dummy.stop(true);
+		}
+	});
+});
+
+describe("client_usage app column migration", () => {
+	test("pre-app broker DBs gain the app column; legacy rows stay queryable as unlabeled", async () => {
+		// Replicate the pre-app schema exactly as older brokers created it, plus
+		// one recorded legacy row — `CREATE TABLE IF NOT EXISTS` must skip it and
+		// the ALTER-based migration must add the column without losing the row.
+		const legacy = new Database(":memory:");
+		legacy.run(`
+			CREATE TABLE clients (
+				install_id TEXT PRIMARY KEY,
+				hostname TEXT,
+				first_seen INTEGER NOT NULL,
+				last_seen INTEGER NOT NULL
+			);
+			CREATE TABLE client_usage (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				recorded_at INTEGER NOT NULL,
+				install_id TEXT NOT NULL,
+				provider TEXT NOT NULL,
+				model TEXT NOT NULL,
+				requests INTEGER NOT NULL,
+				input_tokens INTEGER NOT NULL,
+				output_tokens INTEGER NOT NULL,
+				cache_read_tokens INTEGER NOT NULL,
+				cache_write_tokens INTEGER NOT NULL,
+				cost_usd REAL NOT NULL DEFAULT 0
+			);
+		`);
+		const now = Date.now();
+		legacy.run("INSERT INTO clients (install_id, hostname, first_seen, last_seen) VALUES (?, ?, ?, ?)", [
+			"legacy-install",
+			"legacy-host",
+			now,
+			now,
+		]);
+		legacy.run(
+			`INSERT INTO client_usage (recorded_at, install_id, provider, model, requests, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			[now, "legacy-install", "anthropic", "claude-x", 5, 100, 50, 10, 5, 2.5],
+		);
+
+		const migrated = new SqliteAuthCredentialStore(legacy);
+		try {
+			migrated.recordClientUsage({
+				installId: "legacy-install",
+				app: "robomp",
+				entries: [
+					{
+						at: now,
+						provider: "anthropic",
+						model: "claude-x",
+						requests: 1,
+						inputTokens: 10,
+						outputTokens: 5,
+						cacheReadTokens: 0,
+						cacheWriteTokens: 0,
+						costUsd: 0.1,
+					},
+				],
+			});
+			const summary = migrated.getClientUsageSummary(0);
+			const client = summary.clients.find(c => c.installId === "legacy-install");
+			expect(client?.providers.find(p => p.app === undefined)).toMatchObject({
+				provider: "anthropic",
+				requests: 5,
+				inputTokens: 100,
+			});
+			expect(client?.providers.find(p => p.app === "robomp")).toMatchObject({
+				provider: "anthropic",
+				requests: 1,
+				inputTokens: 10,
+			});
+		} finally {
+			migrated.close();
 		}
 	});
 });

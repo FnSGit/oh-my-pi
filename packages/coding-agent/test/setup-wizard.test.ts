@@ -1,21 +1,33 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, vi } from "bun:test";
+import type { Model } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import * as updateCli from "@oh-my-pi/pi-coding-agent/cli/update-cli";
 import { runOnboardingSetup } from "@oh-my-pi/pi-coding-agent/commands/setup";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { SETTINGS_SCHEMA } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import {
 	ALL_SCENES,
+	createSetupHost,
 	CURRENT_SETUP_VERSION,
 	markSetupWizardComplete,
 	runSetupWizard,
 	type SetupScene,
 	type SetupSceneHost,
 	selectSetupScenes,
-} from "@oh-my-pi/pi-coding-agent/modes/setup-wizard";
-import { WebSearchTab } from "@oh-my-pi/pi-coding-agent/modes/setup-wizard/scenes/web-search";
-import { SetupWizardComponent } from "@oh-my-pi/pi-coding-agent/modes/setup-wizard/wizard-overlay";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+} from "@oh-my-pi/pi-coding-agent/modes/setup";
+import { providersSetupScene } from "@oh-my-pi/pi-tui/setup/scenes/sign-in";
+import { themeSetupScene } from "@oh-my-pi/pi-tui/setup/scenes/theme";
+import { SetupWizardComponent } from "@oh-my-pi/pi-tui/setup/wizard-overlay";
+import { setTerminalGlyphProtocol } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES } from "@oh-my-pi/pi-coding-agent/web/search/types";
+
+import { cfgSetupVersion, cfgSymbolPreset } from "@oh-my-pi/pi-coding-agent/modes/settings";
+
+type SetupApplicationSceneHost = Omit<SetupSceneHost, "ctx"> & { ctx: InteractiveModeContext };
+
+function bindSceneHost(host: SetupApplicationSceneHost): SetupSceneHost {
+	return { ...host, ctx: createSetupHost(host.ctx) };
+}
 
 function fakeContextWithConfiguredModel(): InteractiveModeContext {
 	return {
@@ -31,6 +43,7 @@ function testScene(id: string, minVersion: number, shouldRun?: () => boolean): S
 	return {
 		id,
 		title: id,
+		step: id,
 		minVersion,
 		shouldRun,
 		mount: () => ({
@@ -46,6 +59,15 @@ afterEach(async () => {
 });
 
 describe("setup wizard scene selection", () => {
+	// Tests run from a source checkout, which never updates itself; pin a self-updating install.
+	beforeEach(() => {
+		vi.spyOn(updateCli, "canSelfUpdate").mockResolvedValue(true);
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	it("runs all v1 scenes for a new user", async () => {
 		const scenes = await selectSetupScenes(0, ALL_SCENES, fakeContextWithConfiguredModel(), { isTTY: true });
 		expect(scenes.map(scene => scene.id)).toEqual(ALL_SCENES.map(scene => scene.id));
@@ -81,11 +103,6 @@ describe("setup wizard scene selection", () => {
 		expect(await selectSetupScenes(0, ALL_SCENES, ctx, { isTTY: true, setupWizardEnabled: false })).toEqual([]);
 	});
 
-	it("keeps the providers scene eligible even when a model is already configured", async () => {
-		const scenes = await selectSetupScenes(0, ALL_SCENES, fakeContextWithConfiguredModel(), { isTTY: true });
-		expect(scenes.some(scene => scene.id === "providers")).toBe(true);
-	});
-
 	it("force mode ignores version and user skip gates but still requires a TTY", async () => {
 		const ctx = fakeContextWithConfiguredModel();
 		const selected = await selectSetupScenes(CURRENT_SETUP_VERSION, ALL_SCENES, ctx, {
@@ -99,6 +116,26 @@ describe("setup wizard scene selection", () => {
 		expect(await selectSetupScenes(0, ALL_SCENES, ctx, { isTTY: false, force: true })).toEqual([]);
 	});
 
+	it("skips the auto-update question where omp cannot update itself (Tern, Nix, a source checkout)", async () => {
+		vi.spyOn(updateCli, "canSelfUpdate").mockResolvedValue(false);
+		const scenes = await selectSetupScenes(0, ALL_SCENES, fakeContextWithConfiguredModel(), { isTTY: true });
+		expect(scenes.map(scene => scene.id)).toEqual(
+			ALL_SCENES.map(scene => scene.id).filter(id => id !== "auto-update"),
+		);
+	});
+
+	it("drops the glyph scene once the terminal renders omp's bundled icons in-band", async () => {
+		setTerminalGlyphProtocol(true);
+		try {
+			const scenes = await selectSetupScenes(0, ALL_SCENES, fakeContextWithConfiguredModel(), { isTTY: true });
+			expect(scenes.map(scene => scene.id)).toEqual(
+				ALL_SCENES.map(scene => scene.id).filter(id => id !== "glyph-mode"),
+			);
+		} finally {
+			setTerminalGlyphProtocol(false);
+		}
+	});
+
 	it("applies scene shouldRun only as a hard environment gate", async () => {
 		const selected = await selectSetupScenes(
 			0,
@@ -110,11 +147,95 @@ describe("setup wizard scene selection", () => {
 	});
 });
 
+describe("setup wizard model selection", () => {
+	const CUSTOM_MODEL: Model = buildModel({
+		id: "minimax-m3",
+		name: "MiniMax M3",
+		api: "openai-completions",
+		provider: "spark",
+		baseUrl: "http://127.0.0.1:8000/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 100_000,
+		maxTokens: 32_000,
+	});
+
+	async function pickModelDuringSetup(settings: Settings): Promise<string> {
+		await initTheme(false, "unicode", false, "titanium", "dark");
+		let available: Model[] = [];
+		const finished = Promise.withResolvers<string>();
+		const setModel = mock(
+			async (
+				selected: Model,
+				role: string,
+				options?: { selector?: string; persist?: boolean },
+			): Promise<{ switched: boolean }> => {
+				if (options?.persist) {
+					settings.setModelRole(role, options.selector ?? `${selected.provider}/${selected.id}`);
+				}
+				return { switched: true };
+			},
+		);
+		const host = bindSceneHost({
+			ctx: {
+				settings,
+				session: {
+					model: undefined,
+					modelRegistry: {
+						getAvailable: () => available,
+						getAll: () => available,
+						refresh: async (strategy: string) => {
+							if (strategy === "online-if-uncached") available = [CUSTOM_MODEL];
+						},
+					},
+					setModel,
+					effectiveServiceTier: () => undefined,
+				},
+				ui: { terminal: { rows: 30 } },
+			},
+			requestRender: () => {},
+			finish: (next: string) => finished.resolve(next),
+			setFocus: () => {},
+			restoreFocus: () => {},
+		} as unknown as SetupApplicationSceneHost);
+		const scene = ALL_SCENES.find(candidate => candidate.id === "model");
+		expect(scene).toBeDefined();
+
+		const controller = scene!.mount(host);
+		expect(controller.render?.(120).join("\n")).not.toContain("minimax-m3");
+		await controller.onMount?.();
+		expect(controller.render?.(120).join("\n")).toContain("minimax-m3");
+		controller.handleInput?.("\r");
+		return finished.promise;
+	}
+
+	it("discovers and saves an uncached custom model as the global default", async () => {
+		const settings = Settings.isolated();
+
+		const result = await pickModelDuringSetup(settings);
+
+		expect(result).toBe("done");
+		expect(settings.getGlobalModelRole("default")).toBe("spark/minimax-m3");
+		expect(settings.getProjectModelRole("default")).toBeUndefined();
+	});
+
+	it("saves to the project layer under project role storage", async () => {
+		const settings = Settings.isolated({ modelRoleStorage: "project" });
+
+		const result = await pickModelDuringSetup(settings);
+
+		expect(result).toBe("done");
+		expect(settings.getProjectModelRole("default")).toBe("spark/minimax-m3");
+		expect(settings.getGlobalModelRole("default")).toBeUndefined();
+	});
+});
+
 describe("setup wizard persistence", () => {
 	it("marks the current setup version complete", async () => {
 		const settings = Settings.isolated();
 		await markSetupWizardComplete(settings);
-		expect(settings.get("setupVersion")).toBe(CURRENT_SETUP_VERSION);
+		expect(cfgSetupVersion.get(settings)).toBe(CURRENT_SETUP_VERSION);
 	});
 
 	it("can run a targeted scene without setup-version or welcome-intro side effects", async () => {
@@ -127,6 +248,7 @@ describe("setup wizard persistence", () => {
 		const scene: SetupScene = {
 			id: "providers",
 			title: "providers",
+			step: "providers",
 			minVersion: 1,
 			mount: host => ({
 				title: "providers",
@@ -154,7 +276,7 @@ describe("setup wizard persistence", () => {
 		component?.handleInput?.("\n");
 		await pending;
 
-		expect(settings.get("setupVersion")).toBe(0);
+		expect(cfgSetupVersion.get(settings)).toBe(0);
 		expect(playWelcomeIntro).not.toHaveBeenCalled();
 		expect(hideOverlay).toHaveBeenCalledTimes(1);
 		expect(setFocus).toHaveBeenCalled();
@@ -166,6 +288,7 @@ describe("setup wizard mouse routing", () => {
 		const scene: SetupScene = {
 			id: "scrollable",
 			title: "scrollable",
+			step: "scrollable",
 			minVersion: 1,
 			mount: () => ({
 				title: "scrollable",
@@ -182,7 +305,7 @@ describe("setup wizard mouse routing", () => {
 				requestRender: () => {},
 			},
 		} as unknown as InteractiveModeContext;
-		const component = new SetupWizardComponent(ctx, [scene]);
+		const component = new SetupWizardComponent(createSetupHost(ctx), [scene]);
 		try {
 			void component.run();
 			// Left click during the splash advances into the scene, like Enter.
@@ -204,6 +327,7 @@ describe("setup wizard mouse routing", () => {
 		const scene: SetupScene = {
 			id: "mouse",
 			title: "mouse",
+			step: "mouse",
 			minVersion: 1,
 			mount: () => ({
 				title: "mouse",
@@ -231,7 +355,7 @@ describe("setup wizard mouse routing", () => {
 				requestRender: () => {},
 			},
 		} as unknown as InteractiveModeContext;
-		const component = new SetupWizardComponent(ctx, [scene]);
+		const component = new SetupWizardComponent(createSetupHost(ctx), [scene]);
 		try {
 			void component.run();
 			component.handleInput("\r"); // splash → scene
@@ -257,6 +381,79 @@ describe("setup wizard mouse routing", () => {
 		}
 	});
 });
+describe("setup wizard short terminals", () => {
+	function shortTerminalCtx(rows: number): InteractiveModeContext {
+		return {
+			settings: Settings.isolated(),
+			ui: {
+				terminal: { rows },
+				setFocus: () => {},
+				requestRender: () => {},
+				invalidate: () => {},
+			},
+			session: {
+				modelRegistry: {
+					authStorage: {
+						credentials: { has: () => false },
+						keys: { source: () => undefined },
+					},
+				},
+			},
+			openInBrowser: () => {},
+		} as unknown as InteractiveModeContext;
+	}
+
+	/**
+	 * Advance the wizard's dissolve clock past SCENE_TRANSITION_MS so render()
+	 * shows the fully revealed scene without waiting real time. Activate after
+	 * the splash→scene input (the transition timestamps itself on entry).
+	 */
+	function skipDissolve(): { mockRestore(): void } {
+		const realNow = performance.now.bind(performance);
+		return vi.spyOn(performance, "now").mockImplementation(() => realNow() + 1_000);
+	}
+
+	it("keeps the selected provider row visible while navigating on a 24-row terminal", async () => {
+		await initTheme(false, "unicode", false, "titanium", "light");
+		const component = new SetupWizardComponent(createSetupHost(shortTerminalCtx(24)), [providersSetupScene]);
+		void component.run();
+		component.handleInput("\r"); // splash → scene
+		const nowSpy = skipDissolve();
+		try {
+			// Walk down past a full wrap and back up; the selection must stay
+			// inside the 24-row frame on every step (the list window used to
+			// assume ten visible rows and the wizard clipped the cursor off).
+			for (const key of [...Array(45).fill("\x1b[B"), "\x1b[A", "\x1b[A"]) {
+				component.handleInput(key);
+				const frame = component.render(80).map(line => Bun.stripANSI(line));
+				expect(frame.length).toBe(24);
+				expect(frame.some(line => line.includes(`${theme.nav.cursor} `))).toBe(true);
+			}
+		} finally {
+			nowSpy.mockRestore();
+			component.dispose();
+		}
+	});
+
+	it("keeps the curated theme list and its selection visible on a 24-row terminal", async () => {
+		await initTheme(false, "unicode", false, "titanium", "light");
+		const component = new SetupWizardComponent(createSetupHost(shortTerminalCtx(24)), [themeSetupScene]);
+		void component.run();
+		component.handleInput("\r"); // splash → scene
+		const nowSpy = skipDissolve();
+		try {
+			const frame = component.render(80).map(line => Bun.stripANSI(line));
+			expect(frame.length).toBe(24);
+			expect(frame.some(line => line.trimStart().startsWith(theme.nav.cursor))).toBe(true);
+			for (const label of ["Match terminal", "Titanium", "Light", "Colorblind colors", "ANSI-safe", "Browse all"]) {
+				expect(frame.some(line => line.includes(label))).toBe(true);
+			}
+		} finally {
+			nowSpy.mockRestore();
+			component.dispose();
+		}
+	});
+});
 
 describe("setup wizard theme previews", () => {
 	it("restores the selected glyph preset after previewing ANSI-safe mode", async () => {
@@ -265,7 +462,7 @@ describe("setup wizard theme previews", () => {
 		const setupScene = ALL_SCENES.find(scene => scene.id === "theme");
 		expect(setupScene).toBeDefined();
 
-		const host = {
+		const host = bindSceneHost({
 			ctx: {
 				settings,
 				ui: {
@@ -277,7 +474,7 @@ describe("setup wizard theme previews", () => {
 			finish: () => {},
 			setFocus: () => {},
 			restoreFocus: () => {},
-		} as unknown as SetupSceneHost;
+		} as unknown as SetupApplicationSceneHost);
 
 		const controller = setupScene!.mount(host);
 		controller.handleInput?.("5");
@@ -286,7 +483,7 @@ describe("setup wizard theme previews", () => {
 
 		controller.handleInput?.("2");
 		await Bun.sleep(20);
-		expect(settings.get("symbolPreset")).toBe("nerd");
+		expect(cfgSymbolPreset.get(settings)).toBe("nerd");
 		expect(theme.getSymbolPreset()).toBe("nerd");
 	});
 });
@@ -299,7 +496,7 @@ describe("setup wizard glyph scene", () => {
 		expect(scene).toBeDefined();
 
 		let finished = false;
-		const host = {
+		const host = bindSceneHost({
 			ctx: {
 				settings,
 				ui: { invalidate: () => {}, requestRender: () => {} },
@@ -310,7 +507,7 @@ describe("setup wizard glyph scene", () => {
 			},
 			setFocus: () => {},
 			restoreFocus: () => {},
-		} as unknown as SetupSceneHost;
+		} as unknown as SetupApplicationSceneHost);
 
 		const controller = scene!.mount(host);
 		// Row "1" is now Nerd Font (it must lead the list).
@@ -320,63 +517,8 @@ describe("setup wizard glyph scene", () => {
 
 		controller.handleInput?.("\n");
 		await Bun.sleep(20);
-		expect(settings.get("symbolPreset")).toBe("nerd");
+		expect(cfgSymbolPreset.get(settings)).toBe("nerd");
 		expect(finished).toBe(true);
-	});
-});
-
-describe("setup wizard web search tab", () => {
-	it("exposes every web-search provider preference in the schema-backed TUI list", () => {
-		const schema = SETTINGS_SCHEMA["providers.webSearch"];
-		expect(schema.values).toEqual(SEARCH_PROVIDER_PREFERENCES);
-		expect(schema.ui.options).toEqual(SEARCH_PROVIDER_OPTIONS);
-	});
-
-	it("persists the highlighted provider as the web search preference", async () => {
-		const settings = Settings.isolated();
-		const host = {
-			ctx: {
-				settings,
-				session: { modelRegistry: { authStorage: { hasAuth: () => false } } },
-			},
-			requestRender: () => {},
-			finish: () => {},
-			setFocus: () => {},
-			restoreFocus: () => {},
-		} as unknown as SetupSceneHost;
-
-		const tab = new WebSearchTab(host);
-		tab.handleInput("\x1b[B"); // move off "auto" to the next provider
-		tab.handleInput("\n"); // confirm the highlighted provider
-		await Bun.sleep(20);
-
-		const expected = SETTINGS_SCHEMA["providers.webSearch"].ui.options[1].value;
-		expect(expected).not.toBe("auto");
-		expect(settings.get("providers.webSearch")).toBe(expected);
-	});
-
-	it("can select the last provider in the setup TUI list", async () => {
-		const settings = Settings.isolated();
-		const host = {
-			ctx: {
-				settings,
-				session: { modelRegistry: { authStorage: { hasAuth: () => false } } },
-			},
-			requestRender: () => {},
-			finish: () => {},
-			setFocus: () => {},
-			restoreFocus: () => {},
-		} as unknown as SetupSceneHost;
-
-		const tab = new WebSearchTab(host);
-		for (let i = 1; i < SEARCH_PROVIDER_OPTIONS.length; i++) {
-			tab.handleInput("\x1b[B");
-		}
-		tab.handleInput("\n");
-		await Bun.sleep(20);
-
-		const lastOption = SEARCH_PROVIDER_OPTIONS[SEARCH_PROVIDER_OPTIONS.length - 1]!;
-		expect(settings.get("providers.webSearch")).toBe(lastOption.value);
 	});
 });
 

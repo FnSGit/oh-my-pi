@@ -6,7 +6,7 @@
  * a general-purpose mock. Each test exercises one contract:
  *
  * - the metadata index keeps `existsSync`/`statSync`/`listFilesSync`
- *   coherent with `writeText`/`writer.writeLineSync`;
+ *   coherent with `writeText`/`writer.append`;
  * - `drain()` waits for fire-and-forget background writes;
  * - `deleteSessionWithArtifacts` removes both the JSONL key and any sidecar
  *   keys under the artifacts prefix;
@@ -19,6 +19,7 @@ import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
+import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 interface FakeRedisCall {
 	method: string;
@@ -66,6 +67,45 @@ function createFakeRedis(): FakeRedis {
 			const queue = failures.get(method) ?? [];
 			queue.push(error);
 			failures.set(method, queue);
+		},
+		async send(command, args) {
+			record("send", [command, args]);
+			checkFailure("send");
+			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
+			const script = args[0] ?? "";
+			const keyCount = Number(args[1] ?? "0");
+			const keys = args.slice(2, 2 + keyCount);
+			const argv = args.slice(2 + keyCount);
+			if (script.includes("OMP_WRITE_FULL")) {
+				checkFailure("set");
+				checkFailure("hset");
+				const [fileKey, metaKey, titleKey] = keys;
+				const [content, filePath, mtimeMs, hasTitle, title] = argv;
+				strings.set(fileKey, content);
+				getHash(metaKey).set(filePath, mtimeMs);
+				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
+				else getHash(titleKey).delete(filePath);
+				return 1;
+			}
+			if (script.includes("OMP_APPEND")) {
+				checkFailure("append");
+				checkFailure("hset");
+				const [fileKey, metaKey] = keys;
+				const [line, filePath, mtimeMs] = argv;
+				const next = (strings.get(fileKey) ?? "") + line;
+				strings.set(fileKey, next);
+				getHash(metaKey).set(filePath, mtimeMs);
+				return Buffer.byteLength(next, "utf-8");
+			}
+			if (script.includes("OMP_UPDATE_TITLE")) {
+				checkFailure("hset");
+				const [metaKey, titleKey] = keys;
+				const [filePath, mtimeMs, title] = argv;
+				getHash(metaKey).set(filePath, mtimeMs);
+				getHash(titleKey).set(filePath, title);
+				return 1;
+			}
+			throw new Error("Unsupported Redis script");
 		},
 		async get(key) {
 			record("get", [key]);
@@ -184,6 +224,21 @@ describe("RedisSessionStorage", () => {
 		expect(typeof stat.mtimeMs).toBe("number");
 	});
 
+	it("commits file content and metadata through one atomic Redis script", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const sessionPath = "/sessions/p/atomic.jsonl";
+		await storage.writeText(sessionPath, "old\n");
+		const oldMtime = redis.hashes.get("omp:sessions:meta")?.get(sessionPath);
+		redis.failNext("send", new Error("EVAL transport failed"));
+
+		await expect(storage.writeTextAtomic(sessionPath, "new\n")).rejects.toThrow("EVAL transport failed");
+
+		expect(redis.strings.get(`omp:sessions:file:${sessionPath}`)).toBe("old\n");
+		expect(redis.hashes.get("omp:sessions:meta")?.get(sessionPath)).toBe(oldMtime);
+		expect(storage.statSync(sessionPath).size).toBe(4);
+		expect(redis.calls.some(call => call.method === "send" && call.args[0] === "EVAL")).toBe(true);
+	});
+
 	it("create() warms the metadata index with STRLEN and never GETs full content", async () => {
 		redis.strings.set("omp:sessions:file:/sessions/p/huge.jsonl", "0123456789");
 		redis.hashes.set("omp:sessions:meta", new Map([["/sessions/p/huge.jsonl", String(Date.now())]]));
@@ -192,6 +247,45 @@ describe("RedisSessionStorage", () => {
 		expect(storage.statSync("/sessions/p/huge.jsonl").size).toBe(10);
 		expect(redis.calls.some(call => call.method === "get")).toBe(false);
 		expect(redis.calls.some(call => call.method === "strlen")).toBe(true);
+	});
+
+	it("persists title updates as indexed fields across storage reloads", async () => {
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const sessionPath = "/sessions/p/titled.jsonl";
+		const header = `${JSON.stringify({ type: "session", id: "s", timestamp: "t1", cwd: "/repo" })}\n`;
+		await storage.writeText(
+			sessionPath,
+			`${serializeTitleSlot({ title: "Old", source: "auto", updatedAt: "t1" })}${header}`,
+		);
+
+		await storage.updateSessionTitle(sessionPath, { title: "New", source: "user", updatedAt: "t2" });
+
+		expect(JSON.parse((await storage.readText(sessionPath)).split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
+		expect(JSON.parse((await storage.readTextSlices(sessionPath, 256, 0))[0].split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
+
+		const reloaded = await RedisSessionStorage.create({ client: redis });
+		expect(JSON.parse((await reloaded.readText(sessionPath)).split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
+		expect(JSON.parse((await reloaded.readTextSlices(sessionPath, 256, 0))[0].split("\n")[0])).toMatchObject({
+			type: "title",
+			title: "New",
+			source: "user",
+			updatedAt: "t2",
+		});
 	});
 
 	it("listFilesSync returns only direct children matching the glob", async () => {
@@ -221,11 +315,11 @@ describe("RedisSessionStorage", () => {
 		expect(c).toBeGreaterThan(b);
 	});
 
-	it("writer.writeLineSync appends to Redis after drain", async () => {
+	it("writer.append appends to Redis after drain", async () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		const writer = storage.openWriter("/sessions/p/session.jsonl");
-		writer.writeLineSync('{"type":"session"}\n');
-		writer.writeLineSync('{"type":"message"}\n');
+		await writer.append('{"type":"session"}\n');
+		await writer.append('{"type":"message"}\n');
 
 		// Reads await queued appends and fetch content from Redis.
 		expect(await storage.readText("/sessions/p/session.jsonl")).toBe('{"type":"session"}\n{"type":"message"}\n');
@@ -244,7 +338,7 @@ describe("RedisSessionStorage", () => {
 		await storage.writeText("/sessions/p/keep.jsonl", "old content\n");
 
 		const writer = storage.openWriter("/sessions/p/keep.jsonl", { flags: "w" });
-		writer.writeLineSync("fresh\n");
+		await writer.append("fresh\n");
 		await writer.close();
 
 		expect(await storage.readText("/sessions/p/keep.jsonl")).toBe("fresh\n");
@@ -255,7 +349,7 @@ describe("RedisSessionStorage", () => {
 		const storage = await RedisSessionStorage.create({ client: redis });
 		const writer = storage.openWriter("/sessions/p/fail.jsonl");
 		redis.failNext("append", new Error("redis exploded"));
-		writer.writeLineSync("doomed\n");
+		void writer.append("doomed\n").catch(() => {});
 
 		await expect(storage.drain()).rejects.toThrow("redis exploded");
 		expect(writer.getError()?.message).toBe("redis exploded");

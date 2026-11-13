@@ -1,21 +1,288 @@
 /**
  * Centralized logger for omp.
  *
- * Default: rotating `~/.omp/logs/omp.<DATE>.log`, no console output (writing
+ * Default: rotating `~/.omp/logs/omp.<DATE>.<PID>.log`, no console output (writing
  * to stdout/stderr would corrupt the TUI). Long-running headless services
  * (the auth broker, etc.) call {@link setTransports} to swap in a console
  * transport so a process supervisor (pm2, journald, k8s) captures the logs.
  *
  * Each entry includes `process.pid` so concurrent omp instances stay
- * traceable.
+ * traceable, and the fields of the enclosing {@link withContext} (a session's
+ * `sessionId`) so sessions sharing one process stay apart. The file is created
+ * on the first record written. Records are batched — one write per second or
+ * per 64 KiB — while `warn`/`error` records are written at once together with
+ * everything buffered before them; exit, fatal, and signal paths flush the
+ * rest. `OMP_LOG_LEVEL` optionally limits the levels written to the file
+ * (default: all).
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { isPromise } from "node:util/types";
-import winston from "winston";
-import DailyRotateFile from "winston-daily-rotate-file";
-import { getLogsDir } from "./dirs";
+import { getLogsDir, localDay } from "./dirs";
+import { RotatingFileSink } from "./logger/rotating-file";
+import { isPidAlive } from "./pid";
+import { setStderrRedirectTarget } from "./stderr-guard";
 import { drainModuleLoadEvents } from "./timing-buffer";
+import { isRecord } from "./type-guards";
+/** Severity names accepted by the centralized logger. */
+export type LogLevel = "error" | "warn" | "info" | "debug";
+
+/** Structured log event forwarded to out-of-band sinks such as OpenTelemetry. */
+export interface LogEvent {
+	readonly level: LogLevel;
+	readonly message: string;
+	readonly context: Record<string, unknown> | undefined;
+	readonly timestamp: Date;
+}
+
+/** Receives each structured log event after the local transport path runs. */
+export type LogSink = (event: LogEvent) => void;
+
+/**
+ * Destination that takes this thread's log records in place of its own
+ * transports and sinks (a worker thread routing records to the main thread's
+ * logger); see {@link setLogForwarder}.
+ */
+export interface LogForwarder {
+	/**
+	 * Take one record. Its context is already merged over the enclosing
+	 * {@link withContext} fields and reduced to plain JSON data, so it survives
+	 * a structured clone; `timestamp` is when the record was logged.
+	 */
+	emit(event: LogEvent): void;
+	/** Write every record emitted so far on the receiving side; backs {@link flush}. */
+	flush(): void;
+}
+
+const logSinks = new Set<LogSink>();
+
+/** Set by {@link setLogForwarder}: records go there instead of to local transports and sinks. */
+let logForwarder: LogForwarder | undefined;
+
+/**
+ * Route every later record logged on this thread to `forwarder` instead of the
+ * local transports and sinks, which then stay unused (no log file is opened);
+ * {@link flush} asks the forwarder to flush. `undefined` restores local logging.
+ * For worker threads, whose main thread owns the process log file.
+ */
+export function setLogForwarder(forwarder: LogForwarder | undefined): void {
+	logForwarder = forwarder;
+}
+
+/**
+ * Log a record another thread forwarded (see {@link setLogForwarder}): written
+ * to the local transports with its own timestamp, then handed to the sinks. Its
+ * context is taken as is; the caller's enclosing {@link withContext} is not
+ * merged in. On a thread that forwards itself, the record is forwarded on.
+ */
+export function emitForeign(event: LogEvent): void {
+	const forwarder = logForwarder;
+	if (forwarder) {
+		try {
+			forwarder.emit(event);
+		} catch {
+			// Forwarding is as best-effort as local writes.
+		}
+		return;
+	}
+	try {
+		emitLocally(event.level, event.message, event.context, event.timestamp);
+	} catch {
+		// Silently ignore logging failures
+	}
+	dispatchToSinks(event);
+}
+
+/** Forward one record logged on this thread; never throws. */
+function forwardRecord(
+	forwarder: LogForwarder,
+	level: LogLevel,
+	message: string,
+	context: Record<string, unknown> | undefined,
+): void {
+	try {
+		forwarder.emit({ level, message, context: forwardableContext(context), timestamp: new Date() });
+	} catch {
+		// Forwarding is as best-effort as local writes.
+	}
+}
+
+/**
+ * The call's context merged over the enclosing {@link withContext} fields (call
+ * fields win, as for sinks), as plain JSON data: errors become
+ * `{ name, message, stack, … }` exactly as in the log file. A context that
+ * cannot be serialized (a cycle, a bigint) is dropped from the record.
+ */
+function forwardableContext(context: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+	// An Error passed as the context carries its fields as non-enumerable properties.
+	let merged = context instanceof Error ? errorToRecord(context) : context;
+	const scoped = logContextStorage.getStore();
+	if (scoped) {
+		try {
+			merged = { ...scoped, ...merged };
+		} catch {
+			// A throwing getter must not turn a log call into a failure; keep the call's own fields.
+		}
+	}
+	if (merged === undefined) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(
+			mayContainError(merged) ? JSON.stringify(merged, jsonReplacer) : JSON.stringify(merged),
+		);
+		return isRecord(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Register an out-of-band log sink and return a disposer. */
+export function registerLogSink(sink: LogSink): () => void {
+	logSinks.add(sink);
+	return () => {
+		logSinks.delete(sink);
+	};
+}
+
+function emitToSinks(level: LogLevel, message: string, context: Record<string, unknown> | undefined): void {
+	if (logSinks.size === 0) return;
+	// The enclosing {@link withContext} fields reach sinks as they reach the file;
+	// call-site fields win, and a record outside any context keeps its own object.
+	const scoped = logContextStorage.getStore();
+	let merged = context;
+	if (scoped) {
+		try {
+			merged = { ...scoped, ...context };
+		} catch {
+			// A throwing getter must not turn a log call into a failure; sinks get the call's own fields.
+		}
+	}
+	dispatchToSinks({ level, message, context: merged, timestamp: new Date() });
+}
+
+function dispatchToSinks(event: LogEvent): void {
+	if (logSinks.size === 0) return;
+	for (const sink of logSinks) {
+		try {
+			sink(event);
+		} catch {
+			// Sinks are side channels; they must never break local logging.
+		}
+	}
+}
+
+const PROCESS_LOG_PATTERN = /^omp\.(\d{4}-\d{2}-\d{2})\.(\d+)\.log(?:\.(\d+))?$/;
+/** Per-process audit files written by earlier releases; current sinks track rotations in memory. */
+const PROCESS_AUDIT_PATTERN = /^\.omp\.(\d+)-audit\.json$/;
+/** Shared daily logs (plain, size-rolled, or gzipped) written by the winston-era logger. */
+const LEGACY_LOG_PATTERN = /^omp\.(\d{4}-\d{2}-\d{2})\.log(?:\.\d+)?(?:\.gz)?$/;
+/** Hash-named audit files written by winston-daily-rotate-file. */
+const LEGACY_AUDIT_PATTERN = /^\.[0-9a-f]{8,}-audit\.json$/;
+const RETAINED_STALE_LOGS_PER_PROCESS_DAY = 1;
+const RETAINED_STALE_LOG_DAYS = 5;
+
+/**
+ * Retain one newest completed-process log per process/day within the current
+ * and previous four local calendar days, remove completed-process audit files
+ * left by earlier releases, and age out legacy shared daily logs and their
+ * hash-named audits past the same window. Live PID namespaces are never
+ * touched. The calendar-day boundary preserves daily diagnostic coverage while
+ * bounding completed-process storage and scans.
+ */
+function pruneStaleProcessLogs(dir: string): void {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	const current = new Date();
+	const currentDate = localDay(current);
+	const cutoff = new Date(current);
+	cutoff.setDate(cutoff.getDate() - (RETAINED_STALE_LOG_DAYS - 1));
+	const cutoffDate = localDay(cutoff);
+	cutoff.setHours(0, 0, 0, 0);
+	const cutoffMs = cutoff.getTime();
+
+	const staleLogsByProcessDay = new Map<string, Array<{ path: string; rollover: number }>>();
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		const entryPath = path.join(dir, entry.name);
+		const legacyMatch = LEGACY_LOG_PATTERN.exec(entry.name);
+		if (legacyMatch?.[1]) {
+			if (legacyMatch[1] < cutoffDate) removeBestEffort(entryPath);
+			continue;
+		}
+		if (LEGACY_AUDIT_PATTERN.test(entry.name)) {
+			try {
+				if (fs.statSync(entryPath).mtimeMs < cutoffMs) removeBestEffort(entryPath);
+			} catch {
+				// Another process may have pruned the same legacy audit.
+			}
+			continue;
+		}
+		const logMatch = PROCESS_LOG_PATTERN.exec(entry.name);
+		const auditMatch = PROCESS_AUDIT_PATTERN.exec(entry.name);
+		const pidText = logMatch?.[2] ?? auditMatch?.[1];
+		if (!pidText || isPidAlive(Number(pidText))) continue;
+
+		if (auditMatch) {
+			removeBestEffort(entryPath);
+			continue;
+		}
+		if (!logMatch?.[1]) continue;
+		if (logMatch[1] < cutoffDate || logMatch[1] > currentDate) {
+			removeBestEffort(entryPath);
+			continue;
+		}
+
+		const key = `${pidText}:${logMatch[1]}`;
+		const staleLogs = staleLogsByProcessDay.get(key) ?? [];
+		staleLogs.push({
+			path: entryPath,
+			rollover: Number(logMatch[3] ?? 0),
+		});
+		staleLogsByProcessDay.set(key, staleLogs);
+	}
+
+	for (const staleLogs of staleLogsByProcessDay.values()) {
+		if (staleLogs.length <= RETAINED_STALE_LOGS_PER_PROCESS_DAY) continue;
+		const ranked: Array<{ path: string; mtimeMs: number; rollover: number }> = [];
+		for (const stale of staleLogs) {
+			try {
+				ranked.push({ ...stale, mtimeMs: fs.statSync(stale.path).mtimeMs });
+			} catch {
+				// Another process may have pruned the same stale namespace.
+			}
+		}
+		ranked.sort(
+			(a, b) => b.mtimeMs - a.mtimeMs || b.rollover - a.rollover || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
+		);
+		for (const stale of ranked.slice(RETAINED_STALE_LOGS_PER_PROCESS_DAY)) removeBestEffort(stale.path);
+	}
+}
+
+function removeBestEffort(filePath: string): void {
+	try {
+		fs.rmSync(filePath, { force: true });
+	} catch {
+		// Retention is best-effort; another process may have pruned the same file.
+	}
+}
+
+const scheduledPruneDirs = new Set<string>();
+
+/** Run shared retention only after logger construction has returned to the event loop. */
+function schedulePruneStaleProcessLogs(dir: string): void {
+	if (scheduledPruneDirs.has(dir)) return;
+	scheduledPruneDirs.add(dir);
+	const immediate = setImmediate(() => {
+		scheduledPruneDirs.delete(dir);
+		pruneStaleProcessLogs(dir);
+	});
+	immediate.unref();
+}
 
 /** Ensure a logs directory exists; return the resolved path. */
 function ensureDir(dir: string): string {
@@ -32,99 +299,255 @@ function ensureDir(dir: string): string {
  * forensic logs showed only an opaque empty object.
  */
 function jsonReplacer(_key: string, value: unknown): unknown {
-	if (value instanceof Error) {
-		const out: Record<string, unknown> = {
-			name: value.name,
-			message: value.message,
-			stack: value.stack,
-		};
-		// Preserve `.cause` and any custom enumerable fields the caller attached.
-		const errAsRecord = value as unknown as Record<string, unknown>;
-		for (const k in errAsRecord) out[k] = errAsRecord[k];
-		if (value.cause !== undefined) out.cause = value.cause;
-		return out;
+	return value instanceof Error ? errorToRecord(value) : value;
+}
+
+/** An Error's fields as a plain object: name, message, stack, enumerable extras, and `cause`. */
+function errorToRecord(value: Error): Record<string, unknown> {
+	const out: Record<string, unknown> = {
+		name: value.name,
+		message: value.message,
+		stack: value.stack,
+	};
+	// Preserve `.cause` and any custom enumerable fields the caller attached.
+	const errAsRecord = value as unknown as Record<string, unknown>;
+	for (const k in errAsRecord) out[k] = errAsRecord[k];
+	if (value.cause !== undefined) out.cause = value.cause;
+	return out;
+}
+
+// Values visited by the Error pre-scan before falling back to the replacer.
+const ERROR_SCAN_BUDGET = 128;
+
+/**
+ * Whether `value` may contain an {@link Error} that {@link jsonReplacer} must
+ * unwrap. Walks what `JSON.stringify` serializes (arrays and own enumerable
+ * keys); objects with a `toJSON` other than `Date` may return an Error, and an
+ * exhausted budget answers true.
+ */
+function mayContainError(root: unknown): boolean {
+	const stack: unknown[] = [root];
+	let budget = ERROR_SCAN_BUDGET;
+	while (stack.length > 0) {
+		const value = stack.pop();
+		if (value === null || typeof value !== "object") continue;
+		if (value instanceof Error) return true;
+		if (--budget < 0) return true;
+		if (value instanceof Date) continue;
+		if ("toJSON" in value && typeof value.toJSON === "function") return true;
+		for (const child of Object.values(value)) stack.push(child);
 	}
-	return value;
+	return false;
 }
 
-/** Custom format that includes pid and flattens metadata; built on first use. */
-let logFormat: winston.Logform.Format | undefined;
+function padTimestampPart(value: number, width = 2): string {
+	return String(value).padStart(width, "0");
+}
 
-function getLogFormat(): winston.Logform.Format {
-	logFormat ??= winston.format.combine(
-		winston.format.timestamp({ format: "YYYY-MM-DDTHH:mm:ss.SSSZ" }),
-		winston.format.printf(({ timestamp, level, message, ...meta }) => {
-			const entry: Record<string, unknown> = {
-				timestamp,
-				level,
-				pid: process.pid,
-				message,
-			};
-			// Flatten metadata into entry
-			for (const [key, value] of Object.entries(meta)) {
-				if (key !== "level" && key !== "timestamp" && key !== "message") {
-					entry[key] = value;
-				}
-			}
-			return JSON.stringify(entry, jsonReplacer);
-		}),
+function formatLocalTimestamp(date: Date): string {
+	const offsetMinutes = -date.getTimezoneOffset();
+	const absoluteOffset = Math.abs(offsetMinutes);
+	const offsetSign = offsetMinutes >= 0 ? "+" : "-";
+	return (
+		`${padTimestampPart(date.getFullYear(), 4)}-${padTimestampPart(date.getMonth() + 1)}-${padTimestampPart(date.getDate())}` +
+		`T${padTimestampPart(date.getHours())}:${padTimestampPart(date.getMinutes())}:${padTimestampPart(date.getSeconds())}` +
+		`.${padTimestampPart(date.getMilliseconds(), 3)}${offsetSign}${padTimestampPart(Math.floor(absoluteOffset / 60))}` +
+		`:${padTimestampPart(absoluteOffset % 60)}`
 	);
-	return logFormat;
 }
 
-/** Build a rotating file transport, materializing the target directory lazily. */
-function makeFileTransport(dir?: string): winston.transport {
-	return new DailyRotateFile({
-		dirname: ensureDir(dir ?? getLogsDir()),
-		filename: "omp.%DATE%.log",
-		datePattern: "YYYY-MM-DD",
-		maxSize: "10m",
-		maxFiles: 5,
-		zippedArchive: true,
-	});
-}
+const FORMAT_TOKEN_PATTERN = /%[scdjifoO%]/;
 
-function makeConsoleTransport(): winston.transport {
-	return new winston.transports.Console({ format: getLogFormat() });
+const logContextStorage = new AsyncLocalStorage<Readonly<Record<string, unknown>>>();
+
+/**
+ * Run `fn` with `context`'s fields on every record logged while it runs,
+ * including from the promises, timers and callbacks it starts. A nested call
+ * replaces the enclosing context, as a subagent's session replaces its
+ * parent's; a field passed to the log call itself wins. Fields are read as each
+ * record is written, so a getter stays current.
+ */
+export function withContext<T>(context: Readonly<Record<string, unknown>>, fn: () => T): T {
+	return logContextStorage.run(context, fn);
 }
 
 /**
- * Desired transport configuration, applied when the winston logger is built.
+ * Run `fn` outside any {@link withContext}: for process-wide work started on
+ * behalf of one caller, such as a shared server's read loop, whose later
+ * records belong to no single caller.
+ */
+export function withoutContext<T>(fn: () => T): T {
+	return logContextStorage.exit(fn);
+}
+
+/**
+ * Serialize one log record: timestamp, level, pid, message, then the `scoped`
+ * ({@link withContext}) fields and the context fields.
+ */
+function formatLogRecord(
+	level: LogLevel,
+	message: string,
+	context: Record<string, unknown> | undefined,
+	timestamp: string,
+	scoped: Readonly<Record<string, unknown>> | undefined,
+): string {
+	const metadata =
+		!FORMAT_TOKEN_PATTERN.test(message) && context !== null && typeof context === "object" ? context : undefined;
+	const entry: Record<string, unknown> = {
+		timestamp,
+		level,
+		pid: process.pid,
+		message: metadata?.message ? `${message} ${metadata.message}` : message,
+	};
+	if (scoped) {
+		for (const key of Object.keys(scoped)) {
+			if (key !== "level" && key !== "timestamp" && key !== "message") entry[key] = scoped[key];
+		}
+	}
+	if (metadata) {
+		for (const key of Object.keys(metadata)) {
+			if (key !== "level" && key !== "timestamp" && key !== "message") entry[key] = metadata[key];
+		}
+		// An Error passed as the context carries these as non-enumerable fields.
+		if (metadata.stack) entry.stack = metadata.stack;
+		if (metadata.cause) entry.cause = metadata.cause;
+	}
+	return mayContainError(entry) ? JSON.stringify(entry, jsonReplacer) : JSON.stringify(entry);
+}
+
+/** Longest a buffered file record waits before it is written. */
+const FILE_FLUSH_INTERVAL_MS = 1_000;
+/** Buffered bytes at which the file batch is written immediately. */
+const FILE_FLUSH_BYTES = 64 * 1024;
+
+let exitFlushInstalled = false;
+/** Set once the process is exiting: every later record is written immediately. */
+let exiting = false;
+
+function flushOnExit(): void {
+	exiting = true;
+	flush();
+}
+
+/** Build a rotating file sink with process-local rotation and shared retention. */
+function makeFileTransport(dir?: string): RotatingFileSink {
+	const logsDir = ensureDir(dir ?? getLogsDir());
+	schedulePruneStaleProcessLogs(logsDir);
+	if (!exitFlushInstalled) {
+		exitFlushInstalled = true;
+		// Natural exit and process.exit(); signal and fatal exits that bypass the
+		// `exit` event flush through postmortem's exitProcess().
+		process.on("exit", flushOnExit);
+	}
+	// The sink opens (and creates) its file on the first batch written.
+	return new RotatingFileSink({
+		directory: logsDir,
+		filenamePrefix: "omp",
+		filenameSuffix: String(process.pid),
+		maxBytes: 10 * 1024 * 1024,
+		maxFiles: 5,
+		batch: { intervalMs: FILE_FLUSH_INTERVAL_MS, maxBytes: FILE_FLUSH_BYTES },
+		// Keep the stderr guard's fd 2 on the file this sink is writing.
+		onRotate: setStderrRedirectTarget,
+	});
+}
+
+const LOG_LEVEL_RANK: Record<LogLevel, number> = { error: 0, warn: 1, info: 2, debug: 3 };
+/** `warn` and `error` records are written at once, with everything buffered before them. */
+const IMMEDIATE_FLUSH_RANK = LOG_LEVEL_RANK.warn;
+
+/**
+ * Rank of the most verbose level the file transport persists: `OMP_LOG_LEVEL`
+ * (error|warn|info|debug, case-insensitive), default `debug` (everything).
+ */
+function resolveFileLevelRank(): number {
+	const requested = process.env.OMP_LOG_LEVEL?.trim().toLowerCase();
+	return requested && Object.hasOwn(LOG_LEVEL_RANK, requested)
+		? LOG_LEVEL_RANK[requested as LogLevel]
+		: LOG_LEVEL_RANK.debug;
+}
+
+/**
+ * Write buffered file records to disk now. The file transport batches records
+ * (one write per second or per 64 KiB) and writes `warn`/`error` records
+ * immediately; process exit flushes on its own. Call this before handing the
+ * log file to something that reads it in-process. Never throws.
+ */
+export function flush(): void {
+	try {
+		if (logForwarder) logForwarder.flush();
+		else activeTransports?.file?.flush();
+	} catch {
+		// Flushing diagnostics must never mask the caller's own work or failure.
+	}
+}
+
+/**
+ * Desired transport configuration, applied when local logging is initialized.
  * Default: file ON (TUI-safe), console OFF.
  */
 let transportOpts: { console?: boolean; file?: boolean | string } = { file: true };
 
-/** The winston logger instance, created lazily on first log emission. */
-let winstonLogger: winston.Logger | undefined;
-
-function buildTransports(opts: { console?: boolean; file?: boolean | string }): winston.transport[] {
-	const transports: winston.transport[] = [];
-	if (opts.file) transports.push(makeFileTransport(typeof opts.file === "string" ? opts.file : undefined));
-	if (opts.console) transports.push(makeConsoleTransport());
-	return transports;
+interface LocalTransports {
+	readonly file: RotatingFileSink | undefined;
+	readonly console: boolean;
+	/** Rank of the most verbose level written to {@link file}. */
+	readonly fileLevelRank: number;
 }
 
-function getWinstonLogger(): winston.Logger {
-	winstonLogger ??= winston.createLogger({
-		level: "debug",
-		format: getLogFormat(),
-		transports: buildTransports(transportOpts),
-		// Don't exit on error - logging failures shouldn't crash the app
-		exitOnError: false,
-	});
-	return winstonLogger;
+/** Local transports, constructed lazily on first log emission. */
+let activeTransports: LocalTransports | undefined;
+
+function buildTransports(opts: { console?: boolean; file?: boolean | string }): LocalTransports {
+	return {
+		file: opts.file ? makeFileTransport(typeof opts.file === "string" ? opts.file : undefined) : undefined,
+		console: opts.console === true,
+		fileLevelRank: resolveFileLevelRank(),
+	};
+}
+
+function getLocalTransports(): LocalTransports {
+	activeTransports ??= buildTransports(transportOpts);
+	return activeTransports;
+}
+
+/**
+ * Write one record to the local transports. A `foreignTimestamp` marks a record
+ * another thread logged ({@link emitForeign}): it keeps that time and gets no
+ * {@link withContext} fields of this call stack, while the file still rotates by
+ * the current day so a late record cannot reopen an earlier day's file.
+ */
+function emitLocally(
+	level: LogLevel,
+	message: string,
+	context: Record<string, unknown> | undefined,
+	foreignTimestamp?: Date,
+): void {
+	const transports = getLocalTransports();
+	const rank = LOG_LEVEL_RANK[level];
+	const file = rank <= transports.fileLevelRank ? transports.file : undefined;
+	if (!file && !transports.console) return;
+	const now = new Date();
+	const scoped = foreignTimestamp ? undefined : logContextStorage.getStore();
+	const line = formatLogRecord(level, message, context, formatLocalTimestamp(foreignTimestamp ?? now), scoped);
+	file?.write(line, rank <= IMMEDIATE_FLUSH_RANK || exiting, localDay(now));
+	if (transports.console) fs.writeSync(1, `${line}${os.EOL}`);
 }
 
 /**
  * Replace the active log transports. Pass `console: true, file: false` for
  * long-running services (the auth broker, etc.) that want their structured
  * logs piped into a process supervisor instead of the rotating file.
+ * The previous file transport writes its buffered records before closing, and
+ * the file level (`OMP_LOG_LEVEL`) is re-read on each reconfiguration.
  */
 export function setTransports(opts: { console?: boolean; file?: boolean | string }): void {
 	transportOpts = opts;
-	if (!winstonLogger) return; // applied lazily when the logger is first built
-	winstonLogger.clear();
-	for (const transport of buildTransports(opts)) winstonLogger.add(transport);
+	if (!activeTransports) return; // applied lazily when local logging is first initialized
+	const previousTransports = activeTransports;
+	activeTransports = { file: undefined, console: false, fileLevelRank: previousTransports.fileLevelRank };
+	previousTransports.file?.close();
+	activeTransports = buildTransports(opts);
 }
 
 /**
@@ -133,11 +556,13 @@ export function setTransports(opts: { console?: boolean; file?: boolean | string
  * @param context - The context to log.
  */
 export function error(message: string, context?: Record<string, unknown>): void {
+	if (logForwarder) return forwardRecord(logForwarder, "error", message, context);
 	try {
-		getWinstonLogger().error(message, context);
+		emitLocally("error", message, context);
 	} catch {
 		// Silently ignore logging failures
 	}
+	emitToSinks("error", message, context);
 }
 
 /**
@@ -146,11 +571,13 @@ export function error(message: string, context?: Record<string, unknown>): void 
  * @param context - The context to log.
  */
 export function warn(message: string, context?: Record<string, unknown>): void {
+	if (logForwarder) return forwardRecord(logForwarder, "warn", message, context);
 	try {
-		getWinstonLogger().warn(message, context);
+		emitLocally("warn", message, context);
 	} catch {
 		// Silently ignore logging failures
 	}
+	emitToSinks("warn", message, context);
 }
 
 /**
@@ -159,11 +586,13 @@ export function warn(message: string, context?: Record<string, unknown>): void {
  * @param context - The context to log.
  */
 export function info(message: string, context?: Record<string, unknown>): void {
+	if (logForwarder) return forwardRecord(logForwarder, "info", message, context);
 	try {
-		getWinstonLogger().info(message, context);
+		emitLocally("info", message, context);
 	} catch {
 		// Silently ignore logging failures
 	}
+	emitToSinks("info", message, context);
 }
 
 /**
@@ -172,11 +601,13 @@ export function info(message: string, context?: Record<string, unknown>): void {
  * @param context - The context to log.
  */
 export function debug(message: string, context?: Record<string, unknown>): void {
+	if (logForwarder) return forwardRecord(logForwarder, "debug", message, context);
 	try {
-		getWinstonLogger().debug(message, context);
+		emitLocally("debug", message, context);
 	} catch {
 		// Silently ignore logging failures
 	}
+	emitToSinks("debug", message, context);
 }
 
 /**
@@ -457,7 +888,9 @@ function printSpan(span: Span, depth: number, lines: string[]): void {
 	const tag = parallel ? " [parallel]" : "";
 	const self = selfTimeOf(span);
 	const selfStr = span.children.length > 0 && self > LOGGED_TIMING_THRESHOLD_MS ? ` (self ${fmtMs(self)})` : "";
-	lines.push(`${indent}${span.op}: ${fmtMs(dur)}${selfStr}${tag}`);
+	// Start offset from process origin: gaps between consecutive siblings are
+	// the parent's own (unspanned) work, which duration alone cannot locate.
+	lines.push(`${indent}${span.op}: ${fmtMs(dur)}${selfStr}${tag} @${span.start.toFixed(0)}ms`);
 
 	// Split children into work spans and module-load spans for summarization.
 	const work: Span[] = [];

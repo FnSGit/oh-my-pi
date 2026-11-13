@@ -14,12 +14,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { execSync, spawn } from "node:child_process";
+import { isContextOverflow as originalIsContextOverflow } from "@oh-my-pi/pi-ai/error";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { AssistantMessage, Context, Model, Usage } from "@oh-my-pi/pi-ai/types";
-import { isContextOverflow } from "@oh-my-pi/pi-ai/utils/overflow";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $which } from "@oh-my-pi/pi-utils";
+
+function isContextOverflow(message: AssistantMessage, contextWindow: number | null): boolean {
+	return originalIsContextOverflow(message, contextWindow ?? 0);
+}
+
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -55,7 +60,7 @@ interface OverflowResult {
 }
 
 async function testContextOverflow(model: Model, apiKey: string): Promise<OverflowResult> {
-	const overflowContent = generateOverflowContent(model.contextWindow);
+	const overflowContent = generateOverflowContent(model.contextWindow ?? 0);
 
 	const context: Context = {
 		systemPrompt: ["You are a helpful assistant."],
@@ -75,7 +80,7 @@ async function testContextOverflow(model: Model, apiKey: string): Promise<Overfl
 	return {
 		provider: model.provider,
 		model: model.id,
-		contextWindow: model.contextWindow,
+		contextWindow: model.contextWindow ?? 0,
 		stopReason: response.stopReason,
 		errorMessage: response.errorMessage,
 		usage: response.usage,
@@ -197,6 +202,22 @@ async function discoverLmStudioModel(): Promise<LmStudioDiscoveredModel | undefi
 }
 
 const lmStudioModel = await discoverLmStudioModel();
+
+/**
+ * True when a llama.cpp server answers `/health` with 2xx. Any other listener on
+ * :8081 (e.g. a Jupyter server's 404) must not opt the suite into a live run.
+ */
+async function isLlamaCppHealthy(): Promise<boolean> {
+	if (!Bun.env.PI_LOCAL_LLM || Bun.env.PI_NO_LOCAL_LLM) return false;
+	try {
+		const response = await fetch("http://localhost:8081/health", { signal: AbortSignal.timeout(1000) });
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+const llamaCppHealthy = await isLlamaCppHealthy();
 // =============================================================================
 // Anthropic
 // Expected pattern: "prompt is too long: X tokens > Y maximum"
@@ -216,8 +237,8 @@ describe("Context overflow error handling", () => {
 	});
 
 	describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Anthropic (OAuth)", () => {
-		it("claude-sonnet-4 - should detect overflow via isContextOverflow", async () => {
-			const model = getBundledModel("anthropic", "claude-sonnet-4-20250514");
+		it("claude-sonnet-4-5 - should detect overflow via isContextOverflow", async () => {
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5-20250929");
 			const result = await testContextOverflow(model, e2eApiKey("ANTHROPIC_API_KEY")!);
 			logResult(result);
 
@@ -339,9 +360,9 @@ describe("Context overflow error handling", () => {
 	describe("Google Antigravity (OAuth)", () => {
 		// Gemini model
 		it.skipIf(!antigravityToken)(
-			"gemini-3-flash - should detect overflow via isContextOverflow",
+			"gemini-3.8-flash - should detect overflow via isContextOverflow",
 			async () => {
-				const model = getBundledModel("google-antigravity", "gemini-3-flash");
+				const model = getBundledModel("google-antigravity", "gemini-3.8-flash");
 				const result = await testContextOverflow(model, antigravityToken!);
 				logResult(result);
 
@@ -424,6 +445,24 @@ describe("Context overflow error handling", () => {
 	});
 
 	// =============================================================================
+	// Inception
+	// Expected pattern: "reduce the length of the messages" (code context_length_exceeded)
+	// =============================================================================
+
+	describe.skipIf(!e2eApiKey("INCEPTION_API_KEY"))("Inception", () => {
+		// Every Mercury model shares the error contract; mercury-2 has the smallest window.
+		it("mercury-2 - should detect overflow via isContextOverflow", async () => {
+			const model = getBundledModel("inception", "mercury-2");
+			const result = await testContextOverflow(model, Bun.env.INCEPTION_API_KEY!);
+			logResult(result);
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toMatch(/reduce the length of the messages/i);
+			expect(isContextOverflow(result.response, model.contextWindow)).toBe(true);
+		}, 120000);
+	});
+
+	// =============================================================================
 	// Cerebras
 	// Expected: 400/413 status code with no body
 	// =============================================================================
@@ -459,7 +498,7 @@ describe("Context overflow error handling", () => {
 			// Either way, isContextOverflow should detect it (via usage check or we skip if rate limited)
 			if (result.stopReason === "stop") {
 				expect(result.hasUsageData).toBe(true);
-				expect(result.usage.input).toBeGreaterThan(model.contextWindow);
+				expect(result.usage.input).toBeGreaterThan(model.contextWindow ?? 0);
 				expect(isContextOverflow(result.response, model.contextWindow)).toBe(true);
 			} else {
 				// Rate limited or other error - just log and pass
@@ -663,18 +702,10 @@ describe("Context overflow error handling", () => {
 	});
 
 	// =============================================================================
-	// llama.cpp server (local) - Skip if not running
+	// llama.cpp server (local) - requires PI_LOCAL_LLM=1 and a healthy server on :8081
 	// =============================================================================
 
-	let llamaCppRunning = false;
-	try {
-		execSync("curl -s --max-time 1 http://localhost:8081/health > /dev/null", { stdio: "ignore" });
-		llamaCppRunning = true;
-	} catch {
-		llamaCppRunning = false;
-	}
-
-	describe.skipIf(!llamaCppRunning)("llama.cpp (local)", () => {
+	describe.skipIf(!llamaCppHealthy)("llama.cpp (local)", () => {
 		it("should detect overflow via isContextOverflow", async () => {
 			// Using small context (4096) to match server --ctx-size setting
 			const model: Model<"openai-completions"> = buildModel({

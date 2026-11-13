@@ -8,14 +8,25 @@
  * may strip `search`-style markers and prefers cache-pricing-complete
  * references, both of which would be wrong for canonical coalescing.
  */
-import type { Api, Model } from "../types";
+import { collapseVocabulary, discoveryVocabulary } from "../compat/taxonomy";
+import type { Api, Model, ThinkingConfig } from "../types";
 import { getBracketStrippedModelIdCandidates, getLongestModelLikeIdSegment, getModelLikeIdSegments } from "./id";
-import { REFERENCE_TRAILING_MARKER_PATTERN } from "./markers";
-
 export interface ModelReferenceIndex {
 	exact: Map<string, Model<Api>>;
 	suffixAlias: Map<string, Model<Api>>;
 }
+
+const REFERENCE_MARKER_SUFFIXES = (() => {
+	const discovery = discoveryVocabulary();
+	const suffixes: string[] = [];
+	for (const marker of discovery.trailingMarkers) {
+		suffixes.push(`-${marker}`, `:${marker}`);
+	}
+	for (const marker of discovery.referenceOnlyTrailingMarkers) {
+		suffixes.push(`-${marker}`, `:${marker}`);
+	}
+	return suffixes;
+})();
 
 // xai-oauth subscription entries carry zero public pricing and inflated maxTokens;
 // keep them provider-local so they cannot outrank paid/public Grok references.
@@ -34,10 +45,10 @@ export function isZeroCostXaiOAuthReference(candidate: Model<Api>): boolean {
 function shouldReplaceReference(existing: Model<Api> | undefined, candidate: Model<Api>): boolean {
 	if (!existing) return true;
 	if (candidate.contextWindow !== existing.contextWindow) {
-		return candidate.contextWindow > existing.contextWindow;
+		return (candidate.contextWindow ?? 0) > (existing.contextWindow ?? 0);
 	}
 	if (candidate.maxTokens !== existing.maxTokens) {
-		return candidate.maxTokens > existing.maxTokens;
+		return (candidate.maxTokens ?? 0) > (existing.maxTokens ?? 0);
 	}
 	const existingHasCachePricing = existing.cost.cacheRead > 0 || existing.cost.cacheWrite > 0;
 	const candidateHasCachePricing = candidate.cost.cacheRead > 0 || candidate.cost.cacheWrite > 0;
@@ -89,11 +100,32 @@ function buildSuffixAliasMap(exactReferences: ReadonlyMap<string, Model<Api>>): 
 }
 
 function stripReferenceTrailingMarker(candidate: string): string | undefined {
-	const match = REFERENCE_TRAILING_MARKER_PATTERN.exec(candidate);
-	return match ? candidate.slice(0, match.index) : undefined;
+	const lower = candidate.toLowerCase();
+	let suffixLength = 0;
+	const discovery = discoveryVocabulary();
+	for (const suffix of discovery.billingVariantSuffixes) {
+		if (lower.endsWith(suffix) && suffix.length > suffixLength) suffixLength = suffix.length;
+	}
+	for (const suffix of REFERENCE_MARKER_SUFFIXES) {
+		if (lower.endsWith(suffix) && suffix.length > suffixLength) suffixLength = suffix.length;
+	}
+	const collapse = collapseVocabulary();
+	for (const rule of collapse.suffixes) {
+		if (lower.endsWith(rule.suffix) && rule.suffix.length > suffixLength) suffixLength = rule.suffix.length;
+	}
+	for (const rule of collapse.routingVariants) {
+		if (lower.endsWith(rule.suffix) && rule.suffix.length > suffixLength) suffixLength = rule.suffix.length;
+	}
+	return suffixLength > 0 && suffixLength < candidate.length ? candidate.slice(0, -suffixLength) : undefined;
 }
 
-function getReferenceCandidateIds(modelId: string): string[] {
+/**
+ * Expand a proxied/affixed model id into the ids it may be catalogued under,
+ * least-stripped first: bracket affixes, model-like segments, `:cloud`,
+ * namespace prefix, `:`→`-`, lowercase, and declared trailing markers.
+ * Shared by reference recovery and catalog-metric matching (`./metrics`).
+ */
+export function getReferenceCandidateIds(modelId: string): string[] {
 	const candidates = new Set<string>();
 	const queue = [modelId];
 	for (let index = 0; index < queue.length; index += 1) {
@@ -137,8 +169,27 @@ function getReferenceCandidateIds(modelId: string): string[] {
 	return [...candidates];
 }
 
+/**
+ * Inherit bundled reference thinking only for same-provider matches. Wire routing
+ * (`effortRouting`) is provider-specific; cross-provider inheritance can rewrite
+ * gateway ids (e.g. Portkey `@modal/GLM-5-2-FP8` → devin `glm-5-2`).
+ */
+export function inheritReferenceThinking(
+	modelThinking: ThinkingConfig | undefined,
+	reference: Pick<Model<Api>, "provider" | "thinking"> | undefined,
+	provider: string,
+): ThinkingConfig | undefined {
+	if (modelThinking !== undefined) return modelThinking;
+	if (!reference?.thinking) return undefined;
+	if (reference.provider !== provider) return undefined;
+	return reference.thinking;
+}
+
 /** Resolve a (possibly proxied/affixed) model id to its bundled upstream reference. */
 export function resolveModelReference(modelId: string, index: ModelReferenceIndex): Model<Api> | undefined {
+	// Portkey/gateway wire ids (`@provider/model`) are opaque; fuzzy matching would
+	// map them to unrelated bundled entries (e.g. `@modal/GLM-5-2-FP8` → devin/glm-5-2).
+	if (modelId.startsWith("@")) return undefined;
 	for (const candidate of getReferenceCandidateIds(modelId)) {
 		const key = normalizeReferenceKey(candidate);
 		const reference = index.exact.get(key) ?? index.suffixAlias.get(key);

@@ -19,7 +19,7 @@
 import { describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import type { Context } from "@oh-my-pi/pi-ai/types";
-import { buildOpenAICompat } from "@oh-my-pi/pi-catalog/compat/openai";
+import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { FetchImpl, Model, ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
@@ -44,7 +44,7 @@ describe("issue #2299 — NVIDIA NIM qwen thinking format", () => {
 			contextWindow: 262144,
 			reasoning: true,
 		};
-		const compat = buildOpenAICompat(spec);
+		const compat = resolveModelPolicy(spec).compat;
 		expect(compat.thinkingFormat).toBe("qwen-chat-template");
 	});
 
@@ -63,7 +63,7 @@ describe("issue #2299 — NVIDIA NIM qwen thinking format", () => {
 			contextWindow: 131072,
 			reasoning: true,
 		};
-		expect(buildOpenAICompat(dashscope).thinkingFormat).toBe("qwen");
+		expect(resolveModelPolicy(dashscope).compat.thinkingFormat).toBe("qwen");
 	});
 
 	it("emits chat_template_kwargs.enable_thinking — never top-level enable_thinking — on the wire", async () => {
@@ -98,5 +98,20 @@ describe("issue #2299 — NVIDIA NIM qwen thinking format", () => {
 		// official `qwen/qwen3.5-122b-a10b` docs example uses.
 		expect(parsed.enable_thinking).toBeUndefined();
 		expect(parsed.chat_template_kwargs).toEqual({ enable_thinking: true });
+	});
+});
+
+describe("issue #2299-adj — Fireworks Qwen thinking format", () => {
+	it("resolves the bundled Fireworks Qwen model to the openai thinking format (reasoning_effort)", () => {
+		// The raw 400 came from `fireworks/qwen3.7-plus`: Fireworks hosts Qwen3
+		// with controllable thinking via OpenAI-style `reasoning_effort`, and its
+		// strict request schema rejects the top-level `enable_thinking` boolean
+		// that Alibaba DashScope speaks. Pin the real bundled id/metadata that
+		// produced the failing request, not a synthetic spec.
+		const model = getBundledModel<"openai-completions">("fireworks", "qwen3.7-plus");
+		expect(model.provider).toBe("fireworks");
+		expect(model.baseUrl).toContain("fireworks.ai");
+		expect(model.compat.thinkingFormat).toBe("openai");
+		expect(model.compat.reasoningDisableMode).toBe("lowest-effort");
 	});
 });

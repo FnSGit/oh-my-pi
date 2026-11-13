@@ -1,157 +1,108 @@
-// Lazy registry of web search providers.
-//
-// Each provider is loaded on first use; importing this module loads zero
-// provider implementations. Provider modules are heavy (each pulls in
-// fetch/parse/format helpers) and only one — at most — is needed per session,
-// so eager construction was wasted work at startup.
-//
-// Provider modules are loaded lazily; display metadata lives in types.ts so UI
-// listings can share it without importing provider implementations.
-
-import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import type { WebSearchGrounding } from "@oh-my-pi/pi-catalog/types";
 import type { SearchProvider } from "./providers/base";
-import { SEARCH_PROVIDER_LABELS, SEARCH_PROVIDER_ORDER, type SearchProviderId } from "./types";
+import { getSearchProviderLabel, type SearchEngineId, SearchProviderError } from "./types";
 
 export type { SearchParams } from "./providers/base";
 export { SearchProvider } from "./providers/base";
-export { SEARCH_PROVIDER_ORDER } from "./types";
 
-interface ProviderMeta {
-	id: SearchProviderId;
-	label: string;
-	load: () => Promise<SearchProvider>;
-}
+/**
+ * Search-first-use boundary: every provider module (and its HTTP/MCP/browser
+ * dependencies) loads only when a search actually selects it, so the ~40
+ * provider modules stay out of interactive startup. Instances are memoized
+ * per id, matching the previous singleton-per-provider behavior.
+ */
+type ProviderLoader = () => Promise<SearchProvider>;
 
-/** Lazy factories. Each `load()` dynamic-imports its provider module on first call. */
-const PROVIDER_META: Record<SearchProviderId, ProviderMeta> = {
-	exa: {
-		id: "exa",
-		label: SEARCH_PROVIDER_LABELS.exa,
-		load: async () => new (await import("./providers/exa")).ExaProvider(),
-	},
-	brave: {
-		id: "brave",
-		label: SEARCH_PROVIDER_LABELS.brave,
-		load: async () => new (await import("./providers/brave")).BraveProvider(),
-	},
-	jina: {
-		id: "jina",
-		label: SEARCH_PROVIDER_LABELS.jina,
-		load: async () => new (await import("./providers/jina")).JinaProvider(),
-	},
-	perplexity: {
-		id: "perplexity",
-		label: SEARCH_PROVIDER_LABELS.perplexity,
-		load: async () => new (await import("./providers/perplexity")).PerplexityProvider(),
-	},
-	kimi: {
-		id: "kimi",
-		label: SEARCH_PROVIDER_LABELS.kimi,
-		load: async () => new (await import("./providers/kimi")).KimiProvider(),
-	},
-	zai: {
-		id: "zai",
-		label: SEARCH_PROVIDER_LABELS.zai,
-		load: async () => new (await import("./providers/zai")).ZaiProvider(),
-	},
-	anthropic: {
-		id: "anthropic",
-		label: SEARCH_PROVIDER_LABELS.anthropic,
-		load: async () => new (await import("./providers/anthropic")).AnthropicProvider(),
-	},
-	gemini: {
-		id: "gemini",
-		label: SEARCH_PROVIDER_LABELS.gemini,
-		load: async () => new (await import("./providers/gemini")).GeminiProvider(),
-	},
-	codex: {
-		id: "codex",
-		label: SEARCH_PROVIDER_LABELS.codex,
-		load: async () => new (await import("./providers/codex")).CodexProvider(),
-	},
-	tavily: {
-		id: "tavily",
-		label: SEARCH_PROVIDER_LABELS.tavily,
-		load: async () => new (await import("./providers/tavily")).TavilyProvider(),
-	},
-	parallel: {
-		id: "parallel",
-		label: SEARCH_PROVIDER_LABELS.parallel,
-		load: async () => new (await import("./providers/parallel")).ParallelProvider(),
-	},
-	kagi: {
-		id: "kagi",
-		label: SEARCH_PROVIDER_LABELS.kagi,
-		load: async () => new (await import("./providers/kagi")).KagiProvider(),
-	},
-	synthetic: {
-		id: "synthetic",
-		label: SEARCH_PROVIDER_LABELS.synthetic,
-		load: async () => new (await import("./providers/synthetic")).SyntheticProvider(),
-	},
-	searxng: {
-		id: "searxng",
-		label: SEARCH_PROVIDER_LABELS.searxng,
-		load: async () => new (await import("./providers/searxng")).SearXNGProvider(),
-	},
+type ProviderRegistry<TId extends string> = { [Id in TId]: ProviderLoader };
+
+const PROVIDER_LOADERS: ProviderRegistry<SearchEngineId> = {
+	perplexity: () => import("./providers/perplexity").then(m => new m.PerplexityProvider()),
+	zai: () => import("./providers/zai").then(m => new m.ZaiProvider()),
+	exa: () => import("./providers/exa").then(m => new m.ExaProvider()),
+	tinyfish: () => import("./providers/tinyfish").then(m => new m.TinyFishProvider()),
+	keenable: () => import("./providers/keenable").then(m => new m.KeenableProvider()),
+	sofya: () => import("./providers/sofya").then(m => new m.SofyaProvider()),
+	jina: () => import("./providers/jina").then(m => new m.JinaProvider()),
+	kagi: () => import("./providers/kagi").then(m => new m.KagiProvider()),
+	tavily: () => import("./providers/tavily").then(m => new m.TavilyProvider()),
+	firecrawl: () => import("./providers/firecrawl").then(m => new m.FirecrawlProvider()),
+	brave: () => import("./providers/brave").then(m => new m.BraveProvider()),
+	deepseek: () => import("./providers/deepseek").then(m => new m.DeepSeekProvider()),
+	kimi: () => import("./providers/kimi").then(m => new m.KimiProvider()),
+	parallel: () => import("./providers/parallel").then(m => new m.ParallelProvider()),
+	synthetic: () => import("./providers/synthetic").then(m => new m.SyntheticProvider()),
+	ollama: () => import("./providers/ollama").then(m => new m.OllamaProvider()),
+	searxng: () => import("./providers/searxng").then(m => new m.SearXNGProvider()),
+	duckduckgo: () => import("./providers/duckduckgo").then(m => new m.DuckDuckGoProvider()),
+	google: () => import("./providers/google").then(m => new m.GoogleProvider()),
+	ecosia: () => import("./providers/ecosia").then(m => new m.EcosiaProvider()),
+	startpage: () => import("./providers/startpage").then(m => new m.StartpageProvider()),
+	mojeek: () => import("./providers/mojeek").then(m => new m.MojeekProvider()),
+	public: () => import("./providers/public").then(m => new m.PublicWebProvider()),
+	hackernews: () => import("./providers/hackernews").then(m => new m.HackerNewsProvider()),
 };
 
-const instanceCache = new Map<SearchProviderId, SearchProvider>();
+const GROUNDED_PROVIDER_LOADERS: ProviderRegistry<WebSearchGrounding> = {
+	gemini: () => import("./providers/gemini").then(m => new m.GeminiProvider()),
+	anthropic: () => import("./providers/anthropic").then(m => new m.AnthropicProvider()),
+	codex: () => import("./providers/codex").then(m => new m.CodexProvider()),
+	xai: () => import("./providers/xai").then(m => new m.XAIProvider()),
+	openrouter: () => import("./providers/openrouter").then(m => new m.OpenRouterGroundedProvider()),
+	openai: () => import("./providers/openai").then(m => new m.OpenAIProvider()),
+};
 
-/** Cheap, sync metadata accessor — never triggers a provider load. */
-export function getSearchProviderLabel(id: SearchProviderId): string {
-	return PROVIDER_META[id]?.label ?? id;
-}
+const providerInstances = new Map<string, Promise<SearchProvider>>();
 
-/**
- * Resolve and cache a provider instance. First call for a given id loads the
- * underlying module; subsequent calls return the cached singleton.
- */
-export async function getSearchProvider(id: SearchProviderId): Promise<SearchProvider> {
-	const cached = instanceCache.get(id);
-	if (cached) return cached;
-	const meta = PROVIDER_META[id];
-	if (!meta) {
-		throw new Error(`Unknown search provider: ${id}`);
+function loadProvider(id: string, loader: ProviderLoader): Promise<SearchProvider> {
+	let instance = providerInstances.get(id);
+	if (!instance) {
+		instance = loader();
+		providerInstances.set(id, instance);
 	}
-	const provider = await meta.load();
-	instanceCache.set(id, provider);
-	return provider;
+	return instance;
 }
 
-/** Preferred provider set via settings (default: auto) */
-let preferredProvId: SearchProviderId | "auto" = "auto";
-
-/** Set the preferred web search provider from settings */
-export function setPreferredSearchProvider(provider: SearchProviderId | "auto"): void {
-	preferredProvId = provider;
+/** One candidate that failed during a search, in attempt order. */
+export interface SearchProviderFailure {
+	provider: { id: string; label: string };
+	error: unknown;
 }
 
-/**
- * Determine which providers are configured and currently available.
- * Each candidate is loaded (and its `isAvailable()` called) only as the chain
- * is walked, so unconfigured providers never pay the load cost.
- */
-export async function resolveProviderChain(
-	authStorage: AuthStorage,
-	preferredProvider: SearchProviderId | "auto" = preferredProvId,
-): Promise<SearchProvider[]> {
-	const providers: SearchProvider[] = [];
-
-	if (preferredProvider !== "auto") {
-		const provider = await getSearchProvider(preferredProvider);
-		if (await provider.isExplicitlyAvailable(authStorage)) {
-			providers.push(provider);
+/** Format one provider failure for the user-facing fallback summary. */
+export function formatSearchProviderFailure(error: unknown, provider: { id: string; label: string }): string {
+	if (error instanceof SearchProviderError) {
+		if (error.provider === "anthropic" && error.status === 404) {
+			return "Anthropic web search returned 404 (model or endpoint not found).";
 		}
-	}
-
-	for (const id of SEARCH_PROVIDER_ORDER) {
-		if (id === preferredProvider) continue;
-		const provider = await getSearchProvider(id);
-		if (await provider.isAvailable(authStorage)) {
-			providers.push(provider);
+		if (error.status === 401 || error.status === 403) {
+			if (error.provider === "zai") {
+				return error.message;
+			}
+			return `${getSearchProviderLabel(error.provider)} authorization failed (${error.status}). Check API key or base URL.`;
 		}
+		return error.message;
 	}
+	if (error instanceof Error) return error.message;
+	return `Unknown error from ${provider.label}`;
+}
 
-	return providers;
+/** Format the ordered provider fallback failures for terminal/tool output. */
+export function formatSearchProviderFailures(failures: readonly SearchProviderFailure[]): string {
+	return failures.map(f => `${f.provider.id}: ${formatSearchProviderFailure(f.error, f.provider)}`).join("; ");
+}
+
+/** Whether `id` names a pure search engine exposed as a `web/<id>` catalog model. */
+export function isRegisteredSearchEngine(id: string): id is SearchEngineId {
+	return Object.hasOwn(PROVIDER_LOADERS, id);
+}
+
+/** Resolve a pure search engine after validating its catalog model id. */
+export function getSearchProvider(id: string): Promise<SearchProvider> {
+	if (!isRegisteredSearchEngine(id)) return Promise.reject(new Error(`Unknown search provider: ${id}`));
+	return loadProvider(id, PROVIDER_LOADERS[id]);
+}
+
+/** Resolve the grounding backend declared by a selected chat model. */
+export function getGroundedSearchProvider(grounding: WebSearchGrounding): Promise<SearchProvider> {
+	return loadProvider(`grounded:${grounding}`, GROUNDED_PROVIDER_LOADERS[grounding]);
 }

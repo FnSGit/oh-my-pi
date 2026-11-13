@@ -1,13 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import {
 	classifySource,
 	fetchMarketplace,
 	parseMarketplaceCatalog,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 // Fixture lives at test/marketplace/fixtures/valid-marketplace/
 const FIXTURE_DIR = path.join(import.meta.dir, "fixtures", "valid-marketplace");
@@ -88,6 +89,33 @@ describe("parseMarketplaceCatalog", () => {
 		expect(catalog.plugins[0].name).toBe("hello-plugin");
 	});
 
+	it("parses a catalog whose name has uppercase letters (#10827)", () => {
+		const catalog = parseMarketplaceCatalog(
+			JSON.stringify({
+				name: "HexRaysSA",
+				owner: { name: "HexRaysSA" },
+				plugins: [{ name: "ida-mcp", source: "./plugins/ida-mcp" }],
+			}),
+			"/f.json",
+		);
+		expect(catalog.name).toBe("HexRaysSA");
+	});
+
+	it("skips plugin names that differ only by case to prevent cache collisions", () => {
+		const catalog = parseMarketplaceCatalog(
+			JSON.stringify({
+				name: "HexRaysSA",
+				owner: { name: "HexRaysSA" },
+				plugins: [
+					{ name: "IDA-MCP", source: "./plugins/ida-mcp" },
+					{ name: "ida-mcp", source: "./plugins/ida-mcp-lowercase" },
+				],
+			}),
+			"/f.json",
+		);
+		expect(catalog.plugins.map(plugin => plugin.name)).toEqual(["IDA-MCP"]);
+	});
+
 	it("throws on missing name", () => {
 		const bad = JSON.stringify({ owner: { name: "x" }, plugins: [] });
 		expect(() => parseMarketplaceCatalog(bad, "/f.json")).toThrow(/"name"/);
@@ -139,6 +167,23 @@ describe("parseMarketplaceCatalog", () => {
 		expect(catalog.plugins[0].name).toBe("p1");
 	});
 
+	it("keeps bare-name sources only when metadata.pluginRoot is set", () => {
+		const plugins = [
+			{ name: "bare", source: "formatter" },
+			{ name: "nested", source: "team-a/formatter" },
+		];
+		const withRoot = parseMarketplaceCatalog(
+			JSON.stringify({ name: "m", owner: { name: "x" }, metadata: { pluginRoot: "./plugins" }, plugins }),
+			"/f.json",
+		);
+		expect(withRoot.plugins.map(plugin => plugin.name)).toEqual(["bare"]);
+		const withoutRoot = parseMarketplaceCatalog(
+			JSON.stringify({ name: "m", owner: { name: "x" }, plugins }),
+			"/f.json",
+		);
+		expect(withoutRoot.plugins).toHaveLength(0);
+	});
+
 	it("throws on invalid JSON", () => {
 		expect(() => parseMarketplaceCatalog("{not json", "/f.json")).toThrow(
 			"Failed to parse marketplace catalog at /f.json",
@@ -156,7 +201,7 @@ describe("fetchMarketplace", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		removeSyncWithRetries(tmpDir);
 	});
 
 	it("resolves catalog from fixture directory", async () => {
@@ -174,29 +219,99 @@ describe("fetchMarketplace", () => {
 		await expect(fetchMarketplace(missing, tmpDir)).rejects.toThrow(/Marketplace catalog not found/);
 	});
 
-	it("throws a clear error for relative nonexistent path", async () => {
-		// Use a path that resolves within tmpDir but doesn't exist
-		const fakeSrc = path.join(tmpDir, "ghost-marketplace");
-		await expect(fetchMarketplace(fakeSrc, tmpDir)).rejects.toThrow(/Marketplace catalog not found/);
+	it("loads catalog from .omp-plugin/marketplace.json when present", async () => {
+		const root = path.join(tmpDir, "omp-only");
+		fs.mkdirSync(path.join(root, ".omp-plugin"), { recursive: true });
+		const catalog = {
+			name: "omp-only-marketplace",
+			owner: { name: "Test" },
+			plugins: [{ name: "omp-plugin", source: "./plugins/omp-plugin", description: "x" }],
+		};
+		fs.writeFileSync(path.join(root, ".omp-plugin", "marketplace.json"), JSON.stringify(catalog));
+
+		const result = await fetchMarketplace(root, tmpDir);
+		expect(result.catalog.name).toBe("omp-only-marketplace");
+		expect(result.catalog.plugins[0].name).toBe("omp-plugin");
 	});
 
-	// Network-dependent tests — skip in CI / offline environments.
-	// These verify real git clone and HTTP fetch error handling.
-	it.skip("github source throws on nonexistent repo", async () => {
-		await expect(fetchMarketplace("nonexistent-owner-xyz/nonexistent-repo-xyz", tmpDir)).rejects.toThrow(
-			/git clone failed/,
+	it("prefers .omp-plugin/marketplace.json over .claude-plugin/marketplace.json when both exist", async () => {
+		const root = path.join(tmpDir, "both-catalogs");
+		fs.mkdirSync(path.join(root, ".omp-plugin"), { recursive: true });
+		fs.mkdirSync(path.join(root, ".claude-plugin"), { recursive: true });
+		const ompCatalog = {
+			name: "from-omp-plugin",
+			owner: { name: "Test" },
+			plugins: [{ name: "p", source: "./p", description: "x" }],
+		};
+		const claudeCatalog = {
+			name: "from-claude-plugin",
+			owner: { name: "Test" },
+			plugins: [{ name: "p", source: "./p", description: "x" }],
+		};
+		fs.writeFileSync(path.join(root, ".omp-plugin", "marketplace.json"), JSON.stringify(ompCatalog));
+		fs.writeFileSync(path.join(root, ".claude-plugin", "marketplace.json"), JSON.stringify(claudeCatalog));
+
+		const result = await fetchMarketplace(root, tmpDir);
+		expect(result.catalog.name).toBe("from-omp-plugin");
+	});
+
+	it("error message names both candidate paths when neither exists", async () => {
+		const empty = path.join(tmpDir, "empty-dir");
+		fs.mkdirSync(empty, { recursive: true });
+		await expect(fetchMarketplace(empty, tmpDir)).rejects.toThrow(
+			/\.omp-plugin[\\/]marketplace\.json.*\.claude-plugin[\\/]marketplace\.json/,
 		);
 	});
 
-	it.skip("git source throws on nonexistent repo", async () => {
-		await expect(
-			fetchMarketplace("git@github.com:nonexistent-owner-xyz/nonexistent-repo-xyz.git", tmpDir),
-		).rejects.toThrow(/git clone failed/);
+	it("hides temp clone paths in cloned catalog validation errors", async () => {
+		const cloneSpy = spyOn(vcs, "clone").mockImplementation(async (_url, targetDir) => {
+			fs.mkdirSync(path.join(targetDir, ".claude-plugin"), { recursive: true });
+			fs.writeFileSync(
+				path.join(targetDir, ".claude-plugin", "marketplace.json"),
+				JSON.stringify({ name: "broken-marketplace", plugins: [] }),
+			);
+		});
+
+		try {
+			await expect(fetchMarketplace("kubeshark/kubeshark", tmpDir)).rejects.toThrow(
+				'Cloned repository https://github.com/kubeshark/kubeshark.git: Missing or invalid field "owner" in catalog: .claude-plugin/marketplace.json (source: kubeshark/kubeshark)',
+			);
+		} finally {
+			cloneSpy.mockRestore();
+		}
 	});
 
-	it.skip("url source throws on non-2xx response", async () => {
-		await expect(fetchMarketplace("https://example.com/nonexistent-catalog-xyz.json", tmpDir)).rejects.toThrow(
-			/HTTP [45]\d\d/,
-		);
+	it("removes a partial checkout when cloning fails", async () => {
+		const cloneSpy = spyOn(vcs, "clone").mockImplementation(async (_url, targetDir) => {
+			fs.writeFileSync(path.join(targetDir, "partial"), "unfinished");
+			throw new Error("clone failed");
+		});
+		try {
+			await expect(fetchMarketplace("owner/repo", tmpDir)).rejects.toThrow("clone failed");
+			expect(fs.readdirSync(tmpDir)).toEqual([]);
+		} finally {
+			cloneSpy.mockRestore();
+		}
+	});
+
+	it("keeps simultaneous clone checkouts isolated", async () => {
+		const cloneSpy = spyOn(vcs, "clone").mockImplementation(async (_url, targetDir) => {
+			fs.mkdirSync(path.join(targetDir, ".omp-plugin"));
+			fs.writeFileSync(
+				path.join(targetDir, ".omp-plugin", "marketplace.json"),
+				JSON.stringify({ name: "test-marketplace", owner: { name: "Test" }, plugins: [] }),
+			);
+		});
+		try {
+			const [first, second] = await Promise.all([
+				fetchMarketplace("owner/repo", tmpDir),
+				fetchMarketplace("owner/repo", tmpDir),
+			]);
+			expect(first.clonePath).not.toBe(second.clonePath);
+			expect(fs.existsSync(path.join(first.clonePath!, ".omp-plugin", "marketplace.json"))).toBe(true);
+			expect(fs.existsSync(path.join(second.clonePath!, ".omp-plugin", "marketplace.json"))).toBe(true);
+		} finally {
+			cloneSpy.mockRestore();
+		}
 	});
 });

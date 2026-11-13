@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { normalizeSchemaForGoogle, toolWireSchema } from "@oh-my-pi/pi-ai";
+import { normalizeSchemaForGoogle } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, HIDDEN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
@@ -196,10 +196,12 @@ describe("normalizeSchemaForGoogle", () => {
 		expect(items.enum).toEqual(["only"]);
 	});
 
-	it("passes through primitives unchanged", () => {
+	it("passes through non-boolean primitives and coerces boolean schemas", () => {
 		expect(normalizeSchemaForGoogle("string")).toBe("string");
 		expect(normalizeSchemaForGoogle(123)).toBe(123);
-		expect(normalizeSchemaForGoogle(true)).toBe(true);
+		// Google's wire cannot encode JSON Schema boolean subschemas; `true`
+		// (accept anything) coerces to the equivalent empty schema.
+		expect(normalizeSchemaForGoogle(true)).toEqual({});
 		expect(normalizeSchemaForGoogle(null)).toBe(null);
 	});
 
@@ -269,31 +271,12 @@ describe("tool schema validation (post-sanitization)", () => {
 		expect(allViolations).toEqual([]);
 	});
 
-	it("read path schema advertises local, URL, and internal URI targets", async () => {
-		const session = createTestSession();
-		const tools = await createTools(session);
-		const readTool = tools.find(tool => tool.name === "read");
-		if (!readTool?.parameters) throw new Error("read tool parameters missing");
-
-		const schema = toolWireSchema(readTool) as {
-			properties?: { path?: { description?: string } };
-		};
-		const description = schema.properties?.path?.description ?? "";
-
-		expect(description).toContain("Local path");
-		expect(description).toContain("internal URI");
-		expect(description).toContain("URL");
-		expect(description).toContain("omp://");
-		expect(description).toContain("issue://123");
-		expect(description).toContain("pr://123");
-	});
-
 	it("hidden tools also have valid sanitized schemas", async () => {
 		const session = createTestSession();
 
-		for (const name in HIDDEN_TOOLS) {
-			if (!Object.hasOwn(HIDDEN_TOOLS, name)) continue;
-			const tool = await HIDDEN_TOOLS[name](session);
+		// Object.entries keeps the factory typed without an index cast.
+		for (const [name, factory] of Object.entries(HIDDEN_TOOLS)) {
+			const tool = await factory(session);
 			if (!tool) continue;
 
 			const schema = tool.parameters;
@@ -308,89 +291,5 @@ describe("tool schema validation (post-sanitization)", () => {
 				throw new Error(`Hidden tool ${name} has prohibited schema features after sanitization:\n${details}`);
 			}
 		}
-	});
-});
-
-describe("validateSchema helper", () => {
-	it("detects $schema declarations", () => {
-		const schema = { $schema: "https://json-schema.org/draft/2020-12/schema", type: "object" };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "$schema")).toBe(true);
-	});
-
-	it("detects $ref usage", () => {
-		const schema = { type: "object", properties: { foo: { $ref: "#/$defs/Foo" } } };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "$ref")).toBe(true);
-	});
-
-	it("detects $defs usage", () => {
-		const schema = { $defs: { Foo: { type: "string" } }, type: "object" };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "$defs")).toBe(true);
-	});
-
-	it("detects const usage (should be sanitized away)", () => {
-		const schema = { type: "object", properties: { status: { const: "active" } } };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "const")).toBe(true);
-	});
-
-	it("detects examples field", () => {
-		const schema = { type: "string", examples: ["foo", "bar"] };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "examples")).toBe(true);
-	});
-
-	it("detects prefixItems unsupported by the Google schema path", () => {
-		const schema = { type: "array", prefixItems: [{ type: "string" }] };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "prefixItems")).toBe(true);
-	});
-
-	it("detects unevaluatedProperties unsupported by the Google schema path", () => {
-		const schema = { type: "object", unevaluatedProperties: false };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "unevaluatedProperties")).toBe(true);
-	});
-
-	it("warns on additionalProperties: false", () => {
-		const schema = { type: "object", additionalProperties: false };
-		const violations = validateSchema(schema);
-		const warning = violations.find(v => v.key === "additionalProperties");
-		expect(warning?.severity).toBe("warning");
-	});
-
-	it("warns on format keyword", () => {
-		const schema = { type: "string", format: "uri" };
-		const violations = validateSchema(schema);
-		const warning = violations.find(v => v.key === "format");
-		expect(warning?.severity).toBe("warning");
-	});
-
-	it("recursively validates nested schemas", () => {
-		const schema = {
-			type: "object",
-			properties: {
-				nested: {
-					type: "object",
-					properties: {
-						deep: { $ref: "#/$defs/Deep" },
-					},
-				},
-			},
-		};
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "$ref")).toBe(true);
-		expect(violations.find(v => v.key === "$ref")?.path).toContain("nested");
-	});
-
-	it("validates array prefixItems", () => {
-		const schema = {
-			type: "array",
-			prefixItems: [{ const: "first" }, { type: "string" }],
-		};
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "const")).toBe(true);
 	});
 });

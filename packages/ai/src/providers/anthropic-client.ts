@@ -21,14 +21,21 @@
  *   with up to 25% jitter).
  */
 import { scheduler } from "node:timers/promises";
-import { ProviderHttpError } from "../errors";
+import * as AIError from "../error";
+import { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError } from "../error";
+
+export { AnthropicApiError, AnthropicConnectionError, AnthropicConnectionTimeoutError };
+
 import type { FetchImpl } from "../types";
-import type { MessageCreateParamsStreaming } from "./anthropic-wire";
+import { getShouldRetryFromHeaders } from "../utils/retry-after";
+import type { MessageCreateParams } from "./anthropic-wire";
 
 /** Default pre-response timeout, matching the SDK's 10-minute default. */
 const DEFAULT_TIMEOUT_MS = 600_000;
 /** Default retry budget, matching the SDK's default. */
 const DEFAULT_MAX_RETRIES = 2;
+/** Endpoint every request targets when the caller supplies no `baseURL`. */
+const DEFAULT_BASE_URL = "https://api.anthropic.com";
 const INITIAL_RETRY_DELAY_S = 0.5;
 const MAX_RETRY_DELAY_S = 8;
 
@@ -39,6 +46,14 @@ export interface AnthropicRequestOptions {
 	timeout?: number;
 	/** Per-request retry budget override. */
 	maxRetries?: number;
+	/**
+	 * Maximum delay in milliseconds to wait for a server-directed retry. If the
+	 * server's `retry-after` hint exceeds this value, the retry is declined and
+	 * the original error is surfaced. Non-positive values disable the cap. Defaults to 60000.
+	 */
+	maxRetryDelayMs?: number;
+	/** Per-request headers merged after client defaults. */
+	headers?: Record<string, string>;
 }
 
 /**
@@ -57,6 +72,8 @@ export type AnthropicFetchOptions = RequestInit & {
 		cert?: string;
 		key?: string;
 	};
+	/** Bun extension: see {@link FetchWithRetryOptions.timeout} — `false` disables Bun's native fetch TTFT timeout (issue #2422). */
+	timeout?: number | false;
 };
 
 export interface AnthropicClientOptions {
@@ -66,6 +83,12 @@ export interface AnthropicClientOptions {
 	authToken?: string | null;
 	baseURL?: string | null;
 	maxRetries?: number;
+	/**
+	 * Maximum delay in milliseconds to wait for a server-directed retry. If the
+	 * server's `retry-after` hint exceeds this value, the retry is declined and
+	 * the original error is surfaced. Non-positive values disable the cap. Defaults to 60000.
+	 */
+	maxRetryDelayMs?: number;
 	/** Pre-response timeout in milliseconds. Defaults to 10 minutes. */
 	timeout?: number;
 	defaultHeaders?: Record<string, string>;
@@ -73,55 +96,22 @@ export interface AnthropicClientOptions {
 	fetchOptions?: AnthropicFetchOptions;
 }
 
-/** Non-2xx response from the Anthropic API. */
-export class AnthropicApiError extends ProviderHttpError {
-	declare readonly headers: Headers;
-	readonly requestId: string | null;
-
-	constructor(status: number, message: string, headers: Headers) {
-		super(message, status, { headers });
-		this.name = "AnthropicApiError";
-		this.requestId = headers.get("request-id");
-	}
-
-	static async fromResponse(response: Response): Promise<AnthropicApiError> {
-		const body = await response.text().catch(() => "");
-		const detail = body.trim() || "status code (no body)";
-		return new AnthropicApiError(response.status, `${response.status} ${detail}`, response.headers);
-	}
-}
-
-/** Network-level failure (DNS, TLS, socket reset) after retries were exhausted. */
-export class AnthropicConnectionError extends Error {
-	constructor(cause: unknown) {
-		super("Connection error.", { cause });
-		this.name = "AnthropicConnectionError";
-	}
-}
-
-/** No response headers arrived within the configured request timeout. */
-export class AnthropicConnectionTimeoutError extends Error {
-	constructor() {
-		super("Request timed out.");
-		this.name = "AnthropicConnectionTimeoutError";
-	}
-}
-
 function createAbortError(): Error {
-	return new Error("Request was aborted.");
+	return new AIError.AbortError("Request was aborted.");
 }
 
 /** `x-should-retry` override, then 408/409/429/5xx. */
 function shouldRetryResponse(response: Response): boolean {
-	const shouldRetryHeader = response.headers.get("x-should-retry");
-	if (shouldRetryHeader === "true") return true;
-	if (shouldRetryHeader === "false") return false;
+	const verdict = getShouldRetryFromHeaders(response.headers);
+	if (verdict !== undefined) return verdict;
 	const status = response.status;
-	return status === 408 || status === 409 || status === 429 || status >= 500;
+	// Canonical transient set (408/429/5xx) plus 409, which Anthropic's client
+	// also retries.
+	return AIError.isTransientStatus(status) || status === 409;
 }
 
 /** Server-suggested delay (`retry-after-ms`, then `retry-after` seconds or HTTP date). */
-export function retryDelayFromHeaders(headers: Headers | undefined): number | undefined {
+export function retryDelayFromHeaders(headers: Pick<Headers, "get"> | undefined): number | undefined {
 	if (!headers) return undefined;
 	const retryAfterMs = headers.get("retry-after-ms");
 	if (retryAfterMs) {
@@ -185,7 +175,7 @@ export class AnthropicMessages {
 		this.#path = path;
 	}
 
-	create(params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): AnthropicApiRequest {
+	create(params: MessageCreateParams, options?: AnthropicRequestOptions): AnthropicApiRequest {
 		return this.#client.request(this.#path, params, options);
 	}
 }
@@ -196,26 +186,48 @@ export class AnthropicMessages {
  * alternative Messages-API client via `AnthropicOptions.client`.
  */
 export interface AnthropicMessagesClientLike {
-	messages: { create(params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): unknown };
-	beta?: { messages: { create(params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): unknown } };
+	messages: { create(params: MessageCreateParams, options?: AnthropicRequestOptions): unknown };
+	beta?: { messages: { create(params: MessageCreateParams, options?: AnthropicRequestOptions): unknown } };
+	/**
+	 * Endpoint the client targets, when it exposes one. SDK-style clients
+	 * (`Anthropic`, `AnthropicVertex`) and {@link AnthropicMessagesClient}
+	 * publish it; a client that exposes none keeps its transport opaque, and the
+	 * provider must not assume the model's own routing on its behalf.
+	 */
+	baseURL?: string;
 }
 
 export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 	readonly messages: AnthropicMessages;
 	readonly beta: { readonly messages: AnthropicMessages };
-	#options: AnthropicClientOptions;
+	#http: AnthropicHttpClient;
+	/** Endpoint shared with the HTTP transport. */
+	get baseURL(): string {
+		return this.#http.baseURL;
+	}
 
 	constructor(options: AnthropicClientOptions) {
-		this.#options = options;
+		this.#http = new AnthropicHttpClient(options);
 		this.messages = new AnthropicMessages(this, "/v1/messages");
 		this.beta = { messages: new AnthropicMessages(this, "/v1/messages?beta=true") };
 	}
 
-	request(path: string, params: MessageCreateParamsStreaming, options?: AnthropicRequestOptions): AnthropicApiRequest {
-		return new AnthropicApiRequest(() => this.#send(path, params, options));
+	request(path: string, params: MessageCreateParams, options?: AnthropicRequestOptions): AnthropicApiRequest {
+		return new AnthropicApiRequest(() => this.#http.request("POST", path, params, options));
+	}
+}
+
+/** Shared Anthropic HTTP transport for Messages and resource APIs. */
+export class AnthropicHttpClient {
+	#options: AnthropicClientOptions;
+	readonly baseURL: string;
+
+	constructor(options: AnthropicClientOptions) {
+		this.#options = options;
+		this.baseURL = options.baseURL ?? DEFAULT_BASE_URL;
 	}
 
-	#buildHeaders(): Record<string, string> {
+	#buildHeaders(requestHeaders?: Record<string, string>): Record<string, string> {
 		const opts = this.#options;
 		const defaults = opts.defaultHeaders ?? {};
 		const headers: Record<string, string> = {};
@@ -226,12 +238,21 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 			headers.Authorization = `Bearer ${opts.authToken}`;
 		}
 		Object.assign(headers, defaults);
+		if (requestHeaders) {
+			for (const key in requestHeaders) {
+				for (const existing in headers) {
+					if (existing !== key && existing.toLowerCase() === key.toLowerCase()) delete headers[existing];
+				}
+				headers[key] = requestHeaders[key];
+			}
+		}
 		return headers;
 	}
 
-	async #send(
+	async request(
+		method: "GET" | "POST",
 		path: string,
-		params: MessageCreateParamsStreaming,
+		params?: unknown,
 		options?: AnthropicRequestOptions,
 	): Promise<Response> {
 		const opts = this.#options;
@@ -239,42 +260,53 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 		const callerSignal = options?.signal;
 		const timeoutMs = options?.timeout ?? opts.timeout ?? DEFAULT_TIMEOUT_MS;
 		const maxRetries = Math.max(0, options?.maxRetries ?? opts.maxRetries ?? DEFAULT_MAX_RETRIES);
-		const url = `${opts.baseURL ?? "https://api.anthropic.com"}${path}`;
-		const headers = this.#buildHeaders();
-		const body = JSON.stringify(params);
+		const maxRetryDelayMs = options?.maxRetryDelayMs ?? opts.maxRetryDelayMs ?? 60_000;
+		const url = `${this.baseURL}${path}`;
+		const headers = this.#buildHeaders(options?.headers);
+		const body = params === undefined ? undefined : JSON.stringify(params);
 
 		for (let attempt = 0; ; attempt++) {
 			if (callerSignal?.aborted) throw createAbortError();
 
 			let response: Response;
 			try {
-				response = await this.#fetchOnce(fetchFn, url, headers, body, timeoutMs, callerSignal);
+				response = await this.#fetchOnce(fetchFn, url, method, headers, body, timeoutMs, callerSignal);
 			} catch (error) {
 				if (callerSignal?.aborted) throw createAbortError();
 				if (attempt < maxRetries) {
 					await this.#backoff(attempt, undefined, callerSignal);
 					continue;
 				}
-				if (error instanceof AnthropicConnectionTimeoutError) throw error;
-				throw new AnthropicConnectionError(error);
+				if (error instanceof AIError.AnthropicConnectionTimeoutError) throw error;
+				throw new AIError.AnthropicConnectionError(error, url);
 			}
 
 			if (response.ok) return response;
 
 			if (attempt < maxRetries && shouldRetryResponse(response)) {
+				// Bound the server-directed wait: an over-cap `retry-after` declines
+				// the retry and surfaces the original error (status/body/headers
+				// intact) so higher-level recovery can run. A non-positive cap disables enforcement.
+				// Checked before draining the body so `fromResponse` can still read it.
+				const headerDelayMs = retryDelayFromHeaders(response.headers);
+				if (headerDelayMs !== undefined && maxRetryDelayMs > 0 && headerDelayMs > maxRetryDelayMs) {
+					throw await AIError.AnthropicApiError.fromResponse(response, callerSignal);
+				}
 				await response.body?.cancel().catch(() => {});
 				await this.#backoff(attempt, response.headers, callerSignal);
 				continue;
 			}
-			throw await AnthropicApiError.fromResponse(response);
+
+			throw await AIError.AnthropicApiError.fromResponse(response, callerSignal);
 		}
 	}
 
 	async #fetchOnce(
 		fetchFn: FetchImpl,
 		url: string,
+		method: "GET" | "POST",
 		headers: Record<string, string>,
-		body: string,
+		body: string | undefined,
 		timeoutMs: number,
 		callerSignal: AbortSignal | undefined,
 	): Promise<Response> {
@@ -288,14 +320,14 @@ export class AnthropicMessagesClient implements AnthropicMessagesClientLike {
 		callerSignal?.addEventListener("abort", onAbort, { once: true });
 		try {
 			return await fetchFn(url, {
-				...(this.#options.fetchOptions ?? {}),
-				method: "POST",
+				...this.#options.fetchOptions,
+				method,
 				headers,
 				body,
 				signal: controller.signal,
 			});
 		} catch (error) {
-			if (timedOut && !callerSignal?.aborted) throw new AnthropicConnectionTimeoutError();
+			if (timedOut && !callerSignal?.aborted) throw new AIError.AnthropicConnectionTimeoutError();
 			throw error;
 		} finally {
 			clearTimeout(timer);

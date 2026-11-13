@@ -3,12 +3,26 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
+import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { networkFailureMessage } from "@oh-my-pi/pi-ai/error";
+import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import {
+	calculateCost,
+	getBundledModel,
+	getBundledModels,
+	getBundledProviders,
+	modelsAreEqual,
+} from "@oh-my-pi/pi-catalog/models";
+import { Type as TypeBoxShimType } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-typebox";
+import { isRetryableAssistantError } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import {
 	__resetLegacyPiResolutionCache,
 	installLegacyPiSpecifierShim,
 	loadLegacyPiModule,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
-import { Type as TypeBoxShimType } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 // pi-ai 15.1.0 removed the runtime `Type` export from `@oh-my-pi/pi-ai`'s
 // package root. Legacy extensions (and their aliased-scope variants such as
@@ -20,15 +34,21 @@ import { Type as TypeBoxShimType } from "@oh-my-pi/pi-coding-agent/extensibility
 // `@sinclair/typebox` is served from.
 installLegacyPiSpecifierShim();
 
+// Use a unique API name as well as a unique source ID: registrations are keyed
+// by API name, so registering the shared `mock` API would replace another
+// suite's module-scoped owner before source-scoped cleanup could run.
+const COMPLETE_API = "legacy-pi-ai-type-remap-complete";
+const COMPLETE_API_SOURCE_ID = "legacy-pi-ai-type-remap.test";
 const tempRoots: string[] = [];
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	unregisterCustomApis(COMPLETE_API_SOURCE_ID);
 });
 
 afterAll(async () => {
 	for (const dir of tempRoots) {
-		await fs.rm(dir, { recursive: true, force: true });
+		await removeWithRetries(dir);
 	}
 });
 
@@ -70,38 +90,102 @@ describe("legacy-pi @(scope)/pi-ai root `Type` remap (issue #1437)", () => {
 		expect(loaded.probe).toBe(TypeBoxShimType);
 	});
 
-	it("preserves canonical pi-ai exports alongside the shimmed Type (z is still re-exported)", async () => {
-		const entry = await writeFixtureExtension(
-			[
-				'import { Type, z } from "@earendil-works/pi-ai";',
-				"export const obj = Type.Object({ name: Type.String() });",
-				"export const zodObj = z.object({ name: z.string() });",
-			].join("\n"),
-		);
-
-		const loaded = (await loadLegacyPiModule(entry)) as {
-			obj: { safeParse: (input: unknown) => { success: boolean } };
-			zodObj: { safeParse: (input: unknown) => { success: boolean } };
-		};
-
-		expect(loaded.obj.safeParse({ name: "ok" }).success).toBe(true);
-		expect(loaded.zodObj.safeParse({ name: "ok" }).success).toBe(true);
-		expect(loaded.zodObj.safeParse({}).success).toBe(false);
-	});
-
 	it("does not redirect subpath imports such as @oh-my-pi/pi-ai/utils/schema", async () => {
 		const entry = await writeFixtureExtension(
 			[
-				// `zodToWireSchema` is only exported from the subpath, not the root,
+				// `arkToWireSchema` is only exported from the subpath, not the root,
 				// so a successful import proves the subpath still resolves directly
 				// against the bundled pi-ai package rather than the shim.
-				'import { zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";',
-				"export const fn = zodToWireSchema;",
+				'import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";',
+				"export const fn = arkToWireSchema;",
 			].join("\n"),
 		);
 
 		const loaded = (await loadLegacyPiModule(entry)) as { fn: unknown };
 		expect(typeof loaded.fn).toBe("function");
+	});
+
+	it("re-exports the legacy model catalog and schema helpers from the root", async () => {
+		const loaded = (await loadLegacyPiModule(
+			await writeFixtureExtension(
+				[
+					'import { calculateCost, clampThinkingLevel, getBundledModel, getBundledModels, getBundledProviders, getModel, getModels, modelsAreEqual, StringEnum } from "@oh-my-pi/pi-ai";',
+					"export const helpers = { calculateCost, getBundledModel, getBundledModels, getBundledProviders, getModel, getModels, modelsAreEqual };",
+					"export const supported = clampThinkingLevel({ reasoning: true, thinking: { efforts: ['low', 'high'] } }, 'high');",
+					"export const disabled = clampThinkingLevel({ reasoning: false }, 'high');",
+					'export const schema = StringEnum(["red", "green"] as const, { description: "primary colors" });',
+				].join("\n"),
+			),
+		)) as {
+			helpers: {
+				calculateCost: unknown;
+				getBundledModel: unknown;
+				getBundledModels: unknown;
+				getBundledProviders: unknown;
+				getModel: unknown;
+				getModels: unknown;
+				modelsAreEqual: unknown;
+			};
+			supported: string;
+			disabled: string;
+			schema: { safeParse: (input: unknown) => { success: boolean }; toJSON?: () => any };
+		};
+
+		expect(loaded.helpers.calculateCost).toBe(calculateCost);
+		expect(loaded.helpers.getModel).toBe(getBundledModel);
+		expect(loaded.helpers.getModels).toBe(getBundledModels);
+		expect(loaded.helpers.getBundledModel).toBe(getBundledModel);
+		expect(loaded.helpers.getBundledModels).toBe(getBundledModels);
+		expect(loaded.helpers.getBundledProviders).toBe(getBundledProviders);
+		expect(loaded.helpers.modelsAreEqual).toBe(modelsAreEqual);
+		expect(loaded.supported).toBe("high");
+		expect(loaded.disabled).toBe("off");
+		expect(loaded.schema.safeParse("red").success).toBe(true);
+		expect(loaded.schema.safeParse("blue").success).toBe(false);
+		expect(loaded.schema.toJSON?.()?.description).toBe("primary colors");
+	});
+
+	it("exports isRetryableAssistantError for legacy retry classification (issue #6847)", async () => {
+		// `@earendil-works/pi-ai@0.82.x` exports isRetryableAssistantError from its
+		// package root (utils/retry.js). Plugins such as
+		// `@router-for-me/pi-cliproxyapi-provider` (>=1.4.9) import it, so a missing
+		// shim export surfaced as a plain
+		// `Export named 'isRetryableAssistantError' not found` at validation time.
+		const loaded = (await loadLegacyPiModule(
+			await writeFixtureExtension(
+				[
+					'import { isRetryableAssistantError } from "@earendil-works/pi-ai";',
+					'const err = errorMessage => ({ role: "assistant", stopReason: "error", errorMessage });',
+					'export const transient = isRetryableAssistantError(err("upstream connect error"));',
+					'export const quota = isRetryableAssistantError(err("insufficient_quota"));',
+					'export const ok = isRetryableAssistantError({ role: "assistant", stopReason: "stop" });',
+				].join("\n"),
+			),
+		)) as { transient: boolean; quota: boolean; ok: boolean };
+
+		expect(loaded.transient).toBe(true);
+		expect(loaded.quota).toBe(false);
+		expect(loaded.ok).toBe(false);
+	});
+
+	it("exports getSupportedThinkingLevels for legacy thinking menus (issue #10800)", async () => {
+		// `@earendil-works/pi-ai` exports getSupportedThinkingLevels from its
+		// package root (models.ts). Plugins such as `@companion-ai/feynman`
+		// import it to build their `/thinking` level menu, so a missing shim
+		// export surfaced as a plain
+		// `Export named 'getSupportedThinkingLevels' not found` at load time.
+		const loaded = (await loadLegacyPiModule(
+			await writeFixtureExtension(
+				[
+					'import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";',
+					"export const reasoning = getSupportedThinkingLevels({ reasoning: true, thinking: { efforts: ['low', 'high', 'max'] } });",
+					"export const nonReasoning = getSupportedThinkingLevels({ reasoning: false });",
+				].join("\n"),
+			),
+		)) as { reasoning: string[]; nonReasoning: string[] };
+
+		expect(loaded.reasoning).toEqual(["off", "low", "high", "max"]);
+		expect(loaded.nonReasoning).toEqual(["off"]);
 	});
 });
 
@@ -122,6 +206,116 @@ describe("legacy pi package root remaps (issue #1474)", () => {
 
 		const loaded = (await loadLegacyPiModule(entry)) as { loadedVersion: string };
 		expect(loaded.loadedVersion).toMatch(/^\d+\.\d+\.\d+/);
+	});
+
+	it("loads pi-vimmode's minified legacy imports", async () => {
+		const entry = await writeFixtureExtension(
+			[
+				'import{CustomEditor,copyToClipboard}from"@earendil-works/pi-coding-agent";',
+				'import{CURSOR_MARKER,decodeKittyPrintable,matchesKey,parseKey,truncateToWidth,visibleWidth}from"@earendil-works/pi-tui";',
+				"export const apiTypes=[typeof CustomEditor,typeof copyToClipboard,typeof CURSOR_MARKER,typeof decodeKittyPrintable,typeof matchesKey,typeof parseKey,typeof truncateToWidth,typeof visibleWidth];",
+				'export const printable=decodeKittyPrintable("\\x1b[97u");',
+			].join("\n"),
+		);
+
+		const loaded = (await loadLegacyPiModule(entry)) as { apiTypes: string[]; printable: string };
+		expect(loaded.apiTypes).toEqual([
+			"function",
+			"function",
+			"string",
+			"function",
+			"function",
+			"function",
+			"function",
+			"function",
+		]);
+		expect(loaded.printable).toBe("a");
+	});
+
+	it("loads pi-sprite's legacy terminal helpers", async () => {
+		const entry = await writeFixtureExtension(
+			[
+				'import { deleteAllKittyImages, deleteKittyImage, getCapabilities } from "@earendil-works/pi-tui";',
+				"export const deleteOne = deleteKittyImage(42);",
+				"export const deleteAll = deleteAllKittyImages();",
+				"export const capabilities = getCapabilities();",
+			].join("\n"),
+		);
+
+		const loaded = (await loadLegacyPiModule(entry)) as {
+			deleteOne: string;
+			deleteAll: string;
+			capabilities: { images: "kitty" | "iterm2" | null; trueColor: boolean; hyperlinks: boolean };
+		};
+		// Bare sequences, exactly like upstream Pi: legacy callers (pi-sprite)
+		// apply their own tmux passthrough wrapping.
+		expect(loaded.deleteOne).toBe("\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
+		expect(loaded.deleteAll).toBe("\x1b_Ga=d,d=A,q=2\x1b\\");
+		expect(["kitty", "iterm2", null]).toContain(loaded.capabilities.images);
+		expect(typeof loaded.capabilities.trueColor).toBe("boolean");
+		expect(typeof loaded.capabilities.hyperlinks).toBe("boolean");
+	});
+
+	it("preserves legacy defineTool root imports and usable coding tools", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-legacy-coding-tools-"));
+		tempRoots.push(dir);
+		await fs.writeFile(path.join(dir, "sample.txt"), "legacy read body", "utf8");
+		const entry = path.join(dir, "index.ts");
+		await fs.writeFile(
+			entry,
+			[
+				'import { dirname } from "node:path";',
+				'import { fileURLToPath } from "node:url";',
+				'import { createCodingTools, defineTool, Type } from "@earendil-works/pi-coding-agent";',
+				"const definition = {",
+				'\tname: "legacy_define_tool",',
+				'\tlabel: "Legacy Define Tool",',
+				'\tdescription: "legacy helper probe",',
+				"\tparameters: Type.Object({}),",
+				'\texecute: async () => ({ content: [{ type: "text", text: "ok" }] }),',
+				"};",
+				"const cwd = dirname(fileURLToPath(import.meta.url));",
+				"const codingTools = createCodingTools(cwd);",
+				"const readTool = codingTools.find(tool => tool.name === 'read');",
+				"export const tool = defineTool(definition);",
+				"export const sameReference = tool === definition;",
+				"export const codingToolNames = codingTools.map(tool => tool.name);",
+				"export const readResult = await readTool?.execute('legacy-read', { path: 'sample.txt' });",
+			].join("\n"),
+			"utf8",
+		);
+
+		const loaded = (await loadLegacyPiModule(entry)) as {
+			tool: { name: string; parameters: { safeParse: (input: unknown) => { success: boolean } } };
+			sameReference: boolean;
+			codingToolNames: string[];
+			readResult: { content: Array<{ type: string; text?: string }> };
+		};
+
+		expect(loaded.sameReference).toBe(true);
+		expect(loaded.tool.name).toBe("legacy_define_tool");
+		expect(loaded.codingToolNames).toEqual(["read", "bash", "edit", "write"]);
+		expect(loaded.readResult.content[0]?.text).toContain("legacy read body");
+	});
+
+	it("preserves legacy frontmatter helper root imports", async () => {
+		const entry = await writeFixtureExtension(
+			[
+				'import { parseFrontmatter, stripFrontmatter } from "@earendil-works/pi-coding-agent";',
+				"const content = ['---', 'name: demo', '---', '# Body'].join('\\n');",
+				"export const parsed = parseFrontmatter(content);",
+				"export const stripped = stripFrontmatter(content);",
+			].join("\n"),
+		);
+
+		const loaded = (await loadLegacyPiModule(entry)) as {
+			parsed: { frontmatter: { name?: string }; body: string };
+			stripped: string;
+		};
+
+		expect(loaded.parsed.frontmatter.name).toBe("demo");
+		expect(loaded.parsed.body).toBe("# Body");
+		expect(loaded.stripped).toBe("# Body");
 	});
 
 	it("falls back to legacy-scoped subpath peers for direct plugin imports", async () => {
@@ -185,5 +379,148 @@ describe("legacy pi package root remaps (issue #1474)", () => {
 		const loaded = (await loadLegacyPiModule(entry)) as { probe: () => boolean };
 		expect(typeof loaded.probe).toBe("function");
 		expect(canonicalLookupSeen).toBe(true);
+	});
+});
+it("runs the legacy pi-ai compat `complete` export with SoL-Pi's reducer call shape", async () => {
+	const entry = await writeFixtureExtension(
+		[
+			'import { StringEnum, complete, type Model } from "@earendil-works/pi-ai/compat";',
+			'export const schema = StringEnum(["red", "green"] as const);',
+			"export const completeCompat = complete;",
+			"export type LegacyModel = Model;",
+		].join("\n"),
+	);
+
+	const loaded = (await loadLegacyPiModule(entry)) as {
+		schema: { safeParse: (input: unknown) => { success: boolean } };
+		completeCompat: (
+			model: Model<Api>,
+			context: { systemPrompt?: string; messages: Context["messages"] },
+			options?: SimpleStreamOptions & { timeoutMs?: number },
+		) => Promise<AssistantMessage>;
+	};
+	let callCount = 0;
+	let capturedOptions: SimpleStreamOptions | undefined;
+	registerCustomApi(
+		COMPLETE_API,
+		(model, _context, options) => {
+			callCount++;
+			capturedOptions = options;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "reduced output" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 1,
+						output: 2,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 3,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "done", reason: "stop", message });
+			});
+			return stream;
+		},
+		COMPLETE_API_SOURCE_ID,
+	);
+	const model = buildModel({
+		id: "reducer",
+		name: "Reducer",
+		api: COMPLETE_API,
+		provider: "legacy-pi-ai-type-remap",
+		baseUrl: "",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 4096,
+		maxTokens: 1024,
+	});
+	const response = await loaded.completeCompat(
+		model,
+		{
+			systemPrompt: "Reduce",
+			messages: [{ role: "user", content: [{ type: "text", text: "payload" }], timestamp: 0 }],
+		},
+		{
+			apiKey: "test-key",
+			cacheRetention: "none",
+			maxTokens: 321,
+			sessionId: "sol-pi-run",
+			signal: AbortSignal.timeout(1000),
+			timeoutMs: 1000,
+		},
+	);
+
+	expect(loaded.schema.safeParse("red").success).toBe(true);
+	expect(loaded.schema.safeParse("blue").success).toBe(false);
+	expect(response.content).toEqual([{ type: "text", text: "reduced output" }]);
+	expect(callCount).toBe(1);
+	expect(capturedOptions).toMatchObject({
+		apiKey: "test-key",
+		cacheRetention: "none",
+		maxTokens: 321,
+		sessionId: "sol-pi-run",
+	});
+});
+
+describe("legacy isRetryableAssistantError network-failure wording", () => {
+	function erroredTurn(errorMessage: string): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage,
+			timestamp: Date.now(),
+		};
+	}
+
+	// Each row is a distinct transport failure family; a legacy extension that
+	// stops restarting any of them regressed against the old `Connection error.`.
+	it.each([
+		[
+			"offline",
+			new TypeError("fetch failed", {
+				cause: Object.assign(new Error("connect ENETUNREACH 1.2.3.4:443"), { code: "ENETUNREACH" }),
+			}),
+		],
+		["unreachable", Object.assign(new Error("Was there a typo in the url or port?"), { code: "FailedToOpenSocket" })],
+		[
+			"refused",
+			new TypeError("fetch failed", {
+				cause: new AggregateError([
+					Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:8080"), { code: "ECONNREFUSED" }),
+				]),
+			}),
+		],
+		[
+			"tls",
+			Object.assign(new Error("unable to verify the first certificate"), {
+				code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+			}),
+		],
+	])("restarts a turn that failed with the %s sentence", (kind, cause) => {
+		const message = networkFailureMessage(cause, "https://api.anthropic.com/v1/messages");
+		if (message === undefined) throw new Error(`Expected a ${kind} network-failure sentence`);
+		expect(isRetryableAssistantError(erroredTurn(message))).toBe(true);
 	});
 });

@@ -30,7 +30,9 @@ import {
 	MemorySessionStorage,
 	type SessionStorage,
 	type SessionStorageWriter,
+	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import type { SessionTitleUpdate } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 class CloseHoldingStorage implements SessionStorage {
 	readonly #inner = new MemorySessionStorage();
@@ -40,17 +42,14 @@ class CloseHoldingStorage implements SessionStorage {
 		const inner = this.#inner.openWriter(path, options);
 		const gates = this.#closeGates;
 		return {
-			writeLine(line) {
-				return inner.writeLine(line);
-			},
-			writeLineSync(line) {
-				inner.writeLineSync(line);
+			append(line) {
+				return inner.append(line);
 			},
 			flush() {
 				return inner.flush();
 			},
-			fsync() {
-				return inner.fsync();
+			isOpen() {
+				return inner.isOpen();
 			},
 			async close() {
 				const gate = Promise.withResolvers<void>();
@@ -85,6 +84,9 @@ class CloseHoldingStorage implements SessionStorage {
 	writeTextSync(p: string, content: string): void {
 		this.#inner.writeTextSync(p, content);
 	}
+	updateSessionTitle(p: string, title: SessionTitleUpdate): Promise<void> {
+		return this.#inner.updateSessionTitle(p, title);
+	}
 	statSync(p: string) {
 		return this.#inner.statSync(p);
 	}
@@ -103,6 +105,9 @@ class CloseHoldingStorage implements SessionStorage {
 	writeText(p: string, content: string): Promise<void> {
 		return this.#inner.writeText(p, content);
 	}
+	writeTextAtomic(p: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
+		return this.#inner.writeTextAtomic(p, content, options);
+	}
 	rename(p: string, nextPath: string): Promise<void> {
 		return this.#inner.rename(p, nextPath);
 	}
@@ -111,6 +116,9 @@ class CloseHoldingStorage implements SessionStorage {
 	}
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
 		return this.#inner.deleteSessionWithArtifacts(sessionPath);
+	}
+	drain(): Promise<void> {
+		return this.#inner.drain();
 	}
 }
 
@@ -203,6 +211,11 @@ describe("SessionManager close/appendMessage race", () => {
 				timestamp: Date.now(),
 			});
 		}).not.toThrow();
+
+		const sessionFile = sm.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		const duringCloseContent = await storage.readText(sessionFile);
+		expect(duringCloseContent).toContain('"content":"during-close"');
 
 		// Drain everything.
 		await settle(closePromise, storage);

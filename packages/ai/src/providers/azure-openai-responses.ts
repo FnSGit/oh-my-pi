@@ -1,65 +1,51 @@
-import { $env, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
-import { getEnvApiKey } from "../stream";
+import { $env, type ServerSentEvent } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
+import { getEnvApiKey } from "../env-api-key";
 import type {
 	AssistantMessage,
 	Context,
 	Model,
-	RawSseEvent,
 	ServiceTier,
 	StreamFunction,
 	StreamOptions,
-	Tool,
 	ToolChoice,
 } from "../types";
-import { normalizeSystemPrompts } from "../utils";
+import { resolveCacheRetention } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
+import { withReplaySafeStreamRetry } from "../utils/empty-completion-retry";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
+import type { RawHttpRequestDump } from "../utils/http-inspector";
 import {
 	getOpenAIStreamFirstEventTimeoutMs,
 	getOpenAIStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { postOpenAIStream } from "../utils/openai-http";
+import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { sanitizeSchemaForOpenAIResponses, toolWireSchema } from "../utils/schema";
 import { mapToOpenAIResponsesToolChoice } from "../utils/tool-choice";
-import { getOpenAIResponsesCacheSessionId } from "./openai-responses";
+import { isOpenAIResponsesProgressEvent } from "../utils/websocket";
 import {
-	appendResponsesToolResultMessages,
+	applyOpenAIReasoningEffortFallback,
+	createOpenAIReasoningEffortFallbackKey,
+	type OpenAIReasoningEffortFallback,
+	resolveOpenAIReasoningEffortFallback,
+} from "./openai-reasoning-fallback";
+import type { ResponseCreateParamsStreaming, ResponseStreamEvent } from "./openai-responses-wire";
+import {
 	applyCommonResponsesSamplingParams,
 	applyResponsesReasoningParams,
-	convertResponsesAssistantMessage,
-	convertResponsesInputContent,
+	buildResponsesInput,
 	createInitialResponsesAssistantMessage,
-	isOpenAIResponsesProgressEvent,
-	normalizeResponsesToolCallIdForTransform,
+	getOpenAIPromptCacheKey,
+	parseAzureDeploymentNameMap,
 	processResponsesStream,
-	repairOrphanResponsesToolCalls,
-} from "./openai-responses-shared";
-import type {
-	Tool as OpenAITool,
-	ResponseCreateParamsStreaming,
-	ResponseInput,
-	ResponseStreamEvent,
-} from "./openai-responses-wire";
-import { transformMessages } from "./transform-messages";
+} from "./openai-shared";
+
+export { parseAzureDeploymentNameMap } from "./openai-shared";
 
 const DEFAULT_AZURE_API_VERSION = "v1";
 const AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"Azure OpenAI responses stream timed out while waiting for the first event";
-
-export function parseAzureDeploymentNameMap(value: string | undefined): Map<string, string> {
-	const map = new Map<string, string>();
-	if (!value) return map;
-	for (const entry of value.split(",")) {
-		const trimmed = entry.trim();
-		if (!trimmed) continue;
-		const [modelId, deploymentName] = trimmed.split("=", 2);
-		if (!modelId || !deploymentName) continue;
-		map.set(modelId.trim(), deploymentName.trim());
-	}
-	return map;
-}
 
 function resolveDeploymentName(model: Model<"azure-openai-responses">, options?: AzureOpenAIResponsesOptions): string {
 	if (options?.azureDeploymentName) {
@@ -71,7 +57,7 @@ function resolveDeploymentName(model: Model<"azure-openai-responses">, options?:
 
 // Azure OpenAI Responses-specific options
 export interface AzureOpenAIResponsesOptions extends StreamOptions {
-	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	azureApiVersion?: string;
 	azureResourceName?: string;
@@ -79,6 +65,7 @@ export interface AzureOpenAIResponsesOptions extends StreamOptions {
 	azureDeploymentName?: string;
 	toolChoice?: ToolChoice;
 	serviceTier?: ServiceTier;
+	disableReasoning?: boolean;
 }
 
 type AzureOpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
@@ -89,10 +76,8 @@ type AzureOpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 	repetition_penalty?: number;
 };
 
-/**
- * Generate function for Azure OpenAI Responses API
- */
-export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"> = (
+/** Runs one Azure OpenAI Responses request and decodes its event stream. */
+const streamAzureOpenAIResponsesOnce = (
 	model: Model<"azure-openai-responses">,
 	context: Context,
 	options?: AzureOpenAIResponsesOptions,
@@ -101,7 +86,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 
 	// Start async processing
 	(async () => {
-		const startTime = Date.now();
+		const startTime = performance.now();
 		let firstTokenTime: number | undefined;
 		const deploymentName = resolveDeploymentName(model, options);
 
@@ -112,11 +97,13 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 		);
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		const abortTracker = createAbortSourceTracker(options?.signal);
-		const firstEventTimeoutAbortError = new Error(AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE);
+		const firstEventTimeoutAbortError = new AIError.StreamTimeoutError(
+			AZURE_OPENAI_RESPONSES_FIRST_EVENT_TIMEOUT_MESSAGE,
+		);
 		const { requestAbortController, requestSignal } = abortTracker;
 		const onSseEvent = options?.onSseEvent;
 		const rawSseObserver = onSseEvent
-			? (event: RawSseEvent) => {
+			? (event: ServerSentEvent) => {
 					if (!event.event && event.data && event.data !== "[DONE]") {
 						try {
 							const parsed = JSON.parse(event.data);
@@ -132,15 +119,19 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 							}
 						} catch {}
 					}
-					onSseEvent(event, model);
+					onSseEvent({ event: event.event, data: event.data, raw: [...event.raw] }, model);
 				}
 			: undefined;
 
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const { url, headers } = buildAzureResponsesRequest(model, apiKey, options);
-			const params = buildParams(model, context, options, deploymentName);
-			options?.onPayload?.(params);
+			const { url, headers, baseUrl } = buildAzureResponsesRequest(model, apiKey, options);
+			const requestModel = modelForAzureEndpoint(model, baseUrl);
+			let params = buildParams(requestModel, context, options, deploymentName);
+			const replacementPayload = await options?.onPayload?.(params, requestModel);
+			if (replacementPayload !== undefined) {
+				params = replacementPayload as typeof params;
+			}
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs);
@@ -154,29 +145,53 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				url,
 				body: params,
 			};
-			let requestTimeout: NodeJS.Timeout | undefined;
-			if (requestTimeoutMs !== undefined) {
-				requestTimeout = setTimeout(() => abortTracker.abortLocally(firstEventTimeoutAbortError), requestTimeoutMs);
-			}
+			const reasoningEffortFallbackKey = createOpenAIReasoningEffortFallbackKey(
+				"azure-responses",
+				url,
+				typeof params.model === "string" ? params.model : model.id,
+			);
+			const attemptedReasoningEffortFallbacks = new Set<string>();
 			let openaiStream: AsyncIterable<ResponseStreamEvent>;
-			try {
-				const headersWithTimeout = { ...headers };
+			while (true) {
+				let requestTimeout: NodeJS.Timeout | undefined;
 				if (requestTimeoutMs !== undefined) {
-					headersWithTimeout["X-Stainless-Timeout"] = Math.floor(requestTimeoutMs / 1000).toString();
+					requestTimeout = setTimeout(
+						() => abortTracker.abortLocally(firstEventTimeoutAbortError),
+						requestTimeoutMs,
+					);
 				}
-				const handle = await postOpenAIStream<ResponseStreamEvent>({
-					url,
-					headers: headersWithTimeout,
-					body: params,
-					signal: requestSignal,
-					fetch: options?.fetch,
-					// Watchdog armed → no retries, so they cannot silently extend the deadline.
-					maxAttempts: requestTimeoutMs !== undefined ? 1 : undefined,
-					onSseEvent: rawSseObserver,
-				});
-				openaiStream = handle.events;
-			} finally {
-				if (requestTimeout !== undefined) clearTimeout(requestTimeout);
+				try {
+					const headersWithTimeout = { ...headers };
+					if (requestTimeoutMs !== undefined) {
+						headersWithTimeout["X-Stainless-Timeout"] = Math.floor(requestTimeoutMs / 1000).toString();
+					}
+					const handle = await postOpenAIStream<ResponseStreamEvent>({
+						url,
+						headers: headersWithTimeout,
+						body: params,
+						signal: requestSignal,
+						fetch: options?.fetch,
+						// Transient 408/429/5xx get Retry-After-aware transport retries;
+						// the first-event watchdog aborts `requestSignal`, so retries
+						// cannot extend the caller's deadline.
+						onSseEvent: rawSseObserver,
+					});
+					openaiStream = handle.events;
+					break;
+				} catch (error) {
+					const capturedErrorResponse = error instanceof OpenAIHttpError ? error.captured : undefined;
+					const reasoningEffortFallback: OpenAIReasoningEffortFallback | undefined = !requestSignal.aborted
+						? resolveOpenAIReasoningEffortFallback(error, capturedErrorResponse, params)
+						: undefined;
+					if (reasoningEffortFallback === undefined) throw error;
+					const retryMarker = `${reasoningEffortFallbackKey}:${String(reasoningEffortFallback)}`;
+					if (attemptedReasoningEffortFallbacks.has(retryMarker)) throw error;
+					attemptedReasoningEffortFallbacks.add(retryMarker);
+					applyOpenAIReasoningEffortFallback(params, reasoningEffortFallback);
+					rawRequestDump.body = params;
+				} finally {
+					if (requestTimeout !== undefined) clearTimeout(requestTimeout);
+				}
 			}
 			stream.push({ type: "start", partial: output });
 
@@ -190,13 +205,13 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 				abortSignal: options?.signal,
 				isProgressItem: isOpenAIResponsesProgressEvent,
 			});
-			let sawCompleted = false;
+			let sawTerminalResponseEvent = false;
 			await processResponsesStream(timedOpenaiStream, output, stream, model, {
 				onFirstToken: () => {
-					if (!firstTokenTime) firstTokenTime = Date.now();
+					if (!firstTokenTime) firstTokenTime = performance.now();
 				},
 				onCompleted: () => {
-					sawCompleted = true;
+					sawTerminalResponseEvent = true;
 				},
 			});
 
@@ -206,28 +221,34 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			}
 
 			if (abortTracker.wasCallerAbort()) {
-				throw new Error("Request was aborted");
+				throw new AIError.AbortError();
 			}
 
-			if (!sawCompleted) {
-				throw new Error("Azure OpenAI responses stream closed before response.completed was received");
+			if (!sawTerminalResponseEvent) {
+				throw new AIError.ProviderResponseError(
+					"Azure OpenAI responses stream closed before a terminal response event was received",
+					{ provider: model.provider, kind: "incomplete-stream" },
+				);
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error(output.errorMessage ?? "An unknown error occurred");
+				throw new AIError.ProviderResponseError(output.errorMessage ?? "An unknown error occurred", {
+					provider: model.provider,
+					kind: "output",
+				});
 			}
 
-			output.duration = Date.now() - startTime;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
-			for (const block of output.content) delete (block as { index?: number }).index;
-			const firstEventTimeoutError = abortTracker.getLocalAbortReason();
-			output.stopReason = abortTracker.wasCallerAbort() ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = firstEventTimeoutError?.message ?? (await finalizeErrorMessage(error, rawRequestDump));
-			output.duration = Date.now() - startTime;
+			const result = await AIError.finalize(error, { api: model.api, abortTracker, rawRequestDump });
+			output.stopReason = result.stopReason;
+			output.errorStatus = result.status;
+			output.errorId = result.id;
+			output.errorMessage = result.message;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -237,13 +258,23 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 	return stream;
 };
 
-function normalizeAzureBaseUrl(baseUrl: string): string {
-	return baseUrl.replace(/\/+$/, "");
-}
-
-function buildDefaultBaseUrl(resourceName: string): string {
-	return `https://${resourceName}.openai.azure.com/openai/v1`;
-}
+/**
+ * Retries transient Azure stream failures only before assistant output commits
+ * the attempt. The unsupported explicit prompt-cache config is rejected
+ * synchronously here — callers of the direct entrypoint get the immediate
+ * `ConfigurationError` rather than a stream whose `.result()` rejects later.
+ */
+export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"> = (model, context, options) => {
+	if (options?.promptCache?.mode === "explicit" && resolveCacheRetention(options.cacheRetention) !== "none") {
+		throw new AIError.ConfigurationError(
+			`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; Azure Responses does not emit explicit cache controls.`,
+		);
+	}
+	return withReplaySafeStreamRetry(model, context, options, streamAzureOpenAIResponsesOnce, {
+		retryProviderErrors: true,
+		maxProviderErrorRetries: 1,
+	});
+};
 
 function resolveAzureConfig(
 	model: Model<"azure-openai-responses">,
@@ -257,7 +288,7 @@ function resolveAzureConfig(
 	let resolvedBaseUrl = baseUrl;
 
 	if (!resolvedBaseUrl && resourceName) {
-		resolvedBaseUrl = buildDefaultBaseUrl(resourceName);
+		resolvedBaseUrl = `https://${resourceName}.openai.azure.com/openai/v1`;
 	}
 
 	if (!resolvedBaseUrl && model.baseUrl) {
@@ -265,15 +296,32 @@ function resolveAzureConfig(
 	}
 
 	if (!resolvedBaseUrl) {
-		throw new Error(
+		throw new AIError.ConfigurationError(
 			"Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or pass azureBaseUrl, azureResourceName, or model.baseUrl.",
 		);
 	}
 
 	return {
-		baseUrl: normalizeAzureBaseUrl(resolvedBaseUrl),
+		baseUrl: resolvedBaseUrl.replace(/\/+$/, ""),
 		apiVersion,
 	};
+}
+
+function modelForAzureEndpoint(
+	model: Model<"azure-openai-responses">,
+	baseUrl: string,
+): Model<"azure-openai-responses"> {
+	if (model.supportsComputerUseConfig !== undefined || model.supportsComputerUse !== true) return model;
+	try {
+		const url = new URL(baseUrl);
+		if (
+			url.protocol === "https:" &&
+			(url.hostname.endsWith(".openai.azure.com") || url.hostname === "models.inference.ai.azure.com")
+		) {
+			return model;
+		}
+	} catch {}
+	return { ...model, supportsComputerUse: false };
 }
 
 /**
@@ -289,18 +337,19 @@ function buildAzureResponsesRequest(
 	model: Model<"azure-openai-responses">,
 	apiKey: string,
 	options?: AzureOpenAIResponsesOptions,
-): { url: string; headers: Record<string, string> } {
+): { url: string; headers: Record<string, string>; baseUrl: string } {
 	if (!apiKey) {
 		const envKey = $env.AZURE_OPENAI_API_KEY;
 		if (!envKey) {
-			throw new Error(
+			throw new AIError.MissingApiKeyError(
+				undefined,
 				"Azure OpenAI API key is required. Set AZURE_OPENAI_API_KEY environment variable or pass it as an argument.",
 			);
 		}
 		apiKey = envKey;
 	}
 
-	const headers: Record<string, string> = { "api-key": apiKey, ...(model.headers ?? {}) };
+	const headers: Record<string, string> = { "api-key": apiKey, ...model.headers };
 	if (options?.headers) {
 		Object.assign(headers, options.headers);
 	}
@@ -310,6 +359,7 @@ function buildAzureResponsesRequest(
 	return {
 		url: `${baseUrl}/responses?api-version=${encodeURIComponent(apiVersion)}`,
 		headers,
+		baseUrl,
 	};
 }
 
@@ -319,85 +369,83 @@ function buildParams(
 	options: AzureOpenAIResponsesOptions | undefined,
 	deploymentName: string,
 ) {
-	const messages = convertMessages(model, context, true);
+	const systemRole = model.reasoning && model.compat.supportsDeveloperRole ? "developer" : "system";
+	const messages = buildResponsesInput({
+		model,
+		context,
+		strictResponsesPairing: true,
+		supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal,
+		systemRole,
+		nativeHistory: { replay: true, filterReasoning: false },
+		includeThinkingSignatures: true,
+		developerStringContent: true,
+		preserveAssistantMessageIds: true,
+		repairOrphanOutputs: true,
+	});
 
 	const params: AzureOpenAIResponsesSamplingParams = {
 		model: deploymentName,
 		input: messages,
 		stream: true,
-		prompt_cache_key: getOpenAIResponsesCacheSessionId(options),
+		prompt_cache_key: getOpenAIPromptCacheKey(options),
 		// Encrypted reasoning replay (applyResponsesReasoningParams) requires
 		// stateless responses, matching the openai provider.
 		store: false,
 	};
 
 	applyCommonResponsesSamplingParams(params, options, model);
+	if (options?.include?.length) params.include = Array.from(new Set(options.include));
 
 	if (context.tools) {
-		params.tools = convertTools(context.tools);
-		if (options?.toolChoice) {
-			params.tool_choice = mapToOpenAIResponsesToolChoice(options.toolChoice);
+		const serializedTools: NonNullable<AzureOpenAIResponsesSamplingParams["tools"]> = [];
+		for (const tool of context.tools) {
+			if (tool.native?.type === "computer") {
+				if (model.supportsComputerUse === true) {
+					serializedTools.push({ type: "computer" });
+					continue;
+				}
+				// Fall through: unsupported models get the computer tool as a
+				// plain function tool so function-calling models can drive it.
+			} else if (tool.native !== undefined) continue;
+			serializedTools.push({
+				type: "function",
+				name: tool.name,
+				description: tool.description || "",
+				parameters: sanitizeSchemaForOpenAIResponses(toolWireSchema(tool)),
+				strict: false,
+			});
+		}
+		if (serializedTools.length > 0) {
+			params.tools = serializedTools;
+			if (options?.toolChoice) {
+				let toolChoice = mapToOpenAIResponsesToolChoice(options.toolChoice);
+				const hasComputerTool = serializedTools.some(tool => tool.type === "computer");
+				if (toolChoice && typeof toolChoice !== "string" && toolChoice.type === "computer" && !hasComputerTool) {
+					const computer = context.tools.find(tool => tool.native?.type === "computer");
+					if (computer && serializedTools.some(tool => tool.type === "function" && tool.name === computer.name)) {
+						toolChoice = { type: "function", name: computer.name };
+					}
+				}
+				if (toolChoice && typeof toolChoice !== "string" && toolChoice.type === "function" && hasComputerTool) {
+					const computer = context.tools.find(tool => tool.native?.type === "computer");
+					if (computer?.name === toolChoice.name) {
+						toolChoice = { type: "computer" };
+					}
+				}
+				if (
+					toolChoice &&
+					(typeof toolChoice === "string" ||
+						(toolChoice.type === "computer" && hasComputerTool) ||
+						(toolChoice.type === "function" &&
+							serializedTools.some(tool => tool.type === "function" && tool.name === toolChoice.name)))
+				) {
+					params.tool_choice = toolChoice;
+				}
+			}
 		}
 	}
 
-	applyResponsesReasoningParams(params, model, options, messages);
+	applyResponsesReasoningParams(params, model, options);
 
 	return params;
-}
-
-function convertMessages(
-	model: Model<"azure-openai-responses">,
-	context: Context,
-	strictResponsesPairing: boolean,
-): ResponseInput {
-	const messages: ResponseInput = [];
-	const transformedMessages = transformMessages(context.messages, model, normalizeResponsesToolCallIdForTransform);
-	const knownCallIds = new Set<string>();
-	const customCallIds = new Set<string>();
-
-	const systemPrompts = normalizeSystemPrompts(context.systemPrompt);
-	if (systemPrompts.length > 0) {
-		const role = model.reasoning && model.compat.supportsDeveloperRole ? "developer" : "system";
-		for (const systemPrompt of systemPrompts) {
-			messages.push({ role, content: systemPrompt });
-		}
-	}
-
-	let msgIndex = 0;
-	for (const msg of transformedMessages) {
-		if (msg.role === "user" || msg.role === "developer") {
-			const content = convertResponsesInputContent(msg.content, model.input.includes("image"));
-			if (!content) continue;
-			messages.push({
-				role: "user",
-				content: msg.role === "developer" && typeof msg.content === "string" ? msg.content.toWellFormed() : content,
-			});
-		} else if (msg.role === "assistant") {
-			const outputItems = convertResponsesAssistantMessage(
-				msg as AssistantMessage,
-				model,
-				msgIndex,
-				knownCallIds,
-				true,
-				customCallIds,
-			);
-			if (outputItems.length === 0) continue;
-			messages.push(...outputItems);
-		} else if (msg.role === "toolResult") {
-			appendResponsesToolResultMessages(messages, msg, model, strictResponsesPairing, knownCallIds, customCallIds);
-		}
-		msgIndex++;
-	}
-
-	return repairOrphanResponsesToolCalls(messages);
-}
-
-function convertTools(tools: Tool[]): OpenAITool[] {
-	return tools.map(tool => ({
-		type: "function",
-		name: tool.name,
-		description: tool.description || "",
-		parameters: sanitizeSchemaForOpenAIResponses(toolWireSchema(tool)),
-		strict: false,
-	}));
 }

@@ -1,14 +1,29 @@
+import { retryResetTimezoneOffsetFor } from "@oh-my-pi/pi-catalog/compat/behavior";
+import { extractRetryHint } from "@oh-my-pi/pi-utils";
+
 export type HeadersLike = Headers | Record<string, string | undefined> | undefined | null;
+
+/** Extracts retry timing using the provider's catalog-declared timestamp timezone. */
+export function extractProviderRetryHint(
+	provider: string | undefined,
+	message: string | undefined,
+): number | undefined {
+	const naiveResetTimezoneOffset = provider === undefined ? undefined : retryResetTimezoneOffsetFor(provider);
+	return extractRetryHint(undefined, message, { naiveResetTimezoneOffset });
+}
 
 const RETRY_AFTER_HINT = "retry-after-ms=";
 
-export function formatErrorMessageWithRetryAfter(error: unknown, headers?: HeadersLike): string {
-	const message = error instanceof Error ? error.message : JSON.stringify(error);
+export function errorMessageText(error: unknown): string {
+	return error instanceof Error ? error.message : JSON.stringify(error);
+}
+
+export function appendRetryAfterHint(message: string, headers: HeadersLike): string {
 	if (message.includes(RETRY_AFTER_HINT)) {
 		return message;
 	}
 
-	const retryAfterMs = getRetryAfterMsFromHeaders(headers ?? getHeadersFromError(error));
+	const retryAfterMs = getRetryAfterMsFromHeaders(headers);
 	if (retryAfterMs === undefined) {
 		return message;
 	}
@@ -16,16 +31,37 @@ export function formatErrorMessageWithRetryAfter(error: unknown, headers?: Heade
 	return `${message} ${RETRY_AFTER_HINT}${retryAfterMs}`;
 }
 
+export function formatErrorMessageWithRetryAfter(error: unknown): string {
+	return appendRetryAfterHint(errorMessageText(error), getHeadersFromError(error));
+}
+
 export function getRetryAfterMsFromHeaders(headers: HeadersLike): number | undefined {
 	if (!headers) return undefined;
 
+	const retryAfterMs = parseRetryAfterMsHeader(getHeaderValue(headers, "retry-after-ms"));
 	const retryAfter = parseRetryAfterHeader(getHeaderValue(headers, "retry-after"));
 	const resetMs = parseResetHeader(getHeaderValue(headers, "x-ratelimit-reset-ms"), "ms");
 	const resetSeconds = parseResetHeader(getHeaderValue(headers, "x-ratelimit-reset"), "s");
 
-	const candidates = [retryAfter, resetMs, resetSeconds].filter((value): value is number => value !== undefined);
+	const candidates = [retryAfterMs, retryAfter, resetMs, resetSeconds].filter(
+		(value): value is number => value !== undefined,
+	);
 	if (candidates.length === 0) return undefined;
 	return Math.max(...candidates);
+}
+
+/**
+ * The server's explicit `x-should-retry` verdict: `true`/`false` when the
+ * header says so, `undefined` when absent or unrecognised. Non-standard
+ * (Stainless-SDK convention) but emitted by OpenAI, Anthropic, and retrying
+ * gateways; when present it overrides status/text retry heuristics.
+ */
+export function getShouldRetryFromHeaders(headers: HeadersLike): boolean | undefined {
+	if (!headers) return undefined;
+	const value = getHeaderValue(headers, "x-should-retry");
+	if (value === "true") return true;
+	if (value === "false") return false;
+	return undefined;
 }
 
 export function getHeadersFromError(error: unknown): HeadersLike {
@@ -57,6 +93,14 @@ function getHeaderValue(headers: Headers | Record<string, string | undefined>, n
 		}
 	}
 	return undefined;
+}
+
+/** `retry-after-ms` (Anthropic-style): a plain millisecond delta. */
+function parseRetryAfterMsHeader(value: string | undefined): number | undefined {
+	if (!value) return undefined;
+	const ms = Number(value.trim());
+	if (!Number.isFinite(ms) || ms <= 0) return undefined;
+	return Math.ceil(ms);
 }
 
 function parseRetryAfterHeader(value: string | undefined): number | undefined {

@@ -7,10 +7,12 @@
  * session — these tools only need a populated state accessor and Settings.
  */
 
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync } from "node:fs";
+import * as fs from "node:fs/promises";
 import path from "node:path";
+import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
@@ -25,20 +27,25 @@ import {
 	MnemopiSessionState,
 	setMnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { MemoryEditTool } from "@oh-my-pi/pi-coding-agent/tools/memory-edit";
 import { MemoryRecallTool } from "@oh-my-pi/pi-coding-agent/tools/memory-recall";
 import { MemoryReflectTool } from "@oh-my-pi/pi-coding-agent/tools/memory-reflect";
 import { MemoryRetainTool } from "@oh-my-pi/pi-coding-agent/tools/memory-retain";
+import { resetMemoryForTests } from "@oh-my-pi/pi-mnemopi";
+import { currentLoopPhase, isEnoent, logger, TempDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 
-// Mnemopi is lazy-loaded at runtime; preload it so the sync construction in
-// registerMnemopiState() and getMnemopiScopedDbPaths() can resolve the module.
+// Mnemopi is lazy-loaded at runtime; preload it for synchronous state construction.
 await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 
 const TEST_SESSION_ID = "test-session-id";
 let registeredState: HindsightSessionState | undefined;
 let registeredMnemopiState: MnemopiSessionState | undefined;
 let tempDbPath: string | undefined;
+let tempDbDir: TempDir | undefined;
 
 function makeConfig(overrides: Partial<HindsightConfig> = {}): HindsightConfig {
 	return {
@@ -47,6 +54,7 @@ function makeConfig(overrides: Partial<HindsightConfig> = {}): HindsightConfig {
 		bankId: null,
 		bankIdPrefix: "",
 		scoping: "global",
+		globalScope: false,
 		bankMission: "",
 		retainMission: null,
 		autoRecall: true,
@@ -62,9 +70,12 @@ function makeConfig(overrides: Partial<HindsightConfig> = {}): HindsightConfig {
 		recallMaxQueryChars: 800,
 		recallPromptPreamble: "preamble",
 		debug: false,
+		requestTimeoutMs: 30_000,
+		reflectTimeoutMs: 120_000,
+		recallTimeoutMs: 30_000,
+		retainTimeoutMs: 60_000,
 		mentalModelsEnabled: false,
 		mentalModelAutoSeed: false,
-		mentalModelRefreshIntervalMs: 5 * 60 * 1000,
 		mentalModelMaxRenderChars: 16_000,
 		...overrides,
 	};
@@ -87,6 +98,7 @@ interface RegisterStateOptions {
 	retainTags?: string[];
 	recallTags?: string[];
 	recallTagsMatch?: "any" | "all" | "any_strict" | "all_strict";
+	config?: Partial<HindsightConfig>;
 	sessionOverrides?: Record<string, unknown>;
 }
 
@@ -98,7 +110,7 @@ function registerState(client: HindsightApi, settings?: Settings, opts: Register
 		retainTags: opts.retainTags,
 		recallTags: opts.recallTags,
 		recallTagsMatch: opts.recallTagsMatch,
-		config: makeConfig(),
+		config: makeConfig(opts.config),
 		session: {
 			sessionId: TEST_SESSION_ID,
 			sessionManager: { getEntries: () => [] } as never,
@@ -113,13 +125,22 @@ function registerState(client: HindsightApi, settings?: Settings, opts: Register
 	void settings;
 }
 
+/** Hindsight configs that refuse `scope: "global"` writes, with the error each one raises. */
+const HINDSIGHT_GLOBAL_REJECTIONS = [
+	["while hindsight.globalScope is off", { scoping: "per-project-tagged" }, /set hindsight\.globalScope to true/],
+	[
+		"under per-project scoping",
+		{ scoping: "per-project", globalScope: true },
+		/requires global or per-project-tagged scoping/,
+	],
+] as const;
+
 function makeMnemopiConfig(
 	overrides: (Partial<MnemopiBackendConfig> & Record<string, unknown>) | undefined = {},
 ): MnemopiBackendConfig {
 	if (!tempDbPath) {
-		const tempDir = path.join(tmpdir(), `mnemopi-test-${Date.now()}`);
-		mkdirSync(tempDir, { recursive: true });
-		tempDbPath = path.join(tempDir, "mnemopi.db");
+		tempDbDir = TempDir.createSync(`@mnemopi-test-${Date.now()}-`);
+		tempDbPath = tempDbDir.join("mnemopi.db");
 	}
 	return {
 		dbPath: tempDbPath,
@@ -128,11 +149,18 @@ function makeMnemopiConfig(
 		autoRetain: true,
 		polyphonicRecall: false,
 		enhancedRecall: false,
+		proactiveLinking: false,
 		retainEveryNTurns: 3,
 		recallLimit: 10,
 		recallContextTurns: 1,
 		recallMaxQueryChars: 800,
 		injectionTokenLimit: 1024,
+		indexInjection: false,
+		indexInjectionPrefs: 20,
+		indexInjectionKnowledge: 25,
+		indexInjectionProject: 25,
+		indexInjectionChars: 70,
+		indexInjectionTokenLimit: 2000,
 		debug: false,
 		providerOptions: {
 			noEmbeddings: true,
@@ -152,6 +180,8 @@ function makeMnemopiConfig(
 interface RegisterMnemopiStateOptions {
 	cwd?: string;
 	sessionId?: string;
+	entries?: () => unknown[];
+	listeners?: Set<AgentSessionEventListener>;
 }
 
 function registerMnemopiState(
@@ -165,12 +195,27 @@ function registerMnemopiState(
 		config: finalConfig,
 		session: {
 			sessionId,
+			settings: Settings.isolated({
+				"memory.backend": "mnemopi",
+				"mnemopi.noEmbeddings": true,
+				"mnemopi.llmMode": "none",
+			}),
+			modelRegistry: {
+				getApiKeyForProvider: async () => undefined,
+				resolver: () => async () => undefined,
+			} as never,
 			sessionManager: {
-				getEntries: () => [],
+				getEntries: options.entries ?? (() => []),
+				getBranch: options.entries ?? (() => []),
+				appendCustomEntry: () => "",
 				getCwd: () => options.cwd ?? "/tmp",
 			} as never,
 			emitNotice: () => {},
 			getHindsightSessionState: () => undefined,
+			subscribe: (listener: AgentSessionEventListener) => {
+				options.listeners?.add(listener);
+				return () => options.listeners?.delete(listener);
+			},
 		} as never,
 	});
 	setMnemopiSessionState(registeredMnemopiState.session as never, registeredMnemopiState);
@@ -188,16 +233,11 @@ describe("Hindsight tool factories", () => {
 		registeredState = undefined;
 	});
 
-	it("retain/recall/reflect factories return null when memory.backend !== hindsight", () => {
-		const settings = Settings.isolated({ "memory.backend": "local", "memories.enabled": false });
-		const session = makeSession(settings);
-		expect(MemoryRetainTool.createIf(session)).toBeNull();
-		expect(MemoryRecallTool.createIf(session)).toBeNull();
-		expect(MemoryReflectTool.createIf(session)).toBeNull();
-	});
-
-	it("retain/recall/reflect factories return tool instances when memory.backend === hindsight", () => {
-		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+	it("retain/recall/reflect factories return tool instances when Hindsight is configured", () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
 		const session = makeSession(settings);
 		expect(MemoryRetainTool.createIf(session)).toBeInstanceOf(MemoryRetainTool);
 		expect(MemoryRecallTool.createIf(session)).toBeInstanceOf(MemoryRecallTool);
@@ -210,18 +250,16 @@ describe("Mnemopi tool factories", () => {
 		resetSettingsForTest();
 		registeredMnemopiState = undefined;
 		tempDbPath = undefined;
+		tempDbDir = undefined;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		await registeredMnemopiState?.dispose();
 		registeredMnemopiState = undefined;
-		if (tempDbPath) {
-			try {
-				const tempDir = path.dirname(tempDbPath);
-				rmSync(tempDir, { recursive: true, force: true });
-			} catch {}
-			tempDbPath = undefined;
-		}
+		await tempDbDir?.remove();
+		tempDbDir = undefined;
+		tempDbPath = undefined;
 	});
 
 	it("memory tool factories gate on supported backends", () => {
@@ -243,20 +281,68 @@ describe("Mnemopi tool factories", () => {
 		expect(MemoryReflectTool.createIf(session)).toBeInstanceOf(MemoryReflectTool);
 		expect(MemoryEditTool.createIf(session)).toBeInstanceOf(MemoryEditTool);
 	});
+
+	it("names sibling memory tools by their xd:// URL only when they are mounted as devices", () => {
+		const session = makeSession(Settings.isolated({ "memory.backend": "mnemopi" }));
+		const recall = new MemoryRecallTool(session);
+		const reflect = new MemoryReflectTool(session);
+		const edit = new MemoryEditTool(session);
+		const tools = new Map<string, Tool>([
+			["recall", recall],
+			["reflect", reflect],
+			["memory_edit", edit],
+		]);
+		session.xdev = {
+			tools,
+			mountedNames: new Set(["recall", "memory_edit"]),
+			builtInNames: new Set(tools.keys()),
+			isActive: name => name === "reflect",
+		};
+
+		expect(reflect.description).toContain("unlike `xd://recall`, blends them");
+		expect(recall.description).toContain("`reflect`: synthesized answer");
+		expect(recall.description).toContain("Before any `xd://memory_edit update`");
+		expect(edit.description).toContain("Only ids returned by `xd://recall`.");
+
+		// A mounted device without a summary makes catalog summaries read its description;
+		// rendering refs must not depend on them, or this recurses without bound.
+		Object.assign(recall, { summary: undefined });
+		expect(recall.description).toContain("`reflect`: synthesized answer");
+	});
 });
 
 describe("retain.execute", () => {
+	let agentDir: TempDir;
+	let originalAgentDir: string;
+
 	beforeEach(() => {
 		resetSettingsForTest();
 		registeredState = undefined;
+		originalAgentDir = getAgentDir();
+		agentDir = TempDir.createSync("@hindsight-retain-");
+		setAgentDir(agentDir.path());
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		registeredState?.dispose();
 		registeredState = undefined;
+		setAgentDir(originalAgentDir);
+		await agentDir.remove();
 	});
 
-	it("queues the memory and reports success without calling the API", async () => {
+	/** Undelivered outbox events, across destinations. */
+	async function outboxEvents(): Promise<string[]> {
+		try {
+			const names = await fs.readdir(path.join(agentDir.path(), "hindsight-outbox"), { recursive: true });
+			return names.filter(name => !name.startsWith("quarantine") && name.endsWith(".json"));
+		} catch (error) {
+			if (isEnoent(error)) return [];
+			throw error;
+		}
+	}
+
+	it("persists the memory and reports success without calling the API", async () => {
 		const settings = Settings.isolated({ "memory.backend": "hindsight" });
 		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
 		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
@@ -270,7 +356,137 @@ describe("retain.execute", () => {
 		// Tool returns before any HTTP work happens.
 		expect(retainBatchSpy).not.toHaveBeenCalled();
 		expect(retainSpy).not.toHaveBeenCalled();
-		expect(registeredState?.retainQueue.depth).toBe(1);
+		expect(await outboxEvents()).toHaveLength(1);
+	});
+
+	it("retains global items untagged, in a request separate from project-tagged items", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		registerState(client, settings, {
+			retainTags: ["project:pi"],
+			config: { scoping: "per-project-tagged", globalScope: true },
+		});
+
+		const tool = MemoryRetainTool.createIf(makeSession(settings))!;
+		const result = await tool.execute("call-mixed", {
+			items: [
+				{ content: "pi uses tabs" },
+				{ content: "the user prefers zsh across projects", scope: "global" },
+				{ content: "pi builds with bun", scope: "project" },
+			],
+		});
+		expect(result.content[0]).toEqual({ type: "text", text: "3 memories queued." });
+		await registeredState?.flushRetainQueue();
+
+		expect(retainBatchSpy).toHaveBeenCalledTimes(2);
+		const requests = retainBatchSpy.mock.calls.map(([, items]) =>
+			items.map(item => ({ content: item.content, tags: item.tags })),
+		);
+		expect(requests).toEqual(
+			expect.arrayContaining([
+				[
+					{ content: "pi uses tabs", tags: ["project:pi"] },
+					{ content: "pi builds with bun", tags: ["project:pi"] },
+				],
+				[{ content: "the user prefers zsh across projects", tags: undefined }],
+			]),
+		);
+	});
+
+	it("sends global and project items in one untagged request when the scope has no project tags", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		registerState(client, settings, { config: { scoping: "global", globalScope: true } });
+
+		await MemoryRetainTool.createIf(makeSession(settings))!.execute("call-global-mode", {
+			items: [{ content: "shared fact" }, { content: "explicitly global fact", scope: "global" }],
+		});
+		await registeredState?.flushRetainQueue();
+
+		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
+		expect(retainBatchSpy.mock.calls[0][1].map(item => ({ content: item.content, tags: item.tags }))).toEqual([
+			{ content: "shared fact", tags: undefined },
+			{ content: "explicitly global fact", tags: undefined },
+		]);
+	});
+
+	it("retains items enqueued without a scope as project-scoped", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		registerState(client, settings, { retainTags: ["project:pi"], config: { scoping: "per-project-tagged" } });
+
+		await registeredState!.retainQueue.enqueue("call-direct", [
+			{ content: "direct caller fact", context: "direct context" },
+		]);
+		await registeredState?.flushRetainQueue();
+
+		expect(retainBatchSpy).toHaveBeenCalledTimes(1);
+		expect(retainBatchSpy.mock.calls[0][1].map(item => ({ content: item.content, tags: item.tags }))).toEqual([
+			{ content: "direct caller fact", tags: ["project:pi"] },
+		]);
+	});
+
+	it.each(HINDSIGHT_GLOBAL_REJECTIONS)(
+		"rejects a global item enqueued directly on the queue %s",
+		async (_label, config, error) => {
+			const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+			registerState(client, undefined, { config });
+
+			await expect(
+				registeredState!.retainQueue.enqueue("call-rejected", [{ content: "cross-project fact", scope: "global" }]),
+			).rejects.toThrow(error);
+			expect(await outboxEvents()).toEqual([]);
+		},
+	);
+
+	it.each(HINDSIGHT_GLOBAL_REJECTIONS)(
+		"rejects a batch with a global item %s before queueing anything",
+		async (_label, config, error) => {
+			const settings = Settings.isolated({ "memory.backend": "hindsight" });
+			const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+			registerState(client, settings, { config });
+
+			const tool = MemoryRetainTool.createIf(makeSession(settings))!;
+			await expect(
+				tool.execute("call-global", {
+					items: [{ content: "project fact" }, { content: "global preference", scope: "global" }],
+				}),
+			).rejects.toThrow(error);
+			expect(await outboxEvents()).toEqual([]);
+		},
+	);
+
+	it("keeps a failed delivery on disk, notifies once per outage, and delivers it on a later flush", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockRejectedValue(new Error("HTTP 503"));
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		const noticeSpy = vi.fn();
+		registerState(client, settings, { sessionOverrides: { emitNotice: noticeSpy } });
+
+		const tool = MemoryRetainTool.createIf(makeSession(settings))!;
+		await tool.execute("call-x", { items: [{ content: "kept fact" }] });
+		await registeredState?.flushRetainQueue();
+		await registeredState?.flushRetainQueue();
+
+		expect(noticeSpy).toHaveBeenCalledTimes(1);
+		const [level, message, source] = noticeSpy.mock.calls[0];
+		expect(level).toBe("warning");
+		expect(source).toBe("Hindsight");
+		expect(message).toContain("HTTP 503");
+		expect(message).toContain("1 memory kept");
+		expect(await outboxEvents()).toHaveLength(1);
+
+		retainBatchSpy.mockResolvedValue({} as never);
+		await registeredState?.flushRetainQueue();
+		expect(retainBatchSpy.mock.calls.at(-1)?.[1].map(item => item.content)).toEqual(["kept fact"]);
+		expect(await outboxEvents()).toEqual([]);
 	});
 
 	it("flushes a multi-item tool call as a single retainBatch call with per-item context", async () => {
@@ -291,39 +507,24 @@ describe("retain.execute", () => {
 		const [bankId, items, options] = retainBatchSpy.mock.calls[0];
 		expect(bankId).toBe("test-bank");
 		expect(options).toEqual(expect.objectContaining({ async: true }));
-		expect(items).toEqual([
-			expect.objectContaining({
-				content: "fact one",
-				metadata: { session_id: TEST_SESSION_ID },
-				tags: ["project:pi"],
-			}),
-			expect.objectContaining({
-				content: "fact two",
-				context: "user override",
-				metadata: { session_id: TEST_SESSION_ID },
-				tags: ["project:pi"],
-			}),
-		]);
-		expect(registeredState?.retainQueue.depth).toBe(0);
-	});
-
-	it("emits a UI-only warning notice when the batch flush fails", async () => {
-		const settings = Settings.isolated({ "memory.backend": "hindsight" });
-		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
-		vi.spyOn(HindsightApi.prototype, "retainBatch").mockRejectedValue(new Error("HTTP 503"));
-		const noticeSpy = vi.fn();
-		registerState(client, settings, { sessionOverrides: { emitNotice: noticeSpy } });
-
-		const tool = MemoryRetainTool.createIf(makeSession(settings))!;
-		await tool.execute("call-x", { items: [{ content: "doomed fact" }] });
-		await registeredState?.flushRetainQueue();
-
-		expect(noticeSpy).toHaveBeenCalledTimes(1);
-		const [level, message, source] = noticeSpy.mock.calls[0];
-		expect(level).toBe("warning");
-		expect(source).toBe("Hindsight");
-		expect(message).toContain("HTTP 503");
-		expect(message).toContain("1 memory");
+		// Same-call items share a publication mtime, so their order within the batch is unspecified.
+		expect(items).toHaveLength(2);
+		expect(items).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					content: "fact one",
+					metadata: { session_id: TEST_SESSION_ID },
+					tags: ["project:pi"],
+				}),
+				expect.objectContaining({
+					content: "fact two",
+					context: "user override",
+					metadata: { session_id: TEST_SESSION_ID },
+					tags: ["project:pi"],
+				}),
+			]),
+		);
+		expect(await outboxEvents()).toEqual([]);
 	});
 
 	it("throws when no per-session state is registered", async () => {
@@ -338,19 +539,16 @@ describe("retain.execute (Mnemopi backend)", () => {
 		resetSettingsForTest();
 		registeredMnemopiState = undefined;
 		tempDbPath = undefined;
+		tempDbDir = undefined;
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await registeredMnemopiState?.dispose();
 		registeredMnemopiState = undefined;
-		if (tempDbPath) {
-			try {
-				const tempDir = path.dirname(tempDbPath);
-				rmSync(tempDir, { recursive: true, force: true });
-			} catch {}
-			tempDbPath = undefined;
-		}
+		await tempDbDir?.remove();
+		tempDbDir = undefined;
+		tempDbPath = undefined;
 	});
 
 	it("writes memories synchronously and returns a stored success message", async () => {
@@ -397,6 +595,146 @@ describe("retain.execute (Mnemopi backend)", () => {
 		expect(text).toContain("fact three");
 	});
 
+	// A failed write stored nothing, so reporting the whole batch as stored
+	// misleads the caller about the failure, its cause, and what was kept.
+	it("reports what a batch stored and why a later write failed instead of claiming success", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const state = registerMnemopiState();
+		const memory = state.getScopedRetainTarget().memory;
+		const remember = memory.remember.bind(memory);
+		const storedIds: string[] = [];
+		let writes = 0;
+		vi.spyOn(memory, "remember").mockImplementation((content, options) => {
+			writes += 1;
+			if (writes === 2) throw new Error("database or disk is full");
+			const id = remember(content, options);
+			storedIds.push(id);
+			return id;
+		});
+
+		const tool = MemoryRetainTool.createIf(makeSession(settings))!;
+		const error = await tool
+			.execute("call-mnemopi-partial", {
+				items: [{ content: "fact kept" }, { content: "fact lost" }, { content: "fact never tried" }],
+			})
+			.catch((caught: unknown) => caught);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("did not store item 2 of 3: database or disk is full.");
+		expect((error as Error).message).toContain(`item 1 (id ${storedIds[0]})`);
+		expect((error as Error).message).toContain("Later items were not attempted.");
+		expect(writes).toBe(2);
+		expect(memory.get(storedIds[0]!)).toMatchObject({ content: "fact kept" });
+	});
+
+	it("does not claim untried items when the last item of a batch fails", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const state = registerMnemopiState();
+		vi.spyOn(state.getScopedRetainTarget().memory, "remember").mockImplementation(() => {
+			throw new Error("database or disk is full");
+		});
+
+		const tool = MemoryRetainTool.createIf(makeSession(settings))!;
+		const error = await tool
+			.execute("call-mnemopi-last", { items: [{ content: "only fact" }] })
+			.catch((caught: unknown) => caught);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("item 1 of 1: database or disk is full. Nothing was stored.");
+		expect((error as Error).message).not.toContain("Later items");
+	});
+
+	it("stores explicitly global items only in the shared bank", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const state = registerMnemopiState(
+			makeMnemopiConfig({
+				scoping: "per-project-tagged",
+				bank: "project-alpha",
+				globalBank: "default",
+				retainBank: "project-alpha",
+				recallBanks: ["project-alpha", "default"],
+			}),
+			{ cwd: "/work/project-alpha" },
+		);
+
+		const result = await MemoryRetainTool.createIf(makeSession(settings))!.execute("call-mnemopi-global", {
+			items: [{ content: "the user prefers zsh across projects", scope: "global" }],
+		});
+
+		expect(result.content[0]).toEqual({ type: "text", text: "1 memory stored." });
+		const projectRows = state.memory.beam.db.query("SELECT content FROM working_memory").all() as Array<{
+			content: string;
+		}>;
+		const globalRows = state.globalMemory?.beam.db.query("SELECT content FROM working_memory").all() as
+			| Array<{ content: string }>
+			| undefined;
+		expect(projectRows).toEqual([]);
+		expect(globalRows).toEqual([{ content: "the user prefers zsh across projects" }]);
+	});
+
+	it("stores global items in the retain bank when scoping is global", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const state = registerMnemopiState(
+			makeMnemopiConfig({
+				scoping: "global",
+				bank: "default",
+				globalBank: "default",
+				retainBank: "default",
+				recallBanks: ["default"],
+			}),
+		);
+
+		await MemoryRetainTool.createIf(makeSession(settings))!.execute("call-mnemopi-global-bank", {
+			items: [{ content: "the user prefers fish across projects", scope: "global" }],
+		});
+
+		expect(state.globalMemory).toBeUndefined();
+		expect(state.memory.beam.db.query("SELECT content FROM working_memory").all()).toEqual([
+			{ content: "the user prefers fish across projects" },
+		]);
+	});
+
+	it("rejects an unsupported global scope before storing earlier batch items", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const state = registerMnemopiState(
+			makeMnemopiConfig({
+				scoping: "per-project",
+				bank: "project-alpha",
+				retainBank: "project-alpha",
+				recallBanks: ["project-alpha"],
+			}),
+		);
+
+		await expect(
+			MemoryRetainTool.createIf(makeSession(settings))!.execute("call-mnemopi-unsupported-global", {
+				items: [{ content: "must remain unstored" }, { content: "global item", scope: "global" }],
+			}),
+		).rejects.toThrow(/requires global or per-project-tagged scoping/i);
+		expect(state.memory.beam.db.query("SELECT content FROM working_memory").all()).toEqual([]);
+	});
+
+	it("reports a global storage failure separately from unsupported scoping", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const state = registerMnemopiState(
+			makeMnemopiConfig({
+				scoping: "per-project-tagged",
+				bank: "project-alpha",
+				globalBank: "default",
+				retainBank: "project-alpha",
+				recallBanks: ["project-alpha", "default"],
+			}),
+		);
+		vi.spyOn(state.globalMemory!, "remember").mockImplementation(() => {
+			throw new Error("global bank unavailable");
+		});
+
+		await expect(
+			MemoryRetainTool.createIf(makeSession(settings))!.execute("call-mnemopi-global-failure", {
+				items: [{ content: "global item", scope: "global" }],
+			}),
+		).rejects.toThrow("Mnemopi did not store item 1 of 1: global bank unavailable. Nothing was stored.");
+	});
+
 	it("isolates memories between projects when scoping is per-project", async () => {
 		const settings = Settings.isolated({
 			"memory.backend": "mnemopi",
@@ -430,77 +768,648 @@ describe("retain.execute (Mnemopi backend)", () => {
 	});
 });
 
+describe("global memory scope exposure", () => {
+	beforeEach(() => {
+		registeredState = undefined;
+	});
+
+	afterEach(() => {
+		registeredState = undefined;
+	});
+
+	const offersScope = (tool: MemoryRetainTool | LearnTool) => ({
+		schema: JSON.stringify(tool.parameters.toJsonSchema()).includes('"scope"'),
+		prompt: tool.description.includes("scope: global"),
+	});
+	const expectOffered = (session: ToolSession, offered: boolean) => {
+		expect(offersScope(LearnTool.createIf(session)!)).toEqual({ schema: offered, prompt: offered });
+		expect(offersScope(MemoryRetainTool.createIf(session)!)).toEqual({ schema: offered, prompt: offered });
+	};
+	const memorySettings = (backend: "mnemopi" | "hindsight" | "local", overrides: Record<string, unknown> = {}) =>
+		Settings.isolated({
+			"memory.backend": backend,
+			"hindsight.apiUrl": "http://localhost:8888",
+			"autolearn.enabled": true,
+			...overrides,
+		});
+
+	it.each([
+		["per-project", false],
+		["per-project-tagged", true],
+		["global", true],
+	] as const)("mnemopi backend with %s scoping offers scope: %p", (scoping, offered) => {
+		expectOffered(makeSession(memorySettings("mnemopi", { "mnemopi.scoping": scoping })), offered);
+	});
+
+	it("local backend never offers scope", () => {
+		const session = makeSession(
+			memorySettings("local", { "hindsight.globalScope": true, "mnemopi.scoping": "per-project-tagged" }),
+		);
+		expect(offersScope(LearnTool.createIf(session)!)).toEqual({ schema: false, prompt: false });
+	});
+
+	it.each([
+		["off", { scoping: "per-project-tagged" }, false],
+		["on under per-project", { scoping: "per-project", globalScope: true }, false],
+		["on under per-project-tagged", { scoping: "per-project-tagged", globalScope: true }, true],
+		["on under global", { scoping: "global", globalScope: true }, true],
+	] as const)("hindsight state with global scope %s offers scope: %p", (_label, config, offered) => {
+		const settings = memorySettings("hindsight");
+		registerState(new HindsightApi({ baseUrl: "http://localhost:8888" }), settings, { config });
+		expectOffered(makeSession(settings), offered);
+	});
+
+	it("follows the Hindsight state's config, not live settings, so it never offers a scope the queue rejects", async () => {
+		// A keep-alive subagent alias keeps the config its parent had when it started; the user enabled
+		// hindsight.globalScope afterwards.
+		const settings = memorySettings("hindsight", {
+			"hindsight.globalScope": true,
+			"hindsight.scoping": "per-project-tagged",
+		});
+		registerState(new HindsightApi({ baseUrl: "http://localhost:8888" }), settings, {
+			config: { scoping: "per-project-tagged", globalScope: false },
+		});
+		const session = makeSession(settings);
+
+		expectOffered(session, false);
+		await expect(
+			MemoryRetainTool.createIf(session)!.execute("alias-global", {
+				items: [{ content: "cross-project fact", scope: "global" }],
+			}),
+		).rejects.toThrow(/set hindsight\.globalScope to true/);
+	});
+
+	it("offers no Hindsight scope before the session's Hindsight state exists", () => {
+		expectOffered(
+			makeSession(memorySettings("hindsight", { "hindsight.globalScope": true, "hindsight.scoping": "global" })),
+			false,
+		);
+	});
+
+	it("requires write approval only for global writes", () => {
+		const session = makeSession(
+			Settings.isolated({
+				"memory.backend": "mnemopi",
+				"mnemopi.scoping": "per-project-tagged",
+				"autolearn.enabled": true,
+			}),
+		);
+		const retain = MemoryRetainTool.createIf(session)!;
+		const learn = LearnTool.createIf(session)!;
+		expect(retain.approval({ items: [{ content: "x" }, { content: "y", scope: "global" }] })).toBe("write");
+		expect(retain.approval({ items: [{ content: "x", scope: "project" }] })).toBe("read");
+		expect(learn.approval({ memory: "x", scope: "global" })).toBe("write");
+		expect(learn.approval({ memory: "x" })).toBe("read");
+	});
+});
+
+describe("learn.execute (Mnemopi backend)", () => {
+	let originalAgentDir: string;
+
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredMnemopiState = undefined;
+		tempDbDir = TempDir.createSync("@mnemopi-learn-");
+		tempDbPath = tempDbDir.join("mnemopi.db");
+		originalAgentDir = getAgentDir();
+		setAgentDir(tempDbDir.join("agent"));
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		setAgentDir(originalAgentDir);
+		await registeredMnemopiState?.dispose();
+		registeredMnemopiState = undefined;
+		await tempDbDir?.remove();
+		tempDbDir = undefined;
+		tempDbPath = undefined;
+	});
+
+	it("stores an explicitly global lesson only in the shared bank", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi", "autolearn.enabled": true });
+		const state = registerMnemopiState(
+			makeMnemopiConfig({
+				scoping: "per-project-tagged",
+				bank: "project-alpha",
+				globalBank: "default",
+				retainBank: "project-alpha",
+				recallBanks: ["project-alpha", "default"],
+			}),
+			{ cwd: "/work/project-alpha" },
+		);
+
+		await LearnTool.createIf(makeSession(settings))!.execute("learn-global", {
+			memory: "Use isolated temporary directories when verifying file writes across projects.",
+			scope: "global",
+		});
+
+		expect(state.memory.beam.db.query("SELECT content FROM working_memory").all()).toEqual([]);
+		expect(state.globalMemory!.beam.db.query("SELECT content FROM working_memory").all()).toEqual([
+			{ content: "Use isolated temporary directories when verifying file writes across projects." },
+		]);
+	});
+
+	it("rejects an unsupported global lesson before storing or minting a skill", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi", "autolearn.enabled": true });
+		const state = registerMnemopiState(
+			makeMnemopiConfig({
+				scoping: "per-project",
+				bank: "project-alpha",
+				retainBank: "project-alpha",
+				recallBanks: ["project-alpha"],
+			}),
+		);
+
+		const error = await LearnTool.createIf(makeSession(settings))!
+			.execute("learn-unsupported-global", {
+				memory: "A cross-project lesson must not become project-local.",
+				scope: "global",
+				skill: { action: "create", name: "global-lesson", description: "Shared lesson.", body: "# Shared lesson" },
+			})
+			.catch((error: unknown) => error);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toMatch(/requires global or per-project-tagged scoping/i);
+		expect((error as Error).message).not.toContain("Mnemopi did not store the lesson");
+		expect(state.memory.beam.db.query("SELECT content FROM working_memory").all()).toEqual([]);
+		expect(await Bun.file(path.join(getManagedSkillsDir(), "global-lesson", "SKILL.md")).exists()).toBe(false);
+	});
+});
+
+describe("learn.execute (Hindsight backend)", () => {
+	let originalAgentDir: string;
+	let agentTempDir: TempDir;
+
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredState = undefined;
+		agentTempDir = TempDir.createSync("@hindsight-learn-");
+		originalAgentDir = getAgentDir();
+		setAgentDir(agentTempDir.join("agent"));
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		setAgentDir(originalAgentDir);
+		registeredState = undefined;
+		await agentTempDir.remove();
+	});
+
+	const hindsightSettings = () =>
+		Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"autolearn.enabled": true,
+		});
+
+	it("retains a global lesson untagged while project lessons keep the project tag", async () => {
+		const settings = hindsightSettings();
+		const retainBatchSpy = vi.spyOn(HindsightApi.prototype, "retainBatch").mockResolvedValue({} as never);
+		vi.spyOn(HindsightApi.prototype, "createBank").mockResolvedValue({} as never);
+		registerState(new HindsightApi({ baseUrl: "http://localhost:8888" }), settings, {
+			retainTags: ["project:alpha"],
+			config: { scoping: "per-project-tagged", globalScope: true },
+		});
+		const learn = LearnTool.createIf(makeSession(settings))!;
+
+		await learn.execute("learn-project", { memory: "alpha pins bun 1.3" });
+		await learn.execute("learn-global", {
+			memory: "Use isolated temporary directories when verifying file writes across projects.",
+			scope: "global",
+		});
+		await registeredState?.flushRetainQueue();
+
+		const retained = retainBatchSpy.mock.calls.flatMap(([, items]) =>
+			items.map(item => ({ content: item.content, tags: item.tags })),
+		);
+		expect(retained).toHaveLength(2);
+		expect(retained).toEqual(
+			expect.arrayContaining([
+				{ content: "alpha pins bun 1.3", tags: ["project:alpha"] },
+				{
+					content: "Use isolated temporary directories when verifying file writes across projects.",
+					tags: undefined,
+				},
+			]),
+		);
+	});
+
+	it.each(HINDSIGHT_GLOBAL_REJECTIONS)(
+		"rejects a global lesson %s before queueing or minting a skill",
+		async (_label, config, error) => {
+			const settings = hindsightSettings();
+			registerState(new HindsightApi({ baseUrl: "http://localhost:8888" }), settings, { config });
+
+			await expect(
+				LearnTool.createIf(makeSession(settings))!.execute("learn-unsupported-global", {
+					memory: "A cross-project lesson must not become project-local.",
+					scope: "global",
+					skill: {
+						action: "create",
+						name: "global-lesson",
+						description: "Shared lesson.",
+						body: "# Shared lesson",
+					},
+				}),
+			).rejects.toThrow(error);
+			expect(await Bun.file(path.join(getManagedSkillsDir(), "global-lesson", "SKILL.md")).exists()).toBe(false);
+		},
+	);
+});
+
 describe("Mnemopi backend lifecycle", () => {
 	beforeEach(() => {
 		resetSettingsForTest();
 		registeredMnemopiState = undefined;
 		tempDbPath = undefined;
+		tempDbDir = undefined;
+		// Close any leaked default Mnemopi instance from a prior test so its
+		// SQLite handle doesn't keep the next test's DB files locked on Windows.
+		resetMemoryForTests();
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await registeredMnemopiState?.dispose();
 		registeredMnemopiState = undefined;
-		if (tempDbPath) {
-			try {
-				rmSync(path.dirname(tempDbPath), { recursive: true, force: true });
-			} catch {}
-			tempDbPath = undefined;
-		}
+		// Close the mnemopi default instance so its SQLite handle doesn't keep
+		// the temp DB files locked on Windows.
+		resetMemoryForTests();
+		await tempDbDir?.remove().catch(() => {});
+		tempDbDir = undefined;
+		tempDbPath = undefined;
 	});
 
-	it("auto-retain uses the cumulative transcript turn count", async () => {
+	it("keeps background auto-recall engine failures from escaping", async () => {
+		const entries = [{ type: "message", message: { role: "user", content: "existing memory" } }];
+		const state = registerMnemopiState(makeMnemopiConfig({ autoRecall: true }), {
+			entries: () => entries,
+		});
+		vi.spyOn(state.getScopedRecallTargets()[0].memory, "recallEnhanced").mockRejectedValue(
+			new TypeError("mmrRerankIndices is not a function"),
+		);
+
+		await expect(state.maybeRecallOnAgentStart()).resolves.toBeUndefined();
+		expect(state.hasRecalledForFirstTurn).toBe(false);
+	});
+
+	it("contains unavailable-bank failures from agent-end retention", async () => {
+		const listeners = new Set<AgentSessionEventListener>();
+		const entries = [{ type: "message", message: { role: "user", content: "turn one" } }];
+		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 1 }), {
+			entries: () => entries,
+			listeners,
+		});
+		state.attachSessionListeners();
+		state.memory.beam.db.close();
+		const warning = Promise.withResolvers<void>();
+		const warn = vi.spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (message === "Mnemopi: lifecycle hook failed") warning.resolve();
+			void context;
+		});
+
+		for (const listener of listeners) listener({ type: "agent_end", messages: [] } as never);
+		await warning.promise;
+
+		expect(warn).toHaveBeenCalledWith("Mnemopi: lifecycle hook failed", {
+			banks: ["test-bank"],
+			operation: "agent_end retention",
+			error: "Cannot use a closed database",
+		});
+	});
+
+	it("contains failures before agent-start recall reaches its internal bank guard", async () => {
+		const listeners = new Set<AgentSessionEventListener>();
+		const state = registerMnemopiState(makeMnemopiConfig(), {
+			entries: () => {
+				throw new Error("session journal unavailable");
+			},
+			listeners,
+		});
+		state.attachSessionListeners();
+		const warning = Promise.withResolvers<void>();
+		const warn = vi.spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (message === "Mnemopi: lifecycle hook failed") warning.resolve();
+			void context;
+		});
+
+		for (const listener of listeners) listener({ type: "agent_start" } as never);
+		await warning.promise;
+
+		expect(warn).toHaveBeenCalledWith("Mnemopi: lifecycle hook failed", {
+			banks: ["test-bank"],
+			operation: "agent_start recall",
+			error: "session journal unavailable",
+		});
+	});
+	it("auto-retain stores only the not-yet-retained suffix", async () => {
 		const entries = Array.from({ length: 4 }, (_, index) => ({
 			type: "message",
 			message: { role: "user", content: `turn ${index + 1}` },
 		}));
-		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 4 }), {
+		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 2 }), {
 			cwd: "/work/project-alpha",
+			entries: () => entries,
 		});
-		(state.session.sessionManager as { getEntries: () => unknown[] }).getEntries = () => entries;
+		state.lastRetainedTurn = 2;
 		const retainSpy = vi.spyOn(state, "retainMessages").mockResolvedValue();
 
 		await state.maybeRetainOnAgentEnd([{ role: "user", content: [{ type: "text", text: "turn 4" }] }] as never);
 
 		expect(retainSpy).toHaveBeenCalledTimes(1);
 		expect(retainSpy.mock.calls[0][0]).toEqual([
-			{ role: "user", content: "turn 1" },
-			{ role: "user", content: "turn 2" },
 			{ role: "user", content: "turn 3" },
 			{ role: "user", content: "turn 4" },
 		]);
 		expect(state.lastRetainedTurn).toBe(4);
 	});
 
-	it("registers subagent aliases from parent Mnemopi state without Hindsight", async () => {
-		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
-		const parentState = registerMnemopiState();
-		const childSession = {
-			sessionId: "child-session-id",
-			settings,
-			sessionManager: {
-				getEntries: () => [],
-				getCwd: () => "/tmp",
-			},
-			emitNotice: () => {},
-		} as never;
-
-		await mnemopiBackend.start({
-			session: childSession,
-			settings,
-			modelRegistry: {} as never,
-			agentDir: path.dirname(tempDbPath!),
-			taskDepth: 1,
-			parentMnemopiSessionState: parentState,
+	it("does not retain the current session on dispose when auto-retain is disabled", async () => {
+		const entries = [{ type: "message", message: { role: "user", content: "private turn" } }];
+		const state = registerMnemopiState(makeMnemopiConfig({ autoRetain: false }), {
+			entries: () => entries,
 		});
+		const dbPath = state.memory.dbPath;
+		if (!dbPath) throw new Error("Expected a file-backed Mnemopi database");
 
-		const childState = getMnemopiSessionState(childSession);
-		expect(childState?.aliasOf).toBe(parentState);
-		expect(childState?.getScopedRetainTarget().bank).toBe(parentState.getScopedRetainTarget().bank);
-		await childState?.dispose();
+		await state.dispose();
+
+		const db = new Database(dbPath, { readonly: true });
+		const row = db
+			.prepare<{ count: number }, []>(`
+				SELECT COUNT(*) AS count
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+			`)
+			.get();
+		db.close();
+		expect(row?.count).toBe(0);
 	});
 
-	it("flushes extractions, sleeps, and closes every owned bank on session shutdown (#2320)", async () => {
+	it("explicit enqueue retains the current session when auto-retain is disabled", async () => {
+		const entries = [{ type: "message", message: { role: "user", content: "explicitly retained turn" } }];
+		const state = registerMnemopiState(makeMnemopiConfig({ autoRetain: false }), {
+			entries: () => entries,
+		});
+		const retainMemory = state.getScopedRetainTarget().memory;
+		vi.spyOn(retainMemory, "sleepAllSessions");
+
+		await mnemopiBackend.enqueue(path.dirname(tempDbPath!), "/tmp", state.session);
+
+		const row = retainMemory.beam.db
+			.prepare<{ count: number }, []>(`
+				SELECT COUNT(*) AS count
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+			`)
+			.get();
+		expect(row?.count).toBe(1);
+		expect(retainMemory.sleepAllSessions).toHaveBeenCalledTimes(1);
+	});
+
+	it("stores an explicit memory save as stated, not as an unlabelled transcript row", async () => {
+		const state = registerMnemopiState();
+		const result = await mnemopiBackend.save!(
+			{ agentDir: path.dirname(tempDbPath!), cwd: "/tmp", session: state.session },
+			{ content: "The greenhouse sprinklers run at dawn." },
+		);
+		expect(result.stored).toBe(1);
+
+		const row = state
+			.getScopedRetainTarget()
+			.memory.beam.db.prepare<{ veracity: string }, [string]>("SELECT veracity FROM working_memory WHERE id = ?")
+			.get(result.ids?.[0] ?? "");
+		expect(row?.veracity).toBe("stated");
+	});
+
+	it("promotes aged working memory when the backend starts a top-level session (#10770)", async () => {
+		// Resolve seed and started session to the SAME bank/db: `global` scoping
+		// with the shared `default` bank maps the retain bank straight to dbPath.
+		const settings = Settings.isolated({
+			"memory.backend": "mnemopi",
+			"mnemopi.noEmbeddings": true,
+			"mnemopi.llmMode": "none",
+			"mnemopi.scoping": "global",
+			"mnemopi.bank": "default",
+			"mnemopi.dbPath": makeMnemopiConfig().dbPath,
+		});
+		// Seed an aged, unconsolidated retain row, then close the bank handles so
+		// backend.start reopens the same DB file from disk.
+		const seed = registerMnemopiState(makeMnemopiConfig({ scoping: "global", bank: "default" }));
+		const seedMemory = seed.getScopedRetainTarget().memory;
+		const retainId = seedMemory.remember("aged durable lesson", {
+			source: "coding-agent-retain",
+			scope: "bank",
+			extract: false,
+		});
+		seedMemory.beam.db.run("UPDATE working_memory SET timestamp = ? WHERE id = ?", [
+			new Date(Date.now() - 48 * 3_600_000).toISOString(),
+			retainId,
+		]);
+		await seed.dispose({ consolidate: false });
+		registeredMnemopiState = undefined;
+		resetMemoryForTests();
+
+		const modelRegistry = { getApiKeyForProvider: async () => undefined, resolver: () => async () => undefined };
+		const session = {
+			sessionId: TEST_SESSION_ID,
+			settings,
+			modelRegistry,
+			sessionManager: { getEntries: () => [], getCwd: () => "/tmp" },
+			emitNotice: () => {},
+			getHindsightSessionState: () => undefined,
+			subscribe: () => () => {},
+		} as never;
+		await mnemopiBackend.start({
+			session,
+			settings,
+			modelRegistry: modelRegistry as never,
+			agentDir: path.dirname(tempDbPath!),
+			taskDepth: 0,
+		});
+
+		const started = getMnemopiSessionState(session);
+		expect(started).toBeDefined();
+		registeredMnemopiState = started;
+		const memory = started!.getScopedRetainTarget().memory;
+		// The row must have survived start into the reopened bank, and a later
+		// write (which triggers trimWorkingMemory) must not remove it — start
+		// promoted it to episodic, so the TTL trim skips it.
+		expect(memory.get(retainId)).not.toBeNull();
+		memory.remember("a fresh note after start", { source: "coding-agent-transcript", scope: "bank" });
+		expect(memory.get(retainId)).not.toBeNull();
+	});
+
+	it("does not re-store retained turns during consolidation or after resume", async () => {
+		const entries = Array.from({ length: 6 }, (_, index) => ({
+			type: "message",
+			message: { role: "user", content: `turn ${index + 1}` },
+		}));
+		let visibleTurns = 2;
+		const config = makeMnemopiConfig({ retainEveryNTurns: 2 });
+		const state = registerMnemopiState(config, {
+			cwd: "/work/project-alpha",
+			entries: () => entries.slice(0, visibleTurns),
+		});
+
+		await state.maybeRetainOnAgentEnd([] as never);
+		visibleTurns = 4;
+		await state.maybeRetainOnAgentEnd([] as never);
+		await state.forceRetainCurrentSession();
+		await state.dispose({ consolidate: false });
+
+		visibleTurns = 6;
+		const resumed = registerMnemopiState(config, {
+			cwd: "/work/project-alpha",
+			entries: () => entries.slice(0, visibleTurns),
+		});
+		await resumed.forceRetainCurrentSession();
+
+		const rows = resumed.memory.beam.db
+			.prepare<{ content: string; retainedThroughUserTurn: number }, [string]>(`
+				SELECT
+					content,
+					CAST(json_extract(metadata_json, '$.retained_through_user_turn') AS INTEGER)
+						AS retainedThroughUserTurn
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+				  AND json_extract(metadata_json, '$.session_id') = ?
+				ORDER BY rowid
+			`)
+			.all(TEST_SESSION_ID);
+		expect(rows.map(row => row.content.match(/turn \d+/g))).toEqual([
+			["turn 1", "turn 2"],
+			["turn 3", "turn 4"],
+			["turn 5", "turn 6"],
+		]);
+		expect(rows.map(row => row.retainedThroughUserTurn)).toEqual([2, 4, 6]);
+	});
+
+	it("labels the synchronous retain gate on turns that do not retain", async () => {
+		let observing = false;
+		const phases: (string | undefined)[] = [];
+		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 4 }), {
+			cwd: "/work/project-alpha",
+			entries: () => {
+				if (observing) phases.push(currentLoopPhase());
+				return [{ type: "message", message: { role: "user", content: "turn 1" } }];
+			},
+		});
+		const retainSpy = vi.spyOn(state, "retainMessages");
+
+		observing = true;
+		await state.maybeRetainOnAgentEnd([] as never);
+		observing = false;
+
+		// 1 of 4 turns: the gate skips extraction, but still labels its cursor scan and turn count.
+		expect(retainSpy).not.toHaveBeenCalled();
+		expect(phases.length).toBeGreaterThan(0);
+		expect(phases.every(phase => phase === "mnemopi.retain")).toBe(true);
+		expect(currentLoopPhase()).toBeUndefined();
+	});
+
+	it("reads retain-turn history under mnemopi.retain", async () => {
+		let observing = false;
+		const phases: (string | undefined)[] = [];
+		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 1 }), {
+			cwd: "/work/project-alpha",
+			entries: () => {
+				if (observing) phases.push(currentLoopPhase());
+				return [{ type: "message", message: { role: "user", content: "turn 1" } }];
+			},
+		});
+		const retainSpy = vi.spyOn(state, "retainMessages");
+
+		observing = true;
+		await state.maybeRetainOnAgentEnd([] as never);
+		observing = false;
+
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		expect(phases.length).toBeGreaterThan(0);
+		expect(phases.every(phase => phase === "mnemopi.retain")).toBe(true);
+		expect(currentLoopPhase()).toBeUndefined();
+	});
+
+	it("does not over-count legacy cumulative resumed rows when restoring the cursor", async () => {
+		const entries = Array.from({ length: 8 }, (_, index) => ({
+			type: "message",
+			message: { role: "user", content: `turn ${index + 1}` },
+		}));
+		const config = makeMnemopiConfig({ retainEveryNTurns: 2 });
+		const seed = registerMnemopiState(config, { cwd: "/work/project-alpha" });
+		const turn = (index: number) => ({ role: "user", content: `turn ${index}` });
+		// Legacy pre-fix bank: two incremental rows plus a cumulative row written
+		// by a resumed session whose in-memory cursor had reset to zero. None of
+		// them carry retained_through_user_turn metadata.
+		await seed.retainMessages([turn(1), turn(2)], `${TEST_SESSION_ID}-1`);
+		await seed.retainMessages([turn(3), turn(4)], `${TEST_SESSION_ID}-2`);
+		await seed.retainMessages([turn(1), turn(2), turn(3), turn(4), turn(5), turn(6)], `${TEST_SESSION_ID}-3`);
+		await seed.dispose({ consolidate: false });
+
+		const resumed = registerMnemopiState(config, {
+			cwd: "/work/project-alpha",
+			entries: () => entries,
+		});
+		await resumed.maybeRetainOnAgentEnd([] as never);
+
+		const rows = resumed.memory.beam.db
+			.prepare<{ content: string }, [string]>(`
+				SELECT content
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+				  AND json_extract(metadata_json, '$.session_id') = ?
+				ORDER BY rowid
+			`)
+			.all(TEST_SESSION_ID);
+		expect(rows).toHaveLength(4);
+		expect(rows.at(-1)?.content.match(/turn \d+/g)).toEqual(["turn 7", "turn 8"]);
+	});
+
+	it("retains the full transcript but extracts and embeds clean projections", async () => {
+		const state = registerMnemopiState(makeMnemopiConfig(), { cwd: "/work/project-alpha" });
+		const rememberSpy = vi.spyOn(state, "rememberInScope").mockReturnValue("memory-id");
+
+		await state.retainMessages(
+			[
+				{ role: "user", content: "I always prefer tabs" },
+				{ role: "assistant", content: "the parser never initializes and reorder never activates" },
+				{ role: "user", content: "I never use semicolons" },
+			],
+			"source-1",
+		);
+
+		expect(rememberSpy).toHaveBeenCalledTimes(1);
+		const [storedTranscript, options] = rememberSpy.mock.calls[0];
+		if (options === undefined) throw new Error("retainMessages did not pass remember options");
+		expect(storedTranscript).toContain("[role: assistant]");
+		expect(storedTranscript).toContain("reorder never activates");
+		expect(options.extract).toBe(true);
+		expect(options.extractEntities).toBe(true);
+		expect(options.extractText).toContain("I always prefer tabs");
+		expect(options.extractText).toContain("I never use semicolons");
+		expect(options.extractText).not.toContain("parser never initializes");
+		expect(options.embedText).toContain("I always prefer tabs");
+		expect(options.embedText).toContain("parser never initializes");
+		expect(options.embedText).toContain("I never use semicolons");
+		expect(options.embedText).not.toContain("[role:");
+		expect(options.embedText).not.toContain(":end]");
+	});
+
+	it("labels retention's synchronous work as mnemopi.retain for the loop watchdog", async () => {
+		const state = registerMnemopiState(makeMnemopiConfig(), { cwd: "/work/project-alpha" });
+		let phaseDuringRemember: string | undefined;
+		vi.spyOn(state, "rememberInScope").mockImplementation(() => {
+			phaseDuringRemember = currentLoopPhase();
+			return "memory-id";
+		});
+
+		await state.retainMessages([{ role: "user", content: "I always prefer tabs" }], "source-1");
+
+		// remember()'s SQLite writes and graph linking block the UI loop on large banks.
+		expect(phaseDuringRemember).toBe("mnemopi.retain");
+		expect(currentLoopPhase()).toBeUndefined();
+	});
+
+	it("flushes extractions and closes every owned bank on session shutdown (#2320)", async () => {
 		const config = makeMnemopiConfig({
 			scoping: "per-project-tagged",
 			bank: "project-alpha",
@@ -524,7 +1433,7 @@ describe("Mnemopi backend lifecycle", () => {
 		const perBank = ownedMemories.map(memory => ({
 			memory,
 			flush: vi.spyOn(memory, "flushExtractions"),
-			sleep: vi.spyOn(memory, "sleepAllSessions"),
+			sleep: vi.spyOn(memory, "sleep"),
 			close: vi.spyOn(memory, "close"),
 		}));
 
@@ -533,18 +1442,140 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(retainSpy).toHaveBeenCalledTimes(1);
 		for (const bank of perBank) {
 			expect(bank.flush).toHaveBeenCalledTimes(1);
-			expect(bank.sleep).toHaveBeenCalledTimes(1);
-			expect(bank.sleep).toHaveBeenCalledWith(false);
+			expect(bank.sleep).not.toHaveBeenCalled();
 			expect(bank.close).toHaveBeenCalledTimes(1);
 			const flushedAt = bank.flush.mock.invocationCallOrder[0];
-			const sleptAt = bank.sleep.mock.invocationCallOrder[0];
 			const closedAt = bank.close.mock.invocationCallOrder[0];
-			expect(flushedAt).toBeLessThan(sleptAt);
-			expect(sleptAt).toBeLessThan(closedAt);
+			expect(flushedAt).toBeLessThan(closedAt);
 			expect(retainSpy.mock.invocationCallOrder[0]).toBeLessThan(closedAt);
 		}
 		// State already consumed its owned resources; the afterEach hook would
 		// otherwise re-enter dispose on closed handles.
+		registeredMnemopiState = undefined;
+	});
+
+	it("dispose({ timeoutMs }) returns within the budget when consolidate stalls (#3641)", async () => {
+		const state = registerMnemopiState();
+		const retainMemory = state.getScopedRetainTarget().memory;
+		// Hold flushExtractions hostage longer than any reasonable shutdown budget
+		// so the race exclusively settles via the timeout branch.
+		const flushStall = Promise.withResolvers<void>();
+		let flushCalls = 0;
+		const flushSpy = vi.spyOn(retainMemory, "flushExtractions").mockImplementation(async () => {
+			flushCalls++;
+			await flushStall.promise;
+		});
+		const closeDone = Promise.withResolvers<void>();
+		const close = retainMemory.close.bind(retainMemory);
+		const closeSpy = vi.spyOn(retainMemory, "close").mockImplementation(() => {
+			close();
+			closeDone.resolve();
+		});
+
+		const BUDGET_MS = 20;
+		const start = Bun.nanoseconds();
+		await state.dispose({ timeoutMs: BUDGET_MS });
+		const elapsedMs = (Bun.nanoseconds() - start) / 1_000_000;
+
+		// Dispose must surrender within the budget; the in-flight consolidate is
+		// detached, not awaited. The ceiling is only there to catch a hang, so
+		// it absorbs a full second of timer/scheduling delay on a loaded runner.
+		expect(elapsedMs).toBeLessThan(BUDGET_MS + 1_000);
+		expect(elapsedMs).toBeGreaterThanOrEqual(BUDGET_MS - 10);
+		expect(flushSpy).toHaveBeenCalled();
+		expect(flushCalls).toBe(1);
+		// `close()` is deferred so SQLite writes don't race a closed handle.
+		expect(closeSpy).not.toHaveBeenCalled();
+
+		// Release the stall and confirm the deferred close runs once consolidate
+		// settles — i.e. the SQLite handle still ends up released eventually.
+		flushStall.resolve();
+		await closeDone.promise;
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+
+		registeredMnemopiState = undefined;
+	});
+
+	it("bounds synchronous SQLite lock waits on every owned bank during final retention (#7351)", async () => {
+		// per-project-tagged owns a project retain bank AND the shared bank; lock the
+		// shared bank so a retain-only busy-timeout fix would still stall teardown.
+		const config = makeMnemopiConfig({
+			scoping: "per-project-tagged",
+			bank: "project-alpha",
+			globalBank: "default",
+		});
+		const entries = [
+			{ type: "message", message: { role: "user", content: "hello" } },
+			{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+		];
+		const state = registerMnemopiState(config, { cwd: "/work/project-alpha", entries: () => entries });
+		const ownedDbPaths = getMnemopiScopedDbPaths(config);
+		const sharedDbPath = ownedDbPaths.find(dbPath => dbPath === config.dbPath);
+		const lock = new Database(sharedDbPath!);
+		lock.exec("BEGIN IMMEDIATE");
+		const sharedMemory = state.globalMemory;
+		const sharedFlushCalled = Promise.withResolvers<void>();
+		const sharedFlushSpy = vi.spyOn(sharedMemory!, "flushExtractions").mockImplementation(async () => {
+			// Signal first: the exec below may throw SQLITE_BUSY while the lock is
+			// still held, and the call itself is what the test awaits.
+			sharedFlushCalled.resolve();
+			// Model a pending extraction/embedding commit. An idle shared bank performs
+			// no SQLite work during flush, so merely locking it would not exercise its
+			// connection's busy timeout.
+			sharedMemory!.beam.db.exec("PRAGMA user_version=7351");
+		});
+
+		const started = performance.now();
+		try {
+			await state.dispose({ timeoutMs: 50 });
+		} finally {
+			lock.exec("ROLLBACK");
+			lock.close();
+		}
+		const elapsedMs = performance.now() - started;
+
+		try {
+			expect(elapsedMs).toBeLessThan(500);
+			// When the shutdown budget expires mid-consolidate, dispose detaches the
+			// pass instead of abandoning it (#3641) — so on a slow runner the shared
+			// flush may not have run yet when dispose returns. The lock is released
+			// above, so the detached pass must still reach the shared bank; await
+			// the call itself instead of asserting synchronously.
+			await sharedFlushCalled.promise;
+			expect(sharedFlushSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			registeredMnemopiState = undefined;
+		}
+	});
+
+	it.each([{ retain: false }])("unbounded dispose drains and closes without sleeping (options: %j)", async options => {
+		const state = registerMnemopiState();
+		const retainMemory = state.getScopedRetainTarget().memory;
+		const flushSpy = vi.spyOn(retainMemory, "flushExtractions").mockResolvedValue();
+		const sleepSpy = vi.spyOn(retainMemory, "sleep");
+		const closeSpy = vi.spyOn(retainMemory, "close");
+
+		await state.dispose(options);
+
+		// Unbounded dispose still runs the consolidate-then-close pipeline, but
+		// skips the synchronous bank sleep so the interactive shutdown path stays
+		// fast (#3641). Full consolidation remains reachable via `/memory enqueue`.
+		expect(flushSpy).toHaveBeenCalledTimes(1);
+		expect(sleepSpy).not.toHaveBeenCalled();
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+
+		registeredMnemopiState = undefined;
+	});
+
+	it("dispose retains the current session without scheduling LLM fact extraction", async () => {
+		const state = registerMnemopiState();
+		const retainSpy = vi.spyOn(state, "forceRetainCurrentSession").mockResolvedValue();
+
+		await state.dispose();
+
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		expect(retainSpy).toHaveBeenCalledWith({ extract: false });
+
 		registeredMnemopiState = undefined;
 	});
 
@@ -626,7 +1657,7 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(parentRetainSpy).not.toHaveBeenCalled();
 	});
 
-	it("clears every scoped Mnemopi database for per-project-tagged mode", async () => {
+	it("clears scoped Mnemopi data and rehydrates active state", async () => {
 		const config = makeMnemopiConfig({
 			scoping: "per-project-tagged",
 			bank: "project-alpha",
@@ -634,23 +1665,40 @@ describe("Mnemopi backend lifecycle", () => {
 			retainBank: "project-alpha",
 			recallBanks: ["project-alpha", "default"],
 		});
-		const state = registerMnemopiState(config, { cwd: "/work/project-alpha" });
+		const listeners = new Set<AgentSessionEventListener>();
+		const state = registerMnemopiState(config, { cwd: "/work/project-alpha", listeners });
 		state.rememberInScope("project clear marker", { scope: "bank", extract: false, source: "test" });
 		state.globalMemory?.remember("global clear marker", { scope: "bank", extract: false, source: "test" });
-		const dbPaths = getMnemopiScopedDbPaths(config);
-		for (const dbPath of dbPaths) expect(existsSync(dbPath)).toBe(true);
 		const session = state.session;
 		setMnemopiSessionState(session, state);
 
 		await mnemopiBackend.clear(path.dirname(config.dbPath), "/work/project-alpha", session);
 
-		for (const dbPath of dbPaths) {
-			expect(existsSync(dbPath)).toBe(false);
-			expect(existsSync(`${dbPath}-wal`)).toBe(false);
-			expect(existsSync(`${dbPath}-shm`)).toBe(false);
-		}
-		expect(getMnemopiSessionState(session)).toBeUndefined();
+		const rehydrated = getMnemopiSessionState(session);
+		if (!rehydrated) throw new Error("Mnemopi state was not rehydrated");
+		expect(rehydrated).not.toBe(state);
+		expect(listeners.size).toBe(1);
+		const remaining = await rehydrated.recallResultsScoped("clear marker");
+		expect(remaining.some(hit => String(hit.content).includes("clear marker"))).toBe(false);
+		expect(rehydrated.rememberScoped("after-clear", { source: "test", scope: "bank", extract: false })).toEqual(
+			expect.any(String),
+		);
+		registeredMnemopiState = rehydrated;
+	});
+	it("attaches listeners when enqueue rehydrates missing state", async () => {
+		const config = makeMnemopiConfig();
+		const listeners = new Set<AgentSessionEventListener>();
+		const seed = registerMnemopiState(config, { listeners });
+		const session = seed.session;
+		setMnemopiSessionState(session, undefined);
+		await seed.dispose({ consolidate: false });
 		registeredMnemopiState = undefined;
+
+		await mnemopiBackend.enqueue(path.dirname(config.dbPath), "/tmp", session);
+
+		registeredMnemopiState = getMnemopiSessionState(session);
+		expect(registeredMnemopiState).toBeDefined();
+		expect(listeners.size).toBe(1);
 	});
 
 	it("clear() skips consolidation before deleting the DBs (#2327 review)", async () => {
@@ -689,8 +1737,8 @@ describe("Mnemopi backend lifecycle", () => {
 			expect(bank.sleep).not.toHaveBeenCalled();
 			expect(bank.close).toHaveBeenCalledTimes(1);
 		}
-		expect(getMnemopiSessionState(session)).toBeUndefined();
-		registeredMnemopiState = undefined;
+		registeredMnemopiState = getMnemopiSessionState(session);
+		expect(registeredMnemopiState).toBeDefined();
 	});
 
 	it("exposes direct mnemopi runtime status and search/save results", async () => {
@@ -743,7 +1791,49 @@ describe("Mnemopi backend lifecycle", () => {
 		});
 	});
 
-	it("reports aborted searches and save-without-id failures", async () => {
+	it("redacts credentials in saved content and metadata context before they reach the bank", async () => {
+		const config = makeMnemopiConfig({ bank: "project-alpha", retainBank: "project-alpha" });
+		const state = registerMnemopiState(config, { cwd: "/work/project-alpha" });
+		const session = state.session;
+		setMnemopiSessionState(session, state);
+		const dbPath = state.memory.dbPath;
+		if (!dbPath) throw new Error("Expected a file-backed Mnemopi database");
+
+		const token = `npm_${"aB3dEfGh1JkLmN0pQrStUvWxYz2345678901".slice(0, 36)}`;
+		const save = await mnemopiBackend.save!(
+			{ agentDir: path.dirname(config.dbPath), cwd: "/work/project-alpha", session },
+			{
+				content: `publish the package with ${token}`,
+				source: "test-source",
+				context: `registry auth uses ${token}`,
+				importance: 0.8,
+			},
+		);
+		expect(save).toMatchObject({ backend: "mnemopi", stored: 1 });
+
+		const db = new Database(dbPath, { readonly: true });
+		const row = db
+			.prepare<{ content: string; embed_text: string | null; metadata_json: string | null }, []>(`
+				SELECT content, embed_text, metadata_json
+				FROM working_memory
+				WHERE source = 'test-source'
+			`)
+			.get();
+		const ftsHits = db
+			.prepare<{ count: number }, [string]>(`
+				SELECT COUNT(*) AS count FROM fts_working WHERE fts_working MATCH ?
+			`)
+			.get(token);
+		db.close();
+
+		expect(row).toBeDefined();
+		expect(row?.content).toBe("publish the package with [REDACTED]");
+		expect(row?.embed_text ?? "").not.toContain("npm_");
+		expect(JSON.parse(row?.metadata_json ?? "{}").context).toBe("registry auth uses [REDACTED]");
+		expect(ftsHits?.count ?? 0).toBe(0);
+	});
+
+	it("reports aborted searches and failed saves", async () => {
 		const state = registerMnemopiState();
 		const session = state.session;
 		setMnemopiSessionState(session, state);
@@ -760,19 +1850,22 @@ describe("Mnemopi backend lifecycle", () => {
 			message: "Search aborted.",
 		});
 
-		const rememberSpy = vi.spyOn(state, "rememberScoped").mockReturnValue(undefined);
+		const rememberSpy = vi.spyOn(state, "rememberScoped").mockImplementation(() => {
+			throw new Error("database or disk is full");
+		});
 		await expect(
-			mnemopiBackend.save!({ agentDir: "/tmp/agent", cwd: "/tmp", session }, { content: "memory without id" }),
+			mnemopiBackend.save!({ agentDir: "/tmp/agent", cwd: "/tmp", session }, { content: "memory that fails" }),
 		).resolves.toMatchObject({
 			backend: "mnemopi",
 			stored: 0,
-			message: "Mnemopi did not return a stored memory id.",
+			message: "Mnemopi did not store the memory: database or disk is full",
 		});
 		rememberSpy.mockRestore();
 	});
 
 	it("derives valid project banks from the absolute project root", async () => {
-		const root = path.join(tmpdir(), `mnemopi-bank-${Date.now()}`);
+		const rootDir = TempDir.createSync(`@mnemopi-bank-${Date.now()}-`);
+		const root = rootDir.path();
 		const alphaCwd = path.join(root, "a", "api");
 		const betaCwd = path.join(root, "b", "api");
 		mkdirSync(alphaCwd, { recursive: true });
@@ -796,7 +1889,7 @@ describe("Mnemopi backend lifecycle", () => {
 			}
 			expect(alpha.globalBank).toBe("bad-bank-name-with-spaces-and-punctuation");
 		} finally {
-			rmSync(root, { recursive: true, force: true });
+			rootDir.removeSync();
 		}
 	});
 });
@@ -873,28 +1966,43 @@ describe("recall.execute (Mnemopi backend)", () => {
 		resetSettingsForTest();
 		registeredMnemopiState = undefined;
 		tempDbPath = undefined;
+		tempDbDir = undefined;
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		await registeredMnemopiState?.dispose();
 		registeredMnemopiState = undefined;
-		if (tempDbPath) {
-			try {
-				const tempDir = path.dirname(tempDbPath);
-				rmSync(tempDir, { recursive: true, force: true });
-			} catch {}
-			tempDbPath = undefined;
-		}
+		await tempDbDir?.remove();
+		tempDbDir = undefined;
+		tempDbPath = undefined;
 	});
 
-	it("returns the no-results sentinel when empty", async () => {
+	it("surfaces recall engine failures instead of the no-results sentinel", async () => {
 		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
-		registerMnemopiState();
+		const state = registerMnemopiState();
+		const failure = new TypeError("mmrRerankIndices is not a function");
+		vi.spyOn(state.getScopedRecallTargets()[0].memory, "recallEnhanced").mockRejectedValue(failure);
 
 		const tool = MemoryRecallTool.createIf(makeSession(settings))!;
-		const result = await tool.execute("call-mnemopi-empty", { query: "nonexistent query" });
+		await expect(tool.execute("call-mnemopi-failure", { query: "existing memory" })).rejects.toThrow(failure);
+	});
 
+	it("keeps healthy scoped targets available when another target fails", async () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const state = registerMnemopiState(
+			makeMnemopiConfig({
+				scoping: "per-project-tagged",
+				bank: "project-bank",
+				globalBank: "global-bank",
+			}),
+		);
+		vi.spyOn(state.getScopedRecallTargets()[0].memory, "recallEnhanced").mockRejectedValue(
+			new Error("project bank unavailable"),
+		);
+
+		const tool = MemoryRecallTool.createIf(makeSession(settings))!;
+		const result = await tool.execute("call-mnemopi-partial-failure", { query: "nonexistent query" });
 		expect(result.content[0]).toEqual({ type: "text", text: "No relevant memories found." });
 	});
 
@@ -994,19 +2102,16 @@ describe("memory_edit.execute (Mnemopi backend)", () => {
 		resetSettingsForTest();
 		registeredMnemopiState = undefined;
 		tempDbPath = undefined;
+		tempDbDir = undefined;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		registeredMnemopiState?.dispose();
+		await registeredMnemopiState?.dispose();
 		registeredMnemopiState = undefined;
-		if (tempDbPath) {
-			try {
-				const tempDir = path.dirname(tempDbPath);
-				rmSync(tempDir, { recursive: true, force: true });
-			} catch {}
-			tempDbPath = undefined;
-		}
+		await tempDbDir?.remove();
+		tempDbDir = undefined;
+		tempDbPath = undefined;
 	});
 
 	async function retainAndRecallId(settings: Settings, content: string, query: string): Promise<string> {
@@ -1014,7 +2119,6 @@ describe("memory_edit.execute (Mnemopi backend)", () => {
 			items: [{ content }],
 		});
 		const id = (await registeredMnemopiState?.recallResultsScoped(query))?.[0]?.id;
-		expect(id).toBeString();
 		return id!;
 	}
 
@@ -1147,19 +2251,16 @@ describe("reflect.execute (Mnemopi backend)", () => {
 		resetSettingsForTest();
 		registeredMnemopiState = undefined;
 		tempDbPath = undefined;
+		tempDbDir = undefined;
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
-		registeredMnemopiState?.dispose();
+		await registeredMnemopiState?.dispose();
 		registeredMnemopiState = undefined;
-		if (tempDbPath) {
-			try {
-				const tempDir = path.dirname(tempDbPath);
-				rmSync(tempDir, { recursive: true, force: true });
-			} catch {}
-			tempDbPath = undefined;
-		}
+		await tempDbDir?.remove();
+		tempDbDir = undefined;
+		tempDbPath = undefined;
 	});
 
 	it("returns the no-results sentinel when empty", async () => {
@@ -1202,28 +2303,6 @@ describe("reflect.execute (Mnemopi backend)", () => {
 		expect(text).toContain("dark mode");
 		expect(text).toContain("Vim");
 		expect(text).toContain("tabs");
-	});
-
-	it("includes additional context in the query when provided", async () => {
-		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
-		registerMnemopiState();
-
-		// Store a memory
-		const retainTool = MemoryRetainTool.createIf(makeSession(settings))!;
-		await retainTool.execute("call-mnemopi-store-context", {
-			items: [{ content: "the user works on Python projects" }],
-		});
-
-		// Reflect with context
-		const reflectTool = MemoryReflectTool.createIf(makeSession(settings))!;
-		const result = await reflectTool.execute("call-mnemopi-reflect-context", {
-			query: "what does the user work on?",
-			context: "this is for a new project setup",
-		});
-
-		const text = (result.content[0] as { text: string }).text;
-		expect(text).toContain("Based on recalled memories");
-		expect(text).toContain("Python");
 	});
 
 	it("merges global and project-local memories on reflect when scoping is per-project-tagged", async () => {

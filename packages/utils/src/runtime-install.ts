@@ -2,6 +2,9 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as Module from "node:module";
 import * as path from "node:path";
+import { withFileLock } from "./file-lock";
+import { isEexist, isEnoent } from "./fs-error";
+import { isRecord } from "./type-guards";
 
 /**
  * On-demand runtime dependency support for native-heavy optional packages
@@ -29,10 +32,6 @@ const RUNTIME_CONDITIONS: Record<string, true> = { node: true, require: true, de
 
 /** Extension probes appended to a `main`/`exports` target that lacks one. */
 const RUNTIME_EXTENSIONS: readonly string[] = [".js", ".cjs", ".mjs", ".json", ".node"];
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /**
  * Walk a conditional `exports` target (string, array of fallbacks, or a
@@ -170,6 +169,50 @@ function resolverRegistry(): ResolverRegistration[] {
 	holder[REGISTRY] ??= [];
 	return holder[REGISTRY];
 }
+/** Canonical form of a path, memoized: resolution is per module request, and roots repeat. */
+const canonicalPaths = new Map<string, string>();
+
+/**
+ * Canonical form of `target` for path comparison: symlinks and Windows
+ * junctions resolved, drive/segment casing folded on Windows. Non-existent
+ * paths fall back to `path.resolve`, which still normalizes separators.
+ *
+ * Comparisons must canonicalize because the two sides come from different
+ * worlds: the stock resolver hands back realpath-resolved filenames, while a
+ * registered runtime root is whatever the caller configured (a cache under a
+ * junctioned `F:\Programs\…`, a home directory symlinked onto another volume,
+ * macOS `/tmp` → `/private/tmp`).
+ */
+function canonicalPath(target: string): string {
+	const cached = canonicalPaths.get(target);
+	if (cached !== undefined) return cached;
+	let canonical: string;
+	try {
+		canonical = fs.realpathSync.native(target);
+	} catch {
+		canonical = path.resolve(target);
+	}
+	if (process.platform === "win32") canonical = canonical.toLowerCase();
+	canonicalPaths.set(target, canonical);
+	return canonical;
+}
+
+/**
+ * Path of `candidate` relative to `root` when `candidate` is inside (or is)
+ * `root`, else `null`. Both sides are canonicalized, so a runtime cache
+ * reached through a link still matches the filenames the resolver reports.
+ */
+function relativeWithin(root: string, candidate: string): string | null {
+	const relative = path.relative(canonicalPath(root), canonicalPath(candidate));
+	if (relative !== "" && (relative.startsWith("..") || path.isAbsolute(relative))) return null;
+	return relative;
+}
+
+function parentFilename(parent: unknown): string | null {
+	if (!isRecord(parent)) return null;
+	const filename = parent.filename;
+	return typeof filename === "string" ? filename : null;
+}
 
 export interface RuntimeResolverOptions {
 	/** Absolute path to the runtime cache's `node_modules`. */
@@ -184,24 +227,41 @@ export interface RuntimeResolverOptions {
  * runtime caches. Stock resolution is tried first and kept for anything
  * outside the registered roots (bundled imports, node builtins, host or
  * extension trees). Multiple runtime roots may register; they are consulted
- * in registration order.
+ * in registration order. Returns an uninstaller that drops the registration
+ * and restores the stock resolver once no registrations remain.
  *
  * One stock "success" is distrusted: the compiled-binary resolver ignores
  * `main`/`exports` for real-FS packages (Bun #1763), so a package shipping
  * its TS source next to `dist/` (e.g. `@huggingface/hub`'s root `index.ts`)
  * resolves to the wrong file. When the stock hit lands inside a registered
  * runtime root, the manifest-aware resolution wins.
+ *
+ * KNOWN LIMITATION (Bun 1.3.14): while any JS override of
+ * `Module._resolveFilename` is installed, Bun routes `createRequire(...)`
+ * resolution through it with `parent === undefined` — the requester context is
+ * never passed, so relative requires from a `createRequire` require fail with
+ * "Cannot find module './x' from ''". The override cannot recover what it is
+ * never given. Keep this patch scoped to dedicated worker/runtime processes
+ * (tiny-inference, fastembed); never install it in the main agent process,
+ * where legacy-pi extensions rely on `createRequire` relative requires.
  */
-export function installRuntimeModuleResolver({ runtimeNodeModules, stubs = {} }: RuntimeResolverOptions): void {
+export function installRuntimeModuleResolver({ runtimeNodeModules, stubs = {} }: RuntimeResolverOptions): () => void {
 	const registry = resolverRegistry();
 	const existing = registry.find(entry => entry.runtimeNodeModules === runtimeNodeModules);
 	if (existing) Object.assign(existing.stubs, stubs);
 	else registry.push({ runtimeNodeModules, stubs: { ...stubs } });
 
 	const resolver = (Module as unknown as { default?: ModuleResolver } & ModuleResolver).default ?? Module;
-	const target = resolver as unknown as ModuleResolver & { [PATCHED]?: boolean };
-	if (target[PATCHED]) return;
-	const original = target._resolveFilename.bind(target);
+	const target = resolver as unknown as ModuleResolver & { [PATCHED]?: () => void };
+	const uninstall = (): void => {
+		const entries = resolverRegistry();
+		const index = entries.findIndex(entry => entry.runtimeNodeModules === runtimeNodeModules);
+		if (index !== -1) entries.splice(index, 1);
+		if (entries.length === 0) target[PATCHED]?.();
+	};
+	if (target[PATCHED]) return uninstall;
+	const pristine = target._resolveFilename;
+	const original = pristine.bind(target);
 	target._resolveFilename = (request: string, parent: unknown, isMain: boolean, options?: unknown): string => {
 		let stockResolved: string | null = null;
 		let stockError: unknown;
@@ -212,7 +272,18 @@ export function installRuntimeModuleResolver({ runtimeNodeModules, stubs = {} }:
 		}
 		const bare = !request.startsWith(".") && !request.startsWith("node:") && !path.isAbsolute(request);
 		if (bare) {
+			const parentFile = parentFilename(parent);
 			for (const registration of resolverRegistry()) {
+				const parentInRuntime =
+					parentFile !== null && relativeWithin(registration.runtimeNodeModules, parentFile) !== null;
+				if (parentInRuntime) {
+					const stub = registration.stubs[request];
+					if (stub) return stub;
+					if (!stockResolved || relativeWithin(registration.runtimeNodeModules, stockResolved) === null) {
+						const fallback = resolveRuntimeModule(registration.runtimeNodeModules, request);
+						if (fallback) return fallback;
+					}
+				}
 				if (stockResolved) {
 					// Correct a stock hit only inside the top-level package the
 					// request names. A hit in a nested node_modules (e.g. tar's
@@ -221,8 +292,9 @@ export function installRuntimeModuleResolver({ runtimeNodeModules, stubs = {} }:
 					// it with the top-level instance would cross major versions.
 					const { packageName } = splitBareSpecifier(request);
 					const pkgDir = path.join(registration.runtimeNodeModules, ...packageName.split("/"));
-					if (!stockResolved.startsWith(pkgDir + path.sep)) continue;
-					if (path.relative(pkgDir, stockResolved).split(path.sep).includes("node_modules")) continue;
+					const relative = relativeWithin(pkgDir, stockResolved);
+					if (relative === null || relative === "") continue;
+					if (relative.split(path.sep).includes("node_modules")) continue;
 					const expected = resolveRuntimeModule(registration.runtimeNodeModules, request);
 					if (expected) return expected;
 				} else {
@@ -236,12 +308,18 @@ export function installRuntimeModuleResolver({ runtimeNodeModules, stubs = {} }:
 		if (stockResolved) return stockResolved;
 		throw stockError;
 	};
-	target[PATCHED] = true;
+	target[PATCHED] = () => {
+		target._resolveFilename = pristine;
+		delete target[PATCHED];
+	};
+	return uninstall;
 }
 
 /** Pinned dependency set materialized into a runtime cache directory. */
 export interface RuntimeInstallSpec {
 	dependencies: Record<string, string>;
+	/** Version pins forced across the whole runtime tree (bun `overrides`), e.g. dislodging a transitive dep. */
+	overrides?: Record<string, string>;
 	/** Packages whose lifecycle scripts bun may run during the install. */
 	trustedDependencies?: string[];
 }
@@ -260,34 +338,72 @@ export interface EnsureRuntimeInstalledOptions {
 	lockSleepMs?: number;
 }
 
-function isErrnoCode(error: unknown, code: string): boolean {
-	return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
+/** No runtime install plausibly runs this long, so older legacy lock directories are crash orphans. */
+const STALE_LEGACY_LOCK_MS = 10 * 60_000;
 
-async function acquireInstallLock(runtimeDir: string, attempts: number, sleepMs: number): Promise<() => Promise<void>> {
-	const lockDir = `${runtimeDir}.lock`;
-	await fsp.mkdir(path.dirname(lockDir), { recursive: true });
-	for (let attempt = 0; attempt < attempts; attempt++) {
+/**
+ * Run `fn` while reserving the pre-crash-safe `${runtimeDir}.lock` namespace.
+ *
+ * Versions through 18.0.10 serialized installs with a bare lock *directory*
+ * that only its creator removed; an installer killed outside that window
+ * (SIGKILL/OOM/Ctrl-C) left it unreleasable, wedging every later install for
+ * the full wait envelope (issue #10120). During an in-flight upgrade a legacy
+ * process may still legitimately own this directory, so poll until it is
+ * released and only force-reclaim once the directory is older than any
+ * plausible install ({@link STALE_LEGACY_LOCK_MS}) — never merely because a
+ * retry budget elapsed, which would delete a still-active legacy lock and let
+ * two installers race the same tree. Once the namespace is free, atomically
+ * create and retain a regular file through `fn`: an older process cannot
+ * acquire it between the handoff check and the new install. A file left by a
+ * crashed new installer can be reused immediately because the outer OS lock
+ * proves its owner is gone, unlike a legacy directory whose owner is unknown.
+ */
+async function withLegacyInstallLock<T>(runtimeDir: string, sleepMs: number, fn: () => Promise<T>): Promise<T> {
+	const legacy = `${runtimeDir}.lock`;
+	for (;;) {
 		try {
-			await fsp.mkdir(lockDir);
-			return async () => {
-				await fsp.rm(lockDir, { recursive: true, force: true });
-			};
+			const reservation = await fsp.open(legacy, "wx");
+			await reservation.close();
 		} catch (error) {
-			if (!isErrnoCode(error, "EEXIST")) throw error;
-			await Bun.sleep(sleepMs);
+			if (!isEexist(error)) throw error;
+			let stat: fs.Stats;
+			try {
+				stat = await fsp.stat(legacy);
+			} catch (statError) {
+				if (isEnoent(statError)) continue; // released between open and stat; retry
+				throw statError;
+			}
+			// A non-directory is a reservation left by a newer installer. The
+			// outer OS lock proves that installer is gone, so reuse it at once.
+			if (!stat.isDirectory()) break;
+			// A fresh directory may still belong to a live pre-18.x installer, so
+			// wait for it to finish; only a crash orphan (older than any plausible
+			// install) is force-reclaimed.
+			if (Date.now() - stat.mtimeMs > STALE_LEGACY_LOCK_MS) {
+				await fsp.rm(legacy, { recursive: true, force: true });
+			} else {
+				await Bun.sleep(sleepMs);
+			}
+			continue;
 		}
+		break;
 	}
-	throw new Error(`Timed out waiting for runtime install lock: ${lockDir}`);
+	// Retain the regular-file reservation across the install.
+	try {
+		return await fn();
+	} finally {
+		await fsp.rm(legacy, { force: true });
+	}
 }
 
-async function writeRuntimeManifest(runtimeDir: string, install: RuntimeInstallSpec): Promise<void> {
+export async function writeRuntimeManifest(runtimeDir: string, install: RuntimeInstallSpec): Promise<void> {
 	await fsp.mkdir(runtimeDir, { recursive: true });
 	const manifest: Record<string, unknown> = {
 		private: true,
 		type: "module",
 		dependencies: install.dependencies,
 	};
+	if (install.overrides && Object.keys(install.overrides).length) manifest.overrides = install.overrides;
 	if (install.trustedDependencies?.length) manifest.trustedDependencies = install.trustedDependencies;
 	await Bun.write(path.join(runtimeDir, "package.json"), `${JSON.stringify(manifest, null, "\t")}\n`);
 }
@@ -319,7 +435,14 @@ async function runRuntimeInstall(runtimeDir: string): Promise<void> {
 
 /**
  * Materialize a pinned dependency set into `runtimeDir` (idempotent,
- * cross-process safe via a lock directory). Returns `runtimeDir`.
+ * cross-process safe). Returns `runtimeDir`.
+ *
+ * Serialization uses the OS-backed {@link withFileLock} at
+ * `${runtimeDir}.install.lock`, which the kernel releases on process death, so
+ * a crashed installer cannot wedge later attempts (issue #10120). The path is
+ * deliberately distinct from the legacy `${runtimeDir}.lock` mkdir directory;
+ * {@link withLegacyInstallLock} atomically reserves that namespace during the
+ * new install so older processes cannot cross the migration boundary.
  */
 export async function ensureRuntimeInstalled(options: EnsureRuntimeInstalledOptions): Promise<string> {
 	const { runtimeDir, install, onPhase, lockAttempts = 240, lockSleepMs = 250 } = options;
@@ -335,15 +458,20 @@ export async function ensureRuntimeInstalled(options: EnsureRuntimeInstalledOpti
 	if (await probeManifest.exists()) return runtimeDir;
 
 	onPhase?.("initiate");
-	const releaseLock = await acquireInstallLock(runtimeDir, lockAttempts, lockSleepMs);
-	try {
-		if (await probeManifest.exists()) return runtimeDir;
-		await writeRuntimeManifest(runtimeDir, install);
-		onPhase?.("download");
-		await runRuntimeInstall(runtimeDir);
-		onPhase?.("done");
-		return runtimeDir;
-	} finally {
-		await releaseLock();
-	}
+	// withFileLock does not create parent directories; the runtime cache dir may
+	// not exist yet on the very first install.
+	await fsp.mkdir(path.dirname(runtimeDir), { recursive: true });
+	return withFileLock(
+		`${runtimeDir}.install`,
+		() =>
+			withLegacyInstallLock(runtimeDir, lockSleepMs, async () => {
+				if (await probeManifest.exists()) return runtimeDir;
+				await writeRuntimeManifest(runtimeDir, install);
+				onPhase?.("download");
+				await runRuntimeInstall(runtimeDir);
+				onPhase?.("done");
+				return runtimeDir;
+			}),
+		{ retries: lockAttempts, retryDelayMs: lockSleepMs },
+	);
 }

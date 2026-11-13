@@ -1,10 +1,20 @@
 import { describe, expect, it } from "bun:test";
+import {
+	type Dialect,
+	getDialectDefinition,
+	type InbandScanEvent,
+	ThinkingInbandScanner,
+} from "@oh-my-pi/pi-ai/dialect";
+import { streamGoogleGeminiCli } from "@oh-my-pi/pi-ai/providers/google-gemini-cli";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { stream } from "@oh-my-pi/pi-ai/stream";
-import type { Context, FetchImpl, Model, Tool, ToolCall } from "@oh-my-pi/pi-ai/types";
+import type { Context, FetchImpl, Model, TextContent, ThinkingContent, Tool, ToolCall } from "@oh-my-pi/pi-ai/types";
 import { getStreamMarkupHealingPattern, StreamMarkupHealing } from "@oh-my-pi/pi-ai/utils/stream-markup-healing";
+import { stripDsmlToolMarkup } from "@oh-my-pi/pi-ai/utils/dsml-leak";
+import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 
 interface SseToolCallDelta {
 	index: number;
@@ -16,6 +26,7 @@ interface SseToolCallDelta {
 interface SseChoiceDelta {
 	content?: string;
 	tool_calls?: SseToolCallDelta[];
+	reasoning_content?: string;
 }
 
 interface SseChunk {
@@ -30,7 +41,7 @@ interface SseChunk {
 	}>;
 }
 
-function sseResponse(events: ReadonlyArray<SseChunk | "[DONE]">): Response {
+function sseResponse(events: ReadonlyArray<unknown | "[DONE]">): Response {
 	const payload = `${events
 		.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`)
 		.join("\n\n")}\n\n`;
@@ -40,7 +51,7 @@ function sseResponse(events: ReadonlyArray<SseChunk | "[DONE]">): Response {
 	});
 }
 
-function mockFetch(events: ReadonlyArray<SseChunk | "[DONE]">): FetchImpl {
+function mockFetch(events: ReadonlyArray<unknown | "[DONE]">): FetchImpl {
 	const fn = async (_input: string | URL | Request, _init?: RequestInit): Promise<Response> => sseResponse(events);
 	return Object.assign(fn, { preconnect: fetch.preconnect });
 }
@@ -67,10 +78,30 @@ function chunk(model: string, delta: SseChoiceDelta, finish: SseChunk["choices"]
 	};
 }
 
+it("preserves a parse-error sentinel through Kimi markup healing", async () => {
+	const model = kimiModel();
+	const raw = '{"path":"repaired.txt","content":"hello';
+	const text =
+		"<|tool_calls_section_begin|><|tool_call_begin|>functions.write:0<|tool_call_argument_begin|>" +
+		raw +
+		"<|tool_call_end|><|tool_calls_section_end|>";
+	const result = await streamOpenAICompletions(model, baseContext(), {
+		apiKey: "test-key",
+		fetch: mockFetch([chunk(model.id, { content: text }), chunk(model.id, {}, "stop"), "[DONE]"]),
+	}).result();
+	expect(result.stopReason).toBe("toolUse");
+	const call = result.content.find(block => block.type === "toolCall");
+	if (!call) throw new Error("Expected tool call");
+	expect(call.arguments).toEqual({ __parseError: expect.any(String), __rawJson: raw });
+	expect(() =>
+		validateToolArguments({ name: "write", description: "", parameters: { type: "object" } }, call),
+	).toThrow("Tool call arguments are not valid JSON");
+});
+
 const REPORTED_DSML_LEAK =
 	"<｜DSML｜tool_calls>\n" +
 	' <｜DSML｜invoke name="bash">\n' +
-	' <｜DSML｜parameter name="_i" string="true">Check Fedora 42 available packages</｜DSML｜parameter>\n' +
+	' <｜DSML｜parameter name="i" string="true">Check Fedora 42 available packages</｜DSML｜parameter>\n' +
 	' <｜DSML｜parameter name="command" string="true">docker run --rm --platform linux/arm64 fedora:42 bash -c \'type python3; type git; type sed; type cp; ls /usr/bin/python3 2>/dev/null; rpm -qa | grep -E "^python3|^git-|^sed-|^bash-" | sort\'</｜DSML｜parameter>\n' +
 	' <｜DSML｜parameter name="timeout" string="false">15</｜DSML｜parameter>\n' +
 	" </｜DSML｜invoke>\n" +
@@ -82,7 +113,7 @@ const bashTool: Tool = {
 	parameters: {
 		type: "object",
 		properties: {
-			_i: { type: "string" },
+			[INTENT_FIELD]: { type: "string" },
 			command: { type: "string" },
 			timeout: { type: "number" },
 		},
@@ -116,6 +147,21 @@ const deepseekCloudModel: Model<"ollama-chat"> = buildModel({
 	maxTokens: 8_192,
 });
 
+function geminiCliModel(): Model<"google-gemini-cli"> {
+	return buildModel({
+		id: "gemini-3.5-flash",
+		name: "Gemini 3.5 Flash",
+		api: "google-gemini-cli",
+		provider: "google-antigravity",
+		baseUrl: "https://antigravity.test",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 8_192,
+	});
+}
+
 function ndjsonResponse(lines: ReadonlyArray<unknown>): Response {
 	const body = `${lines.map(line => JSON.stringify(line)).join("\n")}\n`;
 	const encoder = new TextEncoder();
@@ -135,18 +181,199 @@ function mockNdjsonFetch(lines: ReadonlyArray<unknown>): FetchImpl {
 	const fn = async (_input: string | URL | Request, _init?: RequestInit): Promise<Response> => ndjsonResponse(lines);
 	return Object.assign(fn, { preconnect: fetch.preconnect });
 }
+function healingModel(provider: string, id: string): Model<"ollama-chat"> {
+	return buildModel({
+		id,
+		api: "ollama-chat",
+		provider,
+		baseUrl: "http://localhost:11434",
+		name: id,
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	});
+}
 
 describe("StreamMarkupHealing pattern selection", () => {
-	it("selects the requested grammar without creating provider-specific collectors", () => {
-		expect(getStreamMarkupHealingPattern("openrouter", "moonshotai/kimi-k2")).toBe("kimi");
-		expect(getStreamMarkupHealingPattern("ollama-cloud", "deepseek-v4-pro")).toBe("dsml");
-		expect(getStreamMarkupHealingPattern("minimax-code", "MiniMax-M2.5", { parseThinkingTags: true })).toBe(
-			"thinking",
-		);
-		expect(getStreamMarkupHealingPattern("opencode-zen", "minimax-m3")).toBe("thinking");
-		expect(getStreamMarkupHealingPattern("nanogpt", "deepseek/deepseek-v4-pro")).toBe("dsml");
-		expect(getStreamMarkupHealingPattern("ollama-cloud", "gpt-oss:120b")).toBeUndefined();
-		expect(getStreamMarkupHealingPattern("openai", "deepseek-v4-pro")).toBeUndefined();
+	it("routes tool-call leaks to their grammar and everything else to thinking", () => {
+		expect(getStreamMarkupHealingPattern(healingModel("openrouter", "moonshotai/kimi-k2"))).toBe("kimi");
+		expect(getStreamMarkupHealingPattern(healingModel("ollama-cloud", "deepseek-v4-pro"))).toBe("dsml");
+		expect(getStreamMarkupHealingPattern(healingModel("nanogpt", "deepseek/deepseek-v4-pro"))).toBe("dsml");
+		// Every other model heals leaked reasoning idioms by default.
+		expect(getStreamMarkupHealingPattern(healingModel("opencode-zen", "minimax-m3"))).toBe("thinking");
+		expect(getStreamMarkupHealingPattern(healingModel("openrouter", "google/gemini-3.5-flash"))).toBe("thinking");
+		expect(getStreamMarkupHealingPattern(healingModel("ollama-cloud", "gpt-oss:120b"))).toBe("thinking");
+		expect(getStreamMarkupHealingPattern(healingModel("openai", "deepseek-v4-pro"))).toBe("dsml");
+	});
+});
+
+describe("openai-completions leaked thinking healing", () => {
+	// Gemini on OpenRouter (chat-completions) leaks its canonical ` ```thinking `
+	// fence into `delta.content`. The default "thinking" healer must lift it back
+	// into a thinking block instead of leaving the fence as visible text (#bug).
+	const geminiModel = buildModel({
+		id: "google/gemini-3.5-flash",
+		name: "Gemini 3.5 Flash",
+		api: "openai-completions",
+		provider: "openrouter",
+		baseUrl: "https://openrouter.ai/api/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 8_192,
+	});
+
+	it("lifts a leaked gemini thinking fence out of the visible reply", async () => {
+		const leaked = "```thinking\nWeigh the options.\n```\nFinal answer.";
+		const fetchMock = mockFetch([
+			chunk(geminiModel.id, { content: leaked }),
+			chunk(geminiModel.id, {}, "stop"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(geminiModel, baseContext(), {
+			apiKey: "test",
+			fetch: fetchMock,
+		}).result();
+
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => b.text)
+			.join("");
+		const thinking = result.content
+			.filter((b): b is ThinkingContent => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+
+		expect(thinking).toContain("Weigh the options.");
+		expect(text).not.toContain("```thinking");
+		expect(text.trim()).toBe("Final answer.");
+	});
+
+	it("keeps healed thinking from duplicating structured reasoning", async () => {
+		const fetchMock = mockFetch([
+			chunk(geminiModel.id, { reasoning_content: "structured reasoning" }),
+			chunk(geminiModel.id, { content: "```thinking\nleaked copy\n```visible" }),
+			chunk(geminiModel.id, {}, "stop"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(geminiModel, baseContext(), {
+			apiKey: "test",
+			fetch: fetchMock,
+		}).result();
+
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => b.text)
+			.join("");
+		const thinking = result.content
+			.filter((b): b is ThinkingContent => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+
+		expect(thinking).toBe("structured reasoning");
+		expect(thinking).not.toContain("leaked copy");
+		expect(text.trim()).toBe("visible");
+	});
+});
+
+describe("official OpenAI leaked thinking healing exemption", () => {
+	// The official OpenAI endpoint returns structured reasoning and never leaks
+	// fences, so neither the provider-local healer nor the central
+	// wrapLeakedThinkingStream wrap runs — a ` ```thinking ` block the model chose
+	// to write must stay verbatim visible text. Routed through stream() (not the
+	// provider directly) so both gates are exercised.
+	const officialOpenAI = getBundledModel("openai", "gpt-5.5");
+	const completionsModel = buildModel({
+		...officialOpenAI,
+		api: "openai-completions",
+	});
+
+	it("leaves a leaked fence intact for the official OpenAI endpoint", async () => {
+		const leaked = "```thinking\nWeigh the options.\n```\nFinal answer.";
+		const result = await stream(completionsModel, baseContext(), {
+			apiKey: "test",
+			fetch: mockFetch([
+				chunk(completionsModel.id, { content: leaked }),
+				chunk(completionsModel.id, {}, "stop"),
+				"[DONE]",
+			]),
+		}).result();
+
+		expect(result.content.map(b => b.type)).toEqual(["text"]);
+		expect(result.content.filter((b): b is ThinkingContent => b.type === "thinking")).toHaveLength(0);
+		expect(result.content.map(b => (b.type === "text" ? b.text : "")).join("")).toBe(leaked);
+	});
+});
+
+describe("google-gemini-cli leaked thinking healing", () => {
+	it("lifts a leaked Gemini thinking fence before a native tool call", async () => {
+		const model = geminiCliModel();
+		const fetchMock = mockFetch([
+			{
+				response: {
+					candidates: [
+						{
+							content: {
+								role: "model",
+								parts: [
+									{
+										text: "```thinking\nCheck the provider path.\n```\nI will inspect the file.",
+										thoughtSignature: "visible-text-signature",
+									},
+									{
+										functionCall: {
+											name: "read",
+											args: { path: "packages/ai/src/providers/google-gemini-cli.ts" },
+											id: "call_read_1",
+										},
+										thoughtSignature: "function-call-signature",
+									},
+								],
+							},
+							finishReason: "STOP",
+						},
+					],
+					usageMetadata: {
+						promptTokenCount: 10,
+						candidatesTokenCount: 5,
+						thoughtsTokenCount: 3,
+						totalTokenCount: 18,
+					},
+				},
+			},
+		]);
+
+		const result = await streamGoogleGeminiCli(
+			model,
+			{ ...baseContext(), tools: [readTool] },
+			{
+				apiKey: JSON.stringify({ token: "test-token", projectId: "test-project" }),
+				fetch: fetchMock,
+			},
+		).result();
+
+		expect(result.content.map(block => block.type)).toEqual(["thinking", "text", "toolCall"]);
+		const thinking = result.content
+			.filter((block): block is ThinkingContent => block.type === "thinking")
+			.map(block => block.thinking)
+			.join("");
+		const textBlocks = result.content.filter((block): block is TextContent => block.type === "text");
+		const text = textBlocks.map(block => block.text).join("");
+		const calls = result.content.filter((block): block is ToolCall => block.type === "toolCall");
+
+		expect(thinking).toBe("Check the provider path.\n");
+		expect(text).toBe("\nI will inspect the file.");
+		expect(text).not.toContain("```thinking");
+		expect(calls).toHaveLength(1);
+		expect(textBlocks[0]?.textSignature).toBe("visible-text-signature");
+		expect(calls[0]?.id).toBe("call_read_1");
+		expect(calls[0]?.thoughtSignature).toBe("function-call-signature");
+		expect(result.stopReason).toBe("toolUse");
 	});
 });
 
@@ -162,7 +389,7 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		expect(call.id).toMatch(/^call_[0-9a-f]+$/);
 
 		const args = JSON.parse(call.arguments) as Record<string, unknown>;
-		expect(args._i).toBe("Check Fedora 42 available packages");
+		expect(args[INTENT_FIELD]).toBe("Check Fedora 42 available packages");
 		expect(args.timeout).toBe(15);
 		expect(String(args.command)).toContain("2>/dev/null");
 		expect(String(args.command)).toContain('grep -E "^python3|^git-|^sed-|^bash-"');
@@ -195,6 +422,38 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		expect(before.text).toBe("Before\n");
 		expect(call.call.name).toBe("bash");
 		expect(after.text).toBe("\nAfter");
+	});
+
+	it("keeps quoted prose after an unclosed wrapper with no invoke", () => {
+		const input =
+			"之前这些源的完整 `<｜DSML｜tool_calls>` 信封显示为纯文本，工具从不执行。\n\n## Next section\nmore text";
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let i = 0; i < input.length; i += 7) visible += healing.feed(input.slice(i, i + 7));
+		visible += healing.flushPending();
+		expect(visible).toBe(input);
+		expect(stripDsmlToolMarkup(visible)).toBeUndefined();
+		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("passes an unclosed, unquoted wrapper to leak recovery without losing later prose", () => {
+		const input = "Intro. <|DSML|tool_calls>broken call\n\nThe build passed.";
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let i = 0; i < input.length; i += 5) visible += healing.feed(input.slice(i, i + 5));
+		visible += healing.flushPending();
+		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nThe build passed.");
+		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("passes a closed wrapper without an invoke to leak recovery", () => {
+		const input = "Intro.<|DSML|tool_calls>broken</|DSML|tool_calls>Outro.";
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let i = 0; i < input.length; i += 6) visible += healing.feed(input.slice(i, i + 6));
+		visible += healing.flushPending();
+		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nOutro.");
+		expect(healing.drainCompleted()).toEqual([]);
 	});
 
 	it("drops partial calls when the stream ends mid-envelope", () => {
@@ -238,6 +497,234 @@ describe("StreamMarkupHealing DSML envelope pattern", () => {
 		).toBe("");
 		expect(healing.drainCompleted()).toHaveLength(1);
 	});
+
+	it("strips leaked orphan DSML close tags with no matching open (issue #10556)", () => {
+		// Long-session degradation: the model leaks bare closers into visible text.
+		// They must never survive into stored content, where replay reinforces the
+		// XML-protocol mimicry that drops subsequent tool calls.
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		const leaked = "分析文本。\n\n</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+		const visible = healing.feed(leaked) + healing.flushPending();
+		expect(visible).toBe("分析文本。\n\n\n\n");
+		expect(healing.drainCompleted()).toHaveLength(0);
+	});
+
+	it("keeps a malformed call's closers so its removal stops before following prose", () => {
+		// A bare parameter opener (no tool_calls/invoke wrapper) cannot be healed.
+		// Its closers must survive as the call's end marker; stripping them as
+		// orphans would leave no boundary and the prose after would be lost.
+		const leaked =
+			'Intro.\nbash\n<｜DSML｜parameter name="command" string="true">echo hi</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\nThe build passed.';
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		let visible = "";
+		for (let i = 0; i < leaked.length; i += 6) visible += healing.feed(leaked.slice(i, i + 6));
+		visible += healing.flushPending();
+		expect(visible).toBe(leaked);
+		expect(healing.drainCompleted()).toHaveLength(0);
+		expect(stripDsmlToolMarkup(visible)).toBe("Intro.\n\nThe build passed.");
+	});
+
+	it("preserves whitespace after orphan DSML closers split across chunk boundaries", () => {
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		const leaked = "text</｜DSML｜parameter> \n  </|DSML|invoke>\n\tmore";
+		let visible = "";
+		for (let i = 0; i < leaked.length; i += 5) visible += healing.feed(leaked.slice(i, i + 5));
+		visible += healing.flushPending();
+		expect(visible).toBe("text \n  \n\tmore");
+		expect(healing.drainCompleted()).toHaveLength(0);
+	});
+
+	it("heals a leaked thinking fence while still reconstructing the tool call", () => {
+		// The DSML grammar's xml scanner does not parse thinking; proving the fence
+		// is lifted shows the always-on thinking healer runs alongside it.
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		const events = [
+			...healing.feedEvents("```thinking\nplan\n```before "),
+			...healing.feedEvents(REPORTED_DSML_LEAK),
+			...healing.feedEvents(" after"),
+			...healing.flushEvents(),
+		];
+		const thinking = events.flatMap(e => (e.type === "thinking" ? [e.thinking] : [])).join("");
+		const text = events.flatMap(e => (e.type === "text" ? [e.text] : [])).join("");
+		const calls = events.filter(e => e.type === "toolCall");
+		expect(thinking).toBe("plan\n");
+		expect(text).toBe("before  after");
+		expect(calls).toHaveLength(1);
+	});
+});
+
+// Tool calls a degraded DeepSeek V4.1 Flash on Fireworks wrote as text: chat-template
+// tokens re-spelled with `_` for `▁` (wholly or partly), a dropped bar, and calls
+// closed by the section close instead of `<｜tool▁call▁end｜>`.
+const RESPELLED_TEMPLATE_ARGS =
+	'{"command":"grep -n \\"report_endpoint_changes\\" game.log","i":"Listing hotplug events"}';
+const RESPELLED_TEMPLATE_LEAKS = {
+	"underscores, section close ends the call": `\n\n<｜tool_calls_begin｜><｜tool_call_begin｜>bash<｜tool_sep｜>${RESPELLED_TEMPLATE_ARGS}\n\n<｜tool_calls_end｜>`,
+	"dropped bar, doubled section close": `\n\n<｜tool_calls_begin｜><tool_call_begin｜>bash<｜tool_sep｜>${RESPELLED_TEMPLATE_ARGS}<｜tool_calls_end｜><｜tool_calls_end｜>`,
+	"mixed ▁ and _": `\n\n<｜tool▁calls_begin｜><｜tool_call_begin｜>bash<｜tool_sep｜>${RESPELLED_TEMPLATE_ARGS}<｜tool_calls_end｜><｜tool_calls_end｜>`,
+};
+
+describe("StreamMarkupHealing DeepSeek template-token spellings", () => {
+	for (const [shape, leak] of Object.entries(RESPELLED_TEMPLATE_LEAKS)) {
+		for (const step of [leak.length, 1]) {
+			it(`heals a re-spelled call (${shape}) fed ${step === 1 ? "char by char" : "whole"}`, () => {
+				const healing = new StreamMarkupHealing({ pattern: "dsml" });
+				let visible = "";
+				for (let i = 0; i < leak.length; i += step) visible += healing.feed(leak.slice(i, i + step));
+				visible += healing.flushPending();
+				expect(visible.trim()).toBe("");
+				const calls = healing.drainCompleted();
+				expect(calls).toHaveLength(1);
+				expect(calls[0].name).toBe("bash");
+				expect(JSON.parse(calls[0].arguments)).toEqual(JSON.parse(RESPELLED_TEMPLATE_ARGS));
+			});
+		}
+	}
+
+	it("heals consecutive calls when the model skips each call's close", () => {
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		const visible =
+			healing.feed(
+				'<｜tool_calls_begin｜><｜tool_call_begin｜>read<｜tool_sep｜>{"path":"a"}<｜tool_call_begin｜>read<｜tool_sep｜>{"path":"b"}<｜tool_calls_end｜>Done.',
+			) + healing.flushPending();
+		expect(visible).toBe("Done.");
+		expect(healing.drainCompleted().map(call => JSON.parse(call.arguments))).toEqual([{ path: "a" }, { path: "b" }]);
+	});
+
+	it("keeps inferred terminators inside a JSON string as argument text", () => {
+		// Greps and file writes naming the tokens themselves: none of these
+		// occurrences may end the call; only the trailing close does.
+		const cases = [
+			[
+				"bash",
+				{ command: 'grep -c "<｜tool▁calls▁end｜>\\|<｜tool_call_begin｜>\\|<tool_call_end｜>" omp.log' },
+				"<｜tool_calls_end｜>",
+			],
+			[
+				"write",
+				{ content: "x <｜tool▁calls▁end｜> <｜tool▁call▁begin｜> <tool_call_end｜> y" },
+				"<｜tool▁call▁end｜>",
+			],
+		] as const;
+		for (const [name, args, close] of cases) {
+			const leak = `<｜tool_calls_begin｜><｜tool_call_begin｜>${name}<｜tool_sep｜>${JSON.stringify(args)}${close}<｜tool_calls_end｜>`;
+			for (const step of [leak.length, 1]) {
+				const healing = new StreamMarkupHealing({ pattern: "dsml" });
+				let visible = "";
+				for (let i = 0; i < leak.length; i += step) visible += healing.feed(leak.slice(i, i + step));
+				visible += healing.flushPending();
+				expect(visible).toBe("");
+				expect(healing.drainCompleted().map(call => [call.name, JSON.parse(call.arguments)])).toEqual([
+					[name, args],
+				]);
+			}
+		}
+	});
+
+	it("drops template tokens after a stray section open, including one cut off by stream end, but keeps prose", () => {
+		const input =
+			"Hi.<｜tool▁calls▁begin｜>Hello world\nNext line.\n<｜tool▁sep｜>\n<｜end▁of▁sentence｜> Bye.<｜tool_call_begin｜";
+		for (const step of [input.length, 1]) {
+			const healing = new StreamMarkupHealing({ pattern: "dsml" });
+			let visible = "";
+			for (let i = 0; i < input.length; i += step) visible += healing.feed(input.slice(i, i + step));
+			visible += healing.flushPending();
+			// Whitespace before a token is layout and goes with it; before prose it stays.
+			expect(visible).toBe("Hi.Hello world\nNext line. Bye.");
+			expect(healing.drainCompleted()).toEqual([]);
+		}
+	});
+
+	it("keeps re-spelled tokens the model quotes in code as prose, and still heals a call after them", () => {
+		const quoted =
+			"The leak starts with `<｜tool_calls_begin｜>` and a ``<tool_call_begin｜>`` opener:\n\n```\n<｜tool_call_begin｜>bash<｜tool_sep｜>{}\n```\n\n";
+		const call = `<｜tool_calls_begin｜><｜tool_call_begin｜>bash<｜tool_sep｜>${RESPELLED_TEMPLATE_ARGS}<｜tool_calls_end｜>`;
+		const input = quoted + call;
+		for (const step of [input.length, 1]) {
+			const healing = new StreamMarkupHealing({ pattern: "dsml" });
+			let visible = "";
+			for (let i = 0; i < input.length; i += step) visible += healing.feed(input.slice(i, i + step));
+			visible += healing.flushPending();
+			expect(visible).toBe(quoted);
+			expect(healing.drainCompleted().map(c => JSON.parse(c.arguments))).toEqual([
+				JSON.parse(RESPELLED_TEMPLATE_ARGS),
+			]);
+		}
+	});
+
+	it("heals a re-spelled call after an unmatched backtick, which Markdown renders as plain text", () => {
+		// The paragraph ends inside the call, so the run before it never closed and
+		// a token quoted after the call is still code.
+		const call = `<｜tool_calls_begin｜><｜tool_call_begin｜>bash<｜tool_sep｜>${RESPELLED_TEMPLATE_ARGS}\n\n<｜tool_calls_end｜>`;
+		const after = " Then `<｜tool_calls_begin｜>` stays.";
+		for (const prose of ["Run the `grep first. ", "Run the `grep first.\n", "A ``x` run. ", "Run `"]) {
+			const input = prose + call + after;
+			for (const step of [input.length, 1]) {
+				const healing = new StreamMarkupHealing({ pattern: "dsml" });
+				let visible = "";
+				for (let i = 0; i < input.length; i += step) visible += healing.feed(input.slice(i, i + step));
+				visible += healing.flushPending();
+				expect(visible).toBe(prose + after);
+				expect(healing.drainCompleted().map(c => JSON.parse(c.arguments))).toEqual([
+					JSON.parse(RESPELLED_TEMPLATE_ARGS),
+				]);
+			}
+		}
+	});
+
+	it("leaves ASCII-pipe tokens from other templates visible", () => {
+		// Kimi's `<|tool_call_begin|>` shares a name with DeepSeek's token; without a
+		// fullwidth bar it is not DeepSeek markup and must not open a call.
+		const input =
+			'Kimi writes <|tool_call_begin|>functions.read:0<|tool_call_argument_begin|>{"path":"a"}<|tool_call_end|> here.';
+		const healing = new StreamMarkupHealing({ pattern: "dsml" });
+		expect(healing.feed(input) + healing.flushPending()).toBe(input);
+		expect(healing.drainCompleted()).toEqual([]);
+	});
+
+	it("strips an unhealed re-spelled call from history text but keeps quoted tokens and later prose", () => {
+		const text = `I'll grep the log.${RESPELLED_TEMPLATE_LEAKS["underscores, section close ends the call"]}\n\nThe log is large.`;
+		expect(stripDsmlToolMarkup(text)).toBe("I'll grep the log.\n\nThe log is large.");
+		expect(stripDsmlToolMarkup("The template opens calls with `<｜tool▁calls▁begin｜>`.")).toBeUndefined();
+	});
+});
+
+describe("StreamMarkupHealing Qwen XML pattern", () => {
+	const leaked = '<tool_calls>\n<read path="/etc/hostname" />\n</tool_calls>';
+
+	it("parses a self-closing tool element into a structured call", () => {
+		const healing = new StreamMarkupHealing({ pattern: "qwen" });
+		expect(healing.feed(leaked)).toBe("");
+
+		const calls = healing.drainCompleted();
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.name).toBe("read");
+		expect(JSON.parse(calls[0]!.arguments)).toEqual({ path: "/etc/hostname" });
+	});
+
+	it("reconstructs markup split across arbitrary chunk boundaries", () => {
+		const healing = new StreamMarkupHealing({ pattern: "qwen" });
+		let visible = "";
+		for (const char of leaked) visible += healing.feed(char);
+		visible += healing.flushPending();
+
+		expect(visible).toBe("");
+		expect(healing.drainCompleted()).toHaveLength(1);
+	});
+
+	it("preserves text around a complete tool-call section", () => {
+		const healing = new StreamMarkupHealing({ pattern: "qwen" });
+		const events = healing.feedEvents(`Before\n${leaked}\nAfter`);
+
+		expect(events.map(event => event.type)).toEqual(["text", "toolCall", "text"]);
+	});
+
+	it("drops an incomplete tool-call section", () => {
+		const healing = new StreamMarkupHealing({ pattern: "qwen" });
+		expect(healing.feed('<tool_calls><read path="/etc/host')).toBe("");
+		expect(healing.flushPending()).toBe("");
+		expect(healing.drainCompleted()).toHaveLength(0);
+	});
 });
 
 describe("StreamMarkupHealing thinking pattern", () => {
@@ -246,6 +733,131 @@ describe("StreamMarkupHealing thinking pattern", () => {
 		expect(healing.feedEvents("visible <thin")).toEqual([{ type: "text", text: "visible " }]);
 		expect(healing.feedEvents("king>hidden</think")).toEqual([{ type: "thinking", thinking: "hidden" }]);
 		expect(healing.feedEvents("ing> answer")).toEqual([{ type: "text", text: " answer" }]);
+	});
+
+	// Heal input (one or more chunks) through the public entry point, returning the
+	// visible text and the recovered thinking. Spread a string to stream per char.
+	const heal = (...chunks: string[]): { text: string; thinking: string } => {
+		const healing = new StreamMarkupHealing({ pattern: "thinking" });
+		const events = [...chunks.flatMap(chunk => healing.feedEvents(chunk)), ...healing.flushEvents()];
+		let text = "";
+		let thinking = "";
+		for (const event of events) {
+			if (event.type === "text") text += event.text;
+			else if (event.type === "thinking") thinking += event.thinking;
+		}
+		return { text, thinking };
+	};
+
+	// Exhaustive over the dialect union: a missing case is a compile error, so the
+	// healer is proven to recover every dialect's canonical `renderThinking` form.
+	const DIALECT_CASES: { [K in Dialect]: K } = {
+		anthropic: "anthropic",
+		deepseek: "deepseek",
+		gemini: "gemini",
+		gemma: "gemma",
+		glm: "glm",
+		harmony: "harmony",
+		hermes: "hermes",
+		kimi: "kimi",
+		minimax: "minimax",
+		qwen3: "qwen3",
+		xml: "xml",
+	};
+
+	for (const dialect of Object.values(DIALECT_CASES)) {
+		it(`heals leaked ${dialect} reasoning back into thinking`, () => {
+			const rendered = getDialectDefinition(dialect).renderThinking("REASONING_SENTINEL");
+			const { text, thinking } = heal(`prefix ${rendered} suffix`);
+			expect(thinking).toContain("REASONING_SENTINEL");
+			expect(text).toBe("prefix  suffix");
+		});
+	}
+
+	it("heals a gemini ```thinking fence streamed character by character", () => {
+		const { text, thinking } = heal(..."Sure.```thinking\nweigh options\n```Done.");
+		expect(thinking).toBe("weigh options\n");
+		expect(text).toBe("Sure.Done.");
+	});
+
+	it("heals a bare harmony analysis channel leak", () => {
+		const { text, thinking } = heal("<|channel|>analysis<|message|>planning the edit<|end|>Final answer.");
+		expect(thinking).toBe("planning the edit");
+		expect(text).toBe("Final answer.");
+	});
+
+	it("heals a leaked <scratchpad> section", () => {
+		const { text, thinking } = heal("<scratchpad>jot</scratchpad>visible");
+		expect(thinking).toBe("jot");
+		expect(text).toBe("visible");
+	});
+
+	it("passes a bare '<' in idle prose through without holding it back", () => {
+		expect(heal("if a < b:\n    return a")).toEqual({ text: "if a < b:\n    return a", thinking: "" });
+	});
+
+	it("leaves unrelated markup as visible text", () => {
+		expect(heal("see <div>content</div> end")).toEqual({ text: "see <div>content</div> end", thinking: "" });
+	});
+
+	// Issue #5665: a literal reasoning tag inside a Markdown inline-code span was
+	// read as a leaked <think> boundary, splitting the visible row into
+	// text + thinking and corrupting the rendered Markdown.
+	it("keeps a literal think tag inside inline code as visible text", () => {
+		const literal = `<${"think"}>`;
+		const row = `| [#1203 MiniMax CN leaks \`${literal}\` text](https://x) | Fixed | PR merged |`;
+		expect(heal(row)).toEqual({ text: row, thinking: "" });
+	});
+
+	it("keeps a literal think tag inside inline code when streamed char by char", () => {
+		const literal = `<${"think"}>`;
+		const row = `prefix \`${literal}\` suffix`;
+		expect(heal(...row)).toEqual({ text: row, thinking: "" });
+	});
+
+	it("keeps a literal think tag inside a fenced code block as visible text", () => {
+		const literal = `<${"think"}>`;
+		const block = `\`\`\`md\n${literal}\n\`\`\`\nafter`;
+		expect(heal(block)).toEqual({ text: block, thinking: "" });
+	});
+
+	// Issue #5665 (review follow-up): a fenced block only closes on its own fence
+	// line. An inline backtick run inside the block (a `` ``` `` string literal)
+	// must not exit code mode early and let a later literal think tag be healed.
+	it("keeps a fenced block open across an inner triple-backtick literal", () => {
+		const literal = `<${"think"}>literal</${"think"}>`;
+		const block = `\`\`\`md\nconst fence = '\`\`\`';\n${literal}\n\`\`\`\nafter`;
+		expect(heal(block)).toEqual({ text: block, thinking: "" });
+		expect(heal(...block)).toEqual({ text: block, thinking: "" });
+	});
+
+	// Issue #5665 (review follow-up): CommonMark treats a fence indented by up to
+	// three spaces as fenced code. The scanner must still open a fenced block (not
+	// an inline span) so an inner triple-backtick literal does not close it early.
+	it("recognizes a fence indented up to three spaces as a fenced block", () => {
+		const literal = `<${"think"}>literal</${"think"}>`;
+		for (const indent of ["", " ", "   "]) {
+			const block = `${indent}\`\`\`md\nconst fence = '\`\`\`';\n${literal}\n${indent}\`\`\`\nafter`;
+			expect(heal(block)).toEqual({ text: block, thinking: "" });
+			expect(heal(...block)).toEqual({ text: block, thinking: "" });
+		}
+	});
+
+	it("still heals a leaked think tag outside inline code", () => {
+		const literal = `<${"think"}>`;
+		expect(heal(`before \`code\` ${literal}secret</think> after`)).toEqual({
+			text: "before `code`  after",
+			thinking: "secret",
+		});
+	});
+
+	it("emits one balanced thinking boundary for a healed fence", () => {
+		const scanner = new ThinkingInbandScanner();
+		const events: InbandScanEvent[] = [...scanner.feed("a```thinking\nx\n```b"), ...scanner.flush()];
+		expect(events.filter(e => e.type === "thinkingStart")).toHaveLength(1);
+		expect(events.filter(e => e.type === "thinkingEnd")).toHaveLength(1);
+		const thinking = events.map(e => (e.type === "thinkingDelta" ? e.delta : "")).join("");
+		expect(thinking).toBe("x\n");
 	});
 });
 describe("Kimi K2 leaked markup healing", () => {
@@ -297,8 +909,6 @@ describe("Kimi K2 leaked markup healing", () => {
 		const split = "<|tool_ca";
 		const a = full.slice(0, full.indexOf(split) + split.length);
 		const b = full.slice(a.length);
-		expect(a + b).toBe(full);
-		expect(a.endsWith("<|tool_ca")).toBe(true);
 
 		const fetchMock = mockFetch([
 			chunk(model.id, { content: a }),
@@ -468,6 +1078,57 @@ describe("Kimi K2 leaked markup healing", () => {
 		expect(result.stopReason).toBe("toolUse");
 	});
 
+	it("preserves leaked Kimi thinking when structured tool calls suppress synthesized calls", async () => {
+		const fetchMock = mockFetch([
+			chunk(model.id, {
+				content: "<think>plan</think>",
+				tool_calls: [
+					{
+						index: 0,
+						id: "call_structured_abc",
+						type: "function",
+						function: { name: "read", arguments: '{"path":"src/index.ts"}' },
+					},
+				],
+			}),
+			chunk(model.id, {}, "tool_calls"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test", fetch: fetchMock }).result();
+		const thinking = result.content
+			.filter((b): b is ThinkingContent => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
+
+		expect(thinking).toBe("plan");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0].id).toBe("call_structured_abc");
+		expect(toolCalls[0].arguments).toEqual({ path: "src/index.ts" });
+	});
+
+	it("does not duplicate leaked Kimi thinking when explicit reasoning is present", async () => {
+		const fetchMock = mockFetch([
+			chunk(model.id, { reasoning_content: "plan", content: "<think>plan</think>answer" }),
+			chunk(model.id, {}, "stop"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test", fetch: fetchMock }).result();
+		const thinking = result.content
+			.filter((b): b is ThinkingContent => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+		const text = result.content
+			.filter(b => b.type === "text")
+			.map(b => b.text)
+			.join("");
+
+		expect(thinking).toBe("plan");
+		expect(text).toBe("answer");
+	});
+
 	it("promotes a later healed call even if an earlier chunk had structured tool_calls", async () => {
 		const leaked =
 			"<|tool_calls_section_begin|>" +
@@ -563,7 +1224,7 @@ describe("Ollama provider DSML envelope healing", () => {
 		expect(toolCalls).toHaveLength(1);
 		expect(toolCalls[0].name).toBe("bash");
 		expect(toolCalls[0].arguments).toMatchObject({
-			_i: "Check Fedora 42 available packages",
+			[INTENT_FIELD]: "Check Fedora 42 available packages",
 			timeout: 15,
 		});
 		expect(String(toolCalls[0].arguments.command)).toContain("docker run");
@@ -631,7 +1292,7 @@ describe("OpenAI completions MiniMax thinking healing", () => {
 
 		expect(result.content).toEqual([
 			{ type: "text", text: "visible " },
-			{ type: "thinking", thinking: "hidden reasoning", thinkingSignature: undefined },
+			{ type: "thinking", thinking: "hidden reasoning", thinkingSignature: undefined, summary: false },
 			{ type: "text", text: " answer" },
 		]);
 	});
@@ -684,7 +1345,7 @@ describe("OpenAI completions provider DSML envelope healing", () => {
 		expect(toolCalls).toHaveLength(1);
 		expect(toolCalls[0].name).toBe("bash");
 		expect(toolCalls[0].arguments).toMatchObject({
-			_i: "Check Fedora 42 available packages",
+			[INTENT_FIELD]: "Check Fedora 42 available packages",
 			timeout: 15,
 		});
 		expect(result.stopReason).toBe("toolUse");
@@ -692,7 +1353,6 @@ describe("OpenAI completions provider DSML envelope healing", () => {
 
 	it("heals NanoGPT-hosted DeepSeek V4 Pro DSML leaks (issue #1488)", async () => {
 		const model = getBundledModel<"openai-completions">("nanogpt", "deepseek/deepseek-v4-pro");
-		expect(model.provider).toBe("nanogpt");
 
 		let payload: Record<string, unknown> | undefined;
 		const fetchMock = mockFetch([
@@ -732,9 +1392,34 @@ describe("OpenAI completions provider DSML envelope healing", () => {
 		expect(toolCalls).toHaveLength(1);
 		expect(toolCalls[0].name).toBe("bash");
 		expect(toolCalls[0].arguments).toMatchObject({
-			_i: "Check Fedora 42 available packages",
+			[INTENT_FIELD]: "Check Fedora 42 available packages",
 			timeout: 15,
 		});
+		expect(result.stopReason).toBe("toolUse");
+	});
+
+	it("dispatches a Fireworks DeepSeek V4.1 Flash call written in re-spelled template tokens", async () => {
+		const model = getBundledModel<"openai-completions">("fireworks", "deepseek-v4.1-flash");
+		const leak = RESPELLED_TEMPLATE_LEAKS["dropped bar, doubled section close"];
+		const fetchMock = mockFetch([
+			chunk(model.id, { content: leak.slice(0, 40) }),
+			chunk(model.id, { content: leak.slice(40) }),
+			chunk(model.id, {}, "stop"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(
+			model,
+			{ messages: [{ role: "user", content: "grep the log", timestamp: Date.now() }], tools: [bashTool] },
+			{ apiKey: "test-key", fetch: fetchMock },
+		).result();
+
+		const text = result.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
+		expect(text).not.toContain("｜");
+		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
+		expect(toolCalls.map(call => [call.name, call.arguments])).toEqual([
+			["bash", JSON.parse(RESPELLED_TEMPLATE_ARGS)],
+		]);
 		expect(result.stopReason).toBe("toolUse");
 	});
 
@@ -769,5 +1454,96 @@ describe("OpenAI completions provider DSML envelope healing", () => {
 		expect(toolCalls.map(call => call.name)).toEqual(["read", "read"]);
 		expect(toolCalls.map(call => call.arguments)).toEqual([{ path: "a.ts" }, { path: "b.ts" }]);
 		expect(result.stopReason).toBe("toolUse");
+	});
+
+	it("keeps parallel tool calls isolated when separate chunks reuse index 0 with distinct IDs", async () => {
+		const model = getBundledModel<"openai-completions">("nanogpt", "deepseek/deepseek-v4-pro");
+		const fetchMock = mockFetch([
+			chunk(model.id, {
+				tool_calls: [
+					{ index: 0, id: "call_a", type: "function", function: { name: "read", arguments: '{"path":"a.ts"}' } },
+				],
+			}),
+			chunk(model.id, {
+				tool_calls: [
+					{ index: 0, id: "call_b", type: "function", function: { name: "read", arguments: '{"path":' } },
+				],
+			}),
+			chunk(model.id, {
+				tool_calls: [{ index: 0, function: { arguments: '"b.ts"}' } }],
+			}),
+			chunk(model.id, {}, "tool_calls"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(
+			model,
+			{ messages: [{ role: "user", content: "Read a.ts and b.ts", timestamp: Date.now() }], tools: [readTool] },
+			{ apiKey: "test-key", reasoning: "high", fetch: fetchMock },
+		).result();
+
+		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
+		expect(toolCalls).toHaveLength(2);
+		expect(toolCalls.map(call => call.id)).toEqual(["call_a", "call_b"]);
+		expect(toolCalls.map(call => call.name)).toEqual(["read", "read"]);
+		expect(toolCalls.map(call => call.arguments)).toEqual([{ path: "a.ts" }, { path: "b.ts" }]);
+		expect(result.stopReason).toBe("toolUse");
+	});
+
+	it("keeps one tool call whole when a gateway mints a new id for each argument fragment at index 0", async () => {
+		const model = getBundledModel<"openai-completions">("nanogpt", "deepseek/deepseek-v4-pro");
+		const fetchMock = mockFetch([
+			chunk(model.id, {
+				tool_calls: [
+					{ index: 0, id: "call_1", type: "function", function: { name: "read", arguments: '{"path":' } },
+				],
+			}),
+			chunk(model.id, { tool_calls: [{ index: 0, id: "call_2", function: { arguments: '"a.ts"}' } }] }),
+			chunk(model.id, {}, "tool_calls"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(
+			model,
+			{ messages: [{ role: "user", content: "Read a.ts", timestamp: Date.now() }], tools: [readTool] },
+			{ apiKey: "test-key", fetch: fetchMock },
+		).result();
+
+		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
+		expect(toolCalls.map(call => ({ name: call.name, arguments: call.arguments }))).toEqual([
+			{ name: "read", arguments: { path: "a.ts" } },
+		]);
+	});
+
+	it("routes id-less continuations at a reused index to the call that resumed by id", async () => {
+		const model = getBundledModel<"openai-completions">("nanogpt", "deepseek/deepseek-v4-pro");
+		const fetchMock = mockFetch([
+			chunk(model.id, {
+				tool_calls: [
+					{ index: 0, id: "call_a", type: "function", function: { name: "read", arguments: '{"path":' } },
+				],
+			}),
+			chunk(model.id, {
+				tool_calls: [
+					{ index: 0, id: "call_b", type: "function", function: { name: "read", arguments: '{"path":"b.ts"}' } },
+				],
+			}),
+			chunk(model.id, { tool_calls: [{ index: 0, id: "call_a", function: { arguments: '"a' } }] }),
+			chunk(model.id, { tool_calls: [{ index: 0, function: { arguments: '.ts"}' } }] }),
+			chunk(model.id, {}, "tool_calls"),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(
+			model,
+			{ messages: [{ role: "user", content: "Read a.ts and b.ts", timestamp: Date.now() }], tools: [readTool] },
+			{ apiKey: "test-key", fetch: fetchMock },
+		).result();
+
+		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
+		expect(toolCalls.map(call => ({ id: call.id, arguments: call.arguments }))).toEqual([
+			{ id: "call_a", arguments: { path: "a.ts" } },
+			{ id: "call_b", arguments: { path: "b.ts" } },
+		]);
 	});
 });

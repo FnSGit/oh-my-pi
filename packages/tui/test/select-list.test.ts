@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { SelectList } from "@oh-my-pi/pi-tui/components/select-list";
+import { SelectList, type SelectListTheme } from "@oh-my-pi/pi-tui/components/select-list";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@oh-my-pi/pi-tui/keybindings";
+import type { SgrMouseEvent } from "@oh-my-pi/pi-tui/mouse";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
 
 const testTheme = {
@@ -60,6 +61,15 @@ describe("SelectList", () => {
 		setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS));
 	});
 
+	it("re-sanitizes a reused item object whose label changed", () => {
+		const item = { value: "test", label: "before", description: "desc" };
+		const list = new SelectList([item], 5, testTheme);
+		expect(list.render(80)[0]).toContain("before");
+		item.label = "after";
+		list.setItems([item]);
+		expect(list.render(80)[0]).toContain("after");
+	});
+
 	it("normalizes multiline descriptions to single line", () => {
 		const items = [
 			{
@@ -75,6 +85,63 @@ describe("SelectList", () => {
 		expect(rendered.length).toBeGreaterThanOrEqual(1);
 		expect(rendered[0]).not.toContain("\n");
 		expect(rendered[0]).toContain("Line one Line two Line three");
+	});
+
+	it("falls back to an ASCII cursor when a legacy theme omits symbols", () => {
+		const legacyTheme: SelectListTheme = { ...testTheme };
+		Reflect.deleteProperty(legacyTheme, "symbols");
+		const list = new SelectList([{ value: "run", label: "run" }], 1, legacyTheme);
+
+		expect(list.render(40)).toEqual(["> run"]);
+	});
+
+	it("caps wrapped descriptions at maxDescriptionRows with a trailing ellipsis", () => {
+		const longDescription = Array.from({ length: 12 }, (_, i) => `chunk${i} filler words`).join(" ");
+		const items = [
+			{ value: "long", label: "long", description: longDescription },
+			{ value: "short", label: "short", description: "fits" },
+		];
+
+		const list = new SelectList(items, 10, testTheme, {
+			wrapDescription: true,
+			maxDescriptionRows: 2,
+			maxPrimaryColumnWidth: 12,
+		});
+		const rendered = list.render(60);
+
+		// One capped item (2 rows) + one single-row item.
+		expect(rendered.length).toBe(3);
+		expect(rendered[1]).toContain("…");
+	});
+
+	it("reserves one icon column so labels and descriptions align across icon and iconless rows", () => {
+		const items = [
+			{ value: "changelog", label: "changelog", icon: "★", description: "Show changelog entries" },
+			{ value: "hotkeys", label: "hotkeys", description: "Show all keyboard shortcuts" },
+		];
+
+		const list = new SelectList(items, 5, testTheme);
+		const rendered = list.render(80);
+
+		expect(rendered[0]).toContain("★ changelog");
+		expect(rendered[1]).not.toContain("★");
+		expect(visibleIndexOf(rendered[0]!, "changelog")).toBe(visibleIndexOf(rendered[1]!, "hotkeys"));
+		expect(visibleIndexOf(rendered[0]!, "Show changelog")).toBe(visibleIndexOf(rendered[1]!, "Show all"));
+	});
+
+	it("styles icons on unselected rows only, leaving the selected row to selectedText", () => {
+		const themeWithIcon: SelectListTheme = { ...testTheme, icon: (text: string) => `«${text}»` };
+		const items = [
+			{ value: "first", label: "first", icon: "★" },
+			{ value: "second", label: "second", icon: "☂" },
+		];
+
+		const list = new SelectList(items, 5, themeWithIcon);
+		const rendered = list.render(80);
+
+		expect(rendered[0]).toContain("★");
+		expect(rendered[0]).not.toContain("«");
+		expect(rendered[1]).toContain("«☂");
 	});
 
 	it("keeps descriptions aligned when the primary text is truncated", () => {
@@ -371,5 +438,69 @@ describe("SelectList", () => {
 			// The first wrapped line (with the primary label) is still visible.
 			expect(rendered.some(row => row.includes("huge"))).toBe(true);
 		});
+	});
+});
+
+describe("SelectList.routeMouse", () => {
+	const hoverTheme = {
+		...testTheme,
+		hovered: (text: string) => `<hover>${text}</hover>`,
+		selectedText: (text: string) => `<selected>${text}</selected>`,
+	};
+
+	const baseEvent: SgrMouseEvent = {
+		button: 0,
+		col: 0,
+		row: 0,
+		release: false,
+		wheel: null,
+		motion: false,
+		leftClick: false,
+	};
+
+	function makeList() {
+		const items = [
+			{ value: "a", label: "a" },
+			{ value: "b", label: "b" },
+			{ value: "c", label: "c" },
+		];
+		return new SelectList(items, 5, hoverTheme);
+	}
+
+	it("advances selection on a wheel notch", () => {
+		const list = makeList();
+		let changed: string | undefined;
+		list.onSelectionChange = item => {
+			changed = item.value;
+		};
+		list.render(80);
+
+		list.routeMouse({ ...baseEvent, wheel: 1 }, 0, 0);
+
+		expect(changed).toBe("b");
+	});
+
+	it("hovers the row under the pointer on motion", () => {
+		const list = makeList();
+		list.render(80);
+
+		list.routeMouse({ ...baseEvent, motion: true }, 1, 0);
+		const rendered = list.render(80).join("\n");
+
+		expect(rendered).toContain("<hover>");
+		expect(rendered).not.toContain("<hover><selected>");
+	});
+
+	it("confirms the clicked row", () => {
+		const list = makeList();
+		let selected: string | undefined;
+		list.onSelect = item => {
+			selected = item.value;
+		};
+		list.render(80);
+
+		list.routeMouse({ ...baseEvent, leftClick: true }, 2, 0);
+
+		expect(selected).toBe("c");
 	});
 });

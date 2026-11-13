@@ -1,26 +1,41 @@
 import type { ToolSession } from "../../tools";
 import {
+	type BackendAvailability,
 	type ExecutorBackend,
 	type ExecutorBackendExecOptions,
 	type ExecutorBackendResult,
 	resolveEvalUrlRoots,
 } from "../backend";
+import { namespaceSessionId as sharedNamespace, toExecutorBackendResult } from "../backend-helpers";
+import type { BackendProbeOptions } from "../probe";
+import { defaultEvalSessionId } from "../session-id";
 import { executePython, type PythonExecutorOptions } from "./executor";
 import { checkPythonKernelAvailability } from "./kernel";
+import { cfgPythonInterpreter, cfgPythonKernelMode } from "../settings";
 
 const PYTHON_SESSION_PREFIX = "python:";
 
 export function namespaceSessionId(sessionId: string): string {
-	return sessionId.startsWith(PYTHON_SESSION_PREFIX) ? sessionId : `${PYTHON_SESSION_PREFIX}${sessionId}`;
-}
-
-function readSetting<T>(session: ToolSession, key: string): T | undefined {
-	const settings = session.settings as { get?: (key: string) => T | undefined } | undefined;
-	return settings?.get?.(key);
+	return sharedNamespace(sessionId, PYTHON_SESSION_PREFIX);
 }
 
 function readInterpreterSetting(session: ToolSession): string | undefined {
-	return readSetting<string>(session, "python.interpreter")?.trim() || undefined;
+	return cfgPythonInterpreter.get(session)?.trim() || undefined;
+}
+
+/** Resolve the retained Python kernel identity owned by a tool session. */
+export function resolvePythonKernelIdentity(session: ToolSession): {
+	cwd: string;
+	sessionId: string;
+	interpreter: string | undefined;
+	kernelOwnerId: string | undefined;
+} {
+	return {
+		cwd: session.cwd,
+		sessionId: namespaceSessionId(session.getEvalSessionId?.() ?? defaultEvalSessionId(session)),
+		interpreter: readInterpreterSetting(session),
+		kernelOwnerId: session.getEvalKernelOwnerId?.() ?? undefined,
+	};
 }
 
 export default {
@@ -28,41 +43,32 @@ export default {
 	label: "Python",
 	highlightLang: "python",
 
-	async isAvailable(session: ToolSession): Promise<boolean> {
-		const availability = await checkPythonKernelAvailability(session.cwd, readInterpreterSetting(session));
-		return availability.ok;
+	checkAvailability(session: ToolSession, opts?: BackendProbeOptions): Promise<BackendAvailability> {
+		return checkPythonKernelAvailability(session.cwd, readInterpreterSetting(session), opts);
 	},
 
 	async execute(code: string, opts: ExecutorBackendExecOptions): Promise<ExecutorBackendResult> {
-		const kernelMode = readSetting<PythonExecutorOptions["kernelMode"]>(opts.session, "python.kernelMode");
+		const kernelMode = cfgPythonKernelMode.get(opts.session);
+		const identity = resolvePythonKernelIdentity(opts.session);
 		const executorOptions: PythonExecutorOptions = {
-			cwd: opts.cwd,
+			cwd: identity.cwd,
+			filename: opts.filename,
 			idleTimeoutMs: opts.idleTimeoutMs,
 			signal: opts.signal,
-			sessionId: namespaceSessionId(opts.sessionId),
+			sessionId: identity.sessionId,
 			kernelMode,
-			interpreter: readInterpreterSetting(opts.session),
+			interpreter: identity.interpreter,
 			sessionFile: opts.sessionFile,
 			artifactsDir: opts.session.getArtifactsDir?.() ?? undefined,
 			localRoots: resolveEvalUrlRoots(opts.session),
-			kernelOwnerId: opts.kernelOwnerId,
+			kernelOwnerId: identity.kernelOwnerId,
 			reset: opts.reset,
 			onChunk: opts.onChunk,
 			onStatus: opts.onStatus,
+			onReply: opts.onReply,
 			toolSession: opts.session,
 		};
 		const result = await executePython(code, executorOptions);
-		return {
-			output: result.output,
-			exitCode: result.exitCode,
-			cancelled: result.cancelled,
-			truncated: result.truncated,
-			artifactId: result.artifactId,
-			totalLines: result.totalLines,
-			totalBytes: result.totalBytes,
-			outputLines: result.outputLines,
-			outputBytes: result.outputBytes,
-			displayOutputs: result.displayOutputs,
-		};
+		return toExecutorBackendResult(result);
 	},
 } satisfies ExecutorBackend;

@@ -1,4 +1,5 @@
-import { z } from "zod/v4";
+import { type } from "@oh-my-pi/omptype";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { CommitAgentState } from "../../../commit/agentic/state";
 import {
 	capDetails,
@@ -12,15 +13,14 @@ import { validateAnalysis } from "../../../commit/analysis/validation";
 import type { CommitType, ConventionalAnalysis, ConventionalDetail } from "../../../commit/types";
 import { normalizeDetails } from "../../../commit/utils";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
-import * as git from "../../../utils/git";
 import { commitTypeSchema, detailSchema } from "./schemas.js";
 
-const proposeCommitSchema = z.object({
+const proposeCommitSchema = type({
 	type: commitTypeSchema,
-	scope: z.union([z.string(), z.null()]),
-	summary: z.string(),
-	details: z.array(detailSchema),
-	issue_refs: z.array(z.string()),
+	scope: type("string").or("null"),
+	summary: "string",
+	details: detailSchema.array(),
+	issue_refs: "string[]",
 });
 
 interface ProposalResponse {
@@ -37,6 +37,7 @@ interface ProposalResponse {
 }
 
 export function createProposeCommitTool(cwd: string, state: CommitAgentState): CustomTool<typeof proposeCommitSchema> {
+	const repo = vcs.requireGit(cwd);
 	return {
 		name: "propose_commit",
 		label: "Propose Commit",
@@ -56,8 +57,8 @@ export function createProposeCommitTool(cwd: string, state: CommitAgentState): C
 
 			const summaryValidation = validateSummaryRules(summary);
 			const analysisValidation = validateAnalysis(analysis);
-			const stagedFiles = state.overview?.files ?? (await git.diff.changedFiles(cwd, { cached: true }));
-			const diffText = state.diffText ?? (await git.diff(cwd, { cached: true }));
+			const stagedFiles = state.overview?.files ?? (await repo.changedFiles({ cached: true }));
+			const diffText = state.diffText ?? (await repo.diffText({ cached: true }));
 			const typeValidation = validateTypeConsistency(params.type, stagedFiles, {
 				diffText,
 				summary,

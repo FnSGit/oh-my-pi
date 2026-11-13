@@ -1,25 +1,17 @@
 /**
- * Wafer Pass + Wafer Serverless provider wiring.
+ * Wafer Serverless provider wiring.
  *
- * Wafer exposes a single OpenAI-compatible base URL (`https://pass.wafer.ai/v1`)
- * for two SKUs whose entitlement differs server-side:
- *  - `wafer-pass` (flat-rate)
- *  - `wafer-serverless` (pay-as-you-go)
- *
- * Both providers route through `openai-completions` and the catalog id matches
- * the wire id (no rewrite). These tests defend the bundled catalog contract and
- * the case-sensitive id pass-through against the wire.
+ * Wafer Serverless exposes an OpenAI-compatible base URL
+ * (`https://pass.wafer.ai/v1`) and routes through `openai-completions`. The
+ * catalog id matches the wire id (no rewrite). These tests defend the bundled
+ * catalog contract and the case-sensitive id pass-through against the wire.
  */
 import { describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import type { Context } from "@oh-my-pi/pi-ai/types";
+import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
 import { createModelManager } from "@oh-my-pi/pi-catalog/model-manager";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import {
-	waferPassModelManagerOptions,
-	waferServerlessModelManagerOptions,
-} from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
-import type { FetchImpl, Model } from "@oh-my-pi/pi-catalog/types";
+import { waferServerlessModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
 
 function sseResponse(events: unknown[]): Response {
 	const payload = `${events.map(e => `data: ${typeof e === "string" ? e : JSON.stringify(e)}`).join("\n\n")}\n\n`;
@@ -29,32 +21,67 @@ function sseResponse(events: unknown[]): Response {
 	});
 }
 
-describe("Wafer Pass provider", () => {
-	it("ships a bundled GLM-5.1 entry with zai-family thinking compat", () => {
-		const model = getBundledModel<"openai-completions">("wafer-pass", "GLM-5.1");
-		expect(model).toBeDefined();
-		expect(model.id).toBe("GLM-5.1");
-		expect(model.provider).toBe("wafer-pass");
-		expect(model.api).toBe("openai-completions");
-		expect(model.baseUrl).toBe("https://pass.wafer.ai/v1");
-		expect(model.reasoning).toBe(true);
-		expect(model.input).toEqual(["text"]);
-		expect(model.compatConfig?.thinkingFormat).toBe("zai");
-		expect(model.compatConfig?.reasoningContentField).toBe("reasoning_content");
-		expect(model.compatConfig?.supportsDeveloperRole).toBe(false);
-	});
+describe("Wafer Serverless provider", () => {
+	it("ships the documented Serverless catalog (GLM-5.1, Qwen3.5, Qwen3.6, Qwen3.7-Max, Kimi-K2.6, DeepSeek V4 Flash/Pro)", () => {
+		const glm = getBundledModel<"openai-completions">("wafer-serverless", "GLM-5.1");
+		expect(glm).toBeDefined();
+		expect(glm.provider).toBe("wafer-serverless");
+		expect(glm.baseUrl).toBe("https://pass.wafer.ai/v1");
+		expect(glm.compatConfig?.thinkingFormat).toBe("zai");
 
-	it("ships a bundled Qwen3.5-397B-A17B entry with vision input and no reasoning", () => {
-		const model = getBundledModel<"openai-completions">("wafer-pass", "Qwen3.5-397B-A17B");
-		expect(model).toBeDefined();
-		expect(model.id).toBe("Qwen3.5-397B-A17B");
-		expect(model.provider).toBe("wafer-pass");
-		expect(model.reasoning).toBe(false);
-		expect(model.input).toEqual(["text", "image"]);
+		const qwen35 = getBundledModel<"openai-completions">("wafer-serverless", "Qwen3.5-397B-A17B");
+		expect(qwen35).toBeDefined();
+		expect(qwen35.provider).toBe("wafer-serverless");
+
+		const kimi = getBundledModel<"openai-completions">("wafer-serverless", "Kimi-K2.6");
+		expect(kimi).toBeDefined();
+		expect(kimi.contextWindow).toBe(262144);
+		// Kimi-K2.6 routes to Moonshot upstream, which uses zai-style binary
+		// `thinking: { type: "enabled" | "disabled" }`. Locked in explicitly so a
+		// future regen with credentials cannot silently strip it (auto-detect
+		// would mis-pick "openai" because the Wafer baseUrl/provider doesn't match
+		// the api.moonshot.ai / api.kimi.com URL patterns in `buildOpenAICompat`).
+		expect(kimi.compatConfig?.thinkingFormat).toBe("zai");
+		// Kimi-K2.6's retail Serverless rate per wafer.ai (= API cents × 0.0125):
+		// $1.425 in / $6.00 out / $0.2375 cached.
+		expect(kimi.cost).toEqual({ input: 1.425, output: 6, cacheRead: 0.2375, cacheWrite: 0 });
+
+		const qwen36 = getBundledModel<"openai-completions">("wafer-serverless", "Qwen3.6-35B-A3B");
+		expect(qwen36).toBeDefined();
+		// Qwen3.6 advertises 256k context and vision per the live /v1/models response.
+		expect(qwen36.contextWindow).toBe(256000);
+		expect(qwen36.input).toEqual(["text", "image"]);
+
+		const qwen37max = getBundledModel<"openai-completions">("wafer-serverless", "qwen3.7-max");
+		expect(qwen37max).toBeDefined();
+		// Wafer's canonical id is lowercase `qwen3.7-max` — must round-trip verbatim.
+		expect(qwen37max.id).toBe("qwen3.7-max");
+		expect(qwen37max.name).toBe("Qwen3.7 Max");
+		expect(qwen37max.reasoning).toBe(true);
+		// qwen3.7-max routes to Alibaba upstream; native wire format is `enable_thinking`.
+		// The bundled entry leaves `thinkingFormat` unset so the build-time detection
+		// in `buildOpenAICompat` picks "qwen" from the lowercase id.
+		expect(qwen37max.compatConfig?.thinkingFormat).toBeUndefined();
+
+		const dsFlash = getBundledModel<"openai-completions">("wafer-serverless", "deepseek-v4-flash");
+		expect(dsFlash).toBeDefined();
+		// DeepSeek V4 family uses `reasoning_effort`, not zai's `thinking: {type}`.
+		// Bundled entry must NOT pin `thinkingFormat: "zai"` — `buildOpenAICompat`
+		// auto-picks "openai" (default) from the deepseek-* id pattern at build time.
+		expect(dsFlash.compatConfig?.thinkingFormat).toBeUndefined();
+		expect(dsFlash.contextWindow).toBe(1000000);
+		expect(dsFlash.reasoning).toBe(true);
+		expect(dsFlash.compat.reasoningContentField).toBe("reasoning_content");
+
+		const dsPro = getBundledModel<"openai-completions">("wafer-serverless", "deepseek-v4-pro");
+		expect(dsPro).toBeDefined();
+		expect(dsPro.contextWindow).toBe(1000000);
+		expect(dsPro.reasoning).toBe(true);
+		expect(dsPro.compatConfig?.thinkingFormat).toBeUndefined();
 	});
 
 	it("preserves the catalog id verbatim on the wire (no rewrite, case-sensitive)", async () => {
-		const model = getBundledModel<"openai-completions">("wafer-pass", "GLM-5.1");
+		const model = getBundledModel<"openai-completions">("wafer-serverless", "GLM-5.1");
 		const captured: { url: string | null; body: string | null } = { url: null, body: null };
 		const fetchMock: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
 			captured.url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
@@ -85,73 +112,6 @@ describe("Wafer Pass provider", () => {
 	});
 });
 
-describe("Wafer Serverless provider", () => {
-	it("ships the documented Serverless catalog (GLM-5.1, Qwen3.5, Qwen3.6, Qwen3.7-Max, Kimi-K2.6, DeepSeek V4 Flash/Pro)", () => {
-		const glm = getBundledModel<"openai-completions">("wafer-serverless", "GLM-5.1");
-		expect(glm).toBeDefined();
-		expect(glm.provider).toBe("wafer-serverless");
-		expect(glm.baseUrl).toBe("https://pass.wafer.ai/v1");
-		expect(glm.compatConfig?.thinkingFormat).toBe("zai");
-
-		const qwen35 = getBundledModel<"openai-completions">("wafer-serverless", "Qwen3.5-397B-A17B");
-		expect(qwen35).toBeDefined();
-		expect(qwen35.provider).toBe("wafer-serverless");
-
-		const kimi = getBundledModel<"openai-completions">("wafer-serverless", "Kimi-K2.6");
-		expect(kimi).toBeDefined();
-		expect(kimi.contextWindow).toBe(262144);
-		// Kimi-K2.6 routes to Moonshot upstream, which uses zai-style binary
-		// `thinking: { type: "enabled" | "disabled" }`. Locked in explicitly so a
-		// future regen with credentials cannot silently strip it (auto-detect
-		// would mis-pick "openai" because the Wafer baseUrl/provider doesn't match
-		// the api.moonshot.ai / api.kimi.com URL patterns in `buildOpenAICompat`).
-		expect(kimi.compatConfig?.thinkingFormat).toBe("zai");
-		// Kimi-K2.6's retail Serverless rate per wafer.ai (= API cents × 0.0125):
-		// $1.10 in / $4.80 out / $0.1125 cached.
-		expect(kimi.cost).toEqual({ input: 1.1, output: 4.8, cacheRead: 0.1125, cacheWrite: 0 });
-
-		const qwen36 = getBundledModel<"openai-completions">("wafer-serverless", "Qwen3.6-35B-A3B");
-		expect(qwen36).toBeDefined();
-		// Qwen3.6 advertises 256k context and vision per the live /v1/models response.
-		expect(qwen36.contextWindow).toBe(256000);
-		expect(qwen36.input).toEqual(["text", "image"]);
-
-		const qwen37max = getBundledModel<"openai-completions">("wafer-serverless", "qwen3.7-max");
-		expect(qwen37max).toBeDefined();
-		// Wafer's canonical id is lowercase `qwen3.7-max` — must round-trip verbatim.
-		expect(qwen37max.id).toBe("qwen3.7-max");
-		expect(qwen37max.name).toBe("Qwen3.7 Max");
-		expect(qwen37max.reasoning).toBe(true);
-		// qwen3.7-max routes to Alibaba upstream; native wire format is `enable_thinking`.
-		// The bundled entry leaves `thinkingFormat` unset so the build-time detection
-		// in `buildOpenAICompat` picks "qwen" from the lowercase id.
-		expect(qwen37max.compatConfig?.thinkingFormat).toBeUndefined();
-
-		const dsFlash = getBundledModel<"openai-completions">("wafer-serverless", "deepseek-v4-flash");
-		expect(dsFlash).toBeDefined();
-		// DeepSeek V4 family uses `reasoning_effort`, not zai's `thinking: {type}`.
-		// Bundled entry must NOT pin `thinkingFormat: "zai"` — `buildOpenAICompat`
-		// auto-picks "openai" (default) from the deepseek-* id pattern at build time.
-		expect(dsFlash.compatConfig?.thinkingFormat).toBeUndefined();
-		expect(dsFlash.contextWindow).toBe(1000000);
-		expect(dsFlash.reasoning).toBe(true);
-		expect(dsFlash.compatConfig?.reasoningContentField).toBe("reasoning_content");
-
-		const dsPro = getBundledModel<"openai-completions">("wafer-serverless", "deepseek-v4-pro");
-		expect(dsPro).toBeDefined();
-		expect(dsPro.contextWindow).toBe(1000000);
-		expect(dsPro.reasoning).toBe(true);
-		expect(dsPro.compatConfig?.thinkingFormat).toBeUndefined();
-	});
-
-	it("does not expose Serverless-only ids on the Wafer Pass catalog", () => {
-		expect(getBundledModel("wafer-pass", "Kimi-K2.6")).toBeUndefined();
-		expect(getBundledModel("wafer-pass", "Qwen3.6-35B-A3B")).toBeUndefined();
-		expect(getBundledModel("wafer-pass", "qwen3.7-max")).toBeUndefined();
-		expect(getBundledModel("wafer-pass", "deepseek-v4-flash")).toBeUndefined();
-		expect(getBundledModel("wafer-pass", "deepseek-v4-pro")).toBeUndefined();
-	});
-});
 describe("Wafer dynamic discovery mapper", () => {
 	// Synthetic /v1/models response that exercises every upstream provider Wafer
 	// announces, including a deliberately-unknown one. The mapper must:
@@ -224,11 +184,9 @@ describe("Wafer dynamic discovery mapper", () => {
 		}
 	});
 
-	it("zeros cost for the Pass SKU and applies retail × 0.0125 for Serverless", async () => {
-		// Same upstream record served via both SKUs — `wafer.pricing` in cents/M:
-		// 120/360/12. Pass is a flat-rate subscription (no per-token charge), so
-		// `mapWaferModel` zeros the cost regardless of envelope values. Serverless
-		// is pay-as-you-go and applies the empirical × 0.0125 conversion to match
+	it("applies retail × 0.0125 for Serverless pricing", async () => {
+		// `wafer.pricing` is in Wafer's internal cents/M unit. Serverless is
+		// pay-as-you-go and applies the empirical × 0.0125 conversion to match
 		// wafer.ai's published retail rates (120 cents → $1.50/M).
 		const sharedEntry = {
 			id: "Shared-fake",
@@ -248,13 +206,6 @@ describe("Wafer dynamic discovery mapper", () => {
 				},
 			},
 		};
-
-		const fetchMock = mockWaferModelsResponse([sharedEntry]);
-		const passManager = createModelManager(waferPassModelManagerOptions({ apiKey: "wfr_test", fetch: fetchMock }));
-		const passResult = await passManager.refresh("online");
-		const passModel = passResult.models.find(m => m.id === "Shared-fake");
-		expect(passModel).toBeDefined();
-		expect(passModel?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
 		const srvFetchMock = mockWaferModelsResponse([sharedEntry]);
 		const srvManager = createModelManager(

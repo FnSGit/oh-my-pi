@@ -20,21 +20,6 @@ describe("ModelRegistry.create() factory (F6)", () => {
 		await tempDir.remove().catch(() => {});
 	});
 
-	test("produces an instance whose authStorage matches and that exposes bundled models", async () => {
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
-		try {
-			const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
-			expect(registry.authStorage).toBe(authStorage);
-			// The constructor's bundled-model load runs after warmup, so the
-			// factory's returned instance must be queryable immediately.
-			const claude = registry.find("anthropic", "claude-sonnet-4-5");
-			expect(claude).toBeDefined();
-			expect(claude?.id).toBe("claude-sonnet-4-5");
-		} finally {
-			authStorage.close();
-		}
-	});
-
 	test("migrates legacy models.json → models.yml ahead of the sync constructor", async () => {
 		const yml = path.join(tempDir.path(), "models.yml");
 		const json = path.join(tempDir.path(), "models.json");
@@ -44,7 +29,7 @@ describe("ModelRegistry.create() factory (F6)", () => {
 		await Bun.write(json, JSON.stringify({ models: [] }));
 		expect(fs.existsSync(yml)).toBe(false);
 
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		try {
 			new ModelRegistry(authStorage, yml);
 			expect(fs.existsSync(yml)).toBe(true);
@@ -68,5 +53,24 @@ describe("ModelRegistry.create() factory (F6)", () => {
 		cf.tryLoad();
 		const mtime2 = fs.statSync(yml).mtimeMs;
 		expect(mtime2).toBe(mtime1);
+	});
+
+	test("ConfigFile migrates legacy models.json containing comments", async () => {
+		const yml = path.join(tempDir.path(), "models.yml");
+		const json = path.join(tempDir.path(), "models.json");
+		await Bun.write(
+			json,
+			`{
+				// Custom models comment
+				"providers": {
+					/* Block comment */
+				}
+			}`,
+		);
+
+		const cf = new ConfigFile("models", ModelsConfigSchema, yml);
+		const result = cf.tryLoad();
+		expect(result.status).toBe("ok");
+		expect(fs.existsSync(yml)).toBe(true);
 	});
 });

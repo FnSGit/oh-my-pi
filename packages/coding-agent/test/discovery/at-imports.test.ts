@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { expandAtImports, MAX_AT_IMPORT_DEPTH } from "@oh-my-pi/pi-coding-agent/discovery/at-imports";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 /**
  * Behavior contract for the @-import expander used by every AGENTS.md /
@@ -19,7 +20,7 @@ describe("expandAtImports", () => {
 
 	afterEach(async () => {
 		clearFsCache();
-		await fs.rm(tmp, { recursive: true, force: true });
+		await removeWithRetries(tmp);
 	});
 
 	const writeFile = async (relPath: string, content: string): Promise<string> => {
@@ -62,8 +63,22 @@ describe("expandAtImports", () => {
 			});
 			expect(expanded).toContain("See use 2 spaces");
 		} finally {
-			await fs.rm(fakeHome, { recursive: true, force: true });
+			await removeWithRetries(fakeHome);
 		}
+	});
+
+	test("expands backslash-escaped spaces without consuming unescaped whitespace", async () => {
+		await writeFile("rules/plain.md", "Marker: PLAIN-OK");
+		await writeFile("rules/my rule.md", "Marker: SPACED-OK");
+		await writeFile("rules/other.md", "Marker: OTHER-OK");
+		const source = await writeFile(
+			"AGENTS.md",
+			"Rules: @rules/plain.md and @rules/my\\ rule.md then @rules/other.md\n",
+		);
+
+		const expanded = await expandAtImports(await fs.readFile(source, "utf8"), source);
+
+		expect(expanded).toBe("Rules: Marker: PLAIN-OK and Marker: SPACED-OK then Marker: OTHER-OK\n");
 	});
 
 	test("nests imports recursively", async () => {
@@ -108,8 +123,9 @@ describe("expandAtImports", () => {
 
 	test("leaves the original token untouched when the file is missing", async () => {
 		const source = path.join(tmp, "AGENTS.md");
-		const expanded = await expandAtImports("See @./does-not-exist.md\n", source);
-		expect(expanded).toContain("@./does-not-exist.md");
+		const input = "See @./does-not-exist.md and @./does-not\\ exist.md\n";
+		const expanded = await expandAtImports(input, source);
+		expect(expanded).toBe(input);
 	});
 
 	test("does not expand inside fenced code blocks", async () => {

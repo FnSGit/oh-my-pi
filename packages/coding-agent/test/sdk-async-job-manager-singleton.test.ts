@@ -2,20 +2,21 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
-describe("AsyncJobManager singleton across concurrent top-level sessions", () => {
+describe("AsyncJobManager ownership across concurrent top-level sessions", () => {
 	const tempDirs: string[] = [];
 	// Building a ModelRegistry per session is the dominant cost here: createAgentSession
 	// otherwise runs discoverAuthStorage (a fresh AuthStorage DB create+reload) and a
-	// background online model refresh for every spawn (~450ms each). The singleton
-	// ownership behavior under test is independent of model resolution, so we hand every
-	// session one shared, network-free registry built once (~10ms/session instead).
+	// background online model refresh for every spawn (~450ms each). Manager
+	// ownership is independent of model resolution, so we share a network-free registry.
 	let sharedTempDir: string;
 	let sharedAuthStorage: AuthStorage;
 	let sharedModelRegistry: ModelRegistry;
@@ -28,17 +29,17 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 
 	afterAll(() => {
 		sharedAuthStorage.close();
-		fs.rmSync(sharedTempDir, { recursive: true, force: true });
+		removeSyncWithRetries(sharedTempDir);
 	});
 
 	afterEach(async () => {
 		for (const tempDir of tempDirs.splice(0)) {
-			fs.rmSync(tempDir, { recursive: true, force: true });
+			removeSyncWithRetries(tempDir);
 		}
 		AsyncJobManager.resetForTests();
 	});
 
-	async function spawnTopLevelSession(extraSettings?: Record<string, unknown>) {
+	async function spawnTopLevelSession(extraSettings?: Record<string, unknown>, extensions: ExtensionFactory[] = []) {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-async-singleton-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwd = path.join(tempDir, `project-${Snowflake.next()}`);
@@ -47,8 +48,9 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 		const { session } = await createAgentSession({
 			cwd,
 			agentDir,
-			settings: Settings.isolated({ "bash.autoBackground.enabled": true, ...(extraSettings ?? {}) }),
+			settings: Settings.isolated({ "bash.autoBackground.enabled": true, ...extraSettings }),
 			disableExtensionDiscovery: true,
+			extensions,
 			skills: [],
 			contextFiles: [],
 			promptTemplates: [],
@@ -60,45 +62,13 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 		return session;
 	}
 
-	it("keeps the primary session's manager installed after a secondary session disposes", async () => {
-		const primary = await spawnTopLevelSession();
-		try {
-			const primaryManager = AsyncJobManager.instance();
-			expect(primaryManager).toBeDefined();
-
-			const secondary = await spawnTopLevelSession();
-			try {
-				// While the secondary is alive the global instance MUST still point at
-				// the primary's manager so background tools keep delivering completions
-				// to the primary session that owns them.
-				expect(AsyncJobManager.instance()).toBe(primaryManager);
-			} finally {
-				await secondary.dispose();
-			}
-
-			// After the secondary disposes, the primary's manager MUST still be the
-			// reachable singleton — otherwise the `task` async path errors with
-			// "Async execution is enabled but no async job manager is available".
-			expect(AsyncJobManager.instance()).toBe(primaryManager);
-		} finally {
-			await primary.dispose();
-		}
-
-		// Once the owning primary session disposes the singleton clears, matching
-		// the documented single-owner invariant.
-		expect(AsyncJobManager.instance()).toBeUndefined();
-	}, 60000);
-
 	it("does not cancel the primary session's running jobs when a secondary session disposes", async () => {
 		const primary = await spawnTopLevelSession();
 		try {
 			const primaryManager = AsyncJobManager.instance();
 			expect(primaryManager).toBeDefined();
 
-			// Register a long-running job on the primary's manager under the
-			// MAIN_AGENT_ID owner — the same owner the secondary would inherit by
-			// default. The secondary's dispose-time `cancelOwnAsyncJobs` must NOT
-			// cancel this job (issue #1923).
+			// Secondary disposal must not cancel jobs registered by the primary (issue #1923).
 			const release = Promise.withResolvers<string>();
 			const jobId = primaryManager!.register(
 				"bash",
@@ -115,7 +85,7 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 
 			const secondary = await spawnTopLevelSession();
 			try {
-				expect(secondary.getAsyncJobSnapshot()).toBeNull();
+				expect(secondary.getAsyncJobSnapshot()?.running.some(job => job.id === jobId)).toBe(false);
 			} finally {
 				await secondary.dispose();
 			}
@@ -130,29 +100,39 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 		}
 	}, 60000);
 
-	it("refuses async bash from a secondary session instead of routing it to the primary's manager", async () => {
-		const primary = await spawnTopLevelSession({ "async.enabled": true });
+	it("exposes the owning session's jobs through a production extension context", async () => {
+		let observedSnapshot: AsyncJobSnapshot | null | undefined;
+		const snapshotExtension: ExtensionFactory = pi => {
+			pi.registerTool({
+				name: "capture_async_job_snapshot",
+				label: "Capture async job snapshot",
+				description: "Capture the session-owned async job snapshot for this test.",
+				parameters: type({}),
+				approval: "read",
+				async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+					observedSnapshot = ctx.getAsyncJobSnapshot();
+					return { content: [{ type: "text", text: "captured" }] };
+				},
+			});
+		};
+		const session = await spawnTopLevelSession(undefined, [snapshotExtension]);
+		const manager = AsyncJobManager.instance();
+		expect(manager).toBeDefined();
+		const release = Promise.withResolvers<string>();
+		const jobId = manager!.register("bash", "extension snapshot test", async () => release.promise, {
+			ownerId: "Main",
+		});
+
 		try {
-			const primaryManager = AsyncJobManager.instance();
-			expect(primaryManager).toBeDefined();
-			const primaryJobCountBefore = primaryManager!.getAllJobs().length;
+			const snapshotTool = session.getToolByName("capture_async_job_snapshot");
+			expect(snapshotTool).toBeDefined();
+			await snapshotTool!.execute("call-snapshot", {});
 
-			const secondary = await spawnTopLevelSession({ "async.enabled": true });
-			try {
-				const bashTool = secondary.getToolByName("bash");
-				expect(bashTool).toBeDefined();
-				await expect(bashTool!.execute("call-1", { command: "echo hi", async: true })).rejects.toThrow(
-					/Async job manager unavailable/,
-				);
-			} finally {
-				await secondary.dispose();
-			}
-
-			// The secondary's failed async attempt must not have leaked a job into
-			// the primary's manager.
-			expect(primaryManager!.getAllJobs().length).toBe(primaryJobCountBefore);
+			expect(observedSnapshot?.running.some(job => job.id === jobId)).toBe(true);
 		} finally {
-			await primary.dispose();
+			release.resolve("done");
+			await manager!.waitForAll();
+			await session.dispose();
 		}
 	}, 60000);
 

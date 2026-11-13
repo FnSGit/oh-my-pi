@@ -1,25 +1,25 @@
 Plan approved.
 {{#if contextPreserved}}
-- Context preserved. Use conversation history when useful; this plan is the source of truth if it conflicts with earlier exploration.
+- History usable; the plan below authoritative if it conflicts with earlier exploration.
 {{/if}}
 
 <instruction>
-You MUST execute this plan step by step. You have full tool access.
-You MUST verify each step before proceeding to the next.
+Full plan inlined below; durable copy at `{{planFilePath}}` (identical content).
+Execute plan step-by-step with full tool access; MUST verify each step before next.
+NEVER re-read `{{planFilePath}}` while the inline plan is intact; the path is for subagent handoff and recovery only.
 {{#has tools "todo"}}
-Before execution, initialize todo tracking with `todo`.
-After each completed step, immediately update `todo`.
-If `todo` fails, fix the payload and retry before continuing.
+Before execution: initialize todo tracking with `todo`.
+After each completed step: immediately update `todo`.
+If `todo` fails: fix payload; retry before continuing.
 {{/has}}
-The plan path is for subagent handoff only. You already have the plan; NEVER read it.
 </instruction>
-
-The full plan is injected below. You MUST execute it now:
 
 <plan path="{{planFilePath}}">
 {{planContent}}
 </plan>
 
 <critical>
-You MUST keep going until complete. This matters.
+Inline plan compressed, expired, or unrecoverable: NEVER stop; read `{{planFilePath}}`.
+Read failure: report exact path and error; NEVER guess.
+MUST continue until complete.
 </critical>

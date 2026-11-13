@@ -1,93 +1,98 @@
-{{#if asyncEnabled}}{{#if batchEnabled}}Spawns subagents to work in the background — one per `tasks[]` item; a single spawn is a one-item batch.{{else}}Spawns ONE subagent per call to work in the background.{{/if}}
-
-- Spawning is non-blocking: the call returns immediately with the agent id{{#if batchEnabled}}s{{/if}} and job id{{#if batchEnabled}}s{{/if}}; each result is delivered automatically when that agent yields.
-- Parallelism = {{#if batchEnabled}}multiple `tasks[]` items in ONE call. To launch several subagents, you MUST batch them into a single call's `tasks[]` — they share `context` once instead of duplicating it. Separate `task` calls in one message are ONLY for spawns needing a different `agent` type or unrelated `context`{{else}}multiple `task` calls in one assistant message{{/if}}. Concurrency is bounded at {{MAX_CONCURRENCY}} running subagents per session.
-- If genuinely blocked on a result, wait with `job poll`; otherwise keep working. `job cancel` terminates a task and **cannot carry a message** — only for stalled/abandoned work.
-{{else}}{{#if batchEnabled}}Runs subagents synchronously — one per `tasks[]` item; a single spawn is a one-item batch.{{else}}Runs ONE subagent synchronously per call.{{/if}}
-
-- Spawning is blocking: the call returns only after the agent{{#if batchEnabled}}s{{/if}} finish; results arrive inline.
-- Parallelism = {{#if batchEnabled}}multiple `tasks[]` items in ONE call. To launch several subagents, you MUST batch them into a single call's `tasks[]` — they share `context` once instead of duplicating it. Separate `task` calls in one message are ONLY for spawns needing a different `agent` type or unrelated `context`{{else}}multiple `task` calls in one assistant message{{/if}}. Concurrency is bounded at {{MAX_CONCURRENCY}} running subagents per session.
-{{/if}}
-{{#if ircEnabled}}
-- Coordinate with agents via `irc` using their ids. Agents reach you and their siblings live the same way.
-{{/if}}
-
-<lifecycle>
-- Finished agents stay alive: `idle` first, then `parked` after a TTL.{{#if ircEnabled}} Both remain addressable and revivable: messaging one via `irc` wakes it and runs your message as a follow-up turn. **Prefer messaging an agent that already holds the relevant context over spawning fresh** — check `irc` op:"list" for candidates.{{/if}}
-- `history://<id>` is the agent's transcript; `agent://<id>` its latest output artifact.
-</lifecycle>
-
-<parameters>
-- `agent`: agent type to spawn
+{{#if asyncEnabled}}
 {{#if batchEnabled}}
-- `context`: shared background prepended to every assignment — goal, constraints, shared contract (see context-fmt); REQUIRED, session-specific only
-- `tasks`: tasks to spawn — one subagent per item, all in parallel:
-  - `assignment`: complete self-contained instructions; one-liners and missing acceptance criteria are PROHIBITED
-  - `id`: stable agent id, CamelCase, ≤32 chars; generated when omitted
-  - `description`: UI label only — subagent never sees it
+Spawn `tasks[]` concurrently; IDs return immediately.
+{{else}}
+Spawn one agent; ID returns immediately.
+{{/if}}
+{{#if hasBlockingAgents}}
+BLOCKING agents return inline.
+{{/if}}
+{{else}}
+{{#if batchEnabled}}
+Run `tasks[]` synchronously.
+{{else}}
+Run one agent synchronously.
+{{/if}}
+{{/if}}
+{{#if asyncEnabled}}
+{{#ifAny structured hasStructuredAgents}}
+
+# Results
+{{#if structured}}`outputSchema`{{else}}STRUCTURED agents'{{/if}} parsed payload, even invalid: agent://<id> (field /<field>, nested /reports/0/data); invalid preview inline.
+{{/ifAny}}
+
+{{asyncGuidance}}
+{{/if}}
+
+# Inputs
+- `agent`: most specific{{#if batchEnabled}}, inside each `tasks[]` item, NEVER at the top level{{/if}}.
+  - Omit only for the default (`{{defaultAgent}}`); NEVER name it.
+{{#if scoutAvailable}}
+  - Read-only research MUST use `scout` only when files unknown.
+{{/if}}
+  - Prefer one agent to investigate + edit.
+{{#if batchEnabled}}
+- `context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.
+{{/if}}
+{{#if steps}}
+- `steps`: ordered stages for one agent; each is sent only after it finishes the previous one, and the last stage's result is returned.
+  - First step carries `# Target` files/non-goals{{#if batchEnabled}} beyond `context`{{/if}}.
+  - Each step: one `# Change` stage.
+  - Last step adds `# Acceptance` observable result.
+  - Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via local://<path>, NEVER inline.
+  - Independent work → separate tasks.
+{{else}}
+- `task`: self-contained (`# Target` files/non-goals, `# Change` steps/APIs, `# Acceptance` observable result).
+  - Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via local://<path>, NEVER inline.
+{{/if}}
+- `name`: CamelCase ≤32, auto-generated if omitted; address agent by name.{{#if structured}} `outputSchema` overrides agent/session schemas.{{/if}}
+- `solutionSpace`: how open-ended the child's problem is: fix or design given, or which causes or designs remain open.
+  - Volume of work does not widen it; NEVER mention sibling agents or coordination.
+  - Examples: `one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`;
+    `several retry API shapes; error classes to choose`; `deadlock cause open, no repro`
+{{#if evalToolsEnabled}}
+- `tools`: eval-defined, run in your kernel.
+{{/if}}
+{{#if effortEnabled}}
+- `effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
+{{/if}}
+{{#if perCallModelEnabled}}
+- `model`: one exact `provider/model-id[@upstream][:level]` string for this spawn only{{#if batchEnabled}}; per `tasks[]` item{{/if}}.
+  - `@upstream` pins an aggregator route and is part of the model identity.
+  - Only operator-approved models; no roles, arrays, globs or partial IDs.
+  - Approved:
+{{#each perCallModelAdvertisement.roles}}
+    - {{#list patterns join=", "}}`{{this}}`{{/list}} ({{role}})
+{{/each}}
+{{#unless perCallModelAdvertisement.parentModelWithheld}}
+    - your own current model
+{{/unless}}
+    - the selected bundled/user agent's own configured model
+  - A listed glob approves matching exact IDs; write the exact ID, NEVER the glob.
+{{#if perCallModelAdvertisement.allowlist.length}}
+  - Allowlist: {{#list perCallModelAdvertisement.allowlist join=", "}}`{{this}}`{{/list}} (must also be approved).
+{{/if}}
+  - An agent's `task.agentModelOverrides` entry or user-chosen effort conflicts with `model`.
+  - Omit unless needed.
+  - Requested model unavailable → stop and report; NEVER substitute another.
+  - Every request requires an approved model; retry fallback, context promotion and prewalk are off.
+{{/if}}
+{{#if structured}}
+- `schemaMode`: default permissive warns after retries; strict fails.
+{{/if}}
 {{#if isolationEnabled}}
-  - `isolated`: run this spawn in an isolated env; returns patches. Isolated agents are torn down at completion — not addressable afterwards
-{{/if}}
+{{#if applyIsolatedChanges}}
+- `isolated`: worktree; successful changes apply to parent.
 {{else}}
-- `id`: stable agent id, CamelCase, ≤32 chars; generated when omitted
-- `description`: UI label only — subagent never sees it
-- `assignment`: complete self-contained instructions; one-liners and missing acceptance criteria are PROHIBITED
-{{#if isolationEnabled}}
-- `isolated`: run in isolated env; returns patches. Isolated agents are torn down at completion — not addressable afterwards
+- `isolated`: worktree; changes retained, not applied.
 {{/if}}
-{{/if}}
-</parameters>
-
-<rules>
-- **Maximize fan-out.** Issue the widest {{#if batchEnabled}}`tasks[]` batch{{else}}set of parallel `task` calls{{/if}} the work decomposes into. NEVER serialize work that could run concurrently.
-- **Subagents do not verify, lint, or format.** Every assignment MUST instruct the subagent to skip all gates, formatters, and project-wide build/test/lint. You run them once at the end across the union of changed files.
-- No globs, no "update all", no package-wide scope. Fan out.
-- NEVER slow down or serialize because tasks might overlap on some files. Agents resolve collisions among themselves in real time.
-- Subagents have no conversation history. Every fact, file path, and direction they need MUST be explicit in {{#if batchEnabled}}`context` or the item's `assignment`{{else}}the `assignment`{{/if}}.
-{{#if batchEnabled}}
-- **Shared background** lives in `context` once — never duplicated across assignments. Pass large payloads via `local://<path>` URIs, not inline.
-{{else}}
-- **Shared background**: write it ONCE to a `local://` file (e.g. `local://ctx.md`) and reference that path in each assignment. Pass large payloads via `local://<path>` URIs, not inline.
-{{/if}}
-- Prefer agents that investigate **and** edit in one pass; only spin a read-only discovery step when affected files are genuinely unknown.
-- **Read-only agents**: Agents tagged READ-ONLY (e.g. `explore`) have no edit/write/command tools. NEVER hand them an assignment that requires changing files or running commands. Use them to investigate and report back; do the edits yourself or delegate to a writing agent (`task`, `oracle`, `designer`).
-- **No reasoning offload**: NEVER offload reasoning, analysis, design, or decision-making to `quick_task` or `explore` — they run minimal-effort / small models for mechanical lookups and data collection only. Keep judgment and synthesis in your own context; delegate hard thinking to `task`, `plan`, or `oracle`.
-</rules>
-
-<parallelization>
-{{#if ircEnabled}}
-Test: can task B run correctly without seeing A's output? If no, sequence A → B — **unless** B can reasonably ask A for the missing piece over `irc`. Live coordination beats a serial waterfall when the contract is small and easy to describe in a DM.
-Still sequence when one task produces a large, evolving contract (generated types, schema migration, core module API) the other consumes wholesale — IRC round-trips do not replace a finished artifact.
-Parallel when tasks touch disjoint files, are independent refactors/tests, or only need occasional clarification that can be resolved peer-to-peer.
-{{else}}
-Test: can task B run correctly without seeing A's output? If no, sequence A → B.
-Sequential when one task produces a contract (types, API, schema, core module) the other consumes.
-Parallel when tasks touch disjoint files or are independent refactors/tests.
-{{/if}}
-{{#if ircEnabled}}Sequenced follow-ups SHOULD message the agent that produced the prerequisite — it already holds the context.{{/if}}
-</parallelization>
-
-{{#if batchEnabled}}
-<context-fmt>
-# Goal         ← one sentence: what the batch accomplishes
-# Constraints  ← MUST/NEVER rules and session decisions
-# Contract     ← exact types/signatures if tasks share an interface
-</context-fmt>
 {{/if}}
 
-<assignment-fmt>
-# Target       ← exact files and symbols; explicit non-goals
-# Change       ← step-by-step add/remove/rename; APIs and patterns
-# Acceptance   ← observable result; no project-wide commands
-</assignment-fmt>
+{{#if seanceGuidance}}{{seanceGuidance}}{{/if}}Shared edits need one integration owner; give each task its files{{#unless batchEnabled}} and interfaces{{/unless}}.
+Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
 
-<agents>
-{{#if spawningDisabled}}
-Agent spawning is disabled for this context.
-{{else}}
-{{#list agents join="\n"}}
-# {{name}}{{#if readOnly}} — READ-ONLY (no edit/write/exec tools){{/if}}
-{{description}}
-{{/list}}
-{{/if}}
-</agents>
+# Available Agents
+{{#if spawningDisabled}}Agent spawning is currently disabled.
+{{else}}{{#if hasModelMentions}}`m<N>` = user-tagged model (`<model agent="m<N>" name="…"/>`), not specialist; spawn only when user names it.
+{{/if}}{{#list agents join=""}}- `{{name}}`{{#if readOnly}} (read-only, no edits){{/if}}{{#if blocking}} (BLOCKING; inline result){{/if}}{{#if structured}} (STRUCTURED; schema result){{/if}}: {{description}}
+{{/list}}{{/if}}

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { isBlobRef } from "@oh-my-pi/pi-coding-agent/session/blob-store";
-import { type SessionEntry, SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: TempDir[] = [];
@@ -18,7 +19,7 @@ afterEach(async () => {
 });
 
 // Comfortably above BLOB_EXTERNALIZE_THRESHOLD (1024 base64 chars).
-const BIG_IMAGE_B64 = Buffer.alloc(4096, 7).toString("base64");
+const BIG_IMAGE_B64 = Buffer.alloc(1024, 7).toString("base64");
 
 describe("SessionManager collab replication", () => {
 	it("onEntryAppended receives the in-memory entry with inline image data while the persisted line externalizes it", async () => {
@@ -88,23 +89,5 @@ describe("SessionManager collab replication", () => {
 		await loaded.setSessionFile(file);
 		expect(loaded.getEntry("feed0001")?.parentId).toBe(rootId);
 		expect(loaded.getEntry(nextId)?.parentId).toBe("feed0001");
-	});
-
-	it("snapshotForReplication deep-copies entries and preserves the header identity", () => {
-		const { manager, cwd } = makeManager();
-		manager.appendMessage({ role: "user", content: "snapshot me", timestamp: Date.now() });
-
-		const snapshot = manager.snapshotForReplication();
-		expect(snapshot.header.id).toBe(manager.getSessionId());
-		expect(snapshot.header.cwd).toBe(path.resolve(cwd));
-		expect(snapshot.entries).toHaveLength(1);
-
-		// Deep copy: mutating the snapshot must not leak into the live session.
-		const entry = snapshot.entries[0]!;
-		if (entry.type !== "message") throw new Error("unexpected entry type");
-		entry.message = { role: "user", content: "mutated", timestamp: 0 };
-		const live = manager.getEntry(entry.id);
-		if (live?.type !== "message" || live.message.role !== "user") throw new Error("unexpected live entry");
-		expect(live.message.content).toBe("snapshot me");
 	});
 });

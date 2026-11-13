@@ -1,15 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import { type ConflictEntry, renderConflictRegion } from "@oh-my-pi/pi-tui/tools/conflict-detect";
 import {
-	type ConflictEntry,
 	ConflictHistory,
 	expandContentTokens,
 	formatConflictWarning,
 	parseConflictUri,
-	renderConflictRegion,
+	recoverConflictUriPrefix,
 	scanConflictLines,
 	spliceConflict,
 } from "@oh-my-pi/pi-coding-agent/tools/conflict-detect";
-import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 describe("scanConflictLines", () => {
 	it("detects a 2-way conflict with correct line numbers and labels", () => {
@@ -146,16 +146,16 @@ describe("ConflictHistory", () => {
 		});
 		const second = history.register({
 			absolutePath: "/abs/a.ts",
-			displayPath: "a.ts",
+			displayPath: "./a.ts",
 			startLine: 10,
 			separatorLine: 12,
-			endLine: 16, // file gained 2 lines in the ours section
-			oursLines: ["new-ours-1", "new-ours-2", "new-ours-3"],
-			theirsLines: ["new-theirs"],
+			endLine: 14,
+			oursLines: ["old-ours"],
+			theirsLines: ["old-theirs"],
 		});
 		expect(second.id).toBe(first.id);
-		expect(history.get(first.id)?.endLine).toBe(16);
-		expect(history.get(first.id)?.oursLines).toEqual(["new-ours-1", "new-ours-2", "new-ours-3"]);
+		expect(history.get(first.id)?.displayPath).toBe("./a.ts");
+		expect(history.get(first.id)?.oursLines).toEqual(["old-ours"]);
 	});
 
 	it("invalidatePath drops entries scoped to one absolutePath", () => {
@@ -223,25 +223,24 @@ describe("parseConflictUri", () => {
 		expect(() => parseConflictUri("conflict://1/extra")).toThrow(ToolError);
 	});
 
-	it("recovers an erroneous `<file>:` prefix and surfaces it as `recoveredPrefix`", () => {
-		expect(parseConflictUri("src/foo.ts:conflict://3")).toEqual({
-			id: 3,
-			recoveredPrefix: "src/foo.ts",
+	it("does not parse a `<file>:`-prefixed conflict URI", () => {
+		expect(parseConflictUri("src/foo.ts:conflict://3")).toBeNull();
+	});
+});
+
+describe("recoverConflictUriPrefix", () => {
+	it("strips an erroneous `<file>:` prefix and explains it", () => {
+		expect(recoverConflictUriPrefix("src/foo.ts:conflict://3")).toEqual({
+			path: "conflict://3",
+			note: "Note: stripped erroneous 'src/foo.ts:' prefix from path; conflict URIs are global (use `conflict://3`, not `<file>:conflict://3`).",
 		});
-		expect(parseConflictUri("packages/coding-agent/src/x.ts:conflict://*")).toEqual({
-			id: "*",
-			recoveredPrefix: "packages/coding-agent/src/x.ts",
-		});
-		expect(parseConflictUri("a.ts:conflict://2/theirs")).toEqual({
-			id: 2,
-			scope: "theirs",
-			recoveredPrefix: "a.ts",
-		});
+		expect(recoverConflictUriPrefix("packages/coding-agent/src/x.ts:conflict://*").path).toBe("conflict://*");
+		expect(recoverConflictUriPrefix("a.ts:conflict://2/theirs").path).toBe("conflict://2/theirs");
 	});
 
-	it("does not set `recoveredPrefix` on clean URIs", () => {
-		expect(parseConflictUri("conflict://1")).not.toHaveProperty("recoveredPrefix");
-		expect(parseConflictUri("conflict://*")).not.toHaveProperty("recoveredPrefix");
+	it("passes clean URIs and plain paths through without a note", () => {
+		expect(recoverConflictUriPrefix("conflict://1")).toEqual({ path: "conflict://1" });
+		expect(recoverConflictUriPrefix("src/foo.ts:12")).toEqual({ path: "src/foo.ts:12" });
 	});
 });
 
@@ -273,23 +272,23 @@ describe("spliceConflict", () => {
 
 	it("replaces the marker region with the chosen content", () => {
 		const result = spliceConflict(file, entry, "resolved\n");
-		expect(result).toBe("before\nresolved\nafter\n");
+		expect(result.text).toBe("before\nresolved\nafter\n");
 	});
 
 	it("accepts multi-line replacement", () => {
 		const result = spliceConflict(file, entry, "alpha\nbeta\n");
-		expect(result).toBe("before\nalpha\nbeta\nafter\n");
+		expect(result.text).toBe("before\nalpha\nbeta\nafter\n");
 	});
 
 	it("accepts empty replacement", () => {
 		const result = spliceConflict(file, entry, "");
-		expect(result).toBe("before\n\nafter\n");
+		expect(result.text).toBe("before\n\nafter\n");
 	});
 
 	it("relocates the block when earlier lines have been added (line numbers shift)", () => {
 		const shifted = ["// new comment 1", "// new comment 2", ...file.split("\n")].join("\n");
 		const result = spliceConflict(shifted, entry, "resolved\n");
-		expect(result).toBe("// new comment 1\n// new comment 2\nbefore\nresolved\nafter\n");
+		expect(result.text).toBe("// new comment 1\n// new comment 2\nbefore\nresolved\nafter\n");
 	});
 
 	it("rejects when the recorded marker block has been edited away", () => {
@@ -306,13 +305,167 @@ describe("spliceConflict", () => {
 			"\r\n",
 		);
 		const result = spliceConflict(crlfFile, entry, "alpha\nbeta\n");
-		expect(result).toBe("before\r\nalpha\r\nbeta\r\nafter\r\n");
+		expect(result.text).toBe("before\r\nalpha\r\nbeta\r\nafter\r\n");
 	});
 
 	it("does not append \\r when the spliced region ends the file without a trailing newline", () => {
 		const crlfNoEof = ["before", "<<<<<<< HEAD", "ours", "=======", "theirs", ">>>>>>> feat"].join("\r\n");
 		const result = spliceConflict(crlfNoEof, entry, "resolved");
-		expect(result).toBe("before\r\nresolved");
+		expect(result.text).toBe("before\r\nresolved");
+	});
+});
+
+describe("spliceConflict boundary-echo repair", () => {
+	// The 08-multi-file-rename shape: the two lines after the closer are the
+	// function tail models love to re-emit when they paste the "whole
+	// resolved function" as the replacement.
+	const fnLines = [
+		"const queue = [];",
+		"<<<<<<< HEAD",
+		"export function scheduleTask(task, priority = 0) {",
+		"\tif (dupe(task)) {",
+		"\t\treturn;",
+		"\t}",
+		"=======",
+		"export function enqueueTask(task) {",
+		"\tif (queued.has(task.id)) {",
+		"\t\treturn;",
+		"\t}",
+		">>>>>>> feature",
+		"\tqueue.push(task);",
+		"}",
+		"",
+	];
+	const fnEntry = makeEntry({
+		startLine: 2,
+		separatorLine: 7,
+		endLine: 12,
+		oursLabel: "HEAD",
+		theirsLabel: "feature",
+		oursLines: fnLines.slice(2, 6),
+		theirsLines: fnLines.slice(7, 11),
+	});
+
+	it("drops a multi-line trailing echo of the context below the region", () => {
+		const replacement = [
+			"export function scheduleTask(task, priority = 0) {",
+			"\tif (queued.has(task.id)) {",
+			"\t\treturn;",
+			"\t}",
+			"\tqueue.push(task);",
+			"}",
+		].join("\n");
+		const result = spliceConflict(fnLines.join("\n"), fnEntry, replacement);
+		expect(result.trimmedTrailing).toBe(2);
+		expect(result.trimmedLeading).toBe(0);
+		expect(result.text).toBe(
+			[
+				"const queue = [];",
+				"export function scheduleTask(task, priority = 0) {",
+				"\tif (queued.has(task.id)) {",
+				"\t\treturn;",
+				"\t}",
+				"\tqueue.push(task);",
+				"}",
+				"",
+			].join("\n"),
+		);
+	});
+
+	// The 02-rename-vs-limits shape: a lone `}` echoed after a body-only region.
+	const bodyLines = [
+		"function nextDelay(a) {",
+		"<<<<<<< HEAD",
+		"\tconst delay = BASE * 2 ** a;",
+		"\treturn Math.min(delay, 10_000);",
+		"=======",
+		"\tconst d = B * 2 ** a;",
+		"\treturn Math.min(d, 30_000);",
+		">>>>>>> tune",
+		"}",
+		"",
+	];
+	const bodyEntry = makeEntry({
+		startLine: 2,
+		separatorLine: 5,
+		endLine: 8,
+		oursLabel: "HEAD",
+		theirsLabel: "tune",
+		oursLines: bodyLines.slice(2, 4),
+		theirsLines: bodyLines.slice(5, 7),
+	});
+
+	it("drops a single-line echo when it fixes the region's delimiter balance", () => {
+		const replacement = ["\tconst delay = BASE * 2 ** a;", "\treturn Math.min(delay, 30_000);", "}"].join("\n");
+		const result = spliceConflict(bodyLines.join("\n"), bodyEntry, replacement);
+		expect(result.trimmedTrailing).toBe(1);
+		expect(result.text).toBe(
+			[
+				"function nextDelay(a) {",
+				"\tconst delay = BASE * 2 ** a;",
+				"\treturn Math.min(delay, 30_000);",
+				"}",
+				"",
+			].join("\n"),
+		);
+	});
+
+	it("keeps a single-line echo when the delimiter balance is already consistent", () => {
+		const file = ["start", "<<<<<<< HEAD", "a", "=======", "b", ">>>>>>> x", "done();", ""].join("\n");
+		const entry = makeEntry({
+			startLine: 2,
+			separatorLine: 4,
+			endLine: 6,
+			oursLabel: "HEAD",
+			theirsLabel: "x",
+			oursLines: ["a"],
+			theirsLines: ["b"],
+		});
+		const result = spliceConflict(file, entry, "merged\ndone();");
+		expect(result.trimmedTrailing).toBe(0);
+		expect(result.text).toBe("start\nmerged\ndone();\ndone();\n");
+	});
+
+	it("drops a multi-line leading echo of the context above the region", () => {
+		const file = [
+			"// header",
+			"const queue = [];",
+			"<<<<<<< HEAD",
+			"a",
+			"=======",
+			"b",
+			">>>>>>> x",
+			"tail",
+			"",
+		].join("\n");
+		const entry = makeEntry({
+			startLine: 3,
+			separatorLine: 5,
+			endLine: 7,
+			oursLabel: "HEAD",
+			theirsLabel: "x",
+			oursLines: ["a"],
+			theirsLines: ["b"],
+		});
+		const result = spliceConflict(file, entry, "// header\nconst queue = [];\nmerged");
+		expect(result.trimmedLeading).toBe(2);
+		expect(result.text).toBe("// header\nconst queue = [];\nmerged\ntail\n");
+	});
+
+	it("repairs echoes in CRLF files without breaking EOL round-trip", () => {
+		const crlf = bodyLines.join("\r\n");
+		const replacement = ["\tconst delay = BASE * 2 ** a;", "\treturn Math.min(delay, 30_000);", "}"].join("\n");
+		const result = spliceConflict(crlf, bodyEntry, replacement);
+		expect(result.trimmedTrailing).toBe(1);
+		expect(result.text).toBe(
+			[
+				"function nextDelay(a) {",
+				"\tconst delay = BASE * 2 ** a;",
+				"\treturn Math.min(delay, 30_000);",
+				"}",
+				"",
+			].join("\r\n"),
+		);
 	});
 });
 
@@ -512,10 +665,6 @@ describe("expandContentTokens", () => {
 	const entry = makeEntry({
 		oursLines: ["o1", "o2"],
 		theirsLines: ["t1"],
-	});
-
-	it("returns content unchanged when no tokens are present", () => {
-		expect(expandContentTokens("hand-written\nline\n", entry)).toBe("hand-written\nline\n");
 	});
 
 	it("expands a bare `@ours` token", () => {

@@ -11,8 +11,10 @@ to short-circuit the network.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -23,14 +25,18 @@ from robomp.git_ops import GitCommandError, HeadDriftError, PushResult
 from robomp.github_client import (
     CommentInfo,
     GitHubError,
+    IssueIndexEntry,
     IssueInfo,
     IssueSummary,
     PullRequestFileInfo,
     PullRequestInfo,
     PullRequestReviewInfo,
     ReactionInfo,
+    ReleaseInfo,
     RepoInfo,
     ReviewCommentInfo,
+    WorkflowJobInfo,
+    WorkflowRunInfo,
 )
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, sign
 
@@ -118,6 +124,8 @@ class GitHubProxyClient:
             timeout=self._timeout,
         )
 
+    _TRANSIENT_RETRY_DELAYS = (1.0, 3.0, 10.0)
+
     async def _request(
         self,
         method: str,
@@ -127,35 +135,79 @@ class GitHubProxyClient:
         json_body: Mapping[str, Any] | None = None,
     ) -> Any:
         body_bytes = b"" if json_body is None else json.dumps(json_body).encode("utf-8")
-        async with self._async_client() as client:
-            # Build the request first so httpx canonicalizes the URL once;
-            # we then sign against the encoded query string the wire will
-            # carry. Signing before this point would mean re-implementing
-            # httpx's param encoding, with a high risk of byte-level drift
-            # from the server's `request.url.query`.
-            req = client.build_request(
-                method,
-                path,
-                params=params,
-                content=body_bytes if json_body is not None else None,
-            )
-            target = req.url.path
-            if req.url.query:
-                target = f"{target}?{req.url.query.decode('ascii')}"
-            req.headers.update(_signed_headers(method, target, body_bytes, self._key))
-            if json_body is not None:
-                req.headers["Content-Type"] = "application/json"
-            resp = await client.send(req)
-        if resp.status_code >= 400:
-            raise _decode_error(resp)
-        if resp.status_code == 204 or not resp.content:
-            return None
-        return resp.json()
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*self._TRANSIENT_RETRY_DELAYS, None)):
+            try:
+                async with self._async_client() as client:
+                    req = client.build_request(
+                        method,
+                        path,
+                        params=params,
+                        content=body_bytes if json_body is not None else None,
+                    )
+                    target = req.url.path
+                    if req.url.query:
+                        target = f"{target}?{req.url.query.decode('ascii')}"
+                    req.headers.update(_signed_headers(method, target, body_bytes, self._key))
+                    if json_body is not None:
+                        req.headers["Content-Type"] = "application/json"
+                    resp = await client.send(req)
+                if resp.status_code >= 400:
+                    raise _decode_error(resp)
+                if resp.status_code == 204 or not resp.content:
+                    return None
+                return resp.json()
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                log.warning(
+                    "proxy client transient error, retrying",
+                    extra={"method": method, "path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     # ---- reads ----
     async def get_repo(self, repo: str) -> RepoInfo:
         data = await self._request("GET", "/gh/v1/repo", params={"repo": repo})
         return _repo_from(data)
+
+    async def list_workflow_runs(self, repo: str, *, head_sha: str) -> list[WorkflowRunInfo]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/workflow_runs",
+            params={"repo": repo, "head_sha": head_sha},
+        )
+        return [_workflow_run_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
+    async def list_workflow_jobs(self, repo: str, run_id: int) -> list[WorkflowJobInfo]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/workflow_jobs",
+            params={"repo": repo, "run_id": run_id},
+        )
+        return [_workflow_job_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
+    async def get_job_log_tail(self, repo: str, job_id: int, *, tail_lines: int = 200) -> str:
+        data = await self._request(
+            "GET",
+            "/gh/v1/job_log_tail",
+            params={"repo": repo, "job_id": job_id, "tail": tail_lines},
+        )
+        return str(data.get("text") or "") if isinstance(data, dict) else ""
+
+    async def get_tag_sha(self, repo: str, tag: str) -> str | None:
+        data = await self._request("GET", "/gh/v1/tag_ref", params={"repo": repo, "tag": tag})
+        if not isinstance(data, dict) or data.get("sha") is None:
+            return None
+        return str(data["sha"])
+
+    async def get_release_by_tag(self, repo: str, tag: str) -> ReleaseInfo | None:
+        data = await self._request("GET", "/gh/v1/release_by_tag", params={"repo": repo, "tag": tag})
+        if data is None:
+            return None
+        return _release_from(data)
 
     async def get_issue(self, repo: str, number: int) -> IssueInfo:
         data = await self._request("GET", "/gh/v1/issue", params={"repo": repo, "number": number})
@@ -191,6 +243,28 @@ class GitHubProxyClient:
             params={"repo": repo, "state": state, "limit": limit},
         )
         return [_issue_summary_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
+    async def search_issues(self, repo: str, query: str, *, limit: int = 10) -> list[IssueSummary]:
+        data = await self._request(
+            "GET",
+            "/gh/v1/search_issues",
+            params={"repo": repo, "q": query, "limit": limit},
+        )
+        return [_issue_summary_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
+
+    async def list_issue_index_entries(
+        self,
+        repo: str,
+        *,
+        since: str | None = None,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> list[IssueIndexEntry]:
+        params: dict[str, Any] = {"repo": repo, "page": page, "per_page": per_page}
+        if since:
+            params["since"] = since
+        data = await self._request("GET", "/gh/v1/issue_index_entries", params=params)
+        return [_index_entry_from(item) for item in (data.get("items") if isinstance(data, dict) else None) or []]
 
     async def list_comments(self, repo: str, number: int) -> list[CommentInfo]:
         data = await self._request("GET", "/gh/v1/comments", params={"repo": repo, "number": number})
@@ -282,6 +356,15 @@ class GitHubProxyClient:
         )
         return tuple(str(lbl) for lbl in (data.get("labels") if isinstance(data, dict) else None) or [])
 
+    async def remove_issue_label(self, repo: str, number: int, label: str) -> None:
+        if not label:
+            return
+        await self._request(
+            "POST",
+            "/gh/v1/remove_issue_label",
+            json_body={"repo": repo, "number": number, "label": label},
+        )
+
     async def submit_pr_review(
         self,
         *,
@@ -290,17 +373,21 @@ class GitHubProxyClient:
         body: str,
         event: str,
         comments: list[Mapping[str, Any]],
+        commit_id: str | None = None,
     ) -> PullRequestReviewInfo:
+        json_body: dict[str, Any] = {
+            "repo": repo,
+            "pr_number": pr_number,
+            "body": body,
+            "event": event,
+            "comments": comments,
+        }
+        if commit_id:
+            json_body["commit_id"] = commit_id
         data = await self._request(
             "POST",
             "/gh/v1/submit_pr_review",
-            json_body={
-                "repo": repo,
-                "pr_number": pr_number,
-                "body": body,
-                "event": event,
-                "comments": comments,
-            },
+            json_body=json_body,
         )
         return _pr_review_from(data)
 
@@ -363,18 +450,33 @@ class ProxyGitTransport:
             timeout=self._timeout,
         )
 
+    _TRANSIENT_RETRY_DELAYS = (2.0, 5.0, 15.0)
+
     def _post(self, path: str, body: Mapping[str, Any]) -> Mapping[str, Any]:
         body_bytes = json.dumps(body).encode("utf-8")
-        headers = _signed_headers("POST", path, body_bytes, self._key)
-        headers["Content-Type"] = "application/json"
-        with self._client() as client:
-            resp = client.request("POST", path, content=body_bytes, headers=headers)
-        if resp.status_code >= 400:
-            raise _decode_error(resp)
-        if resp.status_code == 204 or not resp.content:
-            return {}
-        data = resp.json()
-        return data if isinstance(data, dict) else {}
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*self._TRANSIENT_RETRY_DELAYS, None)):
+            try:
+                headers = _signed_headers("POST", path, body_bytes, self._key)
+                headers["Content-Type"] = "application/json"
+                with self._client() as client:
+                    resp = client.request("POST", path, content=body_bytes, headers=headers)
+                if resp.status_code >= 400:
+                    raise _decode_error(resp)
+                if resp.status_code == 204 or not resp.content:
+                    return {}
+                data = resp.json()
+                return data if isinstance(data, dict) else {}
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                log.warning(
+                    "proxy transport transient error, retrying",
+                    extra={"path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     def clone_pool(self, *, repo: str, clone_url: str, default_branch: str, target: Path) -> None:
         del target  # remote-resolved on the proxy side from `repo`
@@ -391,9 +493,21 @@ class ProxyGitTransport:
         del pool_dir
         self._post("/gh/v1/git/fetch_ref", {"repo": repo, "ref": ref})
 
-    def fetch_pr_head(self, *, repo: str, pool_dir: Path, pr_number: int) -> None:
+    def fetch_pr_head(
+        self,
+        *,
+        repo: str,
+        pool_dir: Path,
+        pr_number: int,
+        head_ref: str | None = None,
+        head_sha: str | None = None,
+        same_repo: bool = False,
+    ) -> None:
         del pool_dir
-        self._post("/gh/v1/git/fetch_pr_head", {"repo": repo, "pr_number": pr_number})
+        self._post(
+            "/gh/v1/git/fetch_pr_head",
+            {"repo": repo, "pr_number": pr_number, "head_ref": head_ref, "head_sha": head_sha, "same_repo": same_repo},
+        )
 
     def push_branch(
         self,
@@ -417,8 +531,76 @@ class ProxyGitTransport:
         data = self._post("/gh/v1/git/push", body)
         return PushResult(head=str(data.get("head") or expected_head), branch=str(data.get("branch") or branch))
 
+    def push_release(
+        self,
+        *,
+        repo: str,
+        workspace_key: str,
+        repo_dir: Path,
+        branch: str,
+        tag: str,
+        expected_head: str,
+        slot_uid: int | None = None,
+    ) -> PushResult:
+        del repo_dir
+        body: dict[str, Any] = {
+            "repo": repo,
+            "workspace_key": workspace_key,
+            "branch": branch,
+            "tag": tag,
+            "expected_head": expected_head,
+        }
+        if slot_uid is not None:
+            body["slot_uid"] = slot_uid
+        data = self._post("/gh/v1/git/push_release", body)
+        return PushResult(head=str(data.get("head") or expected_head), branch=str(data.get("branch") or branch))
+
 
 # ---------- payload helpers ----------
+
+
+def _workflow_run_from(data: Any) -> WorkflowRunInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed workflow run payload")
+    return WorkflowRunInfo(
+        id=int(data.get("id") or 0),
+        name=str(data.get("name") or ""),
+        event=str(data.get("event") or ""),
+        status=str(data.get("status") or ""),
+        conclusion=str(data["conclusion"]) if data.get("conclusion") is not None else None,
+        head_branch=str(data["head_branch"]) if data.get("head_branch") is not None else None,
+        head_sha=str(data.get("head_sha") or ""),
+        html_url=str(data.get("html_url") or ""),
+        run_attempt=int(data.get("run_attempt") or 1),
+    )
+
+
+def _workflow_job_from(data: Any) -> WorkflowJobInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed workflow job payload")
+    return WorkflowJobInfo(
+        id=int(data.get("id") or 0),
+        run_id=int(data.get("run_id") or 0),
+        name=str(data.get("name") or ""),
+        status=str(data.get("status") or ""),
+        conclusion=str(data["conclusion"]) if data.get("conclusion") is not None else None,
+        html_url=str(data.get("html_url") or ""),
+        failed_steps=tuple(str(step) for step in data.get("failed_steps") or []),
+    )
+
+
+def _release_from(data: Any) -> ReleaseInfo:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed release payload")
+    name = data.get("name")
+    return ReleaseInfo(
+        tag=str(data.get("tag") or ""),
+        name=str(name) if name is not None else None,
+        draft=bool(data.get("draft")),
+        prerelease=bool(data.get("prerelease")),
+        html_url=str(data.get("html_url") or ""),
+        asset_names=tuple(str(asset) for asset in data.get("asset_names") or []),
+    )
 
 
 def _repo_from(data: Any) -> RepoInfo:
@@ -461,6 +643,29 @@ def _issue_summary_from(data: Any) -> IssueSummary:
         comments=int(data.get("comments") or 0),
         updated_at=str(data.get("updated_at") or ""),
         created_at=str(data.get("created_at") or ""),
+        html_url=str(data.get("html_url") or ""),
+        state_reason=str(data.get("state_reason") or ""),
+        is_pull_request=bool(data.get("is_pull_request")),
+    )
+
+
+def _index_entry_from(data: Any) -> IssueIndexEntry:
+    if not isinstance(data, dict):
+        raise GitHubError(500, "proxy returned malformed issue index payload")
+    return IssueIndexEntry(
+        repo=str(data["repo"]),
+        number=int(data["number"]),
+        is_pull_request=bool(data.get("is_pull_request")),
+        title=str(data.get("title") or ""),
+        body=str(data.get("body") or ""),
+        state=str(data.get("state") or ""),
+        state_reason=str(data.get("state_reason") or ""),
+        merged_at=str(data.get("merged_at") or ""),
+        author=str(data.get("author") or ""),
+        labels=tuple(str(x) for x in (data.get("labels") or [])),
+        comments=int(data.get("comments") or 0),
+        created_at=str(data.get("created_at") or ""),
+        updated_at=str(data.get("updated_at") or ""),
         html_url=str(data.get("html_url") or ""),
     )
 
@@ -520,6 +725,7 @@ def _pr_file_from(data: Any) -> PullRequestFileInfo:
         status=str(data.get("status") or ""),
         additions=int(data.get("additions") or 0),
         deletions=int(data.get("deletions") or 0),
+        patch=str(data.get("patch") or ""),
     )
 
 
@@ -537,6 +743,7 @@ def _pr_from(data: Any) -> PullRequestInfo:
         head_repo=str(data.get("head_repo") or ""),
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),
+        head_sha=str(data.get("head_sha") or ""),
     )
 
 

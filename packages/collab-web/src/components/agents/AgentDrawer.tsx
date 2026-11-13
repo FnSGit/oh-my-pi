@@ -1,19 +1,22 @@
-import type { AgentSnapshot, SessionEntry, SubagentProgressPayload } from "@oh-my-pi/pi-wire";
+import type { AgentSnapshot, SessionEntry, SubagentLifecyclePayload, SubagentProgressPayload } from "@oh-my-pi/pi-wire";
 import { OctagonX, RotateCcw, SendHorizontal, X } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { GuestClient } from "../../lib/client";
 import { fmtCost, fmtDuration, fmtTokens } from "../../lib/format";
-import { parseJsonl } from "../../lib/jsonl";
+import { decideTranscriptPoll } from "../../lib/transcript-poll";
 import type { TranscriptProps } from "../transcript/Transcript";
 import { Transcript } from "../transcript/Transcript";
 
 const EMPTY_TOOLS: TranscriptProps["activeTools"] = new Map();
 const POLL_MS = 1200;
+/** Consecutive unchanged polls of a non-running agent before the loop stops. */
+const IDLE_POLLS_BEFORE_STOP = 4;
 
 export function AgentDrawer(props: {
 	agent: AgentSnapshot;
 	progress?: SubagentProgressPayload;
+	lifecycle?: SubagentLifecyclePayload;
 	client: GuestClient;
 	/** View-link guests: hide kill/revive/chat (the host rejects them anyway). */
 	readOnly?: boolean;
@@ -21,9 +24,14 @@ export function AgentDrawer(props: {
 	host?: TranscriptProps["host"];
 	onClose(): void;
 }): ReactNode {
-	const { agent, progress, client, readOnly, host, onClose } = props;
+	const { agent, progress, lifecycle, client, readOnly, host, onClose } = props;
 	const [entries, setEntries] = useState<readonly SessionEntry[]>([]);
+	const [fetchError, setFetchError] = useState<string | null>(null);
 	const [draft, setDraft] = useState("");
+	/** Resumes a stopped poll loop; null while no loop is mounted. */
+	const resumePollingRef = useRef<(() => void) | null>(null);
+	const quiescentRef = useRef(false);
+	quiescentRef.current = agent.status !== "running";
 
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent) => {
@@ -36,47 +44,84 @@ export function AgentDrawer(props: {
 	// Live transcript: poll the host-side session file while the drawer is
 	// open, appending parsed JSONL entries. State resets when the agent
 	// changes; the interval and any in-flight reply are dropped on cleanup.
+	// Once the agent is not running, no partial JSONL line is pending, and
+	// IDLE_POLLS_BEFORE_STOP consecutive polls find the file unchanged, the
+	// loop stops; host activity for the agent resumes it (effect below).
+	// A frame-level host error is terminal: stop polling and show it (the
+	// host replies with an unchanged cursor, so retrying would loop hot).
 	useEffect(() => {
 		setEntries([]);
+		setFetchError(null);
 		if (!agent.hasSessionFile) return;
 		let disposed = false;
+		let failed = false;
 		let inFlight = false;
 		let cursor = 0;
 		let carry = "";
 		let acc: readonly SessionEntry[] = [];
+		let idlePolls = 0;
+		let timer: Timer | null = null;
+		const stopPolling = () => {
+			if (timer !== null) {
+				clearInterval(timer);
+				timer = null;
+			}
+		};
 		const poll = async (): Promise<void> => {
-			if (disposed || inFlight) return;
+			if (disposed || failed || inFlight) return;
 			inFlight = true;
 			try {
 				const reply = await client.fetchTranscript(agent.id, cursor);
-				if (disposed || reply === null) return; // timeout/error → keep polling
-				cursor = reply.newSize;
-				if (!reply.text) return;
-				const parsed = parseJsonl(reply.text, carry);
-				carry = parsed.carry;
-				const fresh: SessionEntry[] = [];
-				for (const item of parsed.items) {
-					if (typeof item !== "object" || item === null) continue;
-					if ((item as { type?: unknown }).type === "session") continue;
-					fresh.push(item as SessionEntry);
-				}
-				if (fresh.length > 0) {
-					acc = [...acc, ...fresh];
-					setEntries(acc);
+				if (disposed) return;
+				const decision = decideTranscriptPoll(reply, carry);
+				switch (decision.action) {
+					case "retry":
+						return; // timeout/transient → keep polling from the same cursor
+					case "stop":
+						failed = true;
+						stopPolling();
+						setFetchError(decision.message);
+						return;
+					case "advance": {
+						const grew = decision.newSize !== cursor;
+						cursor = decision.newSize;
+						carry = decision.carry;
+						if (decision.fresh.length > 0) {
+							acc = [...acc, ...decision.fresh];
+							setEntries(acc);
+						}
+						idlePolls = grew || !quiescentRef.current ? 0 : idlePolls + 1;
+						if (carry === "" && idlePolls >= IDLE_POLLS_BEFORE_STOP) stopPolling();
+						return;
+					}
 				}
 			} finally {
 				inFlight = false;
 			}
 		};
-		void poll();
-		const timer = setInterval(() => {
+		const startPolling = () => {
+			idlePolls = 0;
 			void poll();
-		}, POLL_MS);
+			timer = setInterval(() => {
+				void poll();
+			}, POLL_MS);
+		};
+		resumePollingRef.current = () => {
+			if (!disposed && !failed && timer === null) startPolling();
+		};
+		startPolling();
 		return () => {
 			disposed = true;
-			clearInterval(timer);
+			resumePollingRef.current = null;
+			stopPolling();
 		};
 	}, [agent.id, agent.hasSessionFile, client]);
+
+	// Progress/lifecycle bus frames and status/activity changes for this agent
+	// restart a stopped loop; a running loop ignores them.
+	useEffect(() => {
+		resumePollingRef.current?.();
+	}, [progress, lifecycle, agent.status, agent.lastActivity]);
 
 	const sendChat = () => {
 		const text = draft.trim();
@@ -154,15 +199,22 @@ export function AgentDrawer(props: {
 			) : null}
 			<div className="ag-drawer-body">
 				{agent.hasSessionFile ? (
-					<Transcript
-						compact
-						entries={entries}
-						stream={null}
-						streamDone={false}
-						activeTools={EMPTY_TOOLS}
-						working={agent.status === "running"}
-						host={host}
-					/>
+					<>
+						<Transcript
+							compact
+							entries={entries}
+							stream={null}
+							streamDone={false}
+							activeTools={EMPTY_TOOLS}
+							working={agent.status === "running" && fetchError === null}
+							host={host}
+						/>
+						{fetchError !== null ? (
+							<div className="ag-fetch-error" role="alert">
+								transcript unavailable: {fetchError}
+							</div>
+						) : null}
+					</>
 				) : (
 					<div className="ag-empty">no transcript available</div>
 				)}

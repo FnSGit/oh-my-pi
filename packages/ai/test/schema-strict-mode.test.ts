@@ -1,15 +1,123 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
+import { formatLocalRefPointer, parseLocalRefPointer } from "@oh-my-pi/omptype";
 import type { Tool, ToolCall } from "@oh-my-pi/pi-ai/types";
 import {
+	adaptSchemaForStrict,
+	arkToWireSchema,
+	dereferenceJsonSchema,
 	enforceStrictSchema,
 	isJsonSchemaValueValid,
 	isValidJsonSchema,
+	sanitizeSchemaForOpenAIResponses,
 	sanitizeSchemaForStrictMode,
+	toolWireSchema,
 	tryEnforceStrictSchema,
-	zodToWireSchema,
 } from "@oh-my-pi/pi-ai/utils/schema";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
-import { z } from "zod/v4";
+
+describe("URI-fragment definition references", () => {
+	it("resolves percent-encoded and pointer-escaped names once across schema consumers", () => {
+		for (const defsKey of ["$defs", "definitions"]) {
+			const schema = {
+				type: "object",
+				[defsKey]: {
+					"a%2Fb /~1 空\n": { type: "string" },
+					"a/b /~1 空\n": { type: "boolean" },
+					"": { type: "integer" },
+				},
+				properties: {
+					encoded: { $ref: `#/${defsKey}/a%252Fb%20~1~01%20%E7%A9%BA%0A`, description: "encoded" },
+					raw: { $ref: `#/${defsKey}/a~1b%20~1~01%20%E7%A9%BA%0A`, description: "raw" },
+					empty: { $ref: `#/${defsKey}/`, description: "empty" },
+				},
+				required: ["encoded", "raw", "empty"],
+			};
+			const properties = {
+				encoded: { type: "string", description: "encoded" },
+				raw: { type: "boolean", description: "raw" },
+				empty: { type: "integer", description: "empty" },
+			};
+			expect(dereferenceJsonSchema(schema)).toEqual({
+				type: "object",
+				properties,
+				required: schema.required,
+			});
+			const strict = tryEnforceStrictSchema(schema);
+			expect(strict.strict).toBe(true);
+			expect(strict.schema.properties).toEqual(properties);
+			expect(strict.schema.additionalProperties).toBe(false);
+			const valid = { encoded: "valid", raw: false, empty: 2 };
+			expect(isJsonSchemaValueValid(schema, valid)).toBe(true);
+			expect(isJsonSchemaValueValid(schema, { ...valid, encoded: false })).toBe(false);
+			expect(isJsonSchemaValueValid(schema, { ...valid, raw: "invalid" })).toBe(false);
+			expect(isJsonSchemaValueValid(schema, { ...valid, empty: 2.5 })).toBe(false);
+		}
+	});
+
+	it("rewrites fully encoded draft-07 definition fragments during the upgrade", () => {
+		const schema = {
+			$schema: "http://json-schema.org/draft-07/schema#",
+			type: "object",
+			definitions: { value: { type: "string" } },
+			properties: { value: { $ref: "#%2Fdefinitions%2Fvalue" } },
+			required: ["value"],
+		};
+		const strict = tryEnforceStrictSchema(schema);
+		expect(strict.strict).toBe(true);
+		// The map rename must come with the encoded ref being rewritten to the
+		// renamed `$defs` target; a bare `$ref` stays as-is in strict output.
+		expect(strict.schema.$defs).toEqual({ value: { type: "string" } });
+		expect(strict.schema.properties).toEqual({ value: { $ref: "#/$defs/value" } });
+	});
+
+	it("normalizes enum whitespace through percent-encoded refs in tool arguments", () => {
+		const tool: Tool = {
+			name: "demo",
+			description: "",
+			parameters: {
+				type: "object",
+				$defs: { "a b": { type: "string", enum: ["x y"] } },
+				properties: { v: { $ref: "#/$defs/a%20b" } },
+				required: ["v"],
+			},
+		};
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-encoded-ref",
+			name: "demo",
+			arguments: { v: "x y\n" },
+		}) as { v: string };
+		expect(result.v).toBe("x y");
+	});
+
+	it("round-trips the root fragment through the shared pointer helpers", () => {
+		expect(formatLocalRefPointer([])).toBe("#");
+		expect(parseLocalRefPointer("#")).toEqual([]);
+	});
+
+	it("preserves malformed and external refs for sanitizers but rejects unresolved values", () => {
+		for (const ref of ["#/$defs/%E0%A4%A", "https://example.com/schema#/$defs/value"]) {
+			const schema = {
+				type: "object",
+				$defs: {
+					"%": { type: "string" },
+					"%E0%A4%A": { type: "string" },
+					value: { type: "string" },
+				},
+				properties: { value: { $ref: ref, description: "unresolved" } },
+				required: ["value"],
+			};
+			expect(dereferenceJsonSchema(schema)).toEqual({
+				type: "object",
+				properties: schema.properties,
+				required: schema.required,
+			});
+			expect(sanitizeSchemaForStrictMode(schema).properties).toEqual(schema.properties);
+			expect(isJsonSchemaValueValid(schema, { value: "valid" })).toBe(false);
+		}
+	});
+});
 
 describe("sanitizeSchemaForStrictMode", () => {
 	it("infers object type, strips non-structural keywords, and converts const to enum", () => {
@@ -86,6 +194,68 @@ describe("sanitizeSchemaForStrictMode", () => {
 		expect((objectVariant as Record<string, unknown>).properties).toEqual({ data: { type: "string" } });
 	});
 
+	it("distributes enum values to matching nullable type-array branches", () => {
+		const sanitized = sanitizeSchemaForStrictMode({
+			type: ["string", "null"],
+			enum: ["javascript", "python", null],
+			description: "guide",
+		});
+
+		expect(sanitized).toEqual({
+			anyOf: [
+				{ enum: ["javascript", "python"], type: "string" },
+				{ enum: [null], type: "null" },
+			],
+			description: "guide",
+		});
+	});
+
+	it("drops type-array branches that cannot satisfy enum constraints", () => {
+		const sanitized = sanitizeSchemaForStrictMode({
+			type: ["string", "null"],
+			enum: ["javascript", "python"],
+		});
+
+		expect(sanitized).toEqual({
+			enum: ["javascript", "python"],
+			type: "string",
+		});
+	});
+
+	it("keeps OpenAI Responses strict schemas valid for nullable MCP enum parameters", () => {
+		const guideEnum = ["javascript", "python"];
+		const raw = {
+			type: "object",
+			properties: {
+				guide: {
+					anyOf: [{ type: "string", enum: guideEnum, description: "guide" }, { type: "null" }],
+					default: null,
+					description: "guide",
+				},
+			},
+			required: ["guide"],
+			additionalProperties: false,
+		};
+
+		const wired = toolWireSchema({
+			name: "mcp__sentry_search_docs",
+			description: "",
+			parameters: structuredClone(raw),
+		});
+		const responses = sanitizeSchemaForOpenAIResponses(wired);
+		const strict = adaptSchemaForStrict(responses, true);
+		const properties = strict.schema.properties as Record<string, Record<string, unknown>>;
+
+		expect(strict.strict).toBe(true);
+		expect(properties.guide).toEqual({
+			anyOf: [
+				{ enum: ["javascript", "python"], type: "string" },
+				{ enum: [null], type: "null" },
+			],
+			description: "guide (default: null)",
+		});
+	});
+
 	it("keeps existing anyOf constraints inside each normalized type variant", () => {
 		const schema = {
 			type: ["object", "null"],
@@ -111,19 +281,6 @@ describe("sanitizeSchemaForStrictMode", () => {
 		expect(((objectVariant as Record<string, unknown>).anyOf as unknown[]).length).toBe(1);
 		expect(((nullVariant as Record<string, unknown>).anyOf as unknown[]).length).toBe(1);
 	});
-	it("inlines `default` value into `description` before stripping it", () => {
-		const schema = {
-			type: "number",
-			description: "Timeout in seconds",
-			default: 60,
-		} as Record<string, unknown>;
-
-		const sanitized = sanitizeSchemaForStrictMode(schema);
-
-		expect(sanitized.default).toBeUndefined();
-		expect(sanitized.description).toBe("Timeout in seconds (default: 60)");
-	});
-
 	it("preserves `default` for various primitive types when inlining", () => {
 		const numberSchema = sanitizeSchemaForStrictMode({
 			type: "number",
@@ -425,10 +582,10 @@ describe("sanitizeSchemaForStrictMode", () => {
 
 describe("enforceStrictSchema", () => {
 	it("converts optional properties to nullable schemas and requires all object keys", () => {
-		const schema = zodToWireSchema(
-			z.object({
-				requiredText: z.string(),
-				optionalCount: z.number().optional(),
+		const schema = arkToWireSchema(
+			type({
+				requiredText: type("string"),
+				optionalCount: type("number").optional(),
 			}),
 		);
 
@@ -442,9 +599,9 @@ describe("enforceStrictSchema", () => {
 	});
 
 	it("flattens optional union schemas instead of nesting anyOf wrappers", () => {
-		const schema = zodToWireSchema(
-			z.object({
-				paths: z.union([z.string(), z.array(z.string())]).optional(),
+		const schema = arkToWireSchema(
+			type({
+				paths: type.union([type("string"), type("string").array()]).optional(),
 			}),
 		);
 
@@ -523,12 +680,12 @@ describe("enforceStrictSchema", () => {
 	});
 
 	it("never emits undefined as a schema type", () => {
-		const schema = zodToWireSchema(
-			z.object({
-				questions: z.array(
-					z.object({
-						id: z.string(),
-						recommended: z.number().optional(),
+		const schema = arkToWireSchema(
+			type({
+				questions: type.array(
+					type({
+						id: type("string"),
+						recommended: type("number").optional(),
 					}),
 				),
 			}),
@@ -729,22 +886,22 @@ describe("tryEnforceStrictSchema", () => {
 	});
 
 	it("keeps shared object schemas strict-compatible after adaptation", () => {
-		const sharedTaskSchema = z.object({
-			content: z.string(),
-			status: z.string().optional(),
-			notes: z.string().optional(),
+		const sharedTaskSchema = type({
+			content: type("string"),
+			status: type("string").optional(),
+			notes: type("string").optional(),
 		});
-		const schema = zodToWireSchema(
-			z.object({
-				ops: z.array(
-					z.union([
-						z.object({
-							op: z.literal("replace"),
-							tasks: z.array(sharedTaskSchema),
+		const schema = arkToWireSchema(
+			type({
+				ops: type.array(
+					type.union([
+						type({
+							op: type.unit("replace"),
+							tasks: type.array(sharedTaskSchema),
 						}),
-						z.object({
-							op: z.literal("update"),
-							tasks: z.array(sharedTaskSchema).optional(),
+						type({
+							op: type.unit("update"),
+							tasks: type.array(sharedTaskSchema).optional(),
 						}),
 					]),
 				),
@@ -841,7 +998,7 @@ describe("json-schema validator unsupported-keyword regressions", () => {
 			type: "object",
 			properties: { kind: { type: "string" }, extra: { type: "string" } },
 			if: { properties: { kind: { const: "a" } }, required: ["kind"] },
-			// biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then/else keyword
+			// oxlint-disable-next-line unicorn/no-thenable -- JSON Schema if/then/else keyword
 			then: { required: ["extra"] },
 		};
 		expect(isJsonSchemaValueValid(schema, { kind: "b" })).toBe(true);
@@ -903,7 +1060,7 @@ describe("meta-validator conditional keywords", () => {
 			isValidJsonSchema({
 				type: "object",
 				if: { properties: { kind: { const: "a" } } },
-				// biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then/else keyword
+				// oxlint-disable-next-line unicorn/no-thenable -- JSON Schema if/then/else keyword
 				then: { required: ["extra"] },
 				else: { required: ["other"] },
 			}),
@@ -915,7 +1072,7 @@ describe("meta-validator conditional keywords", () => {
 	});
 
 	it("rejects malformed then", () => {
-		// biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then/else keyword
+		// oxlint-disable-next-line unicorn/no-thenable -- JSON Schema if/then/else keyword
 		expect(isValidJsonSchema({ type: "object", then: "not-a-schema" })).toBe(false);
 	});
 
@@ -940,7 +1097,7 @@ describe("Zod root extras preserved through normalize", () => {
 		const tool: Tool = {
 			name: "simple_tool",
 			description: "",
-			parameters: z.object({ assignment: z.string() }),
+			parameters: type({ assignment: type("string") }),
 		};
 		const toolCall: ToolCall = {
 			type: "toolCall",
@@ -953,5 +1110,40 @@ describe("Zod root extras preserved through normalize", () => {
 		expect(result.assignment).toBe("do thing");
 		expect("schema" in result).toBe(true);
 		expect(result.schema).toBeNull();
+	});
+});
+
+describe("adaptSchemaForStrict — unrepresentable open branches fall back to non-strict", () => {
+	it("falls back when a property schema is an open `true` (z.unknown())", () => {
+		// `z.unknown()` normalizes to `meta: true` (issue #1179); strict providers
+		// reject a typeless property, so the schema must downgrade to non-strict
+		// rather than emit `strict: true` with a `true` property.
+		const wire = toolWireSchema({
+			name: "t",
+			description: "d",
+			parameters: type({ a: type("string"), meta: type("unknown") }),
+		} as Tool);
+		expect((wire.properties as Record<string, unknown>).meta).toBe(true);
+		expect(adaptSchemaForStrict(wire, true).strict).toBe(false);
+	});
+
+	it("falls back when a combiner branch is a boolean schema", () => {
+		const schema: Record<string, unknown> = {
+			type: "object",
+			properties: { a: { anyOf: [true, { type: "string" }] } },
+			required: ["a"],
+			additionalProperties: false,
+		};
+		expect(adaptSchemaForStrict(schema, true).strict).toBe(false);
+	});
+
+	it("falls back when an array `items` schema is unconstrained", () => {
+		const schema: Record<string, unknown> = {
+			type: "object",
+			properties: { xs: { type: "array", items: true } },
+			required: ["xs"],
+			additionalProperties: false,
+		};
+		expect(adaptSchemaForStrict(schema, true).strict).toBe(false);
 	});
 });

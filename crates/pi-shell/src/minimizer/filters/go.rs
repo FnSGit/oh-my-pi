@@ -1,6 +1,6 @@
 //! Go toolchain output filters.
 
-use std::fmt::Write as _;
+use std::fmt::{NumBuffer, Write as _};
 
 use crate::minimizer::{MinimizerCtx, MinimizerOutput, primitives};
 
@@ -54,8 +54,9 @@ fn is_go_tool_golangci_lint(ctx: &MinimizerCtx<'_>) -> bool {
 
 fn filter_go_test(input: &str, exit_code: i32) -> String {
 	// On success, no per-test/per-package detail carries signal: re-derive rtk's
-	// aggregation against DEFAULT text (and opportunistic JSON), counting package
-	// and test markers into a single summary line instead of echoing every PASS/ok.
+	// aggregation against DEFAULT text (and opportunistic JSON), counting
+	// package and test markers into a single summary line instead of echoing
+	// every PASS/ok.
 	if exit_code == 0 {
 		return aggregate_go_test_success(input);
 	}
@@ -315,12 +316,12 @@ fn summarize_golangci_json(line: &str) -> Option<String> {
 			.get("Pos")
 			.and_then(|pos| pos.get("Line"))
 			.and_then(serde_json::Value::as_u64)
-			.map_or(0, |value| value);
+			.unwrap_or(0);
 		let col_no = issue
 			.get("Pos")
 			.and_then(|pos| pos.get("Column"))
 			.and_then(serde_json::Value::as_u64)
-			.map_or(0, |value| value);
+			.unwrap_or(0);
 		let linter = issue
 			.get("FromLinter")
 			.and_then(|v| v.as_str())
@@ -331,9 +332,9 @@ fn summarize_golangci_json(line: &str) -> Option<String> {
 			.map_or("", |value| value);
 		out.push_str(file);
 		out.push(':');
-		out.push_str(&line_no.to_string());
+		out.push_str(line_no.format_into(&mut NumBuffer::new()));
 		out.push(':');
-		out.push_str(&col_no.to_string());
+		out.push_str(col_no.format_into(&mut NumBuffer::new()));
 		out.push_str(": ");
 		out.push_str(text);
 		out.push_str(" (");
@@ -341,9 +342,9 @@ fn summarize_golangci_json(line: &str) -> Option<String> {
 		out.push_str(")\n");
 	}
 	if issues.len() > 40 {
-		out.push_str("… ");
-		out.push_str(&(issues.len() - 40).to_string());
-		out.push_str(" more issues\n");
+		out.push_str("[…");
+		out.push_str((issues.len() - 40).format_into(&mut NumBuffer::new()));
+		out.push_str(" issues elided…]\n");
 	}
 	Some(out)
 }
@@ -397,11 +398,11 @@ fn is_go_noise(line: &str) -> bool {
 fn is_golangci_noise(line: &str) -> bool {
 	let lower = line.to_ascii_lowercase();
 	// Strip runner-log info/warn chatter (snip strips `^level=` wholesale), but
-	// DELIBERATELY KEEP `level=error` — those lines carry config/typecheck failures
-	// that would otherwise vanish silently.
+	// DELIBERATELY KEEP `level=error` — those lines carry config/typecheck
+	// failures that would otherwise vanish silently.
 	// `level=error` carries config/typecheck failures (incl. the canonical
-	// `level=error msg="[linters_context]…"` typecheck headline) — never strip it,
-	// even when it routes through the linters_context component.
+	// `level=error msg="[linters_context]…"` typecheck headline) — never strip
+	// it, even when it routes through the linters_context component.
 	if lower.starts_with("level=error") {
 		return false;
 	}
@@ -476,8 +477,8 @@ mod tests {
 		             kubecraft.ai/.../controller  6.610s\n=== RUN   TestNewClient\n--- PASS: \
 		             TestNewClient (0.00s)\nPASS\nok  kubecraft.ai/.../llm  0.776s\n";
 		let out = filter(&ctx, input, 0);
-		// On success the two `ok` packages collapse to one summary line; the per-test
-		// PASS lines and `=== RUN`/ginkgo banner noise disappear.
+		// On success the two `ok` packages collapse to one summary line; the
+		// per-test PASS lines and `=== RUN`/ginkgo banner noise disappear.
 		assert!(out.text.contains("go test: 2 packages ok"));
 		assert!(!out.text.contains("--- PASS"));
 		assert!(!out.text.contains("=== RUN"));
@@ -506,6 +507,22 @@ mod tests {
 		let out = filter_golangci_lint(input);
 		assert!(out.contains("golangci-lint: 1 issues"));
 		assert!(out.contains("main.go:7:2: unreachable code (govet)"));
+
+		// Match up-to-40 limits, testing elison formatting
+		let mut many_issues = r#"{"Issues":["#.to_string();
+		for i in 0..42 {
+			if i > 0 {
+				many_issues.push(',');
+			}
+			let _ = write!(
+				many_issues,
+				r#"{{"FromLinter":"govet","Text":"err {i}","Pos":{{"Filename":"main.go","Line":{i},"Column":2}}}}"#
+			);
+		}
+		many_issues.push_str("]}");
+		let out_many = filter_golangci_lint(&many_issues);
+		assert!(out_many.contains("golangci-lint: 42 issues"));
+		assert!(out_many.contains("[…2 issues elided…]"));
 	}
 
 	#[test]
@@ -525,8 +542,8 @@ mod tests {
 
 	#[test]
 	fn looks_like_go_error_recognizes_non_location_error_shapes() {
-		// Ported from rtk go_cmd inline inputs: module/compiler failures that carry
-		// no file.go:line:col location must still register as errors.
+		// Ported from rtk go_cmd inline inputs: module/compiler failures that
+		// carry no file.go:line:col location must still register as errors.
 		assert!(looks_like_go_error("undefined: missingFunc"));
 		assert!(looks_like_go_error("cannot find package \"foo/bar\""));
 		assert!(looks_like_go_error(
@@ -595,10 +612,11 @@ mod tests {
 			command:    "golangci-lint run ./...",
 			config:     &cfg,
 		};
-		// Real default (non-json) golangci run: the typecheck headline is emitted by
-		// the logrus logger in its canonical `level=error msg="[linters_context]…"`
-		// shape — the exact format that must survive. Surrounding runner chatter
-		// (incl. a warn-level linters_context line) is stripped.
+		// Real default (non-json) golangci run: the typecheck headline is emitted
+		// by the logrus logger in its canonical `level=error
+		// msg="[linters_context]…"` shape — the exact format that must survive.
+		// Surrounding runner chatter (incl. a warn-level linters_context line)
+		// is stripped.
 		let input = "level=info Active 5 linters\nlevel=warning The linter 'deadcode' is \
 		             deprecated\nlevel=warning msg=\"[linters_context] stale cache\"\nlevel=error \
 		             msg=\"[linters_context] typechecking error: cannot find \
@@ -657,7 +675,8 @@ mod tests {
 {"Action":"output","Output":"ok  example.com/pkg  1.234s\n"}
 {"Action":"pass","Elapsed":1.234}"#;
 		let result = aggregate_go_test_success(input);
-		// Should NOT produce "packages ok" summary — should return head_tail of input
+		// Should NOT produce "packages ok" summary — should return head_tail of
+		// input
 		assert!(!result.contains("packages ok"), "benchmark json run must not be collapsed");
 		assert!(result.contains("BenchmarkFoo"), "benchmark lines must survive");
 	}

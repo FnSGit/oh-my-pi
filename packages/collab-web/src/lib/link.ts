@@ -17,7 +17,7 @@ import {
 	WRITE_TOKEN_BYTES,
 } from "@oh-my-pi/pi-wire";
 
-export { COLLAB_PROTO } from "@oh-my-pi/pi-wire";
+export { COLLAB_PROTO, packEnvelope, rewriteEnvelopePeer, unpackEnvelope } from "@oh-my-pi/pi-wire";
 export type { ParsedCollabLink };
 export { DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH, ROOM_ID_BYTES };
 
@@ -49,28 +49,6 @@ export function decodeBase64Url(text: string): Uint8Array | null {
 	const out = new Uint8Array(binary.length);
 	for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
 	return out;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Wire envelope
-// ═══════════════════════════════════════════════════════════════════════════
-
-export function packEnvelope(peerId: number, sealed: Uint8Array): Uint8Array<ArrayBuffer> {
-	const out = new Uint8Array(ENVELOPE_HEADER_LENGTH + sealed.byteLength);
-	new DataView(out.buffer).setUint32(0, peerId, false);
-	out.set(sealed, ENVELOPE_HEADER_LENGTH);
-	return out;
-}
-
-export function unpackEnvelope(data: Uint8Array): { peerId: number; payload: Uint8Array } | null {
-	if (data.byteLength < ENVELOPE_HEADER_LENGTH) return null;
-	const peerId = new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).getUint32(0, false);
-	return { peerId, payload: data.subarray(ENVELOPE_HEADER_LENGTH) };
-}
-
-/** Rewrite the peerId in place without copying the payload. */
-export function rewriteEnvelopePeer(data: Uint8Array, peerId: number): void {
-	new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).setUint32(0, peerId, false);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -157,15 +135,20 @@ export function parseCollabLink(link: string): ParsedCollabLink | { error: strin
 	} catch {
 		return { error: `Invalid collab link: ${link}` };
 	}
+	if ((url.protocol === "http:" || url.protocol === "https:") && url.hash) {
+		const inner = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
+		const parsed = parseCollabLink(inner);
+		if (!("error" in parsed)) return parsed;
+	}
 	const normalized = normalizeRelayOrigin(url.origin);
 	if ("error" in normalized) return normalized;
 	const match = ROOM_PATH_RE.exec(url.pathname);
 	if (!match) {
-		// Web deep link: `http(s)://<relay>/#<collab-link>` — the fragment holds
-		// the whole link, so recurse on it. The recursion terminates because
-		// the inner text is a strict suffix of the input.
+		// Non-http(s) deep links may also carry a complete collab link in the
+		// fragment. http(s) links are handled once above so invalid fragments
+		// fall through to direct relay validation instead of double-recursing.
 		const inner = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
-		if (inner) return parseCollabLink(inner);
+		if (inner && url.protocol !== "http:" && url.protocol !== "https:") return parseCollabLink(inner);
 		return { error: "Collab link must contain a /r/<roomId> path" };
 	}
 	const roomId = match[1] as string;

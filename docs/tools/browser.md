@@ -1,229 +1,208 @@
-# browser
+# Browser Eval prelude
 
-> Open, reuse, close, and script Puppeteer tabs against headless Chromium or CDP-attached apps.
+The Eval `browser` facade opens, reuses, scripts, and closes named Chromium, Electron, CDP, relay, Tern, or cmux tabs. Use [`read`](./read.md) for static URLs; use `browser` for authenticated state, JavaScript execution, or interaction.
 
 ## Source
-- Entry: `packages/coding-agent/src/tools/browser.ts`
+
+- Host facade: `packages/coding-agent/src/tools/browser.ts`
+- JavaScript/Python facades: `packages/coding-agent/src/tools/browser/prelude.{js,py}`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/browser.md`
-- Key collaborators:
-  - `packages/coding-agent/src/tools/browser/tab-supervisor.ts` — global tab registry; worker lifecycle; run/close coordination.
-  - `packages/coding-agent/src/tools/browser/tab-worker.ts` — executes `run` code; implements the `tab` helper API.
-  - `packages/coding-agent/src/tools/browser/tab-worker-entry.ts` — worker-thread transport bootstrap.
-  - `packages/coding-agent/src/tools/browser/registry.ts` — browser-handle registry keyed by browser kind.
-  - `packages/coding-agent/src/tools/browser/launch.ts` — Puppeteer loading, Chromium resolution/download, headless launch, stealth injection.
-  - `packages/coding-agent/src/tools/browser/attach.ts` — CDP attach/reuse, target picking, spawned-app process handling.
-  - `packages/coding-agent/src/tools/browser/tab-protocol.ts` — worker init/run/result message schema.
-  - `packages/coding-agent/src/tools/browser/readable.ts` — `tab.extract()` readability extraction.
-  - `packages/coding-agent/src/tools/browser/render.ts` — TUI rendering for `open`/`close` status lines and `run` JS cells.
-  - `packages/coding-agent/src/tools/puppeteer/00_stealth_tampering.txt` — mask patched functions/descriptors as native.
-  - `packages/coding-agent/src/tools/puppeteer/01_stealth_activity.txt` — synthesize visibility/focus/scroll activity.
-  - `packages/coding-agent/src/tools/puppeteer/02_stealth_hairline.txt` — fix Modernizr hairline detection.
-  - `packages/coding-agent/src/tools/puppeteer/03_stealth_botd.txt` — spoof `navigator.webdriver`, `window.chrome`, and Chrome fingerprint surfaces.
-  - `packages/coding-agent/src/tools/puppeteer/04_stealth_iframe.txt` — patch iframe `contentWindow`/`srcdoc` behavior.
-  - `packages/coding-agent/src/tools/puppeteer/05_stealth_webgl.txt` — spoof WebGL vendor/renderer/precision.
-  - `packages/coding-agent/src/tools/puppeteer/06_stealth_screen.txt` — normalize screen/viewport/device-pixel-ratio values.
-  - `packages/coding-agent/src/tools/puppeteer/07_stealth_fonts.txt` — spoof local fonts and perturb canvas text rendering.
-  - `packages/coding-agent/src/tools/puppeteer/08_stealth_audio.txt` — spoof audio latency/sample-rate and perturb offline rendering.
-  - `packages/coding-agent/src/tools/puppeteer/09_stealth_locale.txt` — force locale/languages/timezone/date strings.
-  - `packages/coding-agent/src/tools/puppeteer/10_stealth_plugins.txt` — synthesize `navigator.plugins`/`navigator.mimeTypes`.
-  - `packages/coding-agent/src/tools/puppeteer/11_stealth_hardware.txt` — spoof `navigator.hardwareConcurrency`.
-  - `packages/coding-agent/src/tools/puppeteer/12_stealth_codecs.txt` — spoof media codec support.
-  - `packages/coding-agent/src/tools/puppeteer/13_stealth_worker.txt` — carry UA/platform spoofing into `Worker`/`SharedWorker`.
+- Tab lifecycle: `packages/coding-agent/src/tools/browser/tab-supervisor.ts`
+- Browser worker and inner tab API: `packages/coding-agent/src/tools/browser/tab-worker.ts`
+- Browser registry and launch modes: `packages/coding-agent/src/tools/browser/{registry,launch,attach}.ts`
+- Relay: `packages/coding-agent/src/tools/browser/relay/`
+- Cmux backend: `packages/coding-agent/src/tools/browser/cmux/`
+- Tern backend: `packages/coding-agent/src/tools/browser/tern/`
+- WebKit backend (host process, discovery): `packages/coding-agent/src/tools/browser/webkit/`
+- Public helper types and options: `packages/coding-agent/src/tools/browser/declarations.d.ts`
+- Browser settings: `packages/coding-agent/src/tools/browser/settings.ts`
 
-## Inputs
+The prelude exists only while Eval and `browser.enabled` are enabled (`browser.enabled` defaults to `true`). It is not an AgentTool.
+All browser host operations request exec-tier approval, including inspection helpers.
 
-### Shared fields
+## JavaScript API
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `action` | `"open" \| "close" \| "run"` | Yes | Dispatches to the open/close/run path. |
-| `name` | `string` | No | Tab id. Defaults to `"main"`. Tabs live in a process-global map, so the same name is reused across later calls and in-process subagents until closed. |
-| `timeout` | `number` | No | Tool wall-clock timeout in seconds. Defaults to `30`; clamped to the browser tool range before execution. |
+```js
+const tab = await browser.open({
+	name: "main",
+	url: "https://example.com",
+	wait_until: "load",
+});
 
-### `action: "open"`
+const observation = await tab.observe();
+await tab.id(observation.elements[0].id).click();
+const title = await tab.title();
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `url` | `string` | No | Navigate after the tab is ready. Existing reusable tabs also navigate when `url` is supplied. |
-| `viewport` | `{ width: number; height: number; scale?: number }` | No | Requested viewport. For headless launch this becomes the initial viewport; for a page it is applied with `page.setViewport()`. `scale` maps to Puppeteer `deviceScaleFactor`. |
-| `wait_until` | `"load" \| "domcontentloaded" \| "networkidle0" \| "networkidle2"` | No | Navigation wait condition. Defaults to `"load"` where omitted, including `open` navigation and later `tab.goto(...)`. |
-| `dialogs` | `"accept" \| "dismiss"` | No | Installs a page `dialog` handler that auto-accepts or auto-dismisses dialogs. Omitted means no handler. |
-| `app` | `{ path?: string; cdp_url?: string; args?: string[]; target?: string }` | No | Selects browser kind. No `app` uses the session `browser.headless` setting. `app.path` is resolved against the session cwd and used as the executable path for spawn/attach reuse. `app.cdp_url` connects to an existing CDP endpoint. `args` are appended only when spawning `app.path`. `target` is only used for attached/spawned-app page selection. |
+const length = await tab.run(async ({ tab }, suffix) => ((await tab.title()) + suffix).length, {
+	args: ["!"],
+	timeout: 30,
+});
 
-### `action: "close"`
+await tab.close();
+```
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `all` | `boolean` | No | Close every known tab. Omitted closes only `name`. |
-| `kill` | `boolean` | No | When a tab release drops a spawned-app browser handle to refcount 0, also terminate its process tree. Has no effect on headless shutdown and only disconnects connected CDP browsers. |
+- `browser.open(options?) -> Promise<BrowserTab>` opens or reuses a named tab and returns its handle. Its text is one line naming the tab and its browser, the page it landed on when that differs from the requested `url` (or none was given), and the page title, followed by any notices.
+- `browser.tab(name = "main") -> BrowserTab` creates a proxy for that name; it does not open a tab or check that one exists.
+- `browser.tabs() -> Promise<ManagedTabInfo[]>` lists live managed tabs with `name`, `url`, `title`, `targetId`, `kind`, and `persist`.
+- `browser.close({ name?, all?, kill?, timeout? }) -> Promise<void>` releases one or all managed tabs.
+- `tab.close({ kill?, timeout? }) -> Promise<void>` releases that handle's tab.
 
-### `action: "run"`
+`close` and `run` resolve `timeout` like `open`: seconds, default 30, capped by positive `tools.maxTimeout`, then clamped to 1–300. A `run` without `timeout`, and every direct helper call (`tab.evaluate(…)`, `tab.click(…)`, …), defaults instead to the Eval cell's `timeout` when that is longer (300 for a cell with `timeout: 0`): the cell's own timer is suspended while a browser call runs. `waitFor*` helpers take `timeout` in milliseconds and cannot outlast the enclosing call's `timeout`.
 
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `code` | `string` | Yes | Async-function body executed in a VM context with `page`, `browser`, `tab`, `display`, `assert`, `wait`, `console`, timers, `URL`, `TextEncoder`, `TextDecoder`, and `Buffer` in scope. |
+On Chromium tabs, a call that runs out of time fails and omp tries for up to 5 seconds to reattach the tab to a new worker without reloading its page, which resets the tab state set since it was opened (routes, emulation, init scripts, element ids, run globals). A worker that does not stop within 750 ms of the deadline or cancellation is released with its tab. Cancellation stays active during recovery and also stops a stalled replacement worker.
 
-## Outputs
-The tool returns one result per call; no streaming partial output is emitted from the browser implementation itself.
+### Open options
 
-- `open`: text content with `Opened` or `Reused`, browser description, URL, and optional title. `details` includes `action`, `name`, `browser`, `url`, `viewport`, and the same text in `details.result`.
-- `close`: text content with either `Closed ...` or `No tab named ...`. `details` includes `action`, `name`, and `details.result`.
-- `run`: ordered `content` array built as:
-  1. every `display(value)` call in execution order,
-  2. final return value, JSON-stringified unless already a string,
-  3. or `Ran code on tab "..."` if nothing else was produced.
-- `display(value)` coercion in `packages/coding-agent/src/tools/browser/tab-worker.ts`:
-  - `{ type: "image", data: string, mimeType: string }` becomes image content,
-  - `string` becomes text content,
-  - other values become pretty JSON text when serializable, else `String(value)`.
-- `tab.screenshot()` also appends text plus an image content item unless `silent: true`; `details.screenshots` records persisted screenshot metadata `{ dest, mimeType, bytes, width, height }`.
-- `run` `details` includes `action`, `name`, current `browser`/`url` when the tab exists, optional `screenshots`, and `details.result` containing only the concatenated text outputs. Combined run text is capped at the inline byte limit via `enforceInlineByteCap()`; over-cap text is saved as a session artifact (`saveBrowserOutputArtifact()`) and the capped text replaces it in content and `details.result`.
+| Option                | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                | Managed-tab name; default `"main"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `url`                 | Navigate the opened or reused tab to this URL. On Chromium-backed tabs, a navigation that outlasts `timeout` throws an error naming the tab and keeps it on what loaded; reach it with `browser.tab(name)`. A navigation that fails outright (refused connection, blocked domain, certificate error) or an open that is cancelled closes a tab the open created; a reused tab stays open.                                                                                                                                                                                                                                    |
+| `app`                 | One string: `"relay"`, `"tern"`, `"webkit"`, `"chromium"`, `"own"`, `"auto"`, a CDP endpoint URL, or an executable path; backend selection is described below. `argv` supplies extra CLI args for an executable path. `target` selects an attached page by exact target id or case-insensitive URL/title substring.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `viewport`            | `{ width, height, scale? }`; `scale` becomes the device scale factor.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `wait_until`          | `"load"`, `"domcontentloaded"`, `"networkidle0"`, or `"networkidle2"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `dialogs`             | `"accept"` or `"dismiss"` automatic policy. Without one, alerts and beforeunload prompts are accepted; confirms and prompts remain pending.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `allowed_domains`     | Exact hostnames or `*.example.com` patterns (including the bare domain). The network manager aborts intercepted HTTP(S)/WS(S) requests to other hosts; an empty list leaves requests unrestricted. This is not a sandbox, and native-webview coverage differs below.                                                                                                                                                                                                                                                                                                                                                         |
+| `init_scripts`        | Document-start JavaScript sources or cwd-relative source-file paths.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `downloads`           | Absolute or cwd-relative directory for this tab's downloads; defaults to a temporary folder per tab. Tabs in a managed or spawned Chromium keep separate folders while they share a browser, downloads their iframes start included; there a download no tab tracks keeps Chromium's GUID file name. Connected browsers also receive the user's own downloads, so they keep one browser-wide folder (the last tab to set it wins) and real file names. The relay cannot choose Chrome's folder, so a relay tab refuses `downloads`; it tracks its downloads from the moment it opens and reports each where Chrome saved it. |
+| `user_agent`          | Per-tab user-agent override.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `insecure` | Ignore invalid HTTPS certificates for the tab.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `headed`              | Override `browser.headless` for this open. It does not choose between Tern and Chromium: inside a Tern pane, use `app: "own"` to opt out of Tern.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `persist`             | Default `false`; opt out of settle-freeze and idle-close management. On a tab omp opened through the relay, also keep it open in the user's Chrome after the session ends. Explicit reuse by the owning session can change it.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `timeout`             | Seconds; default 30, capped by positive `tools.maxTimeout`, then clamped to 1–300. First-use Chromium installation is outside the open deadline. An open that runs out names the step it stalled in: launching or connecting to the browser, closing a tab to reopen it, or opening the tab.                                                                                                                                                                                                                                                                                                                                 |
 
-## Flow
-1. `BrowserTool.execute()` (`packages/coding-agent/src/tools/browser.ts`) abort-checks, clamps `timeout` via `clampTimeout("browser", ...)`, defaults `name` to `"main"`, and dispatches on `action`.
-2. `open` resolves browser kind with `resolveBrowserKind()`:
-   - `app.cdp_url` → `{ kind: "connected" }` after trimming trailing slashes.
-   - `app.path` → `{ kind: "spawned" }` after resolving against session cwd.
-   - otherwise → `{ kind: "headless", headless: session.settings.get("browser.headless") }`.
-3. `open` rejects reusing the same tab name across different browser kinds (`sameBrowserKind()`); callers must close first.
-4. `open` acquires a browser handle through `acquireBrowser()` (`packages/coding-agent/src/tools/browser/registry.ts`):
-   - existing connected handle is reused by browser-kind key;
-   - stale disconnected handles are disposed and recreated;
-   - headless launches via `launchHeadlessBrowser()`;
-   - `connected` waits for `${cdpUrl}/json/version`, then `puppeteer.connect()`;
-   - `spawned` first tries `findReusableCdp()`, else kills same-path processes, allocates a free loopback port, spawns the executable with `--remote-debugging-port=<port>`, waits for CDP, then connects.
-5. `open` acquires a tab through `acquireTab()` (`packages/coding-agent/src/tools/browser/tab-supervisor.ts`):
-   - same-name + same-browser + alive tab is reused unless `dialogs` changed;
-   - same-name but different browser handle, dead state, or changed dialog policy forces release and recreation;
-   - reusing with a new `url` navigates by issuing `await tab.goto(...)` through the worker, defaulting to `waitUntil: "load"` when `wait_until` is omitted.
-6. New tabs build a `WorkerInitPayload` in `buildInitPayload()`:
-   - headless mode sends `url`, `waitUntil`, `viewport`, `dialogs`, and timeout; the worker defaults missing `waitUntil` to `"load"`.
-   - attach mode resolves a page with `pickElectronTarget()`, gets its target id, and sends `targetId` plus `dialogs`.
-7. `acquireTab()` spawns a dedicated Bun `Worker` from `tab-worker-entry.ts`; if that fails it falls back to inline execution in the main thread (`spawnInlineWorker()`), preserving behavior but losing protection against synchronous infinite loops.
-8. `WorkerCore.#init()` (`packages/coding-agent/src/tools/browser/tab-worker.ts`) connects back to the browser websocket endpoint. Headless mode opens a new page, applies stealth patches, applies viewport, installs dialog handling if requested, and optionally navigates. Attach mode resolves the requested target page and optionally installs dialog handling.
-9. On success the worker sends `ready` with `{ url, title, viewport, targetId }`; the supervisor stores a `TabSession`, increments browser-handle refcount with `holdBrowser()`, and keeps the tab in a process-global `Map<string, TabSession>`.
-10. `run` requires non-empty `code`, looks up the tab with `getTab()`, then delegates to `runInTab()`.
-11. `runInTabWithSnapshot()` rejects dead tabs and concurrent runs (`Tab ... is busy`), captures session cwd plus optional `browser.screenshotDir`, registers an abort hook, sends a `run` message to the worker, and races the result against `timeoutMs + 750` ms. Timeouts force-kill the tab worker and, for headless tabs, close the orphaned page target.
-12. `WorkerCore.#run()` creates a VM context, exposes the raw Puppeteer `page`/`browser` plus a synthetic `tab` API, and executes `(async () => { ...code... })()` via `vm.runInContext()`.
-13. The `tab` helper API implemented in `#createTabApi()` is:
-   - `tab.name: string`
-   - `tab.page: Page`
-   - `tab.signal?: AbortSignal`
-   - `tab.url(): string`
-   - `tab.title(): Promise<string>`
-   - `tab.goto(url, { waitUntil? })`
-   - `tab.observe({ includeAll?, viewportOnly? })`
-   - `tab.screenshot({ selector?, fullPage?, save?, silent? })`
-   - `tab.extract(format = "markdown")`
-   - `tab.click(selector)`
-   - `tab.type(selector, text)`
-   - `tab.fill(selector, value)`
-   - `tab.press(key, { selector? })`
-   - `tab.scroll(deltaX, deltaY)`
-   - `tab.drag(from, to)`
-   - `tab.waitFor(selector)`
-   - `tab.evaluate(fn, ...args)`
-   - `tab.scrollIntoView(selector)`
-   - `tab.select(selector, ...values)`
-   - `tab.uploadFile(selector, ...filePaths)`
-   - `tab.waitForUrl(pattern, { timeout? })`
-   - `tab.waitForResponse(pattern, { timeout? })`
-   - `tab.id(n)`
-14. Selector handling in `normalizeSelector()` accepts plain CSS and Puppeteer query handlers, and rewrites legacy Playwright-style prefixes `p-text/`, `p-xpath/`, `p-pierce/`, `p-aria/`; other `p-*` prefixes throw a `ToolError`.
-15. `tab.observe()` clears the element cache, takes a Puppeteer accessibility snapshot, filters to interactive nodes unless `includeAll`, optionally filters to viewport-visible nodes, assigns numeric ids, caches `ElementHandle`s, and returns URL/title/viewport/scroll metadata plus `elements`.
-16. `tab.id(n)` resolves the cached `ElementHandle`, verifies `el.isConnected`, and throws a stale-id error after cache invalidation if the DOM changed or the cache was cleared.
-17. `tab.goto()` clears the cached element ids before navigating. Any new `tab.observe()` also clears and rebuilds the cache.
-18. `tab.click()` uses a custom retry loop for `text/...` selectors to find an actionable visible match; other selectors use `page.locator(...).click()` with the run timeout.
-19. `tab.screenshot()` captures either the whole page or a selector PNG, downsizes a copy for model output, chooses a persistence path, writes the image to disk, records metadata, and optionally emits text + image display entries.
-20. `display()` calls accumulate in an array. After code finishes, the worker posts `{ displays, returnValue, screenshots }`; `BrowserTool.#run()` appends the return value as trailing text content when not `undefined`.
-21. `close` releases one tab or all tabs via `releaseTab()` / `releaseAllTabs()`. Each tab aborts pending runs, asks the worker to close, waits up to `750` ms for a `closed` ack, terminates the worker, decrements browser refcount, and disposes the browser handle when refcount reaches zero.
+If Chrome detaches the relay during an open's navigation and omp reattaches to the same page, the open returns that tab with a recovery notice instead of closing it. Check its current page before repeating the navigation; reattachment does not reload it or retry input that may already have landed.
+If reattachment uses up the budget before navigation starts, the open still fails but keeps the recovered tab available through `browser.tab(name)`.
 
-## Modes / Variants
-- **Action dispatch**
-  - `open` — acquire/reuse browser + tab.
-  - `close` — release one tab or all tabs.
-  - `run` — execute JS inside the tab worker.
-- **Browser kind**
-  - **Headless**: launches local Chromium with Puppeteer, applies stealth patches, and creates a fresh page per tab.
-  - **Spawned app (`app.path`)**: reuses an existing CDP-enabled process for that executable when possible; otherwise kills same-path processes, spawns the executable with remote debugging enabled, then attaches. No stealth patches are injected.
-  - **Connected browser (`app.cdp_url`)**: attaches to an already-running CDP endpoint. No process ownership; close only disconnects.
-- **Target selection for attached/spawned browsers**
-  - With `app.target`, `pickElectronTarget()` returns the first page whose URL or title contains the case-insensitive substring.
-  - Without `app.target`, it skips titles/URLs matching `request handler|devtools|background page|background host|service worker` and otherwise falls back to the first page.
-- **Worker mode**
-  - **Dedicated worker**: normal path; user code runs off the main thread and can be aborted even when it blocks synchronously.
-  - **Inline fallback**: activated when Bun worker spawn fails; behavior matches, but synchronous infinite loops on user code cannot be interrupted.
-- **Dialog policy**
-  - No `dialogs` field: no auto-handler.
-  - `accept`/`dismiss`: page `dialog` events are handled automatically.
-  - Changing dialog policy on an existing live tab forces tab recreation instead of mutating the worker in place.
-- **Screenshot persistence**
-  - `save` provided: persist full-resolution PNG at the resolved cwd-relative or absolute path.
-  - `browser.screenshotDir` session setting set: persist full-resolution PNG under that directory with a timestamped filename.
-  - Neither set: persist the resized image to a temp-file path under the OS temp dir.
+Reopening with init scripts, a download directory, a user-agent override, or `insecure: true` recycles an existing tab so those worker-init options can take effect.
 
-## Side Effects
-- Filesystem
-  - `loadPuppeteer()` writes `{}` to `<puppeteer-safe-dir>/package.json` before importing `puppeteer-core`.
-  - First headless launch may download Chromium into the Puppeteer cache directory returned by `getPuppeteerDir()`.
-  - `tab.screenshot()` creates parent directories and writes image files.
-  - `tab.uploadFile()` resolves supplied paths against the session cwd.
-- Network
-  - CDP attach paths poll `http://127.0.0.1:<port>/json/version` or the supplied `cdp_url` `/json/version`.
-  - Headless/browser-attach sessions create CDP websocket connections.
-  - Headless first-use Chromium download uses `@puppeteer/browsers`.
-  - User `page` / `tab` operations perform normal browser network traffic.
-- Subprocesses / native bindings
-  - Headless mode launches Chromium through Puppeteer.
-  - `app.path` mode may spawn the target executable via `Bun.spawn()`.
-  - `killExistingByPath()` / `gracefulKillTreeOnce()` use `@oh-my-pi/pi-natives` process inspection/termination.
-  - Worker mode uses Bun `Worker`; fallback mode does not.
-- Session state (transcript, memory, jobs, checkpoints, registries)
-  - Browser handles are cached in a process-global `Map` keyed by browser kind in `packages/coding-agent/src/tools/browser/registry.ts`.
-  - Tabs are cached in a process-global `Map` keyed by `name` in `packages/coding-agent/src/tools/browser/tab-supervisor.ts`.
-  - `run` captures session cwd and optional `browser.screenshotDir` for screenshot/save path resolution.
-  - `restartForModeChange()` drops only headless tabs.
-- User-visible prompts / interactive UI
-  - None beyond normal tool output. Dialog auto-handling is invisible unless it fails and emits debug logs.
-- Background work / cancellation
-  - `open`, `run`, CDP waits, and browser actions thread through abort signals.
-  - A timed-out `run` aborts the worker execution path and can tear down the tab.
+### Direct tab helpers
 
-## Limits & Caps
-- Tool timeout clamp: default `30` s, min `1` s, max `300` s (`TOOL_TIMEOUTS.browser` in `packages/coding-agent/src/tools/tool-timeouts.ts`).
-- Supervisor grace period around init/run/close: `750` ms (`GRACE_MS` in `packages/coding-agent/src/tools/browser/tab-supervisor.ts`).
-- Puppeteer protocol timeout for launch/connect operations: `60_000` ms (`BROWSER_PROTOCOL_TIMEOUT_MS` in `packages/coding-agent/src/tools/browser/launch.ts`).
-- Connected-browser CDP readiness wait: `5_000` ms before `puppeteer.connect()` (`packages/coding-agent/src/tools/browser/registry.ts`).
-- Spawned-app CDP readiness wait after spawn: `30_000` ms (`packages/coding-agent/src/tools/browser/registry.ts`).
-- CDP polling cadence: 150 ms in `waitForCdp()` (`packages/coding-agent/src/tools/browser/attach.ts`).
-- Headless default viewport: `1365x768` at `deviceScaleFactor: 1.25` (`DEFAULT_VIEWPORT` in `packages/coding-agent/src/tools/browser/launch.ts`).
-- Screenshot model-attachment resize cap: `maxWidth 1024`, `maxHeight 1024`, `maxBytes 150 * 1024`, `jpegQuality 70` (`packages/coding-agent/src/tools/browser/tab-worker.ts`).
-- `tab.waitForUrl()` polling interval: `200` ms (`packages/coding-agent/src/tools/browser/tab-worker.ts`).
-- Drag simulation uses `12` mouse-move steps (`packages/coding-agent/src/tools/browser/tab-worker.ts`).
+Direct helpers cross the host bridge and return real structured values. The complete option types are in `browser/declarations.d.ts`.
 
-## Errors
-- `BrowserTool.execute()` converts DOM-style `AbortError` into `ToolAbortError`; other errors propagate.
-- `run` hard-fails on missing code: `Missing required parameter 'code' for action 'run'.`
-- `open` fails when reusing a name across browser kinds: `Tab "..." is bound to a different browser (...). Close it first.`
-- `runInTabWithSnapshot()` fails when the tab is absent/dead (`Tab "..." is not alive. Reopen it.`) or already running (`Tab "..." is busy`).
-- Worker init failures and run failures are serialized through `RunErrorPayload`; `ToolError` and abort state are reconstructed on the host side by `errorFromPayload()`.
-- Attached-target mismatches surface as:
-  - `No page targets available on the attached browser`
-  - `No page target matched "...". Available pages:\n...`
-  - `Target ... is no longer available on the attached browser`
-- Spawned-app path validation requires an absolute executable path after cwd resolution, not an app bundle directory path.
-- Spawn/attach failures are wrapped into `ToolError`s such as `Timed out waiting for CDP endpoint ...`, `Failed to attach to ...`, or `Connected to ... but puppeteer.connect failed: ...`.
-- `tab` helper errors are user-visible `ToolError`s, including unsupported selector prefix, stale/unknown element id, invalid drag target, missing upload files, non-`<select>` for `tab.select()`, non-file-input for `tab.uploadFile()`, and screenshot selector misses.
-- On run timeout, the worker reports `Browser code execution timed out after <ms>ms`; the supervisor may escalate to `Browser code execution hung past grace; tab killed` if the worker does not respond after the grace window.
+- Navigation: `url`, `title`, `goto`, `back`, `forward`, `reload`, `pushState` (SPA navigation without a document load).
+- Inspection: `observe({ includeAll?, viewportOnly?, selector?, compact? })`, `ariaSnapshot(selector?, { depth?, boxes?, interactive?, compact?, urls?, diff? })`, `a11y`, `screenshot`, `diffScreenshot`, `pdf`, `extract(format?, { selector?, outline?, filter? })`, `text`, `html`, `value`, `attr`, `count`, `box`, `styles`, `isVisible`, `isEnabled`, `isChecked`.
+- Interaction: `click`, `dblclick`, `hover`, `focus`, `check`, `uncheck`, `type`, `fill`, `press`, `keyDown`, `keyUp`, `mouseMove`, `mouseDown`, `mouseUp`, `clickAt`, `wheel`, `scroll`, `drag`, `highlight`, `scrollIntoView`, `select`, `uploadFile`. `click(selector, { button?, count? })`, on a tab or a frame, presses another mouse button or clicks more than once, like `BrowserElement.click` below.
+- Waiting: `waitFor(selector, { timeout? })`, `waitForSelector(selector, { timeout?, state?: "attached" | "detached" | "visible" | "hidden", visible?: boolean, hidden?: boolean })`, `waitForUrl(stringOrRegExp, { timeout? })`, `waitForText(text, { timeout?, selector?, exact? })`. On Chromium-backed tabs and their frames, unknown waitForSelector options or values fail immediately; conflicting state and visible/hidden options, or setting both visible and hidden to true, are rejected. Tern and cmux do not read `state` yet and ignore options they do not know: Tern honors `visible`/`hidden`, cmux only `timeout`.
+- Frames: `frames()` lists the frame tree; `frame(selectorOrNameOrUrl)` returns a scoped proxy with `click`, `fill`, `type`, `press`, `text`, `html`, `value`, `attr`, `count`, `isVisible`, `ariaSnapshot`, `evaluate`, `waitFor`, `waitForSelector`, and `screenshot`.
+- Dialogs: `dialog`, `handleDialog`, `setDialogs`.
+- Emulation: `emulate`, `devices`.
+- Clipboard: `clipboardRead`, `clipboardWrite`, `clipboardCopy`, `clipboardPaste`.
+- Storage: `cookies`, `setCookies`, `clearCookies`, `storage`, `setStorage`, `clearStorage`, `saveState`, `loadState`.
+- Initialization/downloads: `addInitScript`, `removeInitScript`, `initScripts`, `waitForDownload`, `downloads`. `waitForDownload` holds the tab until a download finishes, so another call on the tab fails as busy while it waits, and on a tab opened without `downloads` a download started before the first wait is not tracked. Start the wait and the step that downloads in one run: `tab.run("const download = tab.waitForDownload(); await tab.click('#export'); return await download;")`. A finished download whose file is not on omp's machine, as with a browser reached through `app.cdp_url` that runs on another one, fails the wait with the path it looked for and is left out of `downloads()`.
+- Diagnostics: `console`, `errors`, `clearConsole`, `traceStart`, `traceStop`, `profileStart`, `profileStop`, `metrics`.
+- `console({ level?, since?, limit?, clear? })` and `errors({ since?, limit?, clear? })` return `{ entries, nextSeq, dropped }`: `entries` in capture order, `nextSeq` to pass as `since` for later entries, and `dropped` counting entries the bounded buffer evicted. Called directly from a JavaScript cell, array methods, `length` and iteration on the result throw a `TypeError` that says to read `.entries`.
+- Recording: `recordStart`, `recordStop`, `recordRestart`, `recording`.
+- Web Vitals/React: `vitals`, `reactEnable`, `reactTree`, `reactInspect`, `reactRenders`, `reactSuspense`; call `reactEnable` before other `react*` helpers (it installs the hook and reloads).
+- Network: `route`, `unroute`, `routes`, `requests`, `request`, `clearRequests`, `harStart`, `harStop`, `allowedDomains`.
+- Experimental page tools: `webmcpList`, `webmcpInvoke`, `webmcpEvents`, on Chromium tabs only. They read the tools a page registers with Chrome's native WebMCP through the DevTools `WebMCP` domain, including cross-origin iframes; omp injects no page script for them. Nothing runs until the first call. When Chrome offers the page no WebMCP (Chrome before 147, an insecure context, or a page without the WebMCP origin trial in a Chrome started without `--enable-features=WebMCP`), `webmcpList` returns `status: "unavailable"` with a `reason` naming what enables it, and `webmcpInvoke` throws it; invoking needs Chrome 149 or newer. Page-provided tool metadata and results are untrusted; discovery never authorizes invocation.
+- Page execution: `evaluate(fnOrSource, ...args)`. A source string is a page-global expression, not a function body; top-level `return` is invalid. Use a function or an invoked IIFE string when needed.
 
-## Notes
-- `loadPuppeteer()` and `loadPuppeteerInWorker()` temporarily redirect `cwd` to a safe Puppeteer directory before importing `puppeteer-core`, because Puppeteer probes the current working directory during module load.
-- Headless launch prefers a detected system Chrome/Chromium, then `PUPPETEER_EXECUTABLE_PATH`, and only then downloads Chromium.
-- Headless launch always passes `--no-sandbox`, `--disable-setuid-sandbox`, `--disable-blink-features=AutomationControlled`, and a `--window-size=...` matching the initial viewport. It also ignores Puppeteer default args `--disable-extensions`, `--disable-default-apps`, and `--disable-component-extensions-with-background-pages`.
-- Proxy-related env vars only affect headless launch: `PUPPETEER_PROXY`, `PUPPETEER_PROXY_BYPASS_LOOPBACK`, and `PUPPETEER_PROXY_IGNORE_CERT_ERRORS`.
-- Stealth patches are applied only in headless mode. Spawned or externally connected browsers are intentionally left untouched.
-- `applyStealthPatches()` also strips Puppeteer's `//# sourceURL=__puppeteer_evaluation_script__` suffix from CDP `Runtime.evaluate` / `Runtime.callFunctionOn` payloads.
-- `tab.extract()` reads `page.content()`, runs Readability first, then falls back to `main article`/`article`/`main`/`[role='main']`/`body`, and returns `null` if neither extraction path yields content.
-- `close(all: true, kill: false)` disconnects from spawned/connected browsers when the last tab closes but leaves spawned app processes running.
-- Headless orphan cleanup is best-effort: if a worker dies before closing its page, the supervisor searches browser targets by `targetId` and closes that page.
-- Console methods inside `run` do not appear in tool output; they are forwarded as debug/warn/error logs through the worker transport.
+Direct `waitFor` and `waitForSelector` return booleans for the resolved handle, but timeouts can throw. `tab.id(number)` and `tab.ref("e5")` return `BrowserElement` proxies. They support `click`, `dblclick`, `check`, `uncheck`, `highlight`, `type`, `fill`, `press`, `hover`, `focus`, `select`, `uploadFile`, `scrollIntoView`, `boundingBox`, `isVisible`, `isHidden`, `text`, `html`, `value`, `attr`, `styles`, `isEnabled`, `isChecked`, and `evaluate`. `click({ button, count })` presses another mouse button or clicks more than once; cmux tabs press the left button once and refuse other buttons and counts (use `dblclick()`). A string passed to `BrowserElement.evaluate` is a function expression invoked with the element as its first argument.
+
+On Chromium-backed tabs, a successful hidden/detached wait can return `null` inside `tab.run`, or `false` through the direct helper; timeouts throw. A present invisible element can return a handle with `hidden`, and a frame wait returns `true` on completion. A `role/` selector never matches a hidden element, so its `detached` wait also completes once the match is hidden.
+
+Chromium snapshot-ref waits check the live element, not just whether the ref remains in the last snapshot: a hidden element is still attached, and a removed element satisfies hidden/detached.
+
+Selectors accept CSS and Puppeteer `aria/…`, `text/…`, `xpath/…`, `pierce/…`, plus `label/…`, `placeholder/…`, `testid/…`, `alt/…`, `title/…`, and `role/<role>[name="…"]` query handlers. Add ` exact` inside the role name filter for exact matching; names match case-insensitively either way. On Chromium-backed tabs `role/` asks Chrome's accessibility tree for each element's role and name, so it accepts Chrome's own roles such as `DescriptionList`, finds a table Chrome classes as a layout table as `role/table` too, reaches into open shadow roots, and skips hidden and `aria-hidden` elements. On Tern it uses the kit's own rules, which also reach open shadow roots (a Tern with native DOM reads, below, asks the engine's accessibility roles and names instead), and every role and name its `observe()` reports for an element selects that element again (text-only `StaticText` entries have no `role/` selector, on either backend). Playwright-only pseudos such as `:has-text()` and `:visible` are rejected. Use `tab.select` for `<select>` elements; `tab.fill` does not support them.
+
+`observe()` lists interactive elements and assigns numeric ids consumed by `tab.id`; `includeAll: true` adds non-interactive accessibility nodes, and `viewportOnly: true` keeps only elements intersecting the viewport (ignored on cmux). In JavaScript Eval, printing a `tab.observe()` result, or leaving it as a cell's last value, shows every element on its own line (`[id] role "name" value=… states`); `.elements` keeps the data for code. `ariaSnapshot()` assigns `[ref=eN]` ids consumed by `tab.ref`; `diff: true` returns a revisioned full, unchanged, or delta object. Navigation and re-rendering invalidate handles; re-observe and act in the same Eval cell.
+
+The same print form applies to an observation returned by `tab.run(async ({ tab }) => tab.observe())`. An observation changed after it returned (a field assigned, an element added, a getter defined, or a prototype edited in place) prints as plain `util.inspect` output instead, with every element still shown.
+
+On Chromium-backed tabs, a page read, a selector action, `evaluate`, or a wait for page content (`waitFor`, `waitForSelector`, `waitForText`, `waitForUrl`) issued while a navigation the page asked for is on its way (a link or submit button just clicked, a script setting `location`) first waits for the new document to commit and finish parsing, so a click and the read of, or the next step on, the page it loads can share one cell. Raw pointer input (`clickAt`, `wheel`, `mouse*`) and waits for events (`waitForNavigation`, `waitForResponse`, `waitForDownload`) run at once. A request that never starts loading holds a call at most 5 s. A built-in read that loses its document to a navigation mid-call runs once more on the new one; `evaluate` never runs your code twice.
+
+### `tab.run(fnOrCode, options?)`
+
+A run accepts either a serialized function or a JavaScript function-body string, plus `{ args?, timeout? }`:
+
+```js
+const hrefs = await tab.run(async ({ page }) => {
+	return await page.$$eval("a", links => links.map(link => link.href));
+});
+
+const title = await tab.run("return await tab.title();", { timeout: 10 });
+```
+
+Functions receive `{ tab, page, browser, wait, assert }` as their first argument. Additional `args` follow it. `args` that is neither an array nor `null`, or a non-empty `args` with a code string, throws before the run starts; `null` passes no arguments. Plain data, functions, and `RegExp` values are serialized; the function cannot capture Eval-cell closures. Code strings use the same names as globals and allow top-level `await`. A code string returns its trailing expression or top-level `return`, as an Eval cell prints them; one ending in an assignment or a block returns nothing.
+
+The inner `tab` is the full worker helper API. In addition to the direct surface it includes handle-returning `waitFor`/`waitForSelector` and run-scoped `waitForNavigation`/`waitForResponse`. Start a navigation/response wait before the action that triggers it.
+
+Runs use a persistent, per-tab JavaScript runtime with ordinary Eval helpers and full Bun/Node and tool-bridge access. This is API isolation, not a security sandbox. Raw `page.setRequestInterception` and run-added request listeners are cleaned up at run end; `tab.route` handlers persist until `unroute` or tab close.
+
+Code a run hands to `page.evaluate`, `page.evaluateHandle`, `page.$eval`, `page.$$eval`, and `page.waitForFunction` runs in the page's main world, where `tab.evaluate` runs and page globals and custom-element members live; element handles passed as arguments are adopted into it. On Chromium tabs omp's stealth patch runs every other Puppeteer evaluation in an isolated world that shares the DOM but not page scripts: `frame.evaluate`, `elementHandle.evaluate`, and any other `Page` object (`tab.page`, `frame.page()`, `browser.pages()`). Selectors resolve there too, so pass a handle to `page.evaluate(fn, handle)` to read what page scripts attached to it. A handle to a non-element value works only in the world that made it, so create one for `page.evaluate` with `page.evaluateHandle`.
+
+The return value stays structured. Only a value matching the full observation shape receives observation printing; other structured returns, including objects with an `elements` array, keep native inspection. Nonempty text printed inside the run (`print`, `console.*`) prints in the outer Eval cell, printed images remain Eval output, and a run with no printed text emits no placeholder.
+
+## Python API
+
+Python exposes the same handles and direct method names, including `browser.tabs()`. `open` and `close` use keyword arguments, while `browser.tab` and `tab.id`/`tab.ref` synchronously create proxies. Keyword arguments on direct helpers become a trailing JavaScript options object.
+
+```python
+tab = await browser.open(name="main", url="https://example.com")
+observation = await tab.observe(viewportOnly=True)
+await tab.id(observation["elements"][0]["id"]).click()
+title = await tab.run("return await tab.title();", timeout=30)
+await tab.close()
+```
+
+Python `tab.run` accepts a JavaScript string only; it does not accept a Python callable.
+
+## Browser modes
+
+`browser.open` prefers an explicit `app`: a CDP URL, an executable path, `"relay"`, `"tern"`, then `"webkit"`; `"chromium"` and `"own"` also name a browser outright (managed Chromium; omp's own browser, skipping configured CDP, Tern and cmux). Otherwise it considers configured relay (`browser.relay`, overridden either way by `PI_BROWSER_RELAY=1|0`), configured CDP (`browser.cdpUrl`), automatic Tern, cmux, then omp's own browser: its headless WebKit host when that is available (see below), otherwise project-shared managed Chromium. `app: "auto"` skips the relay however it is enabled and falls through to configured CDP, Tern, cmux, then omp's own browser; `app: "own"` goes straight to omp's own browser, and `app: "chromium"` skips the WebKit host (managed Chromium opens instead). Relay and Tern environment kill switches can disable those modes.
+
+- **WebKit (default when installed):** opens a headless web view in omp's own engine, ABKit (a patched WPE WebKit), whose `ABHost` executable omp starts as a child process (one per omp process, shared by its tabs; each tab is one view). It draws to a screen only while a tab is shown in a window (below), yet pages always see a visible, focused window, no automation flag, per-session canvas noise, and a plausible screen and window geometry the host picks itself (on macOS also a Safari user agent and `window.safari`; `user_agent` replaces the agent). On macOS it has WebGL, WebGPU, video and audio playback, Web Audio, WebRTC, WebAuthn (no authenticator: requests end as dismissed), gamepads (none attached) and Web Share (ends as dismissed); sound is discarded, and camera and microphone requests are denied. Its TLS handshake, HTTP/2 settings and request headers are the ones Safari sends. Encrypted media and speech synthesis are not available. Chosen for an open that reaches the end of the precedence above when all of these hold: the backend is on (`browser.webkit`, default `true`; `PI_BROWSER_WEBKIT=0|1` overrides it either way), the host executable exists, and the open needs nothing only Chromium offers (a visible tab, by `headed: true` or `browser.headless = false`, where the engine ships no viewer). The host executable is the installed engine's, `~/.o2/lib/abkit/ABHost` (`ABHost.exe` on Windows; Tern runs the same one), unless `PI_BROWSER_WEBKIT_PATH` or else the `browser.webkitPath` setting names another: either the executable itself, used as it is whatever the file is called, or an ABKit engine directory, which holds it as `ABHost` (`ABHost.exe` on Windows). When neither names one and the default location holds no engine, omp downloads the newest stable ABKit from the build service (`https://build.stencil.so`, product `abkit`; `PI_BUILD_URL` overrides the origin), checks the archive against the size and SHA-256 the service answers, and unpacks its `abkit/` directory into `~/.o2/lib/abkit` under an OS lock, by rename (`webkit/install.ts`). It does so for an open with `app: "webkit"`, and for an open that would otherwise download Chrome for Testing (no `PUPPETEER_EXECUTABLE_PATH`, no system Chrome where one is preferred, none cached), headless or where released engines ship the viewer (macOS). Like Chrome's, the download runs before the open's deadline starts; when it fails, `app: "webkit"` fails with the reason and any other open goes on to Chromium with a note. A missing executable, or a host that fails to start or to open its first tab, falls back to managed Chromium, and the open result says why. `app.webkit: true` requires the host instead: the open fails when no executable resolves, when the host cannot start, and with `headed: true` when its tab cannot be shown because the engine ships no viewer; it still yields to `PI_BROWSER_WEBKIT=0`. `app.webkit: false` opens managed Chromium for that open, which is the way out for a page the engine does not handle (DRM-protected video, speech synthesis).
+  A WebKit tab has a window when its open says `headed: true`, or `browser.headless` is off, and the engine ships its viewer program (`ABView` beside the host; macOS). The host itself stays windowless: omp starts the viewer and presents the tab's view to it, and stops presenting to hide it, so the page is the same page either way and never sees the difference. `/browser visible` and `/browser headless` show and hide the windows of the WebKit tabs that are open, at once; closing a window hides that tab; an open of a live tab with `headed` set shows or hides it. The window comes to the front without taking the keyboard, and what the user clicks, scrolls and types in it goes to the page as trusted input. omp starts the host with no arguments (every profile is in memory and gone with the process), talks to it over its stdin/stdout, logs its stderr at debug level, and stops it when its last tab closes by closing its stdin (the process tree is killed if it has not exited two seconds later); a host whose omp died exits on its own.
+  A default WebKit tab runs no omp script in the page's world. The host's welcome lists `console` and `network`, and omp then reads the console and page-error log (`console`, `errors`) and the request log (`requests`, `request`, HAR, `waitForResponse`, network-idle waits) from the engine's own events: console messages and uncaught exceptions, and `request` / `response` / `requestFinished` / `requestFailed` for every resource load. DOM reads and input are native too, so a page finds no wrapped built-ins and no omp globals. Limits of the native logs: the engine names no resource type (omp derives it from `Sec-Fetch-Dest`, else the response MIME type; XHR reads as `fetch`), events carry no time (`ts` is when omp read the event, and there is no `durationMs`), request body sizes are unknown, and there is no body store: `request(id)` returns the record without `body`, `response.text()` throws, and a HAR has no content. Page-world code is installed only by the helpers that need it, and the page can detect it from then on:
+  - `route`, and `emulate` with `geolocation`, `locale` or `offline`: omp's capture script (wraps `fetch`, `XMLHttpRequest` and `console`, adds `__ompTernCapture`). It leaves the document-start list with the last `unroute` and once those emulations are cleared; a document that already runs it keeps the wrappers until it navigates. While it is installed the engine's events stay the logs' source; of what the script reports, only requests it answered itself (a fulfilling or aborting route, offline) are added, and those do have a body.
+  - `vitals`: the Web Vitals observers (`__ompBrowserVitals`), from the first call for the tab's life; that call reloads the page once unless `reload: false`.
+  - `reactEnable`: the React DevTools hook, for the tab's life.
+  - `init_scripts`, a recording's cursor overlay, and whatever `evaluate` / `tab.run` code itself leaves behind. `highlight` and annotated screenshots draw in the page's DOM from an isolated world while they show.
+  A Tern daemon lists neither `console` nor `network`: its tabs keep the capture and vitals scripts in every document, as before.
+- **Managed Chromium:** creates an omp-owned page in project-shared Chromium and applies stealth patches. Installation happens automatically on first use. `headed` overrides the default hidden mode.
+- **Spawned (`app` executable path):** starts or reuses a CDP-enabled browser/Electron executable. `argv` applies only here; Chromium-family processes use an omp-owned profile unless args specify `--user-data-dir`.
+- **Connected (`app` CDP URL):** attaches to an existing HTTP CDP discovery endpoint.
+- **Relay (`app: "relay"`):** drives the user's real Chrome. Opening a new name without `target` creates omp's own background tab, leaving the user's selected tab and window focus alone (an extension installed before this release selects the new tab instead; reinstall it with `omp browser-relay install`); `url` navigates that tab, and screenshots capture it without raising it. With several browsers on one relay, a new tab opens in the browser of the tab omp used last on that relay (for a page `tab.run` opens, the browser of its own tab), else the browser showing the first selected tab in the relay's tab list (whether or not its window is minimized), else the browser whose extension connected last. `target` borrows an existing tab by exact CDP target id or URL/title substring. Reopening a name that is already open keeps its tab, borrowed or owned.
+- **Tern:** inside a Tern pane, opens a visible browser picture-in-picture over the pane using native WKWebView, not Chromium. `app: "own"` opts out; `headed` does not choose between Tern and Chromium. `app: "tern"` requires Tern. Automatic Tern selection falls back to omp's own browser (the WebKit host when it applies, else managed Chromium) with an explanatory result when Tern cannot host the page. On a Tern whose engine reads the DOM natively (its welcome lists the `dom` op), `observe`, selector resolution, actionability checks, element reads (`text`, `html`, `attr`, `value`, `count`, `boundingBox`, `isVisible`, `isEnabled`, `isChecked`) and waits (`waitFor`, `waitForSelector`, `waitForText`) run in the engine with no script in the page, and every action is trusted input at the point the engine resolved: an element out of view is wheeled into it, `type` clicks the element and types at the caret the click places, `fill` clicks it, selects all and inserts the text, `focus` clicks an editable control, and `scroll(dx, dy, { selector })` wheels over the element. Selectors then match across same-process frames and through open and closed shadow roots, `text/` and `waitForText` ignore case, `observe()` lists no `StaticText` entries, and an element handle names its node: it keeps pointing at the same element after another `observe()` and stops resolving once that element leaves the page. `select`, `highlight`, annotated screenshots, `styles`, `uploadFile`, `ariaSnapshot` and its refs, `frames`/`frame`, element `evaluate`, `focus` on an element that takes no text, and `fill` on date/time/color/range inputs still run omp's page script.
+- **Cmux:** drives an available cmux WKWebView surface.
+
+Automatic Tern and cmux belong to the interactive omp drawn in that terminal. At startup it sets `PI_TERMINAL_OWNER_PID` to its pid, and every command it runs inherits that, so an omp started from those commands (`omp -p` from the bash tool, a script an eval cell runs) sees a pane owned by another process and does not pick Tern or cmux from it; its open without `app` ends at omp's own browser (the WebKit host or managed Chromium) unless a relay or `browser.cdpUrl` it is configured for comes first. Its subagents share the owner's process and keep Tern and cmux. `app.tern: true`, `app.target`, `PI_BROWSER_TERN=1` and `PI_BROWSER_CMUX=1` still select them.
+
+The native-webview backends do not provide full Puppeteer/CDP capabilities. Tern provides fetch/XHR and navigation-response logging, not complete CDP subresource coverage; routing accepts only fetch/XHR resource types. CPU/network throttling, timezone/headers/reduced-motion emulation, CSS-transformed frame input, and tracing/profiling are unsupported; `metrics` returns navigation timing and DOM counts rather than full CDP metrics. Tern PDF accepts only `path`; the WebKit host is driven by the same tab driver as Tern and shares these limits, and additionally has no `pdf`, and its color-scheme emulation is process-wide (the last `emulate({ colorScheme })` applies to every WebKit tab); storage loading restores only the current origin; `webmcp*` helpers throw (WKWebView has no WebMCP). Inspect backend-specific errors rather than assuming Chromium behavior.
+
+Reusing one tab name across browser kinds is rejected until the existing tab is closed. Closing omp-owned Chromium pages, WebKit host views, tabs omp opened in the relay, Tern picture-in-pictures, and owned cmux surfaces closes them. Connected pages and borrowed relay tabs remain open. Spawned browser processes remain open unless `kill: true` releases their last managed tab and terminates an application owned by this process; reused processes are never killed.
+
+Managed Chromium has printing turned off, so a page's `window.print()` returns at once and opens no print preview; `tab.pdf()` still makes PDFs. In a browser omp attaches to (the relay, an `app` CDP URL or executable path) the preview still opens and holds the page until the user cancels it or the tab navigates away.
+
+On Linux under X11, Chrome 150 and later activates its window when a mouse button or touch goes down in the tab that window shows while the window is inactive, omp's CDP input included (`ContentsWebView::DidGetUserInteraction` requests focus for the page's view on such a press). In the relay, a connected browser or any other headed Chrome, `click`, `dblclick`, `tap`, `drag`, `mouseDown`, `clickAt`, a `check` or `uncheck` unless the element already has the requested state (one that refuses the change still presses; unchecking a native radio does not press), and `uploadFile` on anything but an `<input type=file>` therefore bring Chrome to the front when they target a shown tab while the user is in another window, and what the user types next goes to the page; omp does not put their app back. A control that opens a new tab or popup may still bring Chrome forward, however it is activated. The agent's browser guide carries this note on Linux hosts, and elsewhere when `browser.cdpUrl` or `browser.relayUrl` points at another machine. Keys (`type`, `fill`, `press`), `focus`, `select`, `hover`, wheel scrolling and screenshots leave the user's app in front, as does input to a tab its window is not showing; native-Wayland Chrome under GNOME does not activate either.
+
+## Screenshots and output
+
+`tab.screenshot({ selector?, fullPage?, silent?, annotate?, format?, quality?, ifChanged?, threshold? })` returns a saved path, or `{ path?, changed, revision, pixelChangeRatio }` when change detection is enabled. `format` is `png` or `jpeg`; integer `quality` (0–100) requires JPEG. `threshold` is a changed-pixel ratio from 0–1 and implies change detection. An unchanged tracked capture saves/emits nothing.
+
+Chromium-backed captures never activate the tab or raise its window: a background tab, a minimized window, or a window behind other apps is captured where it is, with its current content, so the user's frontmost app keeps focus. On relay and CDP-attached browsers this includes an adopted tab the user has since switched away from.
+
+Images are saved beneath `browser.screenshotDir`, or the OS temporary directory when unset. Chromium saves full resolution when that directory or an explicit format is supplied; otherwise it saves the resized image. Model-visible images are resized to at most 1024×1024 and 150 KiB. The capture text is one line: the size the model sees, the full-size file when one was kept, and, when the image's pixels are not CSS pixels (resized, or captured at a device scale other than 1), the factor from image coordinates to CSS pixels: viewport pixels for `clickAt` on a plain capture, page pixels for `fullPage`, element-relative pixels for `selector`. Unless `silent: true`, a capture emits an Eval image. `annotate: true` overlays numeric interactive-element labels and refreshes `tab.id` mappings. Screenshot options do not accept an output path; `diffScreenshot(baselinePath, { threshold?, output? })` does, and `pdf({ path?, ... })` writes a PDF.
+
+Host result details preserve structured `value` separately from displayed content. Printed text is capped by the shared inline-output policy; over-cap text is stored as a session artifact and the capped text is printed.
+
+## Safety and lifecycle
+
+Relay and attached modes operate on real logged-in sessions; sites attribute actions to the user. Name a target or create a dedicated tab. Never navigate the user's visible tab or take a consequential action without direct authorization.
+
+On macOS, when omp's input to a relay tab opens a new tab or popup while the user is in another app, Chrome makes itself the active app; the relay puts the user's app back in front for the next half second, unless the user clicks, holds ⌘/⌃, picks an app from Spotlight or a launcher, or switches to another app, or the computer tool owns the desktop. `PI_BROWSER_RELAY_KEEP_FRONT=0` in the relay's environment turns this off.
+
+Each named tab permits one active run; Chromium-backed tabs have one worker, while Tern/WebKit/cmux use their own backend. A timed-out or aborted run can recycle the worker and invalidate handles. A call on a Chromium tab whose renderer crashed (under it, or earlier while idle) fails at once and recycles the worker before returning, which reloads the page; its error says so. A page that does not come back (it crashes again as it loads, or a relay tab, which reattaching leaves crashed) closes the tab, as does any crash on a tab whose worker runs inline in the omp process. An open that navigates or resizes such a tab reloads it first and reports it. Tabs belong to the agent that opened them (its advisors included) for that agent's lifetime, across `/new`, `/resume`, fork, and branch; `browser.close({ all: true })` releases the calling agent's tabs and leaves other agents' tabs (a parent's, a subagent's) alone, and each agent's tabs close when it ends. `kill` never closes or kills relay/CDP-attached browsers.
+
+By default, omp-owned managed Chromium tabs freeze at turn settle and unfreeze on next use (`browser.freezeOnTurnEnd = true`). Owned Chromium, WebKit and Tern tabs idle for 1,800 seconds are closed (`browser.idleCloseSec`; `0` disables this). `persist: true` opts a tab out of both policies, but explicit close still releases it. Relay, connected, spawned, and cmux tabs are not auto-frozen or idle-closed. When a session ends, the relay tabs omp opened close, except `persist` ones, which stay open in the user's Chrome.
+
+## Common recovery
+
+- Missing/dead tab: call `browser.open` again.
+- Stale id/ref: call `observe` or `ariaSnapshot` again, then reacquire the handle. A click through a handle or an `aria-ref` whose element the page replaced fails at once; `tab.click`, `dblclick`, `check`, `uncheck`, `uploadFile` and `frame.click` given a selector look it up again instead.
+- Busy tab: await the active helper/run before issuing another.
+- Selector timeout: re-observe and use a supported selector.
+- Relay unavailable: install/start the relay and verify its Chrome extension connection.
+- Attached target missing: inspect available pages and use a precise `target`.
+
+`tab.run` and direct helpers execute against live browser state. Verify the actual page after every UI-changing action.

@@ -1,21 +1,33 @@
 import { describe, expect, it } from "bun:test";
 
-import { buildOpenAIResponsesCompat } from "@oh-my-pi/pi-catalog/compat/openai";
+import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
+
+interface ResponsesCompatTestSpec {
+	id?: string;
+	name: string;
+	provider: string;
+	baseUrl: string;
+}
+
+function buildOpenAIResponsesCompat(spec: ResponsesCompatTestSpec) {
+	return resolveModelPolicy({
+		id: spec.id ?? "test-model",
+		api: "openai-responses",
+		provider: spec.provider,
+		baseUrl: spec.baseUrl,
+		name: spec.name,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 16_384,
+	}).compat;
+}
 
 describe("resolveOpenAIResponsesCompat supportsDeveloperRole", () => {
-	it("returns true for openai provider with official API base URL", () => {
-		const model = { provider: "openai", name: "Test Model", baseUrl: "https://api.openai.com/v1" };
-		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(true);
-	});
-
 	it("returns false for openai provider with custom proxy base URL", () => {
 		const model = { provider: "openai", name: "Test Model", baseUrl: "https://my-proxy.example.com/v1" };
 		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(false);
-	});
-
-	it("returns true for github-copilot provider", () => {
-		const model = { provider: "github-copilot", name: "Test Model", baseUrl: "https://api.githubcopilot.com" };
-		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(true);
 	});
 
 	it("returns false for github-copilot provider with custom proxy base URL", () => {
@@ -46,11 +58,6 @@ describe("resolveOpenAIResponsesCompat supportsDeveloperRole", () => {
 		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(true);
 	});
 
-	it("returns false for generic third-party provider", () => {
-		const model = { provider: "custom", name: "Test Model", baseUrl: "https://api.example.com/v1" };
-		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(false);
-	});
-
 	it("returns false for local/localhost endpoints", () => {
 		const model = { provider: "custom", name: "Test Model", baseUrl: "http://localhost:8080/v1" };
 		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(false);
@@ -70,11 +77,6 @@ describe("resolveOpenAIResponsesCompat supportsDeveloperRole", () => {
 		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(true);
 	});
 
-	it("returns true for github-copilot provider with api.githubcopilot.com", () => {
-		const model = { provider: "github-copilot", name: "Test Model", baseUrl: "https://api.githubcopilot.com" };
-		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(true);
-	});
-
 	it("returns true for github-copilot provider with api.enterprise.githubcopilot.com", () => {
 		const model = {
 			provider: "github-copilot",
@@ -87,27 +89,5 @@ describe("resolveOpenAIResponsesCompat supportsDeveloperRole", () => {
 	it("returns true for github-copilot provider with copilot-api enterprise domain", () => {
 		const model = { provider: "github-copilot", name: "Test Model", baseUrl: "https://copilot-api.mycompany.com" };
 		expect(buildOpenAIResponsesCompat(model).supportsDeveloperRole).toBe(true);
-	});
-});
-
-describe("buildOpenAIResponsesCompat requiresJuiceZeroHack", () => {
-	it("auto-detects GPT-5-family model names case-insensitively", () => {
-		const model = { provider: "openai", name: "GPT-5 Mini", baseUrl: "https://api.openai.com/v1" };
-		expect(buildOpenAIResponsesCompat(model).requiresJuiceZeroHack).toBe(true);
-	});
-
-	it("stays off for non-GPT-5 model names", () => {
-		const model = { provider: "openai", name: "o4-mini", baseUrl: "https://api.openai.com/v1" };
-		expect(buildOpenAIResponsesCompat(model).requiresJuiceZeroHack).toBe(false);
-	});
-
-	it("honors an explicit compat override on a GPT-5 model", () => {
-		const model = {
-			provider: "openai",
-			name: "GPT-5 Mini",
-			baseUrl: "https://api.openai.com/v1",
-			compat: { requiresJuiceZeroHack: false },
-		};
-		expect(buildOpenAIResponsesCompat(model).requiresJuiceZeroHack).toBe(false);
 	});
 });

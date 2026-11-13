@@ -1,7 +1,9 @@
 //! Cross-platform isolation PAL.
 //!
 //! A backend gives the caller a writable "merged" view of a read-only
-//! "lower" tree without paying for a deep copy:
+//! "lower" tree without paying for a deep copy, and tree-cloning backends can
+//! also copy-on-write clone a checkout while omitting selected top-level
+//! entries:
 //!
 //! - **macOS** uses `clonefile(2)` to seed an APFS copy-on-write clone.
 //! - **Linux** mounts a kernel `overlay` filesystem, falling back to
@@ -29,11 +31,13 @@ use async_trait::async_trait;
 
 mod apfs;
 mod btrfs;
+pub mod cow;
 mod diff;
 mod linux_reflink;
 mod overlayfs;
 mod projfs;
 mod rcopy;
+mod tree;
 mod windows_block_clone;
 mod zfs;
 
@@ -56,7 +60,8 @@ pub enum BackendKind {
 	/// Kernel `overlay` filesystem (Linux), with optional `fuse-overlayfs`
 	/// fallback.
 	Overlayfs,
-	/// Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone tree (NTFS/ReFS).
+	/// Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block clone tree (`ReFS`,
+	/// including Dev Drive).
 	WindowsBlockClone,
 	/// Windows Projected File System.
 	Projfs,
@@ -66,6 +71,11 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+	/// Whether this backend can clone a directory tree in place.
+	pub const fn clones_tree(self) -> bool {
+		matches!(self, Self::Apfs | Self::LinuxReflink | Self::WindowsBlockClone)
+	}
+
 	/// Short, stable string identifier. Used by the napi shim.
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -208,6 +218,38 @@ impl std::error::Error for IsoError {}
 
 pub type IsoResult<T> = Result<T, IsoError>;
 
+/// Build the [`IsoError::Other`] for a failed external command, rendered as
+/// `<what> (exit <code>): <trimmed stderr>`.
+///
+/// `stderr` is decoded lossily. `code` is preformatted by the caller so
+/// per-site conventions for signal deaths (`-1` vs `?`) are preserved.
+pub(crate) fn command_failed(
+	what: impl fmt::Display,
+	code: impl fmt::Display,
+	stderr: &[u8],
+) -> IsoError {
+	let stderr = String::from_utf8_lossy(stderr);
+	IsoError::other(format!("{what} (exit {code}): {}", stderr.trim()))
+}
+
+/// The filesystem magic `statfs(2)` reports for `path` (e.g. btrfs
+/// `0x9123683E`), or `None` when the call fails. Magics are 32-bit; libc's
+/// `f_type` width varies by target and C library.
+#[cfg(target_os = "linux")]
+pub(crate) fn statfs_magic(path: &Path) -> Option<u32> {
+	use std::os::unix::ffi::OsStrExt;
+
+	let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+	let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+	// SAFETY: `path` is NUL-terminated and outlives the call; `stat` is a
+	// writable out-pointer of the right type.
+	if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+		return None;
+	}
+	// SAFETY: `statfs` returned 0, so it initialized `stat`.
+	Some(unsafe { stat.assume_init() }.f_type as u32)
+}
+
 /// Backend contract.
 ///
 /// `lower` is the read-only source tree; `merged` is the destination where
@@ -228,6 +270,17 @@ pub trait IsolationBackend: Send + Sync {
 	fn probe(&self) -> ProbeResult;
 
 	fn start(&self, lower: &Path, merged: &Path) -> IsoResult<()>;
+
+	/// Clone `lower` into `merged` copy-on-write, omitting named top-level
+	/// entries.
+	fn clone_tree(
+		&self,
+		_lower: &Path,
+		_merged: &Path,
+		_skip: &[&std::ffi::OsStr],
+	) -> IsoResult<()> {
+		Err(IsoError::unavailable(format!("{} cannot clone a directory tree in place", self.kind())))
+	}
 
 	fn stop(&self, merged: &Path) -> IsoResult<()>;
 
@@ -321,6 +374,26 @@ pub struct Resolution {
 	pub reason:     Option<String>,
 }
 
+/// Host-available tree-cloning backends in fallback order.
+///
+/// A preferred cloning backend is tried first when available. Non-cloning
+/// backends are excluded.
+pub fn clone_candidates(preferred: Option<BackendKind>) -> Vec<BackendKind> {
+	let mut candidates = Vec::new();
+	if let Some(kind) = preferred
+		&& kind.clones_tree()
+		&& backend(kind).probe().available
+	{
+		candidates.push(kind);
+	}
+	for &kind in auto_order() {
+		if Some(kind) != preferred && kind.clones_tree() && backend(kind).probe().available {
+			candidates.push(kind);
+		}
+	}
+	candidates
+}
+
 /// Pick the best backend whose host-level prerequisites are available.
 ///
 /// Caller priority:
@@ -332,9 +405,7 @@ pub struct Resolution {
 ///
 /// This is only a host-level probe. Some backends still reject a specific
 /// `lower`/`merged` pair at [`IsolationBackend::start`] time (cross-device
-/// reflinks, non-subvolume btrfs paths, non-ZFS mountpoints). Callers that can
-/// recover should retry the remaining automatic candidates when `start`
-/// returns [`IsoError::Unavailable`].
+/// reflinks, non-subvolume btrfs paths, non-ZFS mountpoints).
 pub fn resolve(preferred: Option<BackendKind>) -> Resolution {
 	let mut reason = None;
 	let mut candidates = Vec::with_capacity(auto_order().len() + usize::from(preferred.is_some()));

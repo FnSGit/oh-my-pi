@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, OptionsForApi, Tool } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { z } from "zod/v4";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -16,8 +16,8 @@ const oauthTokens = await Promise.all([
 const [anthropicOAuthToken, githubCopilotToken, geminiCliToken, antigravityToken, openaiCodexToken] = oauthTokens;
 
 // Simple calculate tool
-const calculateSchema = z.object({
-	expression: z.string().describe("The mathematical expression to evaluate"),
+const calculateSchema = type({
+	expression: "string",
 });
 
 const calculateTool: Tool = {
@@ -251,9 +251,9 @@ describe("Tool Call Without Result Tests", () => {
 
 	describe("Google Antigravity Provider", () => {
 		it.skipIf(!antigravityToken)(
-			"gemini-3-flash - should filter out tool calls without corresponding tool results",
+			"gemini-3.8-flash - should filter out tool calls without corresponding tool results",
 			async () => {
-				const model = getBundledModel("google-antigravity", "gemini-3-flash");
+				const model = getBundledModel("google-antigravity", "gemini-3.8-flash");
 				await testToolCallWithoutResult(model, { apiKey: antigravityToken });
 			},
 			{ retry: 3, timeout: 30000 },

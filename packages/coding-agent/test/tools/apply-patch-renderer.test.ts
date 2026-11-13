@@ -3,33 +3,17 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
-import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { toolRenderers } from "@oh-my-pi/pi-coding-agent/tools/renderers";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import * as themeModule from "@oh-my-pi/pi-tui/theme";
+import { toolRenderers } from "@oh-my-pi/pi-tui/tools";
 import type { TUI } from "@oh-my-pi/pi-tui";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 async function getUiTheme() {
 	await themeModule.initTheme(false, undefined, undefined, "dark", "light");
 	const theme = await themeModule.getThemeByName("dark");
 	expect(theme).toBeDefined();
 	return theme!;
-}
-
-async function waitForRenderedText(
-	component: ToolExecutionComponent,
-	width: number,
-	expectedText: string,
-): Promise<string> {
-	const deadline = Date.now() + 1_000;
-	let rendered = "";
-	while (Date.now() < deadline) {
-		rendered = Bun.stripANSI(component.render(width).join("\n"));
-		if (rendered.includes(expectedText)) {
-			return rendered;
-		}
-		await Bun.sleep(10);
-	}
-	return rendered;
 }
 
 beforeEach(async () => {
@@ -41,13 +25,9 @@ afterEach(() => {
 });
 
 describe("apply_patch rendering", () => {
-	it("registers apply_patch to use the edit renderer", () => {
-		expect(toolRenderers.apply_patch).toBe(toolRenderers.edit);
-	});
-
 	it("renders apply_patch results through edit UI instead of generic fallback", async () => {
 		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 
 		const component = new ToolExecutionComponent(
 			"apply_patch",
@@ -91,6 +71,7 @@ describe("apply_patch rendering", () => {
 		].join("\n");
 
 		const component = toolRenderers.apply_patch.renderCall({ input }, { expanded: false, isPartial: true }, uiTheme);
+		if (!component) throw new Error("expected a call component");
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 
 		expect(rendered).toContain("src/first.ts");
@@ -103,6 +84,7 @@ describe("apply_patch rendering", () => {
 		const input = ["*** Begin Patch", "*** Update File: src/streaming.ts", "@@", "-before", "+after"].join("\n");
 
 		const component = toolRenderers.apply_patch.renderCall({ input }, { expanded: false, isPartial: true }, uiTheme);
+		if (!component) throw new Error("expected a call component");
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 
 		expect(rendered).toContain("src/streaming.ts");
@@ -110,14 +92,16 @@ describe("apply_patch rendering", () => {
 	});
 
 	it("shows an apply_patch parse error preview for malformed input", async () => {
-		const uiTheme = await getUiTheme();
+		await getUiTheme();
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const malformedInput = ["*** Begin Patch", "*** Update File: src/bad.ts", "*** End Patch"].join("\n");
 
-		const component = toolRenderers.apply_patch.renderCall(
-			{ input: malformedInput },
-			{ expanded: false, isPartial: true },
-			uiTheme,
-		);
+		const component = new ToolExecutionComponent("apply_patch", { input: malformedInput }, {}, undefined, uiStub);
+		component.updateStreamPreview({
+			generation: 1,
+			streaming: false,
+			files: [{ path: "", error: "Line 3: Update file hunk for path 'src/bad.ts' is empty" }],
+		});
 		const rendered = Bun.stripANSI(component.render(160).join("\n"));
 
 		expect(rendered).toContain("src/bad.ts");
@@ -125,8 +109,8 @@ describe("apply_patch rendering", () => {
 	});
 
 	it("shows apply_patch preview diffs after args complete", async () => {
-		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiTheme = await getUiTheme();
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "apply-patch-preview-"));
 		try {
 			await Bun.write(path.join(tmpDir, "preview.ts"), "const value = 1;\n");
@@ -139,22 +123,36 @@ describe("apply_patch rendering", () => {
 				"*** End Patch",
 			].join("\n");
 
+			// The card's bottom rule, where the preview label sits.
+			const bottomRule = (text: string): string =>
+				text.split("\n").findLast(line => line.includes(uiTheme.boxRound.bottomLeft)) ?? "";
 			const component = new ToolExecutionComponent("apply_patch", { input }, {}, undefined, uiStub, tmpDir);
 			const before = Bun.stripANSI(component.render(160).join("\n"));
-			expect(before).not.toContain("(preview)");
+			expect(bottomRule(before)).not.toContain("preview");
 
+			component.updateStreamPreview({
+				generation: 1,
+				streaming: false,
+				files: [
+					{
+						path: "preview.ts",
+						diff: " 1|const value = 1;\n-1|const value = 1;\n+1|const value = 2;",
+						firstChangedLine: 1,
+					},
+				],
+			});
 			component.setArgsComplete();
-			const after = await waitForRenderedText(component, 160, "(preview)");
-			expect(after).toContain("(preview)");
+			const after = Bun.stripANSI(component.render(160).join("\n"));
+			expect(bottomRule(after)).toContain(" preview ");
 			expect(after).toContain("const value = 2;");
 		} finally {
-			await fs.rm(tmpDir, { recursive: true, force: true });
+			await removeWithRetries(tmpDir);
 		}
 	});
 
 	it("refreshes streaming preview immediately on arg updates without scheduling a debounce", async () => {
 		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "apply-patch-instant-preview-"));
 		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
 		try {
@@ -176,13 +174,13 @@ describe("apply_patch rendering", () => {
 			expect(setTimeoutSpy).not.toHaveBeenCalled();
 		} finally {
 			setTimeoutSpy.mockRestore();
-			await fs.rm(tmpDir, { recursive: true, force: true });
+			await removeWithRetries(tmpDir);
 		}
 	});
 
 	it("aligns rendered edit diff separators", async () => {
 		await getUiTheme();
-		const uiStub = { requestRender() {} } as unknown as TUI;
+		const uiStub = { requestRender() {}, requestComponentRender() {} } as unknown as TUI;
 		const component = new ToolExecutionComponent(
 			"edit",
 			{ path: "packages/coding-agent/src/tools/image-gen.ts" },

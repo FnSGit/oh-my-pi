@@ -77,6 +77,26 @@ export function App(): ReactNode {
 		if (creds) connect(creds.link, creds.name);
 	}, [connect]);
 
+	// Visual Viewport: adjust app height to fit screen space when mobile keyboard opens.
+	useEffect(() => {
+		const vv = window.visualViewport;
+		if (!vv) return;
+
+		const updateHeight = () => {
+			document.documentElement.style.setProperty("--viewport-height", `${vv.height}px`);
+			window.scrollTo(0, 0);
+		};
+
+		updateHeight();
+		vv.addEventListener("resize", updateHeight);
+		vv.addEventListener("scroll", updateHeight);
+
+		return () => {
+			vv.removeEventListener("resize", updateHeight);
+			vv.removeEventListener("scroll", updateHeight);
+		};
+	}, []);
+
 	// Deep link: a page load with a hash auto-connects.
 	useEffect(() => {
 		const link = hashLink();
@@ -133,18 +153,24 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	}, [title]);
 
 	const drawerAgent = selectedId != null ? snap.agents.find(a => a.id === selectedId) : undefined;
+	const toggleRail = useCallback(() => setRailOpen(open => !open), []);
+	const closeDrawer = useCallback(() => setSelectedId(null), []);
 
 	return (
 		<div className="sh-app">
+			<div className="sh-ambient" />
 			<HeaderBar
-				snapshot={snap}
+				header={snap.header}
+				state={snap.state}
+				phase={snap.phase}
+				readOnly={snap.readOnly}
 				subCount={subCount}
 				railOpen={railOpen}
-				onToggleRail={() => setRailOpen(open => !open)}
+				onToggleRail={toggleRail}
 				onLeave={onLeave}
 			/>
 			<main className="sh-main">
-				<section className="sh-content" data-rail={railOpen ? "true" : "false"}>
+				<section className="sh-panel" data-rail={railOpen ? "true" : "false"}>
 					<div className="sh-transcript">
 						<Transcript
 							entries={snap.entries}
@@ -153,33 +179,54 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 							activeTools={snap.activeTools}
 							working={snap.working}
 							host={toolHost}
+							phase={snap.phase}
 						/>
 					</div>
+					<Composer
+						client={client}
+						phase={snap.phase}
+						readOnly={snap.readOnly}
+						uiRequest={snap.uiRequest}
+						working={snap.working}
+						queuedMessageCount={snap.state?.queuedMessageCount ?? 0}
+					/>
 				</section>
 				{railOpen && (
-					<aside className="sh-rail">
-						<AgentsPanel
-							agents={snap.agents}
-							progress={snap.progress}
-							lifecycle={snap.lifecycle}
-							selectedId={selectedId}
-							onSelect={setSelectedId}
-						/>
-					</aside>
+					<>
+						<div className="sh-rail-backdrop" onClick={() => setRailOpen(false)} />
+						<aside className="sh-rail">
+							<AgentsPanel
+								agents={snap.agents}
+								progress={snap.progress}
+								lifecycle={snap.lifecycle}
+								selectedId={selectedId}
+								onSelect={setSelectedId}
+							/>
+						</aside>
+					</>
 				)}
 			</main>
-			<Composer client={client} snapshot={snap} />
 			{drawerAgent && (
-				<AgentDrawer
-					agent={drawerAgent}
-					progress={snap.progress.get(drawerAgent.id)}
-					client={client}
-					readOnly={snap.readOnly}
-					host={toolHost}
-					onClose={() => setSelectedId(null)}
-				/>
+				<>
+					<div className="ag-drawer-backdrop" onClick={closeDrawer} />
+					<AgentDrawer
+						agent={drawerAgent}
+						progress={snap.progress.get(drawerAgent.id)}
+						lifecycle={snap.lifecycle.get(drawerAgent.id)}
+						client={client}
+						readOnly={snap.readOnly}
+						host={toolHost}
+						onClose={closeDrawer}
+					/>
+				</>
 			)}
-			<Banners phase={snap.phase} endedReason={snap.endedReason} onRejoin={onRejoin} onNewLink={onLeave} />
+			<Banners
+				phase={snap.phase}
+				endedReason={snap.endedReason}
+				loading={snap.loading}
+				onRejoin={onRejoin}
+				onNewLink={onLeave}
+			/>
 			<Toasts notices={snap.notices} />
 		</div>
 	);

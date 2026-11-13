@@ -1,11 +1,13 @@
 /**
  * `eval` (aliases: js, python, notebook) — code cells executed in the
- * persistent kernel. Args arrive either as the modern `cells` array or as a
- * legacy framed `input` string (`*** Cell`, `*** Begin LANG`, `===== info =====`);
- * both render as discrete highlighted cells. When the result carries typed
- * per-cell details, each cell's output is interleaved beneath its code.
+ * persistent kernel (py/js/rb/jl). Args arrive either as the modern single-cell
+ * flat shape (`language`/`code`/`title`/`timeout`/`reset`), a legacy `cells`
+ * array, or a legacy framed `input` string (`*** Cell`, `*** Begin LANG`,
+ * `===== info =====`); all render as discrete highlighted cells. When the result
+ * carries typed per-cell details, each cell's output is interleaved beneath its code.
  */
 import type { ReactNode } from "react";
+import { Markdown } from "../../components/transcript/Markdown";
 import { Badges, CodeBlock, InvalidArg, Note, Output, ResultImages, ResultText } from "../parts";
 import type { ToolRenderer, ToolRenderProps } from "../types";
 import { argsDigest, detailsRecord, isRecord, normalizeWs, num, str, truncate } from "../util";
@@ -18,13 +20,22 @@ interface EvalCell {
 	code: string;
 }
 
-const HLJS_LANG: Record<string, string> = { py: "python", js: "javascript", ts: "typescript" };
+const HLJS_LANG: Record<string, string> = {
+	py: "python",
+	js: "javascript",
+	ts: "typescript",
+	rb: "ruby",
+	jl: "julia",
+};
 
+/** Map an eval language token to its canonical short id, or null when unknown. */
 function evalLangAlias(token: string | undefined): string | null {
 	const t = (token ?? "").toUpperCase();
 	if (t === "PY" || t === "PYTHON" || t === "IPY" || t === "IPYTHON") return "py";
 	if (t === "JS" || t === "JAVASCRIPT") return "js";
 	if (t === "TS" || t === "TYPESCRIPT") return "ts";
+	if (t === "RB" || t === "RUBY") return "rb";
+	if (t === "JL" || t === "JULIA") return "jl";
 	return null;
 }
 
@@ -215,7 +226,7 @@ function parseEvalCellsLegacy(input: string): EvalCell[] {
 			const info = m[1] ?? "";
 			let lang = inheritedLang;
 			let title = "";
-			const langMatch = info.match(/^(py|js|ts)(?::"([^"]*)")?/);
+			const langMatch = info.match(/^(py|js|ts|rb|jl)(?::"([^"]*)")?/);
 			if (langMatch) {
 				lang = langMatch[1];
 				if (langMatch[2]) title = langMatch[2];
@@ -257,7 +268,7 @@ function cellsFromArgs(args: Record<string, unknown>, name: string): EvalCell[] 
 			if (timeout !== null) attrs.push(`t=${timeout}s`);
 			if (item.reset === true) attrs.push("rst");
 			out.push({
-				lang: str(item.language) === "js" ? "js" : "py",
+				lang: evalLangAlias(str(item.language) ?? undefined) ?? "py",
 				title: str(item.title) ?? "",
 				attrs,
 				code: str(item.code) ?? "",
@@ -268,7 +279,14 @@ function cellsFromArgs(args: Record<string, unknown>, name: string): EvalCell[] 
 	const input = str(args.input);
 	if (input !== null) return parseEvalCells(input).filter(c => c.code !== "" || c.title !== "");
 	const code = str(args.code);
-	if (code !== null) return [{ lang: name === "js" ? "js" : "py", title: "", attrs: [], code }];
+	if (code !== null) {
+		const attrs: string[] = [];
+		const timeout = num(args.timeout);
+		if (timeout !== null) attrs.push(`t=${timeout}s`);
+		if (args.reset === true) attrs.push("rst");
+		const lang = evalLangAlias(str(args.language) ?? undefined) ?? (name === "js" ? "js" : "py");
+		return [{ lang, title: str(args.title) ?? "", attrs, code }];
+	}
 	return [];
 }
 
@@ -282,6 +300,140 @@ interface DetailCell {
 	status: string;
 	durationMs: number | null;
 	exitCode: number | null;
+	views: EvalViewEntry[];
+}
+
+interface EvalTableColumn {
+	head: string;
+	numeric: boolean;
+}
+
+/** A pretty view of part of a cell's printed output (mirrors the tool's `EvalView`). */
+type EvalView =
+	| { kind: "table"; columns: EvalTableColumn[]; rows: string[][] }
+	| { kind: "json"; value: unknown }
+	| { kind: "markdown"; text: string };
+
+interface EvalViewEntry {
+	text: string;
+	view: EvalView;
+}
+
+type EvalOutputPart = { kind: "text"; text: string } | { kind: "view"; view: EvalView };
+
+function viewOf(raw: unknown): EvalView | null {
+	if (!isRecord(raw)) return null;
+	switch (raw.kind) {
+		case "table": {
+			if (!Array.isArray(raw.columns) || !Array.isArray(raw.rows)) return null;
+			const columns: EvalTableColumn[] = [];
+			for (const col of raw.columns) {
+				if (!isRecord(col) || typeof col.head !== "string") return null;
+				columns.push({ head: col.head, numeric: col.numeric === true });
+			}
+			const rows: string[][] = [];
+			for (const row of raw.rows) {
+				if (!Array.isArray(row)) return null;
+				rows.push(row.map(cell => (typeof cell === "string" ? cell : String(cell))));
+			}
+			return { kind: "table", columns, rows };
+		}
+		case "json":
+			return "value" in raw ? { kind: "json", value: raw.value } : null;
+		case "markdown":
+			return typeof raw.text === "string" ? { kind: "markdown", text: raw.text } : null;
+		default:
+			return null;
+	}
+}
+
+function viewsOf(raw: unknown): EvalViewEntry[] {
+	if (!Array.isArray(raw)) return [];
+	const out: EvalViewEntry[] = [];
+	for (const item of raw) {
+		if (!isRecord(item) || typeof item.text !== "string") continue;
+		const view = viewOf(item.view);
+		if (view) out.push({ text: item.text, view });
+	}
+	return out;
+}
+
+/** Same split as pi-tui's `splitEvalOutput`: views in order via a moving `indexOf` cursor; unmatched skipped. */
+function splitEvalOutput(output: string, views: readonly EvalViewEntry[]): EvalOutputPart[] {
+	const parts: EvalOutputPart[] = [];
+	const pushText = (chunk: string, trimStart: boolean, trimEnd: boolean): void => {
+		let text = chunk;
+		if (trimStart) text = text.replace(/^\n+/, "");
+		if (trimEnd) text = text.replace(/\n+$/, "");
+		if (text.trim().length > 0) parts.push({ kind: "text", text });
+	};
+	let cursor = 0;
+	for (const entry of views) {
+		if (!entry.text) continue;
+		const at = output.indexOf(entry.text, cursor);
+		if (at < 0) continue;
+		pushText(output.slice(cursor, at), cursor > 0, true);
+		parts.push({ kind: "view", view: entry.view });
+		cursor = at + entry.text.length;
+	}
+	pushText(output.slice(cursor), cursor > 0, cursor > 0);
+	return parts;
+}
+
+function jsonText(value: unknown): string {
+	try {
+		return JSON.stringify(value, null, 2) ?? String(value);
+	} catch {
+		return String(value);
+	}
+}
+
+function ViewBlock({ view }: { view: EvalView }): ReactNode {
+	switch (view.kind) {
+		case "table":
+			return (
+				<div className="tr-md">
+					<table>
+						<thead>
+							<tr>
+								{view.columns.map((col, c) => (
+									<th key={`h${c}`} style={col.numeric ? { textAlign: "right" } : undefined}>
+										{col.head}
+									</th>
+								))}
+							</tr>
+						</thead>
+						<tbody>
+							{view.rows.map((row, r) => (
+								<tr key={`r${r}`}>
+									{row.map((cell, c) => (
+										<td key={`c${c}`} style={view.columns[c]?.numeric ? { textAlign: "right" } : undefined}>
+											{cell}
+										</td>
+									))}
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+			);
+		case "json":
+			return <Output text={jsonText(view.value)} lang="json" variant="code" maxLines={12} />;
+		case "markdown":
+			return <Markdown text={view.text} />;
+	}
+}
+
+function CellOutput({ cell }: { cell: DetailCell }): ReactNode {
+	const error = cell.status === "error";
+	const parts = splitEvalOutput(cell.output, cell.views);
+	return parts.map((part, i) =>
+		part.kind === "text" ? (
+			<Output key={`p${i}`} text={part.text} maxLines={12} error={error} />
+		) : (
+			<ViewBlock key={`p${i}`} view={part.view} />
+		),
+	);
 }
 
 function detailCellsOf(details: Record<string, unknown> | null): DetailCell[] {
@@ -296,11 +448,12 @@ function detailCellsOf(details: Record<string, unknown> | null): DetailCell[] {
 			index: num(item.index) ?? i,
 			title: str(item.title) ?? "",
 			code: str(item.code) ?? "",
-			lang: language === "js" ? "js" : language !== null ? "py" : null,
+			lang: language !== null ? (evalLangAlias(language) ?? "py") : null,
 			output: str(item.output) ?? "",
 			status: str(item.status) ?? "",
 			durationMs: num(item.durationMs),
 			exitCode: num(item.exitCode),
+			views: viewsOf(item.views),
 		});
 	}
 	return out;
@@ -342,16 +495,6 @@ function Body({ name, args, result }: ToolRenderProps): ReactNode {
 		);
 	}
 
-	const jsonOutputs = Array.isArray(details?.jsonOutputs) ? details.jsonOutputs : [];
-	const jsonText = jsonOutputs
-		.map(v => {
-			try {
-				return JSON.stringify(v, null, 2) ?? String(v);
-			} catch {
-				return String(v);
-			}
-		})
-		.join("\n");
 	const notice = str(details?.notice);
 
 	return (
@@ -374,12 +517,11 @@ function Body({ name, args, result }: ToolRenderProps): ReactNode {
 					return (
 						<div className="tv-cell" key={`c${i}`}>
 							<CodeBlock code={cell.code} lang={HLJS_LANG[cell.lang] ?? null} title={titleParts.join(" · ")} />
-							{dc && dc.output !== "" && <Output text={dc.output} maxLines={12} error={dc.status === "error"} />}
+							{dc && dc.output !== "" && <CellOutput cell={dc} />}
 						</div>
 					);
 				})}
 			</div>
-			{jsonText && <Output text={jsonText} lang="json" variant="code" maxLines={12} title="display" />}
 			{notice && <Note>{notice}</Note>}
 			<ResultImages result={result} />
 			{detailCells.length === 0 && <ResultText result={result} maxLines={12} />}

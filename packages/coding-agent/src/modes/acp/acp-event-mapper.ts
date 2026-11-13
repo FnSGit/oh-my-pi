@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import type {
 	SessionNotification,
 	SessionUpdate,
@@ -5,10 +6,14 @@ import type {
 	ToolCallContent,
 	ToolCallLocation,
 	ToolKind,
-} from "@agentclientprotocol/sdk";
+} from "@oh-my-pi/pi-utils/acp";
+import { InternalUrlRouter } from "../../internal-urls/router";
+import { extractUriScheme } from "../../internal-urls/parse";
+import type { SchemeSpec } from "../../internal-urls/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { resolveToCwd } from "../../tools/path-utils";
-import type { TodoStatus } from "../../tools/todo";
+import { resolveToCwd, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
+import type { TodoStatus } from "@oh-my-pi/pi-tui/tools/todo";
+import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 
 interface MessageProgress {
 	textEmitted: boolean;
@@ -19,6 +24,7 @@ interface AcpEventMapperOptions {
 	getMessageId?: (message: unknown) => string | undefined;
 	getMessageProgress?: (message: unknown) => MessageProgress | undefined;
 	getToolArgs?: (toolCallId: string) => unknown;
+	resolveImageData?: (data: string, mimeType: string | undefined) => string;
 	/**
 	 * Session cwd. Tool call locations sent to ACP clients must be absolute
 	 * (the editor host needs them to open or focus files). When provided,
@@ -55,6 +61,10 @@ interface BinaryLikeContent extends TypedValue {
 
 interface PathContainer {
 	path?: unknown;
+}
+
+interface ResolvedPathContainer {
+	resolvedPath?: unknown;
 }
 
 interface OldPathContainer {
@@ -126,7 +136,27 @@ interface TextMessageLike {
 
 const ACP_TEXT_LIMIT = 4_000;
 
-export function mapToolKind(toolName: string): ToolKind {
+/** Declared spec of the registered scheme a `write` call targets; undefined for file paths and other tools. */
+function writeTargetSpec(toolName: string, args: unknown): SchemeSpec | undefined {
+	if (toolName !== "write") return undefined;
+	const path = extractStringProperty<PathContainer>(args, "path");
+	if (!path) return undefined;
+	const router = InternalUrlRouter.instance();
+	const scheme = extractUriScheme(path);
+	return scheme && router.canHandle(path) ? router.spec(scheme) : undefined;
+}
+
+/** Peer-to-peer messages (coordination-scoped writes) stay off the external ACP session stream. */
+function isInternalAgentMessageTool(toolName: string, args: unknown): boolean {
+	return writeTargetSpec(toolName, args)?.write?.scope === "coordination";
+}
+
+export function mapToolKind(toolName: string, args?: unknown): ToolKind {
+	// A device write (xd:// tool dispatch, proc:// control) executes something —
+	// "edit" would make ACP clients render it as a file modification to a
+	// nonexistent path (and auto-approve it under edit-tier policies). Reads
+	// stay "read": listing devices or fetching docs is discovery.
+	if (writeTargetSpec(toolName, args)?.backing === "device") return "execute";
 	switch (toolName) {
 		case "read":
 			return "read";
@@ -142,8 +172,8 @@ export function mapToolKind(toolName: string): ToolKind {
 		case "exec":
 		case "eval":
 			return "execute";
-		case "search":
-		case "find":
+		case "grep":
+		case "glob":
 		case "ast_grep":
 			return "search";
 		case "web_search":
@@ -166,6 +196,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "message_end":
 			return mapAssistantMessageEnd(event, sessionId, options);
 		case "tool_execution_start": {
+			if (isInternalAgentMessageTool(event.toolName, event.args)) return [];
 			const update = buildToolCallStartUpdate({
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,
@@ -176,31 +207,34 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_update": {
+			if (isInternalAgentMessageTool(event.toolName, event.args)) return [];
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolName, event.args),
-				extractToolCallContent(event.partialResult),
+				extractToolCallContent(event.partialResult, options),
 			);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
-				status: "in_progress",
+				status: toolUpdateStatus(event.partialResult),
 				rawOutput: event.partialResult,
 			};
 			if (content.length > 0) {
 				update.content = content;
 			}
-			const locations = extractToolLocations(event.args, options.cwd);
+			const locations = extractToolLocations(event.args, options.cwd, event.toolName);
 			if (locations.length > 0) {
 				update.locations = locations;
 			}
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_end": {
-			const resultContent = [...extractDiffToolCallContent(event.result), ...extractToolCallContent(event.result)];
-			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolName, getToolExecutionEndArgs(event, options)),
-				resultContent,
-			);
+			const args = getToolExecutionEndArgs(event, options);
+			if (isInternalAgentMessageTool(event.toolName, args)) return [];
+			const resultContent = [
+				...extractDiffToolCallContent(event.result),
+				...extractToolCallContent(event.result, options),
+			];
+			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
@@ -249,6 +283,14 @@ function mapAssistantMessageUpdate(
 	let text: string;
 	const progress = options.getMessageProgress?.(event.message);
 	switch (event.assistantMessageEvent.type) {
+		case "image_end":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "agent_message_chunk",
+					content: event.assistantMessageEvent.content,
+					messageId: options.getMessageId?.(event.message),
+				}),
+			];
 		case "text_delta":
 			sessionUpdate = "agent_message_chunk";
 			text = event.assistantMessageEvent.delta;
@@ -256,13 +298,28 @@ function mapAssistantMessageUpdate(
 				progress.textEmitted = true;
 			}
 			break;
-		case "thinking_delta":
+		case "thinking_delta": {
+			const block = event.assistantMessageEvent.partial?.content?.[event.assistantMessageEvent.contentIndex];
+			if (block?.type === "thinking" && !canonicalizeMessage(block.thinking)) return [];
 			sessionUpdate = "agent_thought_chunk";
 			text = event.assistantMessageEvent.delta;
 			if (text.length > 0 && progress) {
 				progress.thoughtEmitted = true;
 			}
 			break;
+		}
+		case "thinking_end": {
+			// Narration streams as thinking; once its block closes as narration,
+			// surface it as the reply it is.
+			const block = event.assistantMessageEvent.partial?.content?.[event.assistantMessageEvent.contentIndex];
+			if (block?.type !== "thinking" || !block.narration) return [];
+			sessionUpdate = "agent_message_chunk";
+			text = canonicalizeMessage(event.assistantMessageEvent.content);
+			if (text.length > 0 && progress) {
+				progress.textEmitted = true;
+			}
+			break;
+		}
 		case "done":
 			if (progress?.textEmitted) {
 				return [];
@@ -276,6 +333,11 @@ function mapAssistantMessageUpdate(
 		case "error":
 			sessionUpdate = "agent_message_chunk";
 			text = event.assistantMessageEvent.error.errorMessage ?? "Unknown error";
+			// The surfaced error is the message's visible text: keeps the
+			// message_end / agent_end fallbacks from emitting again.
+			if (text.length > 0 && progress) {
+				progress.textEmitted = true;
+			}
 			break;
 		default:
 			return [];
@@ -406,8 +468,9 @@ export function buildToolCallStartUpdate(input: {
 	const update: ToolCall & { sessionUpdate: "tool_call" } = {
 		sessionUpdate: "tool_call",
 		toolCallId: input.toolCallId,
+		name: input.toolName,
 		title: buildToolTitle(input.toolName, input.args, input.intent),
-		kind: mapToolKind(input.toolName),
+		kind: mapToolKind(input.toolName, input.args),
 		status: input.status ?? "pending",
 		rawInput: input.args,
 	};
@@ -415,7 +478,7 @@ export function buildToolCallStartUpdate(input: {
 	if (content.length > 0) {
 		update.content = content;
 	}
-	const locations = extractToolLocations(input.args, input.cwd);
+	const locations = extractToolLocations(input.args, input.cwd, input.toolName);
 	if (locations.length > 0) {
 		update.locations = locations;
 	}
@@ -464,8 +527,13 @@ function buildEvalStartText(args: unknown): string | undefined {
 	if (typeof args !== "object" || args === null || Array.isArray(args)) {
 		return undefined;
 	}
-	const cells = (args as EvalCellContainer).cells;
-	if (!Array.isArray(cells) || cells.length === 0) {
+	const container = args as EvalCellContainer & EvalCellLike;
+	const cells = Array.isArray(container.cells)
+		? container.cells
+		: typeof container.code === "string"
+			? [container]
+			: [];
+	if (cells.length === 0) {
 		return undefined;
 	}
 	const lines: string[] = [];
@@ -526,6 +594,9 @@ function buildToolTitle(toolName: string, args: unknown, intent: string | undefi
 		extractStringProperty<PatternContainer>(args, "pattern") ??
 		extractStringProperty<QueryContainer>(args, "query");
 	if (subject) {
+		// Internal URLs (xd://github, skill://react, …) name their target fully;
+		// prefixing the transport tool reads as a file write to a fake path.
+		if (INTERNAL_URL_SUBJECT.test(subject)) return subject;
 		return `${toolName}: ${subject}`;
 	}
 
@@ -547,18 +618,55 @@ function toAcpLocationPath(value: string, cwd?: string): string {
 	}
 }
 
-function extractToolLocations(args: unknown, cwd?: string): ToolCallLocation[] {
+/**
+ * Scheme-qualified subjects (`xd://`, `skill://`, `agent://`, `https://`, …)
+ * are not local files: resolving them against cwd fabricates paths like
+ * `/repo/xd:/github` and makes editors focus nonexistent files.
+ */
+const INTERNAL_URL_SUBJECT = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+function existingFileLocationPath(raw: string | undefined, cwd?: string): string | undefined {
+	if (!raw || INTERNAL_URL_SUBJECT.test(raw)) return undefined;
+	const resolved = toAcpLocationPath(raw, cwd);
+	try {
+		return fs.statSync(resolved).isFile() ? resolved : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Return the single existing file represented by a `read` argument.
+ *
+ * ACP locations are editor navigation targets, not tool inputs. Read inputs may
+ * name selectors, delimited paths, globs, directories, archive members, or
+ * internal resources, so only a path that resolves to a regular file is safe
+ * to publish. Literal selector-shaped filenames retain read-tool precedence.
+ */
+function readLocationBasePath(
+	raw: string | undefined,
+	cwd: string | undefined,
+	toolName: string | undefined,
+): string | undefined {
+	if (raw === undefined || toolName !== "read") return raw;
+	if (!cwd || INTERNAL_URL_SUBJECT.test(raw)) return undefined;
+
+	const candidate = splitPathAndSelPreferringLiteralSync(raw, cwd).path;
+	return existingFileLocationPath(candidate, cwd);
+}
+
+function extractToolLocations(args: unknown, cwd?: string, toolName?: string): ToolCallLocation[] {
 	const locations: ToolCallLocation[] = [];
 	const seen = new Set<string>();
 	const pushPath = (raw: string | undefined) => {
-		if (!raw) return;
+		if (!raw || INTERNAL_URL_SUBJECT.test(raw)) return;
 		const path = toAcpLocationPath(raw, cwd);
 		if (seen.has(path)) return;
 		seen.add(path);
 		locations.push({ path });
 	};
 
-	pushPath(extractStringProperty<PathContainer>(args, "path"));
+	pushPath(readLocationBasePath(extractStringProperty<PathContainer>(args, "path"), cwd, toolName));
 	pushPath(extractStringProperty<OldPathContainer>(args, "oldPath"));
 	pushPath(extractStringProperty<NewPathContainer>(args, "newPath"));
 
@@ -571,6 +679,13 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 	const details = (result as { details?: unknown }).details;
 	if (typeof details !== "object" || details === null) return [];
 	const direct = extractToolLocations(details, cwd);
+	const resolvedFile = existingFileLocationPath(
+		extractStringProperty<ResolvedPathContainer>(details, "resolvedPath"),
+		cwd,
+	);
+	if (resolvedFile && !direct.some(location => location.path === resolvedFile)) {
+		direct.push({ path: resolvedFile });
+	}
 	const perFile = (details as { perFileResults?: unknown }).perFileResults;
 	if (!Array.isArray(perFile)) {
 		return direct;
@@ -628,17 +743,41 @@ function extractTerminalId(value: unknown): string | undefined {
 	return extractStringProperty<TerminalIdContainer>(details, "terminalId");
 }
 
+interface AsyncJobContainer {
+	async?: unknown;
+}
+
+interface AsyncStateContainer {
+	state?: unknown;
+}
+
+/**
+ * Status of a `tool_execution_update` frame: the settled frame of a call's
+ * background job (`details.async.state` completed, failed or cancelled, sent
+ * after the call returned) settles the call; any other frame is progress.
+ */
+function toolUpdateStatus(partialResult: unknown): "in_progress" | "completed" | "failed" {
+	if (typeof partialResult !== "object" || partialResult === null) return "in_progress";
+	const details = (partialResult as DetailsContainer).details;
+	if (typeof details !== "object" || details === null) return "in_progress";
+	const state = extractStringProperty<AsyncStateContainer>((details as AsyncJobContainer).async, "state");
+	if (state === "completed") return "completed";
+	return state === "failed" || state === "cancelled" ? "failed" : "in_progress";
+}
+
 function terminalToolCallContent(terminalId: string): ToolCallContent {
 	return { type: "terminal", terminalId };
 }
 
-function extractToolCallContent(value: unknown): ToolCallContent[] {
-	const richContent = extractStructuredToolCallContent(value);
+function extractToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {
+	const richContent = extractStructuredToolCallContent(value, options);
+	const detailsImageContent = extractDetailsImageToolCallContent(value, options, richContent);
+	const combinedContent = [...richContent, ...detailsImageContent];
 	const terminalId = extractTerminalId(value);
 	const content =
-		terminalId && !hasTerminalContent(richContent, terminalId)
-			? [...richContent, terminalToolCallContent(terminalId)]
-			: richContent;
+		terminalId && !hasTerminalContent(combinedContent, terminalId)
+			? [...combinedContent, terminalToolCallContent(terminalId)]
+			: combinedContent;
 	const fallbackText = extractReadableText(value);
 	if (!fallbackText) {
 		return content;
@@ -649,7 +788,7 @@ function extractToolCallContent(value: unknown): ToolCallContent[] {
 	return [...content, textToolCallContent(fallbackText)];
 }
 
-function extractStructuredToolCallContent(value: unknown): ToolCallContent[] {
+function extractStructuredToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {
 	const blocks = getContentBlocks(value);
 	if (!blocks) {
 		return [];
@@ -657,7 +796,7 @@ function extractStructuredToolCallContent(value: unknown): ToolCallContent[] {
 
 	const content: ToolCallContent[] = [];
 	for (const block of blocks) {
-		const toolCallContent = toToolCallContent(block);
+		const toolCallContent = toToolCallContent(block, options);
 		if (toolCallContent) {
 			content.push(toolCallContent);
 		}
@@ -676,7 +815,7 @@ function getContentBlocks(value: unknown): unknown[] | undefined {
 	return Array.isArray(content) ? content : undefined;
 }
 
-function toToolCallContent(value: unknown): ToolCallContent | undefined {
+function toToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent | undefined {
 	const type = getContentType(value);
 	if (!type) {
 		return undefined;
@@ -688,21 +827,8 @@ function toToolCallContent(value: unknown): ToolCallContent | undefined {
 			return text ? textToolCallContent(text) : undefined;
 		}
 		case "image":
-		case "audio": {
-			const data = extractStringProperty<BinaryLikeContent>(value, "data");
-			const mimeType = extractStringProperty<BinaryLikeContent>(value, "mimeType");
-			if (!data || !mimeType) {
-				return undefined;
-			}
-			return {
-				type: "content",
-				content: {
-					type,
-					data,
-					mimeType,
-				},
-			};
-		}
+		case "audio":
+			return binaryToolCallContent(type, value, options);
 		case "resource_link": {
 			const uri = extractStringProperty<ResourceLinkLikeContent>(value, "uri");
 			const name = extractStringProperty<ResourceLinkLikeContent>(value, "name");
@@ -758,6 +884,64 @@ function toToolCallContent(value: unknown): ToolCallContent | undefined {
 		default:
 			return undefined;
 	}
+}
+
+function binaryToolCallContent(
+	type: "image" | "audio",
+	value: unknown,
+	options: AcpEventMapperOptions,
+): ToolCallContent | undefined {
+	const data = extractStringProperty<BinaryLikeContent>(value, "data");
+	const mimeType = extractStringProperty<BinaryLikeContent>(value, "mimeType");
+	if (!data || !mimeType) {
+		return undefined;
+	}
+	return {
+		type: "content",
+		content: {
+			type,
+			data: type === "image" ? (options.resolveImageData?.(data, mimeType) ?? data) : data,
+			mimeType,
+		},
+	};
+}
+
+function extractDetailsImageToolCallContent(
+	value: unknown,
+	options: AcpEventMapperOptions,
+	existing: ToolCallContent[],
+): ToolCallContent[] {
+	const images = extractDetailsImages(value);
+	if (!images) {
+		return [];
+	}
+	const seen = new Set(existing.map(imageContentKey).filter((key): key is string => key !== undefined));
+	const content: ToolCallContent[] = [];
+	for (const image of images) {
+		const toolCallContent = binaryToolCallContent("image", image, options);
+		const key = imageContentKey(toolCallContent);
+		if (!toolCallContent || !key || seen.has(key)) {
+			continue;
+		}
+		seen.add(key);
+		content.push(toolCallContent);
+	}
+	return content;
+}
+
+function extractDetailsImages(value: unknown): unknown[] | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const details = (value as DetailsContainer).details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const images = (details as { images?: unknown }).images;
+	return Array.isArray(images) && images.length > 0 ? images : undefined;
+}
+
+function imageContentKey(value: ToolCallContent | undefined): string | undefined {
+	if (value?.type !== "content" || value.content.type !== "image") {
+		return undefined;
+	}
+	return `${value.content.mimeType}\u0000${value.content.data}`;
 }
 
 function extractEmbeddedResource(
@@ -837,6 +1021,15 @@ function extractReadableText(value: unknown): string | undefined {
 		if (text.length > 0) {
 			return normalizeText(text);
 		}
+		// A structured result envelope (`{ content: [...] }`) whose blocks carry no
+		// plain text has nothing readable to surface, and its data already rides the
+		// ACP frame as `rawOutput`. Serializing the whole envelope to JSON would just
+		// render a raw blob as the tool row (e.g. wait progress, issue #9511), so
+		// stop here instead of falling through to the JSON fallback.
+		return undefined;
+	}
+	if (extractDetailsImages(value)) {
+		return undefined;
 	}
 	if (isTerminalOnlyDetails(value)) {
 		return undefined;
@@ -856,7 +1049,7 @@ function isTerminalOnlyDetails(value: unknown): boolean {
 	return content === undefined || (Array.isArray(content) && content.length === 0);
 }
 
-function extractAssistantMessageText(value: unknown): string {
+export function extractAssistantMessageText(value: unknown): string {
 	if (typeof value !== "object" || value === null || !("content" in value)) {
 		return "";
 	}

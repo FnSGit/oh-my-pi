@@ -1,13 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { type } from "@oh-my-pi/omptype";
+import { type OpenAICompletionsOptions, streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { type OpenAIResponsesOptions, streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type { Context, Model, Tool } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { z } from "zod/v4";
 
 const echoTool: Tool = {
 	name: "echo",
 	description: "Echo input",
-	parameters: z.object({ text: z.string() }),
+	parameters: type({ text: "string" }),
 };
 
 const context: Context = {
@@ -21,9 +22,12 @@ function abortedSignal(): AbortSignal {
 	return controller.signal;
 }
 
-async function capturePayload(opts: Parameters<typeof streamOpenAICompletions>[2]): Promise<Record<string, unknown>> {
+async function capturePayload(
+	model: Model<"openai-completions">,
+	opts: OpenAICompletionsOptions,
+): Promise<Record<string, unknown>> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
-	streamOpenAICompletions(getBundledModel("opencode-go", "deepseek-v4-pro"), context, {
+	streamOpenAICompletions(model, context, {
 		...opts,
 		apiKey: "test-key",
 		signal: abortedSignal(),
@@ -32,14 +36,42 @@ async function capturePayload(opts: Parameters<typeof streamOpenAICompletions>[2
 	return (await promise) as Record<string, unknown>;
 }
 
-describe("issue #945 — OpenCode Go DeepSeek tool_choice is disabled", () => {
-	it("marks deepseek-v4-pro as not supporting tool_choice via compat override", () => {
-		const model = getBundledModel("opencode-go", "deepseek-v4-pro") as Model<"openai-completions">;
-		expect(model.compat?.supportsToolChoice).toBe(false);
+async function captureResponsesPayload(
+	model: Model<"openai-responses">,
+	opts: OpenAIResponsesOptions,
+): Promise<Record<string, unknown>> {
+	const { promise, resolve } = Promise.withResolvers<unknown>();
+	streamOpenAIResponses(model, context, {
+		...opts,
+		apiKey: "test-key",
+		signal: abortedSignal(),
+		onPayload: payload => resolve(payload),
+	});
+	return (await promise) as Record<string, unknown>;
+}
+
+describe("OpenCode Go tool_choice compatibility", () => {
+	it("omits forced tool_choice from DeepSeek Flash Responses payloads while preserving tools", async () => {
+		const model = getBundledModel("opencode-go", "deepseek-v4-flash") as Model<"openai-responses">;
+		expect(model.compat.supportsToolChoice).toBe(false);
+		const body = await captureResponsesPayload(model, {
+			toolChoice: { type: "tool", name: "echo" },
+		});
+		expect(body.tools).toEqual([expect.objectContaining({ type: "function", name: "echo" })]);
+		expect(body.tool_choice).toBeUndefined();
 	});
 
-	it("omits tool_choice from payload but preserves tools and reasoning_effort", async () => {
-		const body = await capturePayload({ reasoning: "high", toolChoice: "auto" });
+	it("omits tool_choice from MiMo title-style payloads while preserving tools", async () => {
+		const model = getBundledModel("opencode-go", "mimo-v2.5-pro") as Model<"openai-completions">;
+		const body = await capturePayload(model, { reasoning: "high", toolChoice: { type: "tool", name: "echo" } });
+		expect(body.tools).toBeDefined();
+		expect(body.tool_choice).toBeUndefined();
+		expect(body.reasoning_effort).toBe("high");
+	});
+
+	it("omits tool_choice from DeepSeek payloads but preserves tools and reasoning_effort", async () => {
+		const model = getBundledModel("opencode-go", "deepseek-v4-pro") as Model<"openai-completions">;
+		const body = await capturePayload(model, { reasoning: "high", toolChoice: "auto" });
 		expect(body.tools).toBeDefined();
 		expect(body.tool_choice).toBeUndefined();
 		expect(body.reasoning_effort).toBe("high");

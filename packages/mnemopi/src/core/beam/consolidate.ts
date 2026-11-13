@@ -1,8 +1,12 @@
 import type { SQLQueryBindings } from "bun:sqlite";
+import { logger } from "@oh-my-pi/pi-utils";
+import { polyphonicRecallEnabled } from "../../config";
 import { generateId, stableMemoryId } from "../../util/ids";
 import { aaakEncode } from "../aaak";
-import { heuristicExtractFacts } from "../extraction";
-import { clampVeracity } from "../veracity-consolidation";
+import { REGEX_EXTRACTION_MAX_INPUT_CHARS } from "../entities";
+import { EpisodicGraph } from "../episodic-graph";
+import { type ExtractedFactCategories, heuristicExtractFacts } from "../extraction";
+import { clampVeracity, VERACITY_WEIGHTS, type Veracity, VeracityConsolidator } from "../veracity-consolidation";
 import { scheduleEmbedding } from "./helpers";
 import type { BeamMemoryState, BeamStats, JsonValue, MemoriaRetrieveResult, Metadata, SleepResult } from "./types";
 
@@ -56,6 +60,92 @@ const TIER2_DAYS = envInt("MNEMOPI_TIER2_DAYS", 30);
 const TIER3_DAYS = envInt("MNEMOPI_TIER3_DAYS", 180);
 const DEGRADE_BATCH_SIZE = envInt("MNEMOPI_DEGRADE_BATCH", 100);
 const TIER3_MAX_CHARS = envInt("MNEMOPI_TIER3_MAX_CHARS", 300);
+const DEFAULT_MAX_EPISODE_CHARS = 100_000;
+const SLEEP_SUMMARY_SEPARATOR = " | ";
+const SLEEP_TRUNCATION_MARKER = "\n[... sleep_consolidation episode truncated by maxEpisodeChars ...]";
+const PATTERN_FACT_EXTRACTION_MAX_INPUT_CHARS = REGEX_EXTRACTION_MAX_INPUT_CHARS;
+/** Dotted number that may name a version: `v1.2`, `1.2.3`, `1.2.3-beta.1`, or a bare `1.2`. */
+const VERSION_CANDIDATE = /\b(v?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9.]+)?)\b/g;
+/**
+ * Keyword immediately before a bare `x.y` marking it as a version rather than a decimal or price.
+ * Opening prose/Markdown delimiters may sit between them: `version (2.4)`, ``version `2.4` ``, `version **2.4**`.
+ */
+const VERSION_CUE_BEFORE =
+	/\b(?:versions?|ver|releases?|released|upgraded?|downgraded?|bumped?)(?:\s+(?:is|was|to|from|of|at|on))?[\s:=#([`"'*_]*$/i;
+
+/**
+ * Whether a {@link VERSION_CANDIDATE} match at `index` is a version mention.
+ *
+ * A bare `x.y` is indistinguishable from a decimal (`12.50`, `3.9949820000000003`), so it only
+ * counts behind a version keyword. `v`-prefixed and full `x.y.z` forms count on their own unless
+ * they are a slice of a longer dotted run such as an IP address.
+ */
+function isVersionMention(text: string, value: string, index: number): boolean {
+	const end = index + value.length;
+	if (text[index - 1] === "." || /^\.\d/.test(text.slice(end, end + 2))) return false;
+	if (value.startsWith("v") || /^\d+\.\d+\.\d+/.test(value)) return true;
+	return VERSION_CUE_BEFORE.test(text.slice(Math.max(0, index - 40), index));
+}
+
+type SleepSummary = {
+	summary: string;
+	originalChars: number;
+	truncated: boolean;
+	maxChars: number;
+};
+type SleepChunk = {
+	items: Row[];
+	originalChars: number;
+};
+
+function normalizedMaxEpisodeChars(beam: BeamMemoryState): number {
+	const configured = Math.trunc(beam.config?.maxEpisodeChars ?? DEFAULT_MAX_EPISODE_CHARS);
+	return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MAX_EPISODE_CHARS;
+}
+
+function markTruncated(content: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (maxChars <= SLEEP_TRUNCATION_MARKER.length) return content.slice(0, maxChars);
+	const bodyChars = maxChars - SLEEP_TRUNCATION_MARKER.length;
+	return `${content.slice(0, bodyChars).trimEnd()}${SLEEP_TRUNCATION_MARKER}`;
+}
+
+function splitSleepItems(beam: BeamMemoryState, source: string, items: readonly Row[]): SleepChunk[] {
+	const maxChars = normalizedMaxEpisodeChars(beam);
+	const prefixChars = `[${source}] `.length;
+	const joinedLimit = Math.max(0, maxChars - prefixChars);
+	const chunks: SleepChunk[] = [];
+	let current: Row[] = [];
+	let currentChars = 0;
+
+	for (const item of items) {
+		const contentChars = (rowValue(item, "content") ?? "").length;
+		const separatorChars = current.length === 0 ? 0 : SLEEP_SUMMARY_SEPARATOR.length;
+		if (current.length > 0 && currentChars + separatorChars + contentChars > joinedLimit) {
+			chunks.push({ items: current, originalChars: currentChars });
+			current = [];
+			currentChars = 0;
+		}
+		current.push(item);
+		currentChars += (current.length === 1 ? 0 : SLEEP_SUMMARY_SEPARATOR.length) + contentChars;
+	}
+	if (current.length > 0) chunks.push({ items: current, originalChars: currentChars });
+	return chunks;
+}
+
+function buildSleepSummary(beam: BeamMemoryState, source: string, chunk: SleepChunk): SleepSummary {
+	const maxChars = normalizedMaxEpisodeChars(beam);
+	const prefix = `[${source}] `;
+	const joined = chunk.items.map(item => rowValue(item, "content") ?? "").join(SLEEP_SUMMARY_SEPARATOR);
+	const uncapped = `${prefix}${aaakEncode(joined)}`;
+	const truncated = uncapped.length > maxChars;
+	return {
+		summary: truncated ? markTruncated(uncapped, maxChars) : uncapped,
+		originalChars: chunk.originalChars,
+		truncated,
+		maxChars,
+	};
+}
 
 function isoNow(): string {
 	return new Date().toISOString();
@@ -226,7 +316,7 @@ function insertFactRows(
 function insertTimeline(
 	beam: BeamMemoryState,
 	messageIdx: number,
-	date: string,
+	date: string | null,
 	description: string,
 	sourceMemoryId: string | null,
 ): void {
@@ -259,6 +349,161 @@ function insertKg(
 		source: sourceMemoryId ?? "extraction",
 		confidence: 0.65,
 	});
+	consolidateKgFact(beam, subject, predicate, object, sourceMemoryId);
+}
+
+/** Veracity of the memory a fact was extracted from, restricted to the consolidator's vocabulary. */
+function sourceMemoryVeracity(beam: BeamMemoryState, sourceMemoryId: string | null): Veracity {
+	if (sourceMemoryId === null) return "unknown";
+	const row = (beam.db.query("SELECT veracity FROM working_memory WHERE id = ?").get(sourceMemoryId) ??
+		beam.db.query("SELECT veracity FROM episodic_memory WHERE id = ?").get(sourceMemoryId)) as {
+		veracity: string | null;
+	} | null;
+	const veracity = row?.veracity ?? "unknown";
+	return Object.hasOwn(VERACITY_WEIGHTS, veracity) ? (veracity as Veracity) : "unknown";
+}
+
+/**
+ * This beam's veracity consolidator, created on first use so `consolidated_facts` /
+ * `conflicts` DDL only runs once polyphonic recall needs them.
+ */
+export function ensureVeracityConsolidator(beam: BeamMemoryState): VeracityConsolidator {
+	const existing = beam.veracityConsolidator;
+	if (existing instanceof VeracityConsolidator && existing.conn === beam.db) return existing;
+	const consolidator = new VeracityConsolidator(beam.dbPath ?? ":memory:", beam.db);
+	beam.veracityConsolidator = consolidator;
+	return consolidator;
+}
+
+/**
+ * Feed an extracted subject/predicate/object fact into the veracity consolidator so
+ * repeated mentions gain confidence in `consolidated_facts`, which the polyphonic
+ * recall fact voice reads. Only runs while polyphonic recall is enabled for this beam;
+ * facts written with it off are picked up by {@link backfillConsolidatedFacts}.
+ * Best-effort: a failure never blocks the extraction write.
+ */
+function consolidateKgFact(
+	beam: BeamMemoryState,
+	subject: string,
+	predicate: string,
+	object: string,
+	sourceMemoryId: string | null,
+): void {
+	if (!polyphonicRecallEnabled(process.env, beam.config?.polyphonicRecall)) return;
+	const cleanSubject = subject.trim();
+	const cleanPredicate = predicate.trim();
+	const cleanObject = object.trim();
+	if (cleanSubject === "" || cleanPredicate === "" || cleanObject === "") return;
+	try {
+		ensureVeracityConsolidator(beam).consolidateFact(
+			cleanSubject,
+			cleanPredicate,
+			cleanObject,
+			sourceMemoryVeracity(beam, sourceMemoryId),
+			sourceMemoryId,
+		);
+	} catch (error) {
+		// Fact consolidation is an enrichment; the MEMORIA/KG rows above are already written,
+		// and the next polyphonic engine built on this bank backfills the fact.
+		logger.warn("mnemopi: fact consolidation failed", { subject: cleanSubject, error: String(error) });
+	}
+}
+
+/**
+ * Consolidate every extracted KG fact (`memoria_kg`) whose source memory is not yet
+ * among that fact's `consolidated_facts` sources, e.g. facts written while polyphonic
+ * recall was off. Idempotent: a (fact, source) pair is only ever counted once.
+ * Facts without a source memory are skipped; the fact voice could not return them.
+ */
+export function backfillConsolidatedFacts(beam: BeamMemoryState, consolidator: VeracityConsolidator): number {
+	const rows = beam.db
+		.query(`
+			SELECT trim(k.subject) AS subject, trim(k.predicate) AS predicate, trim(k.object) AS object,
+				k.source_memory_id AS source
+			FROM memoria_kg k
+			WHERE k.source_memory_id IS NOT NULL AND k.source_memory_id != ''
+				AND trim(k.subject) != '' AND trim(k.predicate) != '' AND trim(k.object) != ''
+				AND NOT EXISTS (
+					SELECT 1 FROM consolidated_facts cf, json_each(cf.sources_json) s
+					WHERE cf.subject = trim(k.subject) AND cf.predicate = trim(k.predicate)
+						AND cf.object = trim(k.object) AND s.value = k.source_memory_id
+				)
+			GROUP BY 1, 2, 3, 4
+			ORDER BY MIN(k.id)
+		`)
+		.all() as { subject: string; predicate: string; object: string; source: string }[];
+	if (rows.length === 0) return 0;
+	consolidator.serializedWrite(() => {
+		for (const row of rows) {
+			consolidator.consolidateFact(
+				row.subject,
+				row.predicate,
+				row.object,
+				sourceMemoryVeracity(beam, row.source),
+				row.source,
+			);
+		}
+	});
+	return rows.length;
+}
+
+function insertPreference(
+	beam: BeamMemoryState,
+	messageIdx: number,
+	preference: string,
+	topic: string | null,
+	sourceMemoryId: string | null,
+): void {
+	beam.db.run(
+		`INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		[sourceSession(beam), messageIdx, preference, topic, null, preference, sourceMemoryId],
+	);
+}
+
+function insertInstruction(
+	beam: BeamMemoryState,
+	messageIdx: number,
+	instruction: string,
+	context: string,
+	sourceMemoryId: string | null,
+): void {
+	beam.db.run(
+		`INSERT INTO memoria_instructions (session_id, message_idx, instruction, active, topic, context_snippet, source_memory_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		[sourceSession(beam), messageIdx, instruction, 1, null, context, sourceMemoryId],
+	);
+}
+
+function timelineDate(description: string): string | null {
+	return /\b\d{4}-\d{2}-\d{2}\b/.exec(description)?.[0] ?? null;
+}
+
+/**
+ * Populate the episodic graph (gists, facts, edges) for a freshly consolidated
+ * memory. The graph backs Polyphonic Recall's `graph` voice, which relies on
+ * `findGistsByParticipant`, `findFactsBySubject`, and `findRelatedMemories`.
+ *
+ * Best-effort: failures (closed DB, missing optional tables) MUST NOT roll back
+ * the consolidation that already wrote the episodic row, so any throw here is
+ * swallowed. Unlike the proactive-link path in `store.ts` this is unconditional
+ * — consolidation is the explicit "settle and compress" step where the graph
+ * is supposed to gain edges.
+ */
+function ingestIntoEpisodicGraph(beam: BeamMemoryState, memoryId: string, summary: string): void {
+	try {
+		const graph =
+			beam.episodicGraph instanceof EpisodicGraph
+				? beam.episodicGraph
+				: new EpisodicGraph({ db: beam.db, dbPath: beam.dbPath });
+		graph.ingestMemory(summary, memoryId, {
+			sessionId: sourceSession(beam),
+			linkExisting: true,
+			extractEntities: true,
+		});
+	} catch {
+		// Graph enrichment is best-effort and never blocks consolidation.
+	}
 }
 
 export function consolidateToEpisodic(
@@ -299,6 +544,7 @@ export function consolidateToEpisodic(
 		],
 	);
 	extractAndStoreFacts(beam, summary, 0, memoryId);
+	ingestIntoEpisodicGraph(beam, memoryId, summary);
 	scheduleEmbedding(beam, [{ memoryId, content: summary }]);
 	emitEvent(beam, "MEMORY_CONSOLIDATED", memoryId, summary, source, importance, {
 		summary_of: [...sourceWmIds],
@@ -364,33 +610,65 @@ export function detectLanguage(_beam: BeamMemoryState, text: string): string {
 	}
 	return spanish >= 3 ? "es" : "en";
 }
+type StoreFactStringOptions = {
+	routeHeuristicCategories?: boolean;
+};
+
 export function storeFactStrings(
 	beam: BeamMemoryState,
 	facts: readonly string[],
 	messageIdx = 0,
 	sourceMemoryId: string | null = null,
 	importance = 0.7,
+	options: StoreFactStringOptions = {},
 ): number {
+	const routeHeuristicCategories = options.routeHeuristicCategories ?? true;
 	let stored = 0;
 	for (const fact of facts) {
 		insertFactRows(beam, messageIdx, "entity", "fact", fact, fact, importance, sourceMemoryId);
 		stored++;
+		if (!routeHeuristicCategories) continue;
 		const pref = /^The user (prefers|dislikes) (.+)$/i.exec(fact);
 		if (pref?.[2]) {
-			beam.db.run(
-				`INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-				[sourceSession(beam), messageIdx, fact, pref[2], null, fact, sourceMemoryId],
-			);
+			insertPreference(beam, messageIdx, fact, pref[2], sourceMemoryId);
 		}
 		const instruction = /^Instruction: (.+)$/i.exec(fact);
 		if (instruction?.[1]) {
-			beam.db.run(
-				`INSERT INTO memoria_instructions (session_id, message_idx, instruction, active, topic, context_snippet, source_memory_id)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-				[sourceSession(beam), messageIdx, instruction[1], 1, null, fact, sourceMemoryId],
-			);
+			insertInstruction(beam, messageIdx, instruction[1], fact, sourceMemoryId);
 		}
+	}
+	return stored;
+}
+
+/** Store category-preserving LLM extraction output in MEMORIA and KG tables. */
+export function storeExtractedFactCategories(
+	beam: BeamMemoryState,
+	extracted: ExtractedFactCategories,
+	messageIdx = 0,
+	sourceMemoryId: string | null = null,
+	importance = 0.7,
+): number {
+	let stored = storeFactStrings(beam, extracted.facts, messageIdx, sourceMemoryId, importance);
+	stored += storeFactStrings(beam, extracted.instructions, messageIdx, sourceMemoryId, importance, {
+		routeHeuristicCategories: false,
+	});
+	stored += storeFactStrings(beam, extracted.preferences, messageIdx, sourceMemoryId, importance, {
+		routeHeuristicCategories: false,
+	});
+	stored += storeFactStrings(beam, extracted.timelines, messageIdx, sourceMemoryId, importance, {
+		routeHeuristicCategories: false,
+	});
+	for (const instruction of extracted.instructions) {
+		insertInstruction(beam, messageIdx, instruction, instruction, sourceMemoryId);
+	}
+	for (const preference of extracted.preferences) {
+		insertPreference(beam, messageIdx, preference, null, sourceMemoryId);
+	}
+	for (const timeline of extracted.timelines) {
+		insertTimeline(beam, messageIdx, timelineDate(timeline), timeline, sourceMemoryId);
+	}
+	for (const triple of extracted.kg) {
+		insertKg(beam, messageIdx, triple.subject, triple.predicate, triple.object, sourceMemoryId);
 	}
 	return stored;
 }
@@ -411,18 +689,42 @@ export function extractAndStoreFacts(
 		decision: 0,
 	};
 	const text = String(content ?? "");
+	if (text.length > PATTERN_FACT_EXTRACTION_MAX_INPUT_CHARS) return counts;
 	for (const match of text.matchAll(
 		/(\d+(?:[.,]\d+)?)\s*(ms|sec|seconds?|minutes?|hours?|days?|weeks?|months?|%|KB|MB|GB|TB|rows?|columns?|roles?|features?|bugs?|commits?|cards?|users?|items?|tests?|APIs?|endpoints?|sprints?|tickets?)\b/gi,
 	)) {
 		const rawUnit = match[2] ?? "";
 		let unit = rawUnit.toLowerCase();
 		if (unit.endsWith("s") && !unit.endsWith("ms")) unit = unit.slice(0, -1);
-		const prefixWords = text
-			.slice(Math.max(0, (match.index ?? 0) - 50), match.index ?? 0)
+		// The naive fixed 50-char lookbehind can cross a markdown table cell, a code fence, or
+		// a sentence boundary and glue unrelated words into one underscore-joined key (e.g.
+		// "iam-role_smrx/sm-secrets_ssm-parameters_api" -> "2api" from a table row, or
+		// "cadence_90/60/5_30-_second" from a run-on list). Clamping the window to start after
+		// the nearest preceding structural boundary -- newline, table pipe, sentence-ending
+		// punctuation, or a backtick -- keeps the phrase within one cell/sentence/line, matching
+		// what a human would read as "the words right before this number" rather than 50 raw
+		// characters regardless of what they cross.
+		//
+		// A bare `.` is NOT always a sentence boundary: "v1.2", "3.14", "18.0.8" all contain
+		// dots that are part of a version/decimal number, not sentence punctuation. Only count
+		// `.`/`!`/`?` as a boundary when followed by whitespace or the end of the window -- i.e.
+		// it actually ends a sentence.
+		const windowStart = Math.max(0, (match.index ?? 0) - 50);
+		let window = text.slice(windowStart, match.index ?? 0);
+		const boundaryMatch = /\n|\||`|[.!?](?=\s|$)|;/g;
+		let lastBoundary = -1;
+		for (let m = boundaryMatch.exec(window); m; m = boundaryMatch.exec(window)) lastBoundary = m.index;
+		if (lastBoundary !== -1) window = window.slice(lastBoundary + 1);
+		const prefixWords = window
 			.replace(/`[^`]*`/g, " ")
 			.split(/\s+/)
-			.map(w => w.replace(/[.,:;!?()[\]"'`*_]/g, ""))
-			.filter(w => w.length > 2 && !/^(the|and|for|was|of|to|an?|in|on|at|by|is|are|has|had|not|but|or)$/i.test(w))
+			.map(w => w.replace(/[^\p{L}\p{N}-]/gu, ""))
+			.filter(
+				w =>
+					w.length > 2 &&
+					/\p{L}/u.test(w) &&
+					!/^(the|and|for|was|of|to|an?|in|on|at|by|is|are|has|had|not|but|or)$/i.test(w),
+			)
 			.slice(-3)
 			.join("_")
 			.toLowerCase();
@@ -453,9 +755,9 @@ export function extractAndStoreFacts(
 		}
 	}
 
-	for (const match of text.matchAll(/\b(v?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9.]+)?)\b/g)) {
+	for (const match of text.matchAll(VERSION_CANDIDATE)) {
 		const value = match[1] ?? "";
-		if (/^\d{4}-\d{2}$/.test(value)) continue;
+		if (!isVersionMention(text, value, match.index ?? 0)) continue;
 		insertFactRows(
 			beam,
 			messageIdx,
@@ -669,8 +971,8 @@ function extractKeySignal(content: string, maxChars: number): string {
 }
 
 function invalidateEpisodicVectors(beam: BeamMemoryState, memoryId: string): void {
-	beam.db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(memoryId);
-	beam.db.prepare("UPDATE episodic_memory SET binary_vector = NULL WHERE id = ?").run(memoryId);
+	beam.db.run("DELETE FROM memory_embeddings WHERE memory_id = ?", [memoryId]);
+	beam.db.run("UPDATE episodic_memory SET binary_vector = NULL WHERE id = ?", [memoryId]);
 }
 
 export function degradeEpisodic(beam: BeamMemoryState, dryRun = false): Record<string, JsonValue> {
@@ -801,7 +1103,7 @@ function eligibleWorkingRows(beam: BeamMemoryState, sessionId: string): Row[] {
 	return asRows(
 		beam.db
 			.query(
-				`SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity
+				`SELECT id, COALESCE(embed_text, content) AS content, source, timestamp, importance, metadata_json, scope, valid_until, veracity
 		 FROM working_memory
 		 WHERE COALESCE(session_id, 'default') = ? AND timestamp < ? AND consolidated_at IS NULL
 		 ORDER BY timestamp ASC LIMIT ?`,
@@ -849,26 +1151,34 @@ export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
 	const consolidatedIds: string[] = [];
 	let summariesCreated = 0;
 	for (const [source, items] of grouped) {
-		const lines = items.map(item => rowValue(item, "content") ?? "");
-		const ids = items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
-		let scope = "session";
-		let validUntil: string | null = null;
-		for (const item of items) {
-			if (rowValue(item, "scope") === "global") scope = "global";
-			const itemValidUntil = rowValue(item, "valid_until");
-			if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
+		for (const chunk of splitSleepItems(beam, source, items)) {
+			const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
+			let scope = "session";
+			let validUntil: string | null = null;
+			for (const item of chunk.items) {
+				if (rowValue(item, "scope") === "global") scope = "global";
+				const itemValidUntil = rowValue(item, "valid_until");
+				if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
+			}
+			const sleepSummary = buildSleepSummary(beam, source, chunk);
+			const metadata: Metadata = { original_count: chunk.items.length, source, llm_used: false };
+			if (sleepSummary.truncated) {
+				metadata.truncated = true;
+				metadata.original_chars = sleepSummary.originalChars;
+				metadata.max_chars = sleepSummary.maxChars;
+			}
+			const summary = sleepSummary.summary;
+			if (!dryRun) {
+				consolidateToEpisodic(beam, summary, ids, "sleep_consolidation", 0.6, {
+					scope,
+					validUntil,
+					veracity: aggregateEpisodicVeracity(chunk.items.map(item => rowValue(item, "veracity") ?? "unknown")),
+					metadata,
+				});
+			}
+			consolidatedIds.push(...ids);
+			summariesCreated++;
 		}
-		const summary = `[${source}] ${aaakEncode(lines.join(" | "))}`;
-		if (!dryRun) {
-			consolidateToEpisodic(beam, summary, ids, "sleep_consolidation", 0.6, {
-				scope,
-				validUntil,
-				veracity: aggregateEpisodicVeracity(items.map(item => rowValue(item, "veracity") ?? "unknown")),
-				metadata: { original_count: items.length, source, llm_used: false },
-			});
-		}
-		consolidatedIds.push(...ids);
-		summariesCreated++;
 	}
 	if (!dryRun) {
 		beam.db.run(

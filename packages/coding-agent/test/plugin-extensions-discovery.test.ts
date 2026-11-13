@@ -1,29 +1,46 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
-import { getAgentDir, getPluginsDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { __closeExtensionParseCacheForTests } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
+import { getAgentDir, getPluginsDir, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 const currentPiCodingAgentPath = Bun.resolveSync("@oh-my-pi/pi-coding-agent", import.meta.dir);
 const currentPiExtensionsPath = Bun.resolveSync("@oh-my-pi/pi-coding-agent/extensibility/extensions", import.meta.dir);
 
 describe("plugin extension discovery", () => {
 	let projectDir: TempDir;
-	let tempXdgDataHome = "";
-	let originalXdgDataHome: string | undefined;
+	let tempHome = "";
 	const originalAgentDir = getAgentDir();
+	const xdgVars = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
+	const originalXdg = new Map<string, string | undefined>();
 
 	beforeEach(() => {
 		projectDir = TempDir.createSync("@pi-plugin-ext-");
-		originalXdgDataHome = process.env.XDG_DATA_HOME;
-		tempXdgDataHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-data-"));
-		fs.mkdirSync(path.join(tempXdgDataHome, "omp"), { recursive: true });
-		process.env.XDG_DATA_HOME = tempXdgDataHome;
-		// Rebuild path caches after changing XDG env so plugin discovery resolves into the temp root.
-		setAgentDir(originalAgentDir);
+		// Redirect the whole config root to an isolated temp home so plugin discovery
+		// resolves into `<tempHome>/.omp/plugins` on every platform. Two things are needed:
+		//  - mock os.homedir() so configRoot = `<tempHome>/.omp` (the previous
+		//    XDG_DATA_HOME redirect was a no-op on Windows, where these tests then wrote
+		//    into and rm'd the developer's real `~/.omp/plugins`);
+		//  - clear the XDG_* vars, because on Linux/macOS the resolver prefers
+		//    `$XDG_DATA_HOME/omp` over the home config root when that dir exists, so an
+		//    XDG-migrated environment would otherwise still resolve the real plugins dir.
+		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-home-"));
+		for (const key of xdgVars) {
+			originalXdg.set(key, process.env[key]);
+			delete process.env[key];
+		}
+		spyOn(os, "homedir").mockReturnValue(tempHome);
+		setAgentDir(path.join(tempHome, ".omp", "agent"));
 
 		const pluginsDir = getPluginsDir();
+		// Safety gate: never write fixtures outside the temp home. This is the exact
+		// failure mode being fixed — a resolver/mock regression that resolves to the real
+		// ~/.omp must fail loudly here instead of clobbering the developer's plugins.
+		if (!pluginsDir.startsWith(tempHome + path.sep)) {
+			throw new Error(`plugin isolation failed: getPluginsDir() resolved outside the temp home: ${pluginsDir}`);
+		}
 		const pluginDir = path.join(pluginsDir, "node_modules", "@demo", "plugin");
 		fs.mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
 		fs.writeFileSync(
@@ -58,13 +75,17 @@ describe("plugin extension discovery", () => {
 
 	afterEach(() => {
 		projectDir.removeSync();
-		fs.rmSync(tempXdgDataHome, { recursive: true, force: true });
-		if (originalXdgDataHome === undefined) {
-			delete process.env.XDG_DATA_HOME;
-		} else {
-			process.env.XDG_DATA_HOME = originalXdgDataHome;
+		spyOn(os, "homedir").mockRestore();
+		for (const [key, value] of originalXdg) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
 		}
+		originalXdg.clear();
 		setAgentDir(originalAgentDir);
+		// The legacy Pi parse cache db lives under the temp home's `.omp/cache`;
+		// release it so Windows can delete the directory.
+		__closeExtensionParseCacheForTests();
+		removeSyncWithRetries(tempHome);
 	});
 
 	it("loads installed plugin extensions declared in package.json", async () => {
@@ -76,11 +97,46 @@ describe("plugin extension discovery", () => {
 		expect(extension?.commands.has("plugin-ext")).toBe(true);
 	});
 
+	it("loads installed plugin extensions that detach API methods", async () => {
+		const extensionPath = path.join(getPluginsDir(), "node_modules", "@demo", "plugin", "dist", "extension.ts");
+		fs.writeFileSync(
+			extensionPath,
+			`
+				export default function(pi) {
+					const onAny = pi.on;
+					onAny("auto_compaction_start", () => {});
+					const onEvent = pi.events.on;
+					const emitEvent = pi.events.emit;
+					const clearEvents = pi.events.clear;
+					let received;
+					onEvent("pi:model-adapter/register", payload => {
+						received = payload;
+					});
+					emitEvent("pi:model-adapter/register", { id: "gemini-acp" });
+					if (received?.id !== "gemini-acp") {
+						throw new Error("detached pi.events.emit/on did not deliver payload");
+					}
+					clearEvents();
+					emitEvent("pi:model-adapter/register", { id: "after-clear" });
+					if (received?.id !== "gemini-acp") {
+						throw new Error("detached pi.events.clear did not clear listeners");
+					}
+				}
+			`,
+		);
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+		const extension = result.extensions.find(ext => ext.path === extensionPath);
+
+		expect(result.errors).toHaveLength(0);
+		expect(extension?.handlers.get("auto_compaction_start")).toHaveLength(1);
+	});
+
 	it("loads installed legacy Pi plugin extensions from Windows drive-letter paths", async () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "legacy-pi-plugin");
 		const extensionPath = path.join(pluginDir, "dist", "extension.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(path.dirname(extensionPath), { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -143,7 +199,7 @@ describe("plugin extension discovery", () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "package-import-plugin");
 		const extensionPath = path.join(pluginDir, "src", "index.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(path.join(pluginDir, "src", "feature"), { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -201,7 +257,7 @@ describe("plugin extension discovery", () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "conditional-import-plugin");
 		const extensionPath = path.join(pluginDir, "src", "index.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(path.join(pluginDir, "node"), { recursive: true });
 		fs.mkdirSync(path.join(pluginDir, "import"), { recursive: true });
 		fs.writeFileSync(
@@ -263,7 +319,7 @@ describe("plugin extension discovery", () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "json-import-plugin");
 		const extensionPath = path.join(pluginDir, "src", "index.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(path.join(pluginDir, "src"), { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -312,7 +368,7 @@ describe("plugin extension discovery", () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "null-exact-import-plugin");
 		const extensionPath = path.join(pluginDir, "src", "index.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(path.join(pluginDir, "src"), { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -362,7 +418,7 @@ describe("plugin extension discovery", () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "null-conditional-import-plugin");
 		const extensionPath = path.join(pluginDir, "src", "index.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(path.join(pluginDir, "src"), { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -414,7 +470,7 @@ describe("plugin extension discovery", () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "side-effect-plugin");
 		const extensionPath = path.join(pluginDir, "src", "index.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(path.join(pluginDir, "src"), { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -494,7 +550,7 @@ describe("plugin extension discovery", () => {
 		const pluginDir = path.join(pluginsDir, "node_modules", "dir-entry-plugin");
 		const extensionDir = path.join(pluginDir, ".pi", "extensions", "dir-entry");
 		const extensionPath = path.join(extensionDir, "index.ts");
-		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
 		fs.mkdirSync(extensionDir, { recursive: true });
 		fs.writeFileSync(
 			path.join(pluginsDir, "package.json"),
@@ -533,5 +589,200 @@ describe("plugin extension discovery", () => {
 		expect(pluginError).toBeUndefined();
 		expect(extension).toBeDefined();
 		expect(extension?.commands.has("dir-entry-ext")).toBe(true);
+	});
+
+	it("loads installed plugin extensions whose manifest entry points at a directory of sub-extensions", async () => {
+		const pluginsDir = getPluginsDir();
+		const pluginDir = path.join(pluginsDir, "node_modules", "subdir-entry-plugin");
+		const extensionDir = path.join(pluginDir, "extensions", "feature");
+		const extensionPath = path.join(extensionDir, "index.ts");
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
+		fs.mkdirSync(extensionDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginsDir, "package.json"),
+			JSON.stringify({
+				name: "omp-plugins",
+				private: true,
+				dependencies: {
+					"subdir-entry-plugin": "1.0.0",
+				},
+			}),
+		);
+		fs.writeFileSync(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({
+				name: "subdir-entry-plugin",
+				version: "1.0.0",
+				pi: {
+					// Directory entry with no direct index — the loader must scan one
+					// level and pick up `extensions/<name>/index.ts` (pi package layout).
+					extensions: ["./extensions"],
+				},
+			}),
+		);
+		fs.writeFileSync(
+			extensionPath,
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("subdir-entry-ext", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+		const extension = result.extensions.find(ext => ext.path === extensionPath);
+		const pluginError = result.errors.find(err => err.path.includes("subdir-entry-plugin"));
+
+		expect(pluginError).toBeUndefined();
+		expect(extension).toBeDefined();
+		expect(extension?.commands.has("subdir-entry-ext")).toBe(true);
+	});
+
+	it("resolves a sub-extension directory via its own package.json manifest over a decoy index", async () => {
+		const pluginsDir = getPluginsDir();
+		const pluginDir = path.join(pluginsDir, "node_modules", "nested-manifest-plugin");
+		const featureDir = path.join(pluginDir, "extensions", "feature");
+		const realEntry = path.join(featureDir, "dist", "real-ext.ts");
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
+		fs.mkdirSync(path.dirname(realEntry), { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginsDir, "package.json"),
+			JSON.stringify({
+				name: "omp-plugins",
+				private: true,
+				dependencies: {
+					"nested-manifest-plugin": "1.0.0",
+				},
+			}),
+		);
+		fs.writeFileSync(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({
+				name: "nested-manifest-plugin",
+				version: "1.0.0",
+				pi: { extensions: ["./extensions"] },
+			}),
+		);
+		// Child package declares its real entry via its own manifest; the index.ts
+		// is a decoy that must NOT win (manifest takes precedence, like the -e scanner).
+		fs.writeFileSync(
+			path.join(featureDir, "package.json"),
+			JSON.stringify({ name: "feature-ext", version: "1.0.0", omp: { extensions: ["./dist/real-ext.ts"] } }),
+		);
+		fs.writeFileSync(
+			realEntry,
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("nested-manifest-ext", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+		fs.writeFileSync(
+			path.join(featureDir, "index.ts"),
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("decoy-index-ext", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+		const extension = result.extensions.find(ext => ext.path === realEntry);
+		const decoy = result.extensions.find(ext => ext.commands.has("decoy-index-ext"));
+		const pluginError = result.errors.find(err => err.path.includes("nested-manifest-plugin"));
+
+		expect(pluginError).toBeUndefined();
+		expect(extension).toBeDefined();
+		expect(extension?.commands.has("nested-manifest-ext")).toBe(true);
+		expect(decoy).toBeUndefined();
+	});
+
+	it("does not fall back to a decoy index when a sub-extension manifest declares a missing entry", async () => {
+		const pluginsDir = getPluginsDir();
+		const pluginDir = path.join(pluginsDir, "node_modules", "missing-decl-plugin");
+		const featureDir = path.join(pluginDir, "extensions", "feature");
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
+		fs.mkdirSync(featureDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginsDir, "package.json"),
+			JSON.stringify({
+				name: "omp-plugins",
+				private: true,
+				dependencies: {
+					"missing-decl-plugin": "1.0.0",
+				},
+			}),
+		);
+		fs.writeFileSync(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({
+				name: "missing-decl-plugin",
+				version: "1.0.0",
+				pi: { extensions: ["./extensions"] },
+			}),
+		);
+		// The child manifest is authoritative: it declares ./dist/real-ext.ts, which does
+		// not exist (e.g. unbuilt). The leftover index.ts must NOT be loaded as a fallback.
+		fs.writeFileSync(
+			path.join(featureDir, "package.json"),
+			JSON.stringify({ name: "feature-ext", version: "1.0.0", omp: { extensions: ["./dist/real-ext.ts"] } }),
+		);
+		fs.writeFileSync(
+			path.join(featureDir, "index.ts"),
+			[
+				"export default function(pi) {",
+				'\tpi.registerCommand("decoy-index-ext", { handler: async () => {} });',
+				"}",
+			].join("\n"),
+		);
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+		const decoy = result.extensions.find(ext => ext.commands.has("decoy-index-ext"));
+
+		expect(decoy).toBeUndefined();
+	});
+
+	it("skips .d.ts declaration files when scanning a flat extensions directory", async () => {
+		const pluginsDir = getPluginsDir();
+		const pluginDir = path.join(pluginsDir, "node_modules", "dts-plugin");
+		const extensionsDir = path.join(pluginDir, "extensions");
+		const moduleEntry = path.join(extensionsDir, "ext.js");
+		removeSyncWithRetries(path.join(pluginsDir, "node_modules"));
+		fs.mkdirSync(extensionsDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(pluginsDir, "package.json"),
+			JSON.stringify({
+				name: "omp-plugins",
+				private: true,
+				dependencies: {
+					"dts-plugin": "1.0.0",
+				},
+			}),
+		);
+		fs.writeFileSync(
+			path.join(pluginDir, "package.json"),
+			JSON.stringify({
+				name: "dts-plugin",
+				version: "1.0.0",
+				omp: { extensions: ["./extensions"] },
+			}),
+		);
+		fs.writeFileSync(
+			moduleEntry,
+			["export default function(pi) {", '\tpi.registerCommand("dts-ext", { handler: async () => {} });', "}"].join(
+				"\n",
+			),
+		);
+		// A sibling declaration file must be ignored — importing it would fail.
+		fs.writeFileSync(path.join(extensionsDir, "ext.d.ts"), "export default function (pi: unknown): void;\n");
+
+		const result = await discoverAndLoadExtensions([], projectDir.path());
+		const extension = result.extensions.find(ext => ext.path === moduleEntry);
+		const declaration = result.extensions.find(ext => ext.path.endsWith("ext.d.ts"));
+
+		expect(result.errors).toHaveLength(0);
+		expect(extension).toBeDefined();
+		expect(extension?.commands.has("dts-ext")).toBe(true);
+		expect(declaration).toBeUndefined();
 	});
 });

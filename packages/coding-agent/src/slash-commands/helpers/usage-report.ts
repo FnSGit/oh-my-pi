@@ -1,14 +1,17 @@
 import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { OAuthAccountIdentity } from "../../session/auth-storage";
+import { collapseSharedUsageReports, summarizeUsageResetCredits } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import type { SlashCommandRuntime } from "../types";
-import { reportMatchesActiveAccount } from "./active-oauth-account";
-import { formatDuration, renderAsciiBar } from "./format";
+import { formatCodexUsageReportLabel, reportMatchesActiveAccount } from "./active-oauth-account";
+import { formatCoarseDuration, formatProviderName, renderAsciiBar } from "@oh-my-pi/pi-tui/chrome/format";
 
-function formatProviderName(provider: string): string {
-	return provider
-		.split(/[-_]/g)
-		.map(part => (part ? part[0].toUpperCase() + part.slice(1) : ""))
-		.join(" ");
+function formatWindowSuffix(label: string, windowLabel: string | undefined): string {
+	if (!windowLabel) return "";
+	const normalizedLabel = label.toLowerCase();
+	const normalizedWindow = windowLabel.toLowerCase();
+	if (normalizedWindow === "quota window" || normalizedLabel.includes(normalizedWindow)) return "";
+	return ` — ${windowLabel}`;
 }
 
 function formatUsageAmount(limit: UsageLimit): string {
@@ -23,25 +26,42 @@ function formatUsageAmount(limit: UsageLimit): string {
 	return `${usedText}${remainingText}`;
 }
 
-function formatUsageReportAccount(report: UsageReport, limit: UsageLimit, index: number): string {
+function formatUsageReportAccount(
+	report: UsageReport,
+	peers: readonly UsageReport[],
+	limit: UsageLimit,
+	index: number,
+): string {
+	const codex = report.provider === "openai-codex";
+	const metaOrgName = report.metadata?.orgName;
+	const metaOrgId = report.metadata?.orgId;
+	const org = typeof metaOrgName === "string" && metaOrgName ? metaOrgName : metaOrgId;
+	const label = (identity: string, includeOrg: boolean): string => {
+		if (codex) return formatCodexUsageReportLabel(report, peers, identity);
+		return includeOrg && typeof org === "string" && org && org !== identity ? `${identity} (${org})` : identity;
+	};
 	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return email;
-	const accountId = report.metadata?.accountId ?? limit.scope.accountId;
-	if (typeof accountId === "string" && accountId) return accountId;
-	const projectId = report.metadata?.projectId ?? limit.scope.projectId;
-	if (typeof projectId === "string" && projectId) return projectId;
-	return `account ${index + 1}`;
+	if (typeof email === "string" && email) return label(email, true);
+	// Empty metadata must not hide a valid scoped identity.
+	const metaAccountId = report.metadata?.accountId;
+	const accountId = typeof metaAccountId === "string" && metaAccountId ? metaAccountId : limit.scope.accountId;
+	if (typeof accountId === "string" && accountId) return label(accountId, true);
+	const metaProjectId = report.metadata?.projectId;
+	const projectId = typeof metaProjectId === "string" && metaProjectId ? metaProjectId : limit.scope.projectId;
+	return label(typeof projectId === "string" && projectId ? projectId : `account ${index + 1}`, false);
 }
 
 function renderUsageReports(
 	reports: UsageReport[],
 	nowMs: number,
 	resolveActiveAccount?: (provider: string) => OAuthAccountIdentity | undefined,
+	usageModelSelectors: readonly string[] = [],
 ): string {
-	const latestFetchedAt = Math.max(...reports.map(report => report.fetchedAt ?? 0));
-	const lines = [`Usage${latestFetchedAt ? ` (${formatDuration(nowMs - latestFetchedAt)} ago)` : ""}`];
+	const displayReports = collapseSharedUsageReports(reports);
+	const latestFetchedAt = Math.max(...displayReports.map(report => report.fetchedAt ?? 0));
+	const lines = [`Usage${latestFetchedAt ? ` (${formatCoarseDuration(nowMs - latestFetchedAt)} ago)` : ""}`];
 	const grouped = new Map<string, UsageReport[]>();
-	for (const report of reports) {
+	for (const report of displayReports) {
 		const providerReports = grouped.get(report.provider) ?? [];
 		providerReports.push(report);
 		grouped.set(report.provider, providerReports);
@@ -51,39 +71,88 @@ function renderUsageReports(
 		left.localeCompare(right),
 	)) {
 		lines.push("", formatProviderName(provider));
+		const reportingModels = usageModelSelectors.filter(selector => selector.startsWith(`${provider}/`));
+		if (reportingModels.length > 0) {
+			lines.push("  Models with usage data");
+			for (const selector of reportingModels) lines.push(`    ${sanitizeText(selector)}`);
+		}
 		const activeAccount = resolveActiveAccount?.(provider);
+		// Provider-wide disclaimers render once per provider, not per limit.
+		const providerNotes = [...new Set(providerReports.flatMap(report => report.notes ?? []))];
+		for (const note of providerNotes)
+			lines.push(`  ${sanitizeText(note.replace(/[\r\n]+/g, " ").replace(/\t/g, "  "))}`);
 		for (const report of providerReports) {
 			const inUse = reportMatchesActiveAccount(report, activeAccount);
-			const savedResets = report.resetCredits?.availableCount ?? 0;
-			if (savedResets > 0) {
-				const resetLabel =
+			const resets = summarizeUsageResetCredits(report.resetCredits, nowMs);
+			if (resets && resets.bankedCount > 0) {
+				const resetIdentity =
 					typeof report.metadata?.email === "string"
 						? report.metadata.email
 						: typeof report.metadata?.accountId === "string"
 							? report.metadata.accountId
 							: "account";
+				let resetLabel: string;
+				if (report.provider === "openai-codex") {
+					resetLabel = formatCodexUsageReportLabel(report, providerReports, resetIdentity);
+				} else {
+					const orgName = report.metadata?.orgName;
+					const orgId = report.metadata?.orgId;
+					const org =
+						typeof orgName === "string" && orgName ? orgName : typeof orgId === "string" ? orgId : undefined;
+					const raw = org && org !== resetIdentity ? `${resetIdentity} (${org})` : resetIdentity;
+					resetLabel = sanitizeText(raw.replace(/[\r\n\t]+/g, " "));
+				}
+				const availability =
+					resets.redeemableCount === resets.bankedCount ? "available" : `${resets.redeemableCount} usable now`;
 				lines.push(
-					`- ${resetLabel}: ${savedResets} saved rate-limit reset${savedResets === 1 ? "" : "s"} available — /usage reset to spend`,
+					`- ${resetLabel}: ${resets.bankedCount} saved rate-limit reset${resets.bankedCount === 1 ? "" : "s"} — ${availability} — /usage reset to spend`,
 				);
+				if (resets.soonestExpiry) {
+					const expiryMs = Date.parse(resets.soonestExpiry);
+					const remaining = expiryMs - nowMs;
+					if (remaining > 0) {
+						lines.push(
+							`  soonest expires in ${formatCoarseDuration(remaining)} (${resets.soonestExpiry.slice(0, 10)})`,
+						);
+					} else {
+						lines.push(`  expired (${resets.soonestExpiry.slice(0, 10)})`);
+					}
+				}
+				if (resets.redeemableCount === 0 && resets.unavailableReason) {
+					const reason = sanitizeText(resets.unavailableReason.replace(/[\r\n\t]+/g, " "));
+					lines.push(`  unavailable: ${reason}`);
+				}
 			}
 			if (report.limits.length === 0) {
 				const email = typeof report.metadata?.email === "string" ? report.metadata.email : "account";
-				lines.push(`- ${email}: no limits reported`);
+				const label =
+					report.provider === "openai-codex" ? formatCodexUsageReportLabel(report, providerReports, email) : email;
+				lines.push(`- ${label}: no limits reported`);
 				continue;
 			}
 			for (let index = 0; index < report.limits.length; index++) {
 				const limit = report.limits[index]!;
 				const window = limit.window?.label ?? limit.scope.windowId;
-				const tier = limit.scope.tier ? ` (${limit.scope.tier})` : "";
-				lines.push(`- ${limit.label}${tier}${window ? ` — ${window}` : ""}`);
+				// Skip the tier suffix when the label already names it (e.g. Anthropic's
+				// "Claude 7 Day (Fable)" with scope.tier "fable") — mirrors limitTitle in usage-cli.
+				const tier =
+					limit.scope.tier && !limit.label.toLowerCase().includes(limit.scope.tier.toLowerCase())
+						? ` (${limit.scope.tier})`
+						: "";
+				lines.push(`- ${limit.label}${tier}${formatWindowSuffix(limit.label, window)}`);
 				lines.push(
-					`  ${formatUsageReportAccount(report, limit, index)}: ${formatUsageAmount(limit)}${inUse ? "  ← in use by this session" : ""}`,
+					`  ${formatUsageReportAccount(report, providerReports, limit, index)}: ${formatUsageAmount(limit)}${inUse ? "  ← in use by this session" : ""}`,
 				);
 				lines.push(`  ${renderAsciiBar(limit.amount.usedFraction)}`);
 				if (limit.window?.resetsAt && limit.window.resetsAt > nowMs) {
-					lines.push(`  resets in ${formatDuration(limit.window.resetsAt - nowMs)}`);
+					lines.push(
+						`  ${limit.window.resetLabel ?? "resets"} in ${formatCoarseDuration(limit.window.resetsAt - nowMs)}`,
+					);
 				}
-				if (limit.notes && limit.notes.length > 0) lines.push(`  ${limit.notes.join(" • ")}`);
+				if (limit.notes && limit.notes.length > 0)
+					lines.push(
+						`  ${limit.notes.map(n => sanitizeText(n.replace(/[\r\n]+/g, " ").replace(/\t/g, "  "))).join(" • ")}`,
+					);
 			}
 		}
 	}
@@ -98,30 +167,35 @@ function renderUsageReports(
 export async function buildUsageReportText(runtime: SlashCommandRuntime): Promise<string> {
 	const provider = runtime.session as SlashCommandRuntime["session"] & {
 		fetchUsageReports?: () => Promise<UsageReport[] | null>;
+		getUsageReportingModelSelectors?: (reports: readonly UsageReport[]) => string[];
 	};
 	if (provider.fetchUsageReports) {
 		const reports = await provider.fetchUsageReports();
 		if (reports && reports.length > 0) {
 			const currentProvider = runtime.session.model?.provider;
 			const activeAccount = currentProvider
-				? runtime.session.modelRegistry.authStorage.getOAuthAccountIdentity(
-						currentProvider,
-						runtime.session.sessionId,
-					)
+				? runtime.session.modelRegistry.authStorage.oauth.identity(currentProvider, runtime.session.sessionId)
 				: undefined;
-			return renderUsageReports(reports, Date.now(), providerId =>
-				providerId === currentProvider ? activeAccount : undefined,
+			const usageModelSelectors = provider.getUsageReportingModelSelectors?.(reports) ?? [];
+			return renderUsageReports(
+				reports,
+				Date.now(),
+				providerId => (providerId === currentProvider ? activeAccount : undefined),
+				usageModelSelectors,
 			);
 		}
 	}
 
 	const stats = runtime.session.sessionManager.getUsageStatistics();
+	const orchestrationTokens = stats.orchestrationInput + stats.orchestrationOutput + stats.orchestrationCacheRead;
 	return [
 		"Usage",
 		`Input tokens: ${stats.input}`,
 		`Output tokens: ${stats.output}`,
 		`Cache read tokens: ${stats.cacheRead}`,
 		`Cache write tokens: ${stats.cacheWrite}`,
+		`Total tokens: ${stats.totalTokens}`,
+		...(orchestrationTokens > 0 ? [`Orchestration tokens: ${orchestrationTokens}`] : []),
 		`Premium requests: ${stats.premiumRequests}`,
 		`Cost: $${stats.cost.toFixed(6)}`,
 	].join("\n");

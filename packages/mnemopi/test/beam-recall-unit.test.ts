@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { factRecall, formatContext, recall, recallEnhanced } from "@oh-my-pi/pi-mnemopi/core/beam/recall";
+import { currentEmbeddingModel } from "@oh-my-pi/pi-mnemopi/core/embeddings";
 import { initBeam } from "@oh-my-pi/pi-mnemopi/core/beam/schema";
+import { invalidate } from "@oh-my-pi/pi-mnemopi/core/beam/store";
 import type { BeamMemoryState } from "@oh-my-pi/pi-mnemopi/core/beam/types";
+import { currentLoopPhase } from "@oh-my-pi/pi-utils";
 
 type TestBeam = BeamMemoryState & { close(): void };
 
@@ -33,6 +36,7 @@ function makeBeam(): TestBeam {
 			importanceWeight: 0.2,
 			useCloud: false,
 			localLlmEnabled: false,
+			maxEpisodeChars: 100_000,
 		},
 		close() {
 			db.close();
@@ -85,6 +89,156 @@ function insertEpisodic(
 }
 
 describe("beam recall free functions", () => {
+	it("does not crowd an older shared identifier out with recent substring-only project hits", async () => {
+		const shared = makeBeam();
+		const project = makeBeam();
+		insertWorking(shared, "account-rule", "Use the personal 1Password account for credentials.", {
+			timestamp: "2026-05-23T12:00:00.000Z",
+			importance: 0.75,
+		});
+		shared.db.run("UPDATE working_memory SET veracity = 'tool' WHERE id = 'account-rule'");
+		insertWorking(project, "gate-status", "The qualification gates pass with green checks.", { importance: 0.75 });
+		insertWorking(project, "word-choice", "Keep the word concise in the summary.", { importance: 0.75 });
+		for (const [beam, ids] of [
+			[shared, ["account-rule"]],
+			[project, ["gate-status", "word-choice"]],
+		] as const) {
+			for (const id of ids) {
+				beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, ?)", [
+					id,
+					JSON.stringify([0.5, Math.sqrt(0.75)]),
+					currentEmbeddingModel(),
+				]);
+			}
+		}
+		const options = { queryEmbedding: [1, 0], queryTime: "2026-05-30T12:00:00.000Z", updateRecallCounts: false };
+		const sharedHits = await recallEnhanced(shared, "1Password", 2, options);
+		const projectHits = await recallEnhanced(project, "1Password", 2, options);
+		const merged = [...sharedHits, ...projectHits].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, 2);
+		expect(merged.map(result => result.id)).toEqual(["account-rule"]);
+	});
+
+	it("rejects substring-only lexical matches in either direction and across phrase boundaries", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "substring", "A predisposition to word games about bobcat dogma.");
+		for (const query of ["redis", "password", "cat dog"]) {
+			expect(await recall(beam, query, 5, { queryEmbedding: null })).toEqual([]);
+		}
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, confidence) VALUES ('noise', 's1', 'entity', 'fact', 'A predisposition to word games.', 1)",
+		);
+		expect(factRecall(beam, "redis", 5)).toEqual([]);
+	});
+
+	it("reports its synchronous ranking to the loop watchdog as mnemopi.recall", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "build", "The build succeeded.");
+
+		const query = beam.db.query.bind(beam.db);
+		const phases: (string | undefined)[] = [];
+		const spy = spyOn(beam.db, "query").mockImplementation(((...args: Parameters<typeof beam.db.query>) => {
+			phases.push(currentLoopPhase());
+			return query(...args);
+		}) as typeof beam.db.query);
+		try {
+			await recall(beam, "build", 5, { queryEmbedding: null });
+		} finally {
+			spy.mockRestore();
+		}
+
+		expect(phases.length).toBeGreaterThan(0);
+		expect(phases.every(phase => phase === "mnemopi.recall")).toBe(true);
+		expect(currentLoopPhase()).toBeUndefined();
+	});
+
+	it("labels every default-linear enhanced recall-count update with facts included", async () => {
+		const beam = makeBeam();
+		beam.config.polyphonicRecall = false;
+		beam.config.enhancedRecall = false;
+		insertWorking(beam, "build", "The build succeeded.");
+		insertEpisodic(beam, "build-runbook", "The build rollback plan is in the runbook.");
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, confidence) VALUES ('build-fact', 's1', 'build', 'status', 'succeeded', 1)",
+		);
+		const run = beam.db.run.bind(beam.db);
+		const phases: (string | undefined)[] = [];
+		const spy = spyOn(beam.db, "run").mockImplementation(((sql: string, ...params: unknown[]) => {
+			phases.push(currentLoopPhase());
+			return run(sql, ...(params as []));
+		}) as typeof beam.db.run);
+		try {
+			const results = await recallEnhanced(beam, "build", 5, {
+				includeFacts: true,
+				queryEmbedding: null,
+				useCache: false,
+			});
+			expect(results.map(result => result.id)).toContain("build");
+			expect(results.map(result => result.id)).toContain("build-runbook");
+			expect(results.some(result => result.tier_label === "fact")).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
+
+		expect(phases.length).toBeGreaterThan(0);
+		expect(phases.every(phase => phase === "mnemopi.recall")).toBe(true);
+		expect(currentLoopPhase()).toBeUndefined();
+	});
+
+	it("keeps compound synonym aliases and queried identifiers intact", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "generic-data", "Raw data is retained for the audit.");
+		insertWorking(beam, "generic-build", "The build succeeded.");
+		expect(await recall(beam, "database", 5, { queryEmbedding: null })).toEqual([]);
+		expect(await recall(beam, "build_id", 5, { queryEmbedding: null })).toEqual([]);
+		insertWorking(beam, "compound-alias", "The data_store persists records.");
+		insertWorking(beam, "compound-id", "The build_id is recorded.");
+		expect((await recall(beam, "database", 5, { queryEmbedding: null })).map(result => result.id)).toEqual([
+			"compound-alias",
+		]);
+		expect((await recall(beam, "build_id", 5, { queryEmbedding: null })).map(result => result.id)).toEqual([
+			"compound-id",
+		]);
+	});
+
+	it("matches other forms of a query word but not longer words that merely start with it", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "backups", "Nightly backups run at 03:00.");
+		insertWorking(beam, "deployment", "The deployment finished yesterday.");
+		insertWorking(beam, "cache", "Clear the cache before the benchmark.");
+		insertWorking(beam, "story", "The story covers the login flow.");
+		insertWorking(beam, "fact", "One fact about the nightly job.");
+		insertWorking(beam, "fragments", "We will be back tomorrow; the gates pass; redistribution is paused.");
+		const ids = async (query: string) =>
+			(await recall(beam, query, 5, { queryEmbedding: null })).map(result => result.id);
+		expect(await ids("backup")).toEqual(["backups"]);
+		expect(await ids("deploy")).toEqual(["deployment"]);
+		expect(await ids("caching")).toEqual(["cache"]);
+		expect(await ids("stories")).toEqual(["story"]);
+		expect(await ids("facts")).toEqual(["fact"]);
+		for (const query of ["passwords", "passport", "redis", "background"]) {
+			expect(await ids(query)).toEqual([]);
+		}
+	});
+
+	it("preserves synonym and semantic-only recall without substring lexical evidence", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "synonym", "The datastore retains customer records.");
+		expect((await recall(beam, "database", 5, { queryEmbedding: null })).map(result => result.id)).toContain(
+			"synonym",
+		);
+		insertWorking(beam, "identifier", "telemetry_api_latency_ms stays below the threshold.");
+		expect((await recall(beam, "telemetry latency", 5, { queryEmbedding: null })).map(result => result.id)).toEqual([
+			"identifier",
+		]);
+		insertWorking(beam, "semantic", "The vault selects the personal login.");
+		beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES ('semantic', '[1,0]', ?)", [
+			currentEmbeddingModel(),
+		]);
+		expect((await recall(beam, "1Password", 5, { queryEmbedding: [1, 0] })).map(result => result.id)).toEqual([
+			"semantic",
+		]);
+	});
+
 	it("orders deterministic FTS-only working-memory hits by lexical strength", async () => {
 		const beam = makeBeam();
 		insertWorking(beam, "wm-weak", "banana appears once beside unrelated notes");
@@ -113,6 +267,28 @@ describe("beam recall free functions", () => {
 		expect(results.map(result => result.id)).toContain("wm-deploy");
 		expect(results.map(result => result.id)).toContain("em-deploy");
 		expect(new Set(results.map(result => result.tier_label))).toEqual(new Set(["working", "episodic"]));
+	});
+
+	it("keeps global episodic rows visible when a channelId filter is active while still isolating other channels", async () => {
+		const beam = makeBeam();
+		// Global row with channel_id NULL — the shape produced by importFromDict()
+		// and by any cross-channel/global memory. Must survive a channelId filter.
+		insertEpisodic(beam, "em-global", "quokka migration protocol uses base64 snapshots");
+		// Non-global row owned by a different channel/session — must stay hidden.
+		beam.db.run(
+			"INSERT INTO episodic_memory (id, content, source, timestamp, session_id, importance, scope, channel_id, veracity, memory_type) VALUES ('em-other-channel', 'quokka migration protocol for team beta', 'test', ?, 'other-session', 0.5, 'session', 'other-bank', 'unknown', 'general')",
+			["2026-05-30T12:00:00.000Z"],
+		);
+
+		const results = await recall(beam, "quokka migration protocol", 5, {
+			queryTime: "2026-05-30T12:00:00.000Z",
+			channelId: "project-bank",
+			includeWorking: false,
+		});
+
+		const ids = results.map(result => result.id);
+		expect(ids).toContain("em-global");
+		expect(ids).not.toContain("em-other-channel");
 	});
 
 	it("boosts memories near the requested temporal target", async () => {
@@ -179,6 +355,22 @@ describe("beam recall free functions", () => {
 		expect(results.map(result => result.id)).not.toContain("wm-other");
 	});
 
+	it("preserves lexical-strength ordering for repeated spaceless CJK words", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "cjk-once", "数据库密码已轮换");
+		insertWorking(beam, "cjk-repeat", "数据库数据库数据库数据库密码");
+		const results = await recall(beam, "数据库", 5, {
+			queryEmbedding: null,
+			queryTime: "2026-05-30T12:00:00.000Z",
+			vecWeight: 1,
+			ftsWeight: 0,
+			importanceWeight: 0,
+		});
+		expect(results.find(result => result.id === "cjk-repeat")?.score ?? 0).toBeGreaterThan(
+			results.find(result => result.id === "cjk-once")?.score ?? 1,
+		);
+	});
+
 	it("does not retry scoped recall without the session filter when only another session matches", async () => {
 		const beam = makeBeam();
 		insertWorking(beam, "wm-private-other", "orion marker lives only in the other private session", {
@@ -235,6 +427,160 @@ describe("beam recall free functions", () => {
 		expect(results[0]?.content).toBe("postgres database");
 		expect(results[0]?.fact_id).toBe("fact-1");
 		expect(results[0]?.subject).toBe("service");
+	});
+
+	it("keeps exact fact hits for conversational questions", () => {
+		const beam = makeBeam();
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-name", beam.sessionId, "name", "is", "Alice", "2026-05-30T00:00:00.000Z", 0.95],
+		);
+
+		const results = factRecall(beam, "what do you know about my name", 3);
+
+		expect(results[0]?.fact_id).toBe("fact-name");
+		expect(results[0]?.content).toBe("Alice");
+	});
+
+	it("scores exact fact hits above filler-heavy working memories", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "wm-filler", "could you remind me about my old onboarding checklist", { importance: 1.0 });
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-name", beam.sessionId, "name", "is", "Alice", "2026-05-30T00:00:00.000Z", 0.95],
+		);
+		const results = await recallEnhanced(beam, "could you remind me about my name", 1, {
+			includeFacts: true,
+			queryEmbedding: null,
+			useMmr: false,
+		});
+
+		expect(results[0]?.id).toBe("fact-name");
+	});
+
+	it("treats current-intent words as optional fact-query scaffolding", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "wm-current", "my current name profile is stale", { importance: 1.0 });
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-name", beam.sessionId, "name", "called", "Alice", "2026-05-30T00:00:00.000Z", 0.1],
+		);
+
+		const results = await recallEnhanced(beam, "what my current name", 1, {
+			includeFacts: true,
+			queryEmbedding: null,
+			useMmr: false,
+		});
+
+		expect(results[0]?.id).toBe("fact-name");
+	});
+
+	it("strips clitic fragments before scoring conversational fact queries", async () => {
+		const beam = makeBeam();
+		insertWorking(beam, "wm-clitic", "what s my name onboarding checklist", { importance: 1.0 });
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-name", beam.sessionId, "name", "called", "Eve", "2026-05-30T00:00:00.000Z", 0.1],
+		);
+
+		const results = await recallEnhanced(beam, "what's my name", 1, {
+			includeFacts: true,
+			queryEmbedding: null,
+			useMmr: false,
+		});
+
+		expect(results[0]?.id).toBe("fact-name");
+	});
+
+	it("preserves stop-word-looking entity tokens when scoring facts", async () => {
+		const beam = makeBeam();
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-may", beam.sessionId, "May", "birthday", "June 1", "2026-05-30T00:00:00.000Z", 0.1],
+		);
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-bob", beam.sessionId, "Bob", "birthday", "June 2", "2026-05-30T00:00:00.000Z", 1.0],
+		);
+
+		const results = await recallEnhanced(beam, "May birthday", 1, {
+			includeFacts: true,
+			queryEmbedding: null,
+			useMmr: false,
+		});
+
+		expect(results[0]?.id).toBe("fact-may");
+	});
+
+	it("preserves matching two-letter fact entities when scoring facts", async () => {
+		const beam = makeBeam();
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-us", beam.sessionId, "US", "timezone", "Eastern", "2026-05-30T00:00:00.000Z", 0.1],
+		);
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-eu", beam.sessionId, "EU", "timezone", "Central European", "2026-05-30T00:00:00.000Z", 1.0],
+		);
+
+		const results = await recallEnhanced(beam, "US timezone", 1, {
+			includeFacts: true,
+			queryEmbedding: null,
+			useMmr: false,
+		});
+
+		expect(results[0]?.id).toBe("fact-us");
+	});
+
+	it("does not preserve filler tokens through substring matches", async () => {
+		const beam = makeBeam();
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-my", beam.sessionId, "my", "birthday", "June 1", "2026-05-30T00:00:00.000Z", 0.1],
+		);
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			["fact-amy", beam.sessionId, "Amy", "birthday", "June 2", "2026-05-30T00:00:00.000Z", 1.0],
+		);
+
+		const results = await recallEnhanced(beam, "what is my birthday", 1, {
+			includeFacts: true,
+			queryEmbedding: null,
+			useMmr: false,
+		});
+
+		expect(results[0]?.id).toBe("fact-my");
+	});
+
+	it("keeps exact working-memory hits above weak matching facts in enhanced recall", async () => {
+		const beam = makeBeam();
+		insertWorking(
+			beam,
+			"wm-quasar",
+			"MNEMOPI FULL PIPELINE TEST 20260613: The user Verge prefers OMP memory to run at full power. Unique entity QuasarOtter owns SignalPineapple and uses RecallEngine-Seven.",
+		);
+		beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			[
+				"fact-generic",
+				beam.sessionId,
+				"Instruction",
+				"states",
+				"always trigger the user stop sequence in mnemopi's callRemoteLlm test",
+				"2026-05-30T00:00:00.000Z",
+				1.0,
+			],
+		);
+
+		const results = await recallEnhanced(
+			beam,
+			"QuasarOtter SignalPineapple RecallEngine-Seven MNEMOPI FULL PIPELINE TEST 20260613",
+			3,
+			{ includeFacts: true, queryEmbedding: null, useMmr: false },
+		);
+
+		expect(results[0]?.id).toBe("wm-quasar");
+		expect(results.map(result => result.id)).toContain("fact-generic");
 	});
 
 	it("filters fact recall to same-session facts plus explicitly global facts", () => {
@@ -302,5 +648,83 @@ describe("beam recall free functions", () => {
 		expect(results[0]?.id).toBeTruthy();
 		expect(typeof results[0]?.score).toBe("number");
 		expect(results[0]?.explanation).toBeTruthy();
+	});
+
+	it("clips long content with a trailing ellipsis and reports the original length (issue #4443)", async () => {
+		const beam = makeBeam();
+		const head = "Decision record: the deploy pipeline uses blue-green cutover. ";
+		const body = "Detail sentence about rollout invariants. ".repeat(20);
+		const tail = "CRITICAL-TAIL: rollback requires restoring the previous DNS weight map first.";
+		const full = `${head}${body}${tail}`;
+		insertWorking(beam, "wm-long", full, { importance: 0.9 });
+
+		const results = await recall(beam, "deploy pipeline blue-green cutover", 5);
+		const hit = results.find(row => row.id === "wm-long");
+		expect(hit).toBeDefined();
+		expect(hit?.truncated).toBe(true);
+		expect(hit?.full_length).toBe(full.length);
+		expect(hit?.content.length).toBe(500);
+		expect(hit?.content.endsWith("…")).toBe(true);
+		expect(hit?.content.includes("CRITICAL-TAIL")).toBe(false);
+	});
+
+	it("returns short content untouched with truncated=false", async () => {
+		const beam = makeBeam();
+		const short = "quick working note that fits well under the preview cap";
+		insertWorking(beam, "wm-short", short);
+
+		const results = await recall(beam, "quick working note preview cap", 5);
+		const hit = results.find(row => row.id === "wm-short");
+		expect(hit).toBeDefined();
+		expect(hit?.truncated).toBe(false);
+		expect(hit?.full_length).toBe(short.length);
+		expect(hit?.content).toBe(short);
+	});
+
+	it("honours a caller-supplied contentPreviewChars cap and disables clipping when 0", async () => {
+		const beam = makeBeam();
+		const long = "long ".repeat(400).trim();
+		insertWorking(beam, "wm-cap", long);
+
+		const capped = await recall(beam, "long", 3, { contentPreviewChars: 40 });
+		const cappedHit = capped.find(row => row.id === "wm-cap");
+		expect(cappedHit?.content.length).toBe(40);
+		expect(cappedHit?.content.endsWith("…")).toBe(true);
+		expect(cappedHit?.full_length).toBe(long.length);
+
+		const full = await recall(beam, "long", 3, { contentPreviewChars: 0 });
+		const fullHit = full.find(row => row.id === "wm-cap");
+		expect(fullHit?.content).toBe(long);
+		expect(fullHit?.truncated).toBe(false);
+	});
+});
+
+describe("fact recall respects source lifecycle", () => {
+	it("hides a fact once its source row is superseded or expired, keeps sourceless facts visible", () => {
+		const beam = makeBeam();
+		const stale = new Date(Date.now() - 60_000).toISOString();
+		const insertFact = (factId: string, object: string, sourceMsgId: string | null): void => {
+			beam.db.run(
+				"INSERT INTO facts (fact_id, session_id, subject, predicate, object, timestamp, confidence, source_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				[factId, beam.sessionId, "release process", "uses", object, "2026-05-30T00:00:00.000Z", 0.8, sourceMsgId],
+			);
+		};
+
+		insertWorking(beam, "src-live", "release process uses canary", { importance: 0.6 });
+		insertFact("fact-live", "canary", "src-live");
+		insertWorking(beam, "src-expired", "release process uses bluegreen", { importance: 0.6 });
+		beam.db.run("UPDATE working_memory SET valid_until = ? WHERE id = ?", [stale, "src-expired"]);
+		insertFact("fact-expired", "bluegreen", "src-expired");
+		insertFact("fact-orphan", "orphan", null);
+
+		const before = factRecall(beam, "release process uses", 10).map(row => row.fact_id);
+		expect(before).toContain("fact-live");
+		expect(before).toContain("fact-orphan");
+		expect(before).not.toContain("fact-expired");
+
+		expect(invalidate(beam, "src-live", "src-live-v2")).toBe(true);
+		const after = factRecall(beam, "release process uses", 10).map(row => row.fact_id);
+		expect(after).not.toContain("fact-live");
+		expect(after).toContain("fact-orphan");
 	});
 });

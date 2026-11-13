@@ -20,38 +20,13 @@ import { parseArgs } from "node:util";
 import { countTokens, Encoding } from "@oh-my-pi/pi-natives";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { loadBundledAgents } from "../packages/coding-agent/src/task/agents";
+import { isReadOnlyAgent } from "../packages/coding-agent/src/task/read-only-policy";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 const TOOL_PROMPT_DIR = path.join(REPO_ROOT, "packages/coding-agent/src/prompts/tools");
 const DEFAULT_READ_LIMIT = "300";
 const DEFAULT_MAX_LINES = "3000";
 const DEFAULT_MAX_CONCURRENCY = 32;
-
-// Mirrors the task prompt's READ-ONLY badge semantics without importing the
-// whole task tool module just to render a static estimate.
-const READ_ONLY_TOOL_NAMES: Record<string, true> = {
-	ask: true,
-	ast_grep: true,
-	checkpoint: true,
-	find: true,
-	inspect_image: true,
-	irc: true,
-	job: true,
-	memory_edit: true,
-	read: true,
-	recall: true,
-	reflect: true,
-	render_mermaid: true,
-	report_finding: true,
-	resolve: true,
-	retain: true,
-	rewind: true,
-	search: true,
-	search_tool_bm25: true,
-	todo: true,
-	web_search: true,
-	yield: true,
-};
 
 interface AgentPromptRow {
 	name: string;
@@ -87,7 +62,7 @@ function parseEncoding(value: string | undefined): Encoding {
 	const normalized = value.toLowerCase().replace(/-/g, "_");
 	if (normalized === "o200k" || normalized === "o200k_base") return Encoding.O200kBase;
 	if (normalized === "cl100k" || normalized === "cl100k_base") return Encoding.Cl100kBase;
-	throw new Error(`Unknown encoding \"${value}\". Expected o200k_base or cl100k_base.`);
+	throw new Error(`Unknown encoding "${value}". Expected o200k_base or cl100k_base.`);
 }
 
 function parseCli(): CliOptions | null {
@@ -117,7 +92,9 @@ function relativePath(filePath: string): string {
 
 async function collectPromptPaths(positionals: readonly string[]): Promise<string[]> {
 	if (positionals.length === 0) {
-		const files = await Array.fromAsync(new Bun.Glob("*.md").scan({ cwd: TOOL_PROMPT_DIR, absolute: true, onlyFiles: true }));
+		const files = await Array.fromAsync(
+			new Bun.Glob("*.md").scan({ cwd: TOOL_PROMPT_DIR, absolute: true, onlyFiles: true }),
+		);
 		return files.sort((a, b) => relativePath(a).localeCompare(relativePath(b)));
 	}
 
@@ -139,14 +116,11 @@ async function collectPromptPaths(positionals: readonly string[]): Promise<strin
 }
 
 function bundledAgents(): AgentPromptRow[] {
-	return loadBundledAgents().map(agent => {
-		const tools = agent.tools ?? [];
-		return {
-			name: agent.name,
-			description: agent.description,
-			readOnly: tools.length > 0 && tools.every(tool => READ_ONLY_TOOL_NAMES[tool] === true),
-		};
-	});
+	return loadBundledAgents().map(agent => ({
+		name: agent.name,
+		description: agent.description,
+		readOnly: isReadOnlyAgent(agent),
+	}));
 }
 
 function renderContext(): Record<string, unknown> {
@@ -203,8 +177,6 @@ function renderContext(): Record<string, unknown> {
 	};
 }
 
-
-
 async function estimatePrompt(filePath: string, encoding: Encoding): Promise<PromptEstimate> {
 	const template = await Bun.file(filePath).text();
 	const rendered = prompt.render(template, renderContext());
@@ -222,7 +194,11 @@ function printTable(estimates: PromptEstimate[], encoding: Encoding): void {
 	const totalTokens = rows.reduce((sum, row) => sum + row.tokens, 0);
 	const totalChars = rows.reduce((sum, row) => sum + row.chars, 0);
 	const totalLines = rows.reduce((sum, row) => sum + row.lines, 0);
-	const tokenWidth = Math.max("tokens".length, String(totalTokens).length, ...rows.map(row => String(row.tokens).length));
+	const tokenWidth = Math.max(
+		"tokens".length,
+		String(totalTokens).length,
+		...rows.map(row => String(row.tokens).length),
+	);
 	const charWidth = Math.max("chars".length, String(totalChars).length, ...rows.map(row => String(row.chars).length));
 	const lineWidth = Math.max("lines".length, String(totalLines).length, ...rows.map(row => String(row.lines).length));
 
@@ -238,7 +214,9 @@ function printTable(estimates: PromptEstimate[], encoding: Encoding): void {
 		);
 	}
 	console.log(`${"-".repeat(tokenWidth)}  ${"-".repeat(charWidth)}  ${"-".repeat(lineWidth)}  ${"-".repeat(6)}`);
-	console.log(`${String(totalTokens).padStart(tokenWidth)}  ${String(totalChars).padStart(charWidth)}  ${String(totalLines).padStart(lineWidth)}  TOTAL (${rows.length} prompts)`);
+	console.log(
+		`${String(totalTokens).padStart(tokenWidth)}  ${String(totalChars).padStart(charWidth)}  ${String(totalLines).padStart(lineWidth)}  TOTAL (${rows.length} prompts)`,
+	);
 }
 
 async function run(): Promise<void> {

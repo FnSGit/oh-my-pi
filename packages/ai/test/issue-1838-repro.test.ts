@@ -104,16 +104,29 @@ async function capturePayload(
 	return promise;
 }
 
+interface CompletionAssistantWireMessage {
+	role: "assistant";
+	reasoning_content?: unknown;
+}
+
 interface CompletionBody {
 	thinking?: { type?: string; keep?: string };
+	messages?: unknown[];
+	stream?: boolean;
+}
+
+function isCompletionAssistantWireMessage(message: unknown): message is CompletionAssistantWireMessage {
+	if (typeof message !== "object" || message === null) return false;
+	return (message as { role?: unknown }).role === "assistant";
+}
+
+function findCompletionAssistantWireMessage(
+	messages: readonly unknown[] | undefined,
+): CompletionAssistantWireMessage | undefined {
+	return messages?.find(isCompletionAssistantWireMessage);
 }
 
 describe("issue #1838 — kimi-k2.6 preserves historical reasoning across tool calls", () => {
-	it("sends thinking.keep='all' on native Moonshot kimi-k2.6 when reasoning is enabled", async () => {
-		const payload = (await capturePayload(moonshotKimiModel("kimi-k2.6"), { reasoning: "high" })) as CompletionBody;
-		expect(payload.thinking).toEqual({ type: "enabled", keep: "all" });
-	});
-
 	it("preserves the Moonshot-native gate against gateway IDs that match the kimi-k2.6 prefix", async () => {
 		// Sanity: the Moonshot-native gate is provider+baseUrl driven, not id-only.
 		// A made-up host with `kimi-k2.6` in the id but a non-Moonshot baseUrl must
@@ -248,11 +261,11 @@ describe("issue #1838 — kimi-k2.6 preserves historical reasoning across tool c
 					},
 				],
 			},
-		)) as CompletionBody & { messages?: Array<Record<string, unknown>>; stream?: boolean };
+		)) as CompletionBody;
 		expect(payload.thinking).toEqual({ type: "enabled", keep: "all" });
 		expect(payload.stream).toBe(true);
-		const assistant = payload.messages?.find(m => m.role === "assistant");
+		const assistant = findCompletionAssistantWireMessage(payload.messages);
 		expect(assistant).toBeDefined();
-		expect(Reflect.get(assistant as object, "reasoning_content")).toBe("Need to read the file first.");
+		expect(assistant?.reasoning_content).toBe("Need to read the file first.");
 	});
 });

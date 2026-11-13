@@ -16,11 +16,11 @@
  * requires when tool history is present.
  */
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import type { AssistantMessage, Context, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { z } from "zod/v4";
 
 function abortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -78,7 +78,7 @@ function assistantWithToolCall(): AssistantMessage {
 const echoTool: Tool = {
 	name: "echo",
 	description: "Echo input",
-	parameters: z.object({ text: z.string() }),
+	parameters: type({ text: "string" }),
 };
 
 describe("issue #1227 — /btw fails on LiteLLM→Bedrock with tool history", () => {

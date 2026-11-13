@@ -3,13 +3,13 @@
  *
  * The session JSON is gzipped and sealed with a fresh AES-256-GCM key
  * (`[12B IV][ciphertext+tag]`, same layout as collab frames), then pushed to
- * one of two stores:
+ * one of two stores, chosen by `share.store`:
  *
- *   1. A secret GitHub gist (preferred — free, durable, no relay storage)
- *      holding base64 of the sealed blob, when an authenticated `gh` exists.
- *   2. The share server (`POST <serverUrl>` → `{"id":"…"}`), capped at 1 MB;
- *      oversized sessions are truncated (images first, then long strings,
- *      then oldest entries) until the sealed blob fits.
+ *   1. The share server (default — `POST <serverUrl>` → `{"id":"…"}`), capped
+ *      at 1 MB; oversized sessions are truncated (images first, then long
+ *      strings, then oldest entries) until the sealed blob fits.
+ *   2. A secret GitHub gist (`store: "gist"`, when an authenticated `gh`
+ *      exists; falls back to the share server) holding base64 of the blob.
  *
  * Either way the link is `<serverUrl>/<id>#<base64url key>`. The viewer page
  * served there fetches the blob (gist ids are hex; server ids never are),
@@ -19,12 +19,18 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentState } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, AgentState } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { $which, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
+import { obfuscateToolArguments } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { SecretValueSet } from "../secrets/placeholder";
+import { type SessionEntry, type SessionHeader, TITLE_CHANGE_ENTRY_TYPE } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
+import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import type { SubSession } from "../session/sub-sessions";
 import { buildSessionData, type SessionData } from "./html";
 
 export { DEFAULT_SHARE_URL };
@@ -47,16 +53,29 @@ const TEXT_CAPS = [32_768, 8_192, 2_048, 512];
 const BLANK_IMAGE_DATA_URL = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
 const IMAGE_OMITTED_TEXT = "[image omitted from share]";
 
+export type ShareStore = "blob" | "gist";
+
 export interface ShareSessionOptions {
 	/** Share server/viewer base URL; defaults to {@link DEFAULT_SHARE_URL}. */
 	serverUrl?: string;
+	/**
+	 * Where to upload the sealed blob. `"blob"` (default) posts to the share
+	 * server; `"gist"` pushes to a secret GitHub gist first (needs an
+	 * authenticated `gh`) and falls back to the server.
+	 */
+	store?: ShareStore;
 	/** Agent state for system prompt + tool descriptions in the snapshot. */
 	state?: AgentState;
 	/**
-	 * Redacts the snapshot before sealing: deep-walks every string (entries,
-	 * header, system prompt, tool descriptions) through the obfuscator, so
-	 * secrets that landed in persisted entries (tool outputs reading .env,
-	 * etc.) never leave the machine. Pass undefined to skip.
+	 * Redacts the snapshot before sealing via a typed, per-field walk over the
+	 * session (header title/cwd, system prompt, tool descriptions, entry summaries,
+	 * labels, and message text — including tool-result output and `@file` mentions),
+	 * so secrets that landed in persisted entries (tool outputs reading .env, etc.)
+	 * never leave the machine. Inline image bytes are preserved (size-trimmed
+	 * separately); opaque provider-replay blobs (`providerPayload`,
+	 * `redactedThinking`, `compaction.preserveData`) and untyped extension payloads
+	 * (`details`/`data`/`outputSchema`) are dropped rather than walked. Pass
+	 * undefined to skip redaction entirely.
 	 */
 	obfuscator?: SecretObfuscator;
 }
@@ -75,10 +94,410 @@ export interface ShareSessionResult {
 /** Build the snapshot that gets sealed and uploaded, redacted when an obfuscator is provided. */
 export function buildShareSnapshot(sm: SessionManager, options?: ShareSessionOptions): SessionData {
 	const data = buildSessionData(sm, options?.state);
-	return options?.obfuscator?.hasSecrets() ? options.obfuscator.obfuscateObject(data) : data;
+	return options?.obfuscator?.hasSecrets() ? redactSessionDataForShare(options.obfuscator, data) : data;
 }
 
-/** Share the session; tries a secret gist first, then the share server. */
+/**
+ * Redact secrets from a share snapshot. A share blob leaves the machine, so
+ * every text-bearing field is rewritten through the obfuscator. The walk is
+ * typed end-to-end (no generic object traversal): inline image bytes are left
+ * intact (size-trimmed later by {@link stripImagePayloads}) and opaque,
+ * untyped payloads we cannot redact field-by-field (`compaction.preserveData`,
+ * extension `details`/`data`, `mode_change.data`, structured output schemas)
+ * are dropped so they cannot leak.
+ */
+function collectShareRegexSecretValues(o: SecretObfuscator, data: SessionData): SecretValueSet {
+	const values = new SecretValueSet();
+	const add = (value: string | undefined): void => {
+		if (value === undefined) return;
+		for (const secretValue of o.collectRegexSecretValuesForObfuscation(value)) {
+			values.add(secretValue);
+		}
+	};
+	const addJsonStrings = (value: unknown): void => {
+		if (typeof value === "string") {
+			add(value);
+			return;
+		}
+		if (Array.isArray(value)) {
+			for (const item of value) addJsonStrings(item);
+			return;
+		}
+		if (!isRecord(value)) return;
+		for (const item of Object.values(value)) addJsonStrings(item);
+	};
+	const addContent = (content: string | (TextContent | ImageContent)[]): void => {
+		if (typeof content === "string") {
+			add(content);
+			return;
+		}
+		for (const block of content) {
+			if (block.type === "text") add(block.text);
+		}
+	};
+	const addOutputMeta = (meta: OutputMeta | undefined): void => {
+		if (!meta) return;
+		add(meta.source?.value);
+		add(meta.minimized?.filter);
+		if (!meta.diagnostics) return;
+		add(meta.diagnostics.summary);
+		for (const message of meta.diagnostics.messages) add(message);
+	};
+	const addMessage = (message: AgentMessage): void => {
+		switch (message.role) {
+			case "user":
+			case "developer":
+			case "custom":
+			case "hookMessage":
+			case "toolResult":
+				addContent(message.content as string | (TextContent | ImageContent)[]);
+				return;
+			case "assistant":
+				add(message.errorMessage);
+				for (const block of message.content) {
+					if (block.type === "text") add(block.text);
+					else if (block.type === "thinking") add(block.thinking);
+					else if (block.type === "toolCall") {
+						addJsonStrings(block.arguments);
+						add(block.intent);
+						add(block.rawBlock);
+					}
+				}
+				return;
+			case "bashExecution":
+				add(message.command);
+				add(message.output);
+				addOutputMeta(message.meta);
+				return;
+			case "pythonExecution":
+				add(message.code);
+				add(message.output);
+				addOutputMeta(message.meta);
+				return;
+			case "branchSummary":
+				add(message.summary);
+				return;
+			case "compactionSummary":
+				add(message.summary);
+				add(message.shortSummary);
+				if (message.blocks) addContent(message.blocks);
+				return;
+			case "fileMention":
+				for (const file of message.files) {
+					add(file.path);
+					add(file.content);
+				}
+				return;
+			default:
+				return;
+		}
+	};
+	const addEntry = (entry: SessionEntry): void => {
+		switch (entry.type) {
+			case "message":
+				addMessage(entry.message);
+				return;
+			case "compaction":
+				add(entry.summary);
+				add(entry.shortSummary);
+				return;
+			case "branch_summary":
+				add(entry.summary);
+				return;
+			case "custom_message":
+				addContent(entry.content);
+				return;
+			case "session_init":
+				for (const block of [entry.systemPrompt].flat()) add(block);
+				add(entry.task);
+				return;
+			case "label":
+				add(entry.label);
+				return;
+			case TITLE_CHANGE_ENTRY_TYPE:
+				add(entry.title);
+				add(entry.previousTitle);
+				add(entry.trigger);
+				return;
+			default:
+				return;
+		}
+	};
+	const addHeader = (header: SessionHeader | null): void => {
+		if (!header) return;
+		add(header.title);
+		add(header.cwd);
+		for (const previousSessionFile of header.previousSessionFiles ?? []) add(previousSessionFile);
+	};
+
+	addHeader(data.header);
+	add(data.systemPrompt);
+	for (const tool of data.tools ?? []) add(tool.description);
+	for (const entry of data.entries) addEntry(entry);
+	for (const sub of Object.values(data.subSessions ?? {})) {
+		addHeader(sub.header);
+		for (const entry of sub.entries) addEntry(entry);
+	}
+	return values;
+}
+
+function redactShareHeader(
+	o: SecretObfuscator,
+	header: SessionHeader | null,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): SessionHeader | null {
+	if (!header) return header;
+	return {
+		...header,
+		title: header.title === undefined ? undefined : o.obfuscate(header.title, sharedRegexSecretValues),
+		cwd: o.obfuscate(header.cwd, sharedRegexSecretValues),
+		previousSessionFiles: header.previousSessionFiles?.map(previousSessionFile =>
+			o.obfuscate(previousSessionFile, sharedRegexSecretValues),
+		),
+	};
+}
+
+function redactSessionDataForShare(o: SecretObfuscator, data: SessionData): SessionData {
+	return o.batch(() => redactSessionDataBatch(o, data));
+}
+
+function redactSessionDataBatch(o: SecretObfuscator, data: SessionData): SessionData {
+	const sharedRegexSecretValues = collectShareRegexSecretValues(o, data);
+	return {
+		...data,
+		header: redactShareHeader(o, data.header, sharedRegexSecretValues),
+		systemPrompt:
+			data.systemPrompt === undefined ? undefined : o.obfuscate(data.systemPrompt, sharedRegexSecretValues),
+		tools: data.tools?.map(tool => ({
+			...tool,
+			description: o.obfuscate(tool.description, sharedRegexSecretValues),
+		})),
+		entries: data.entries.map(entry => redactShareEntry(o, entry, sharedRegexSecretValues)),
+		subSessions: data.subSessions
+			? Object.fromEntries(
+					Object.entries(data.subSessions).map(([key, sub]) => [
+						key,
+						redactShareSubSession(o, sub, sharedRegexSecretValues),
+					]),
+				)
+			: data.subSessions,
+	};
+}
+
+function redactShareSubSession(
+	o: SecretObfuscator,
+	sub: SubSession,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): SubSession {
+	return {
+		...sub,
+		header: redactShareHeader(o, sub.header, sharedRegexSecretValues),
+		entries: sub.entries.map(entry => redactShareEntry(o, entry, sharedRegexSecretValues)),
+	};
+}
+
+function redactShareEntry(
+	o: SecretObfuscator,
+	entry: SessionEntry,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): SessionEntry {
+	switch (entry.type) {
+		case "message":
+			return { ...entry, message: redactShareMessage(o, entry.message, sharedRegexSecretValues) };
+		case "compaction":
+			return {
+				...entry,
+				summary: o.obfuscate(entry.summary, sharedRegexSecretValues),
+				shortSummary:
+					entry.shortSummary === undefined ? undefined : o.obfuscate(entry.shortSummary, sharedRegexSecretValues),
+				details: undefined,
+				preserveData: undefined,
+			};
+		case "branch_summary":
+			return { ...entry, summary: o.obfuscate(entry.summary, sharedRegexSecretValues), details: undefined };
+		case "custom_message":
+			return {
+				...entry,
+				content: redactShareContent(o, entry.content, sharedRegexSecretValues),
+				details: undefined,
+			};
+		case "custom":
+			return { ...entry, data: undefined };
+		case "mode_change":
+			return { ...entry, data: undefined };
+		case "session_init":
+			return {
+				...entry,
+				systemPrompt:
+					typeof entry.systemPrompt === "string"
+						? o.obfuscate(entry.systemPrompt, sharedRegexSecretValues)
+						: entry.systemPrompt.map(block => o.obfuscate(block, sharedRegexSecretValues)),
+				task: o.obfuscate(entry.task, sharedRegexSecretValues),
+				outputSchema: undefined,
+				// Revival-only state; its item ids can carry user text.
+				workPoolYieldItems: undefined,
+			};
+		case "label":
+			return {
+				...entry,
+				label: entry.label === undefined ? undefined : o.obfuscate(entry.label, sharedRegexSecretValues),
+			};
+		case TITLE_CHANGE_ENTRY_TYPE:
+			return {
+				...entry,
+				title: o.obfuscate(entry.title, sharedRegexSecretValues),
+				previousTitle:
+					entry.previousTitle === undefined
+						? undefined
+						: o.obfuscate(entry.previousTitle, sharedRegexSecretValues),
+				trigger: entry.trigger === undefined ? undefined : o.obfuscate(entry.trigger, sharedRegexSecretValues),
+			};
+		default:
+			return entry;
+	}
+}
+
+function redactShareContent(
+	o: SecretObfuscator,
+	content: string | (TextContent | ImageContent)[],
+	sharedRegexSecretValues: ReadonlySet<string>,
+): string | (TextContent | ImageContent)[] {
+	if (typeof content === "string") return o.obfuscate(content, sharedRegexSecretValues);
+	return content.map(block =>
+		block.type === "text" ? { ...block, text: o.obfuscate(block.text, sharedRegexSecretValues) } : block,
+	);
+}
+
+/** Redact freeform strings in tool output metadata (source path/URL, diagnostics, minimizer filter); numeric truncation info is preserved. */
+function redactShareOutputMeta(
+	o: SecretObfuscator,
+	meta: OutputMeta | undefined,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): OutputMeta | undefined {
+	if (!meta) return meta;
+	return {
+		...meta,
+		source: meta.source
+			? { ...meta.source, value: o.obfuscate(meta.source.value, sharedRegexSecretValues) }
+			: meta.source,
+		diagnostics: meta.diagnostics
+			? {
+					summary: o.obfuscate(meta.diagnostics.summary, sharedRegexSecretValues),
+					messages: meta.diagnostics.messages.map(message => o.obfuscate(message, sharedRegexSecretValues)),
+				}
+			: meta.diagnostics,
+		minimized: meta.minimized
+			? { ...meta.minimized, filter: o.obfuscate(meta.minimized.filter, sharedRegexSecretValues) }
+			: meta.minimized,
+	};
+}
+
+function redactShareMessage(
+	o: SecretObfuscator,
+	message: AgentMessage,
+	sharedRegexSecretValues: ReadonlySet<string>,
+): AgentMessage {
+	switch (message.role) {
+		case "user":
+		case "developer":
+			return {
+				...message,
+				providerPayload: undefined,
+				content: redactShareContent(o, message.content, sharedRegexSecretValues),
+			} as AgentMessage;
+		case "custom":
+		case "hookMessage":
+			return {
+				...message,
+				details: undefined,
+				content: redactShareContent(o, message.content, sharedRegexSecretValues),
+			} as AgentMessage;
+		case "toolResult":
+			return {
+				...message,
+				details: undefined,
+				content: redactShareContent(o, message.content, sharedRegexSecretValues) as (TextContent | ImageContent)[],
+			};
+		case "assistant":
+			// Drop opaque provider-replay state (encrypted reasoning / native history) the viewer
+			// never reads and we cannot redact field-by-field: `providerPayload`, any
+			// `redactedThinking` blocks, and native Anthropic server-tool blocks
+			// (`server_tool_use` input / `web_search_tool_result` encrypted_content).
+			return {
+				...message,
+				providerPayload: undefined,
+				errorMessage:
+					message.errorMessage === undefined
+						? undefined
+						: o.obfuscate(message.errorMessage, sharedRegexSecretValues),
+				content: message.content.flatMap((block): AssistantMessage["content"] => {
+					if (block.type === "redactedThinking" || block.type === "anthropicServerTool") return [];
+					if (block.type === "text") return [{ ...block, text: o.obfuscate(block.text, sharedRegexSecretValues) }];
+					if (block.type === "thinking") {
+						return [{ ...block, thinking: o.obfuscate(block.thinking, sharedRegexSecretValues) }];
+					}
+					if (block.type === "toolCall") {
+						return [
+							{
+								...block,
+								arguments: obfuscateToolArguments(o, block.arguments, sharedRegexSecretValues),
+								intent:
+									block.intent === undefined ? undefined : o.obfuscate(block.intent, sharedRegexSecretValues),
+								rawBlock:
+									block.rawBlock === undefined
+										? undefined
+										: o.obfuscate(block.rawBlock, sharedRegexSecretValues),
+							},
+						];
+					}
+					return [block];
+				}),
+			};
+		case "bashExecution":
+			return {
+				...message,
+				command: o.obfuscate(message.command, sharedRegexSecretValues),
+				output: o.obfuscate(message.output, sharedRegexSecretValues),
+				meta: redactShareOutputMeta(o, message.meta, sharedRegexSecretValues),
+			};
+		case "pythonExecution":
+			return {
+				...message,
+				code: o.obfuscate(message.code, sharedRegexSecretValues),
+				output: o.obfuscate(message.output, sharedRegexSecretValues),
+				meta: redactShareOutputMeta(o, message.meta, sharedRegexSecretValues),
+			};
+		case "branchSummary":
+			return { ...message, summary: o.obfuscate(message.summary, sharedRegexSecretValues) };
+		case "compactionSummary":
+			return {
+				...message,
+				providerPayload: undefined,
+				summary: o.obfuscate(message.summary, sharedRegexSecretValues),
+				shortSummary:
+					message.shortSummary === undefined
+						? undefined
+						: o.obfuscate(message.shortSummary, sharedRegexSecretValues),
+				blocks:
+					message.blocks === undefined
+						? undefined
+						: (redactShareContent(o, message.blocks, sharedRegexSecretValues) as (TextContent | ImageContent)[]),
+			};
+		case "fileMention":
+			return {
+				...message,
+				files: message.files.map(file => ({
+					...file,
+					path: o.obfuscate(file.path, sharedRegexSecretValues),
+					content: o.obfuscate(file.content, sharedRegexSecretValues),
+				})),
+			};
+		default:
+			return message;
+	}
+}
+
+/** Share the session; uploads to the share server unless `options.store` is `"gist"`. */
 export async function shareSession(sm: SessionManager, options?: ShareSessionOptions): Promise<ShareSessionResult> {
 	const data = buildShareSnapshot(sm, options);
 	const keyBytes = new Uint8Array(SHARE_KEY_BYTES);
@@ -87,29 +506,23 @@ export async function shareSession(sm: SessionManager, options?: ShareSessionOpt
 	const keyText = Buffer.from(keyBytes).toString("base64url");
 	const base = normalizeShareServerUrl(options?.serverUrl);
 
-	const forGist = await sealToFit(key, data, GIST_MAX_SEALED_BYTES);
-	const gist = await tryCreateGist(forGist.sealed);
-	if (gist) {
-		return {
-			url: `${base}/${gist.id}#${keyText}`,
-			method: "gist",
-			gistUrl: gist.url,
-			truncated: forGist.truncated,
-			sealedBytes: forGist.sealed.byteLength,
-		};
+	if (options?.store === "gist") {
+		const forGist = await sealToFit(key, data, GIST_MAX_SEALED_BYTES);
+		const gist = await tryCreateGist(forGist.sealed);
+		if (gist) {
+			return {
+				url: `${base}/${gist.id}#${keyText}`,
+				method: "gist",
+				gistUrl: gist.url,
+				truncated: forGist.truncated,
+				sealedBytes: forGist.sealed.byteLength,
+			};
+		}
+		// gh unusable or gist creation failed — fall back to the share server.
+		return shareViaServer(key, data, base, keyText, forGist);
 	}
 
-	const forServer =
-		forGist.sealed.byteLength <= SERVER_MAX_SEALED_BYTES
-			? forGist
-			: await sealToFit(key, data, SERVER_MAX_SEALED_BYTES);
-	const id = await uploadToServer(forServer.sealed, base);
-	return {
-		url: `${base}/${id}#${keyText}`,
-		method: "server",
-		truncated: forServer.truncated,
-		sealedBytes: forServer.sealed.byteLength,
-	};
+	return shareViaServer(key, data, base, keyText);
 }
 
 /** Strip trailing slashes so `<base>/<id>` composes cleanly. */
@@ -241,6 +654,27 @@ async function tryCreateGist(sealed: Uint8Array): Promise<{ id: string; url: str
 	} finally {
 		await fs.rm(dir, { recursive: true, force: true });
 	}
+}
+
+/** Seal to the server cap (reusing `preFit` when it already fits) and upload. */
+async function shareViaServer(
+	key: CryptoKey,
+	data: SessionData,
+	base: string,
+	keyText: string,
+	preFit?: SealedSession,
+): Promise<ShareSessionResult> {
+	const forServer =
+		preFit && preFit.sealed.byteLength <= SERVER_MAX_SEALED_BYTES
+			? preFit
+			: await sealToFit(key, data, SERVER_MAX_SEALED_BYTES);
+	const id = await uploadToServer(forServer.sealed, base);
+	return {
+		url: `${base}/${id}#${keyText}`,
+		method: "server",
+		truncated: forServer.truncated,
+		sealedBytes: forServer.sealed.byteLength,
+	};
 }
 
 /** POST the sealed blob to the share server; returns the assigned id. */

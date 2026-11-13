@@ -1,13 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ExtensionContext, ExtensionFactory } from "../extensibility/extensions";
-import * as git from "../utils/git";
 import commandResumeTemplate from "./command-resume.md" with { type: "text" };
-import { createDashboardController } from "./dashboard";
+import { createDashboardController } from "@oh-my-pi/pi-tui/apps/autoresearch-dashboard";
+import { currentResults, findBaselineMetric, findBaselineRunNumber } from "@oh-my-pi/pi-tui/apps/autoresearch-data";
 import { ensureAutoresearchBranch } from "./git";
-import { formatNum } from "./helpers";
+import { formatNum } from "@oh-my-pi/pi-tui/tools/autoresearch";
 import promptTemplate from "./prompt.md" with { type: "text" };
 import setupPromptTemplate from "./prompt-setup.md" with { type: "text" };
 import resumeMessageTemplate from "./resume-message.md" with { type: "text" };
@@ -15,9 +16,6 @@ import {
 	buildExperimentState,
 	createExperimentState,
 	createRuntimeStore,
-	currentResults,
-	findBaselineMetric,
-	findBaselineRunNumber,
 	findBestKeptMetric,
 	reconstructControlState,
 } from "./state";
@@ -26,7 +24,8 @@ import { createInitExperimentTool } from "./tools/init-experiment";
 import { createLogExperimentTool } from "./tools/log-experiment";
 import { createRunExperimentTool } from "./tools/run-experiment";
 import { createUpdateNotesTool } from "./tools/update-notes";
-import type { AutoresearchRuntime, ExperimentResult, PendingRunSummary } from "./types";
+import type { AutoresearchRuntime, PendingRunSummary } from "./types";
+import type { ExperimentResult } from "@oh-my-pi/pi-tui/tools/autoresearch";
 
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];
 
@@ -320,6 +319,11 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		runtime.lastRunDuration = pendingRun?.durationSeconds ?? runtime.lastRunDuration;
 		runtime.lastRunAsi = pendingRun?.parsedAsi ?? runtime.lastRunAsi;
 		const state = runtime.state;
+		// `event.systemPrompt` is typed `string[]`, but upstream code paths can leave
+		// it unset (issue #3665). Coerce defensively so the autoresearch block still
+		// renders — the model just loses the upstream prefix for this turn, which is
+		// strictly better than crashing the handler.
+		const basePrompt = Array.isArray(event.systemPrompt) ? event.systemPrompt.join("\n\n") : "";
 		const currentSegmentResults = currentResults(state.results, state.currentSegment);
 		const baselineMetric = findBaselineMetric(state.results, state.currentSegment);
 		const baselineRunNumber = findBaselineRunNumber(state.results, state.currentSegment);
@@ -358,7 +362,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 			return {
 				systemPrompt: [
 					prompt.render(setupPromptTemplate, {
-						base_system_prompt: event.systemPrompt.join("\n\n"),
+						base_system_prompt: basePrompt,
 						has_goal: goal.trim().length > 0,
 						goal,
 						working_dir: ctx.cwd,
@@ -373,7 +377,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		return {
 			systemPrompt: [
 				prompt.render(promptTemplate, {
-					base_system_prompt: event.systemPrompt.join("\n\n"),
+					base_system_prompt: basePrompt,
 					has_goal: goal.trim().length > 0,
 					goal,
 					working_dir: ctx.cwd,
@@ -423,8 +427,9 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 		const shouldResetTree = !opts.keepTree && (onAutoresearchBranch || opts.resetTreeForce);
 		if (shouldResetTree && session?.baselineCommit) {
 			try {
-				await git.reset(ctx.cwd, { hard: true, target: session.baselineCommit });
-				await git.clean(ctx.cwd);
+				const repository = vcs.requireGit(ctx.cwd);
+				await repository.reset("hard", session.baselineCommit);
+				await repository.clean({});
 				ctx.ui.notify(`Reset worktree to baseline ${session.baselineCommit.slice(0, 12)}.`, "info");
 			} catch (err) {
 				ctx.ui.notify(
@@ -529,7 +534,7 @@ function bestKeptResult(
 
 async function tryReadBranch(cwd: string): Promise<string | null> {
 	try {
-		return (await git.branch.current(cwd)) ?? null;
+		return (await vcs.repo(cwd)?.label()) ?? null;
 	} catch {
 		return null;
 	}

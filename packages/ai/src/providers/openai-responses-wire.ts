@@ -791,7 +791,7 @@ export interface Response {
 	 * When this parameter is set, the response body will include the `service_tier`
 	 * utilized.
 	 */
-	service_tier?: "auto" | "default" | "flex" | "scale" | "priority" | null;
+	service_tier?: "auto" | "default" | "flex" | "scale" | "priority" | "ultrafast" | null;
 	/**
 	 * The status of the response generation. One of `completed`, `failed`,
 	 * `in_progress`, `cancelled`, `queued`, or `incomplete`.
@@ -871,60 +871,6 @@ export declare namespace Response {
 		output: Moderation.ModerationResult | Moderation.Error;
 	}
 	namespace Moderation {
-		/**
-		 * A moderation result produced for the response input or output.
-		 */
-		interface ModerationResult {
-			/**
-			 * A dictionary of moderation categories to booleans, True if the input is flagged
-			 * under this category.
-			 */
-			categories: {
-				[key: string]: boolean;
-			};
-			/**
-			 * Which modalities of input are reflected by the score for each category.
-			 */
-			category_applied_input_types: {
-				[key: string]: Array<"text" | "image">;
-			};
-			/**
-			 * A dictionary of moderation categories to scores.
-			 */
-			category_scores: {
-				[key: string]: number;
-			};
-			/**
-			 * A boolean indicating whether the content was flagged by any category.
-			 */
-			flagged: boolean;
-			/**
-			 * The moderation model that produced this result.
-			 */
-			model: string;
-			/**
-			 * The object type, which was always `moderation_result` for successful moderation
-			 * results.
-			 */
-			type: "moderation_result";
-		}
-		/**
-		 * An error produced while attempting moderation for the response input or output.
-		 */
-		interface Error {
-			/**
-			 * The error code.
-			 */
-			code: string;
-			/**
-			 * The error message.
-			 */
-			message: string;
-			/**
-			 * The object type, which was always `error` for moderation failures.
-			 */
-			type: "error";
-		}
 		/**
 		 * A moderation result produced for the response input or output.
 		 */
@@ -2515,6 +2461,14 @@ export interface ResponseFunctionToolCall {
 	 */
 	namespace?: string;
 	/**
+	 * Plaintext-argument marker for collaboration tool calls (codex-rs
+	 * `encrypted_function_args`, #35845): an empty array marks the arguments as
+	 * plaintext agent-message payloads rather than encrypted blobs. Preserved
+	 * verbatim across history replay so the backend keeps treating them as
+	 * plaintext; omitted entirely for ordinary function calls.
+	 */
+	encrypted_function_args?: string[];
+	/**
 	 * The status of the item. One of `in_progress`, `completed`, or `incomplete`.
 	 * Populated when items are returned via API.
 	 */
@@ -2884,6 +2838,8 @@ export interface ResponseInputFile {
 	 * The name of the file to be sent to the model.
 	 */
 	filename?: string;
+	/** Explicit OpenAI prompt-cache breakpoint. */
+	prompt_cache_breakpoint?: { mode: "explicit" };
 }
 /**
  * A file input to the model.
@@ -2939,6 +2895,8 @@ export interface ResponseInputImage {
 	 * encoded image in a data URL.
 	 */
 	image_url?: string | null;
+	/** Explicit OpenAI prompt-cache breakpoint. */
+	prompt_cache_breakpoint?: { mode: "explicit" };
 }
 /**
  * An image input to the model. Learn about
@@ -3001,6 +2959,7 @@ export type ResponseInputItem =
 	| ResponseCustomToolCallOutput
 	| ResponseCustomToolCall
 	| ResponseInputItem.CompactionTrigger
+	| ResponseInputItem.ConfigurationUpdate
 	| ResponseInputItem.ItemReference;
 export declare namespace ResponseInputItem {
 	/**
@@ -3588,6 +3547,20 @@ export declare namespace ResponseInputItem {
 		type: "compaction_trigger";
 	}
 	/**
+	 * Changes reasoning effort for subsequent responses without touching the
+	 * request-level `reasoning.effort` (GPT-6 family). Must not be adjacent to
+	 * another `configuration_update`.
+	 */
+	interface ConfigurationUpdate {
+		/**
+		 * The type of the item. Always `configuration_update`.
+		 */
+		type: "configuration_update";
+		reasoning: {
+			effort: string;
+		};
+	}
+	/**
 	 * An internal identifier for an item to reference.
 	 */
 	interface ItemReference {
@@ -3642,6 +3615,8 @@ export interface ResponseInputText {
 	 * The type of the input item. Always `input_text`.
 	 */
 	type: "input_text";
+	/** Explicit OpenAI prompt-cache breakpoint. */
+	prompt_cache_breakpoint?: { mode: "explicit" };
 }
 /**
  * A text input to the model.
@@ -5849,7 +5824,7 @@ export interface ResponseCreateParamsBase {
 	 * - [Conversation state](https://platform.openai.com/docs/guides/conversation-state)
 	 * - [Function calling](https://platform.openai.com/docs/guides/function-calling)
 	 */
-	input?: string | ResponseInput;
+	input?: ResponseInput;
 	/**
 	 * A system (or developer) message inserted into the model's context.
 	 *
@@ -5922,6 +5897,8 @@ export interface ResponseCreateParamsBase {
 	 *   `prompt_cache_retention` is not specified.
 	 */
 	prompt_cache_retention?: "in_memory" | "24h" | null;
+	/** Explicit prompt-cache mode and minimum lifetime (`12h` is Responses-only) for GPT-5.6+ models. */
+	prompt_cache_options?: { mode: "implicit" | "explicit"; ttl?: "30m" | "12h" } | null;
 	/**
 	 * **gpt-5 and o-series models only**
 	 *
@@ -5955,7 +5932,7 @@ export interface ResponseCreateParamsBase {
 	 * When this parameter is set, the response body will include the `service_tier`
 	 * utilized.
 	 */
-	service_tier?: "auto" | "default" | "flex" | "scale" | "priority" | null;
+	service_tier?: "auto" | "default" | "flex" | "scale" | "priority" | "ultrafast" | null;
 	/**
 	 * Whether to store the generated model response for later retrieval via API.
 	 */
@@ -6305,9 +6282,9 @@ export interface Reasoning {
 	/**
 	 * Constrains effort on reasoning for
 	 * [reasoning models](https://platform.openai.com/docs/guides/reasoning). Currently
-	 * supported values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
-	 * Reducing reasoning effort can result in faster responses and fewer tokens used
-	 * on reasoning in a response.
+	 * supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+	 * `max`. Reducing reasoning effort can result in faster responses and fewer
+	 * tokens used on reasoning in a response.
 	 *
 	 * - `gpt-5.1` defaults to `none`, which does not perform reasoning. The supported
 	 *   reasoning values for `gpt-5.1` are `none`, `low`, `medium`, and `high`. Tool
@@ -6316,8 +6293,16 @@ export interface Reasoning {
 	 *   support `none`.
 	 * - The `gpt-5-pro` model defaults to (and only supports) `high` reasoning effort.
 	 * - `xhigh` is supported for all models after `gpt-5.1-codex-max`.
+	 * - `max` is supported for `gpt-5.6` and later models.
 	 */
 	effort?: ReasoningEffort | null;
+	/**
+	 * **gpt-5.6 and later models only**
+	 *
+	 * Reasoning serving mode. `pro` routes the request to the pro reasoning
+	 * path (more compute per response); omit for the standard path.
+	 */
+	mode?: "pro" | null;
 	/**
 	 * @deprecated **Deprecated:** use `summary` instead.
 	 *
@@ -6339,9 +6324,9 @@ export interface Reasoning {
 /**
  * Constrains effort on reasoning for
  * [reasoning models](https://platform.openai.com/docs/guides/reasoning). Currently
- * supported values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`.
- * Reducing reasoning effort can result in faster responses and fewer tokens used
- * on reasoning in a response.
+ * supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+ * `max`. Reducing reasoning effort can result in faster responses and fewer tokens
+ * used on reasoning in a response.
  *
  * - `gpt-5.1` defaults to `none`, which does not perform reasoning. The supported
  *   reasoning values for `gpt-5.1` are `none`, `low`, `medium`, and `high`. Tool
@@ -6350,8 +6335,9 @@ export interface Reasoning {
  *   support `none`.
  * - The `gpt-5-pro` model defaults to (and only supports) `high` reasoning effort.
  * - `xhigh` is supported for all models after `gpt-5.1-codex-max`.
+ * - `max` is supported for `gpt-5.6` and later models.
  */
-export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 /**
  * JSON object response format. An older method of generating JSON responses. Using
  * `json_schema` is recommended for models that support it. Note that the model

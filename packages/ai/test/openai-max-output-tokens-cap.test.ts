@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { type Context, type Model, type ModelSpec, OPENAI_MAX_OUTPUT_TOKENS } from "@oh-my-pi/pi-ai/types";
@@ -7,13 +6,13 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 // Output-token wire policy for OpenAI-family providers:
-//   - Non-aggregator completions + all responses: clamp to OPENAI_MAX_OUTPUT_TOKENS
-//     (mirrors Anthropic's cap) so a catalog maxTokens that tracks the context
-//     window never overflows the upstream.
-//   - OpenRouter completions: omit max_tokens entirely. OpenRouter filters out any
-//     upstream whose output cap is below the requested value (e.g. Cerebras GLM-4.7
-//     ~40k), silently defeating provider routing. Kimi via OpenRouter is exempt
-//     (it derives TPM rate limits from max_tokens).
+//   - Non-aggregator completions + non-OpenRouter responses: clamp to
+//     OPENAI_MAX_OUTPUT_TOKENS (mirrors Anthropic's cap) so a catalog maxTokens
+//     that tracks the context window never overflows the upstream.
+//   - OpenRouter completions/responses: omit default max token fields entirely.
+//     OpenRouter filters out any upstream whose output cap is below the requested
+//     value (e.g. Cerebras GLM-4.7 ~40k), silently defeating provider routing.
+//     Explicit caller caps and Kimi chat-completions via OpenRouter are still sent.
 
 const ctx: Context = {
 	systemPrompt: ["hi"],
@@ -44,13 +43,34 @@ function captureResponsesBody(): { fetchMock: FetchImpl; captured: Record<string
 	return { fetchMock, captured };
 }
 
-async function drainResponses(model: Model<"openai-responses">): Promise<Record<string, unknown>> {
-	const { fetchMock, captured } = captureResponsesBody();
-	const stream = streamSimple(model, ctx, { apiKey: "k", fetch: fetchMock });
-	for await (const event of stream) {
-		if (event.type === "done" || event.type === "error") break;
+async function drainResponses(
+	model: Model<"openai-responses" | "openrouter">,
+	maxTokens?: number,
+): Promise<Record<string, unknown>> {
+	const previousOpenRouterResponses = Bun.env.PI_OPENROUTER_RESPONSES;
+	if (model.api === "openrouter") Bun.env.PI_OPENROUTER_RESPONSES = "1";
+	try {
+		const { fetchMock, captured } = captureResponsesBody();
+		const apiKey =
+			model.provider === "muse-code"
+				? JSON.stringify({ oauthAccessToken: "meta-account-access", apiKey: "muse-subscription-key" })
+				: "k";
+		const stream = streamSimple(model, ctx, {
+			apiKey,
+			...(maxTokens === undefined ? {} : { maxTokens }),
+			fetch: fetchMock,
+		});
+		for await (const event of stream) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+		return captured;
+	} finally {
+		if (previousOpenRouterResponses === undefined) {
+			delete Bun.env.PI_OPENROUTER_RESPONSES;
+		} else {
+			Bun.env.PI_OPENROUTER_RESPONSES = previousOpenRouterResponses;
+		}
 	}
-	return captured;
 }
 
 function completionsSse(): Response {
@@ -77,7 +97,7 @@ function completionsSse(): Response {
 
 async function captureCompletionsBody(
 	model: Model<"openai-completions">,
-	maxTokens: number,
+	maxTokens?: number,
 ): Promise<Record<string, unknown>> {
 	let payload: Record<string, unknown> | undefined;
 	const fetchMock: FetchImpl = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -85,7 +105,11 @@ async function captureCompletionsBody(
 		return completionsSse();
 	};
 
-	const result = await streamOpenAICompletions(model, ctx, { apiKey: "k", maxTokens, fetch: fetchMock }).result();
+	const result = await streamSimple(model, ctx, {
+		apiKey: "k",
+		...(maxTokens === undefined ? {} : { maxTokens }),
+		fetch: fetchMock,
+	}).result();
 	expect(result.stopReason).toBe("stop");
 	if (!payload) throw new Error("Expected OpenAI completions request payload");
 	return payload;
@@ -97,6 +121,21 @@ function glmCompletionsModel(maxTokens: number): Model<"openai-completions"> {
 		id: "z-ai/glm-4.7",
 		name: "GLM 4.7",
 		api: "openai-completions",
+		provider: "openrouter",
+		baseUrl: "https://openrouter.ai/api/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 202_752,
+		maxTokens,
+	});
+}
+
+function openRouterResponsesModel(maxTokens: number): Model<"openrouter"> {
+	return buildModel({
+		id: "z-ai/glm-4.7",
+		name: "GLM 4.7",
+		api: "openrouter",
 		provider: "openrouter",
 		baseUrl: "https://openrouter.ai/api/v1",
 		reasoning: false,
@@ -123,6 +162,23 @@ function directCompletionsModel(maxTokens: number): Model<"openai-completions"> 
 	});
 }
 
+// First-party DeepSeek Flash: synthetic spec exercises the KDL clamp rule via
+// buildModel instead of the bundled snapshot.
+function deepseekFlashModel(id: string): Model<"openai-completions"> {
+	return buildModel({
+		id,
+		name: id,
+		api: "openai-completions",
+		provider: "deepseek",
+		baseUrl: "https://api.deepseek.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+	});
+}
+
 // Kimi via OpenRouter stays exempt from the omit (TPM rate limits need max_tokens).
 function kimiOpenRouterModel(maxTokens: number): Model<"openai-completions"> {
 	return buildModel({
@@ -131,6 +187,40 @@ function kimiOpenRouterModel(maxTokens: number): Model<"openai-completions"> {
 		api: "openai-completions",
 		provider: "openrouter",
 		baseUrl: "https://openrouter.ai/api/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 131_072,
+		maxTokens,
+	});
+}
+
+function localCompletionsModel(
+	provider: string,
+	baseUrl: string,
+	maxTokens: number | null,
+): Model<"openai-completions"> {
+	return buildModel({
+		id: "local-model",
+		name: "Local Model",
+		api: "openai-completions",
+		provider,
+		baseUrl,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 131_072,
+		maxTokens,
+	});
+}
+
+function localResponsesModel(provider: string, baseUrl: string, maxTokens: number | null): Model<"openai-responses"> {
+	return buildModel({
+		id: "local-model",
+		name: "Local Model",
+		api: "openai-responses",
+		provider,
+		baseUrl,
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -152,6 +242,34 @@ describe("OpenAI-family output-token cap", () => {
 		expect(body.max_output_tokens).toBe(OPENAI_MAX_OUTPUT_TOKENS);
 	});
 
+	it.each([
+		["Meta Model API", "meta"],
+		["Muse Code", "muse-code"],
+	] as const)("lets %s Responses requests use the advertised model cap", async (_label, provider) => {
+		const model = getBundledModel(provider, "muse-spark-1.1") as Model<"openai-responses">;
+		const body = await drainResponses(model);
+		expect(body.max_output_tokens).toBe(131_072);
+	});
+
+	it("omits default max_output_tokens for OpenRouter Responses so provider routing is not filtered", async () => {
+		const body = await drainResponses(openRouterResponsesModel(131_072));
+		expect(body.max_output_tokens).toBeUndefined();
+	});
+
+	it("sends explicit maxTokens for OpenRouter Responses caller caps", async () => {
+		const body = await drainResponses(openRouterResponsesModel(131_072), 2_048);
+		expect(body.max_output_tokens).toBe(2_048);
+	});
+
+	it.each(["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"])(
+		"lets first-party DeepSeek %s requests use the documented 384k output cap",
+		async id => {
+			const model = deepseekFlashModel(id);
+			const body = await captureCompletionsBody(model, model.maxTokens ?? undefined);
+			expect(body.max_tokens).toBe(384_000);
+		},
+	);
+
 	it("clamps non-aggregator completions output to the 64k ceiling", async () => {
 		const body = await captureCompletionsBody(directCompletionsModel(131_072), 131_072);
 		expect(body.max_completion_tokens ?? body.max_tokens).toBe(OPENAI_MAX_OUTPUT_TOKENS);
@@ -167,14 +285,55 @@ describe("OpenAI-family output-token cap", () => {
 		expect(body.max_completion_tokens ?? body.max_tokens).toBe(32_000);
 	});
 
-	it("omits max_tokens entirely for OpenRouter so provider routing is not filtered", async () => {
-		const body = await captureCompletionsBody(glmCompletionsModel(131_072), 131_072);
+	it("omits default max_tokens for OpenRouter so provider routing is not filtered", async () => {
+		const body = await captureCompletionsBody(glmCompletionsModel(131_072));
 		expect(body.max_tokens).toBeUndefined();
 		expect(body.max_completion_tokens).toBeUndefined();
 	});
 
+	it("sends explicit maxTokens for OpenRouter caller caps", async () => {
+		const body = await captureCompletionsBody(glmCompletionsModel(131_072), 2_048);
+		expect(body.max_completion_tokens ?? body.max_tokens).toBe(2_048);
+	});
+
 	it("still sends max_tokens for Kimi via OpenRouter (TPM rate-limit requirement)", async () => {
-		const body = await captureCompletionsBody(kimiOpenRouterModel(131_072), 131_072);
+		const body = await captureCompletionsBody(kimiOpenRouterModel(131_072));
 		expect(body.max_completion_tokens ?? body.max_tokens).toBe(OPENAI_MAX_OUTPUT_TOKENS);
+	});
+
+	it("lets loopback custom completions use model.maxTokens above 64k", async () => {
+		const model = localCompletionsModel("custom", "http://127.0.0.1:8080/v1", 131_072);
+		const body = await captureCompletionsBody(model, 131_072);
+		expect(body.max_completion_tokens ?? body.max_tokens).toBe(131_072);
+	});
+
+	it("still clamps LiteLLM completions to the 64k ceiling", async () => {
+		const model = localCompletionsModel("litellm", "http://127.0.0.1:4000/v1", 131_072);
+		const body = await captureCompletionsBody(model, 131_072);
+		expect(body.max_completion_tokens ?? body.max_tokens).toBe(OPENAI_MAX_OUTPUT_TOKENS);
+	});
+
+	it("keeps the 64k fallback when a local model has null maxTokens", async () => {
+		const model = localCompletionsModel("llama.cpp", "http://127.0.0.1:8080/v1", null);
+		const body = await captureCompletionsBody(model, 100_000);
+		expect(body.max_completion_tokens ?? body.max_tokens).toBe(OPENAI_MAX_OUTPUT_TOKENS);
+	});
+
+	it("lets loopback custom Responses hosts use model.maxTokens above 64k", async () => {
+		const model = localResponsesModel("custom", "http://127.0.0.1:8080/v1", 131_072);
+		const body = await drainResponses(model, 131_072);
+		expect(body.max_output_tokens).toBe(131_072);
+	});
+
+	it("still clamps LiteLLM Responses to the 64k ceiling", async () => {
+		const model = localResponsesModel("litellm", "http://127.0.0.1:4000/v1", 131_072);
+		const body = await drainResponses(model, 131_072);
+		expect(body.max_output_tokens).toBe(OPENAI_MAX_OUTPUT_TOKENS);
+	});
+
+	it("keeps the 64k Responses fallback when a local model has null maxTokens", async () => {
+		const model = localResponsesModel("llama.cpp", "http://127.0.0.1:8080/v1", null);
+		const body = await drainResponses(model, 100_000);
+		expect(body.max_output_tokens).toBe(OPENAI_MAX_OUTPUT_TOKENS);
 	});
 });

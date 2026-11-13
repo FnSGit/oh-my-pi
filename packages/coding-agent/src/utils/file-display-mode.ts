@@ -2,7 +2,8 @@
  * Resolve line-display mode for file-like outputs (read, grep, @file mentions).
  */
 
-import { resolveEditMode } from "./edit-mode";
+import { type EditModeSessionLike, resolveEditMode } from "./edit-mode";
+import { cfgReadLineNumbers } from "../tools/settings";
 
 export interface FileDisplayMode {
 	lineNumbers: boolean;
@@ -10,18 +11,15 @@ export interface FileDisplayMode {
 }
 
 /** Session-like object providing settings and tool availability for display mode resolution. */
-export interface FileDisplayModeSession {
+export interface FileDisplayModeSession extends EditModeSessionLike {
 	/** Whether the edit tool is available. Hashlines are suppressed without it. */
 	hasEditTool?: boolean;
-	settings: {
-		get(key: "readLineNumbers" | "readHashLines" | "edit.mode"): unknown;
-	};
 }
 
 /**
  * Computes effective line display mode from session settings/env.
  * Hashline mode takes precedence and implies line-addressed output everywhere.
- * Hashlines are suppressed when the edit tool is not available (e.g. explore agents),
+ * Hashlines are suppressed when the edit tool is not available (e.g. scout agents),
  * when the caller signals a `raw` read, and when the source is `immutable`
  * (e.g. internal URLs like artifact://, agent://, memory:// — there is no edit
  * path that could consume the anchors). Raw output is returned as-is.
@@ -36,10 +34,9 @@ export function resolveFileDisplayMode(
 	const usesHashLineAnchors = editMode === "hashline";
 	const raw = options?.raw === true;
 	const immutable = options?.immutable === true;
-	const hashLines =
-		!raw && !immutable && hasEditTool && usesHashLineAnchors && settings.get("readHashLines") !== false;
+	const hashLines = !raw && !immutable && hasEditTool && usesHashLineAnchors;
 	return {
 		hashLines,
-		lineNumbers: !raw && (hashLines || settings.get("readLineNumbers") === true),
+		lineNumbers: !raw && (hashLines || cfgReadLineNumbers.get(settings) === true),
 	};
 }

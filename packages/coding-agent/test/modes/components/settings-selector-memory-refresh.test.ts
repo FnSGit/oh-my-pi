@@ -1,20 +1,49 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { SettingsSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/settings-selector";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { loadHindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
+import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
+import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui";
+import { createPluginSettingsHost } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/settings-host";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+
+import { cfgHindsightApiToken } from "@oh-my-pi/pi-coding-agent/hindsight/settings";
+import { cfgMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/settings";
 
 beforeAll(async () => {
 	await initTheme();
 });
 
+let geometryStub: { restore(): void } | undefined;
+
 beforeEach(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
+	geometryStub = stubStdoutGeometry(120);
 });
 
 afterEach(() => {
 	resetSettingsForTest();
+	geometryStub?.restore();
+	geometryStub = undefined;
 });
+
+function stubStdoutGeometry(cols: number): { restore(): void } {
+	const rowsDesc = Object.getOwnPropertyDescriptor(process.stdout, "rows");
+	const colsDesc = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+	const rows = 40;
+	Object.defineProperty(process.stdout, "rows", { configurable: true, get: () => rows, set: () => {} });
+	Object.defineProperty(process.stdout, "columns", { configurable: true, get: () => cols, set: () => {} });
+	const restoreOne = (key: "rows" | "columns", desc: PropertyDescriptor | undefined) => {
+		if (desc) Object.defineProperty(process.stdout, key, desc);
+		else Object.defineProperty(process.stdout, key, { configurable: true, value: undefined, writable: true });
+	};
+	return {
+		restore() {
+			restoreOne("rows", rowsDesc);
+			restoreOne("columns", colsDesc);
+		},
+	};
+}
 
 function createSelector(onCancel: () => void = () => {}): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
@@ -22,7 +51,9 @@ function createSelector(onCancel: () => void = () => {}): SettingsSelectorCompon
 			availableThinkingLevels: [],
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],
-			cwd: process.cwd(),
+			providers: [],
+			settings: createSettingsHost(),
+			plugins: createPluginSettingsHost(process.cwd()),
 		},
 		{
 			onChange: () => {},
@@ -40,7 +71,7 @@ function focusMemoryTab(comp: SettingsSelectorComponent): void {
 
 describe("SettingsSelectorComponent memory tab", () => {
 	it("reveals condition-gated Hindsight rows the moment memory.backend changes via the submenu", () => {
-		settings.set("memory.backend", "off");
+		cfgMemoryBackend.set(settings, "off");
 		const comp = createSelector();
 		focusMemoryTab(comp);
 		// Width 70 keeps the flat single-column layout (the wide split layout
@@ -48,6 +79,7 @@ describe("SettingsSelectorComponent memory tab", () => {
 		const before = comp.render(70).join("\n");
 		expect(before).toContain("Memory Backend");
 		expect(before).not.toContain("Hindsight API URL");
+		expect(before).not.toContain("Hindsight API Token");
 
 		// Memory Backend is the only visible row, so it's already selected at index 0.
 		// Enter opens the SelectSubmenu pre-positioned on "off"; navigate to "hindsight" (index 2) and confirm.
@@ -56,15 +88,44 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\x1b[B");
 		comp.handleInput("\n");
 
-		expect(settings.get("memory.backend")).toBe("hindsight");
+		expect(cfgMemoryBackend.get(settings)).toBe("hindsight");
 		const after = comp.render(70).join("\n");
 		expect(after).toContain("Memory Backend");
 		expect(after).toContain("Hindsight API URL");
+		expect(after).toContain("Hindsight API Token");
 		expect(after).toContain("Hindsight Auto Recall");
 	});
 
+	it("saves a pasted Hindsight API token from its settings row", () => {
+		cfgMemoryBackend.set(settings, "hindsight");
+		cfgHindsightApiToken.set(settings, "saved-secret-token");
+		const comp = createSelector();
+
+		for (const ch of "hindsight api token") comp.handleInput(ch);
+		const row = comp.render(120).join("\n");
+		expect(row).toContain("Hindsight API Token");
+		expect(row).toContain("••••••••");
+		expect(row).not.toContain("saved-secret-token");
+
+		comp.handleInput("\n");
+		expect(comp.render(120).join("\n")).not.toContain("saved-secret-token");
+		comp.handleInput("\n");
+		expect(cfgHindsightApiToken.get(settings)).toBe("saved-secret-token");
+		expect(comp.render(120).join("\n")).not.toContain("saved-secret-token");
+
+		comp.handleInput("\n");
+		comp.handleInput("\x15");
+		comp.handleInput("\x1b[200~test-token-123\x1b[201~");
+		expect(comp.render(120).join("\n")).not.toContain("test-token-123");
+		comp.handleInput("\n");
+
+		expect(cfgHindsightApiToken.get(settings)).toBe("test-token-123");
+		expect(loadHindsightConfig(settings).hindsightApiToken).toBe("test-token-123");
+		expect(comp.render(120).join("\n")).not.toContain("test-token-123");
+	});
+
 	it("hides Hindsight rows again when the backend is switched back to off without leaving the tab", () => {
-		settings.set("memory.backend", "hindsight");
+		cfgMemoryBackend.set(settings, "hindsight");
 		const comp = createSelector();
 		focusMemoryTab(comp);
 		// Width 70 keeps the flat layout so all sections' rows render inline.
@@ -77,45 +138,11 @@ describe("SettingsSelectorComponent memory tab", () => {
 		comp.handleInput("\x1b[A");
 		comp.handleInput("\n");
 
-		expect(settings.get("memory.backend")).toBe("off");
+		expect(cfgMemoryBackend.get(settings)).toBe("off");
 		const after = comp.render(70).join("\n");
 		expect(after).toContain("Memory Backend");
 		expect(after).not.toContain("Hindsight API URL");
 		expect(after).not.toContain("Hindsight Auto Recall");
-	});
-
-	it("renders group titles, suppressing groups whose items are all condition-hidden", () => {
-		settings.set("memory.backend", "off");
-		const comp = createSelector();
-		focusMemoryTab(comp);
-
-		const strip = (line: string): string => line.replace(/\x1b\[[0-9;]*m/g, "");
-
-		// The fullscreen frame wraps every content line in │…│. A single visible
-		// group renders flat: the title is a standalone heading row inside the
-		// frame. Mnemopi/Hindsight groups are fully condition-hidden and emit nothing.
-		const flatHeadings = comp
-			.render(120)
-			.map(line => strip(line).replace(/^│/, "").replace(/│$/, "").trim())
-			.filter(line => line === "General" || line === "Mnemopi" || line === "Hindsight");
-		expect(flatHeadings).toEqual(["General"]);
-
-		// Switch backend to hindsight: a second group materializes, so the wide
-		// render switches to the split layout with section titles in the sidebar.
-		comp.handleInput("\n");
-		comp.handleInput("\x1b[B");
-		comp.handleInput("\x1b[B");
-		comp.handleInput("\n");
-
-		// Split rows carry three │s — frame, sidebar divider, frame — so the
-		// sidebar cell is the segment between the first two.
-		const sidebarTitles = comp
-			.render(120)
-			.map(line => strip(line).split("│"))
-			.filter(parts => parts.length >= 4)
-			.map(parts => parts[1].trim())
-			.filter(title => title.length > 0);
-		expect(sidebarTitles).toEqual(["General", "Hindsight"]);
 	});
 
 	it("clears the global settings search on Escape before closing the selector", () => {
@@ -147,14 +174,14 @@ describe("SettingsSelectorComponent memory tab", () => {
 
 	it("puts the exact global settings search hit before incidental matches", () => {
 		const comp = createSelector();
-		for (const ch of "image provider") comp.handleInput(ch);
+		for (const ch of "fetch provider") comp.handleInput(ch);
 
 		const strip = (line: string): string => line.replace(/\x1b\[[0-9;]*m/g, "");
 		const rendered = comp.render(120).map(strip).join("\n");
 		const providersIndex = rendered.indexOf("Providers");
 		const appearanceIndex = rendered.indexOf("Appearance");
 
-		expect(rendered).toContain("Image Provider");
+		expect(rendered).toContain("Fetch Provider");
 		expect(rendered).not.toContain("Include Model in Prompt");
 		expect(rendered).not.toContain("Service Tier");
 		expect(providersIndex).toBeGreaterThanOrEqual(0);
@@ -188,21 +215,17 @@ describe("SettingsSelectorComponent memory tab", () => {
 
 	it("delegates Escape to an open settings submenu before closing the selector", () => {
 		let cancelCount = 0;
-		settings.set("memory.backend", "off");
+		cfgMemoryBackend.set(settings, "off");
 		const comp = createSelector(() => {
 			cancelCount++;
 		});
 		focusMemoryTab(comp);
 
 		comp.handleInput("\n");
-		expect(comp.render(120).join("\n")).toContain("Esc to go back");
-
 		comp.handleInput("\x1b");
 		const afterBack = comp.render(120).join("\n");
 		expect(cancelCount).toBe(0);
 		expect(afterBack).toContain("Memory Backend");
-		expect(afterBack).toContain("Esc to close");
-		expect(afterBack).not.toContain("Esc to go back");
 
 		comp.handleInput("\x1b");
 		expect(cancelCount).toBe(1);

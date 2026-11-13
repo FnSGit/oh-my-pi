@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { applyAnthropicUsageExtras } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { parseChunkUsage } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import type { Model, Usage } from "@oh-my-pi/pi-ai/types";
+import {
+	calculateOpenAIUsageAccounting,
+	populateResponsesUsageFromResponse,
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
+import type { AssistantMessage, Model, Usage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 const OPENAI_MODEL: Model<"openai-completions"> = buildModel({
@@ -15,6 +19,19 @@ const OPENAI_MODEL: Model<"openai-completions"> = buildModel({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 200_000,
 	maxTokens: 8_192,
+});
+
+const OPENROUTER_MODEL: Model<"openai-completions"> = buildModel({
+	id: "deepseek/deepseek-v4-flash",
+	name: "DeepSeek V4 Flash",
+	api: "openai-completions",
+	provider: "openrouter",
+	baseUrl: "https://openrouter.ai/api/v1",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0.098, output: 0.196, cacheRead: 0.02, cacheWrite: 0 },
+	contextWindow: 1_048_576,
+	maxTokens: 384_000,
 });
 
 function blankUsage(): Usage {
@@ -48,6 +65,21 @@ describe("openai-completions parseChunkUsage", () => {
 		expect(usage.cacheRead).toBe(200);
 		expect(usage.totalTokens).toBe(1_100);
 		expect(usage.reasoningTokens).toBe(40);
+	});
+
+	it("uses OpenRouter's reported account charge instead of the catalog estimate", () => {
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 1_000_000,
+				completion_tokens: 100_000,
+				cost: 0.42,
+			},
+			OPENROUTER_MODEL,
+			undefined,
+		);
+
+		expect(usage.cost.total).toBe(0.42);
+		expect(usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite).toBeCloseTo(0.42);
 	});
 
 	it("omits reasoningTokens when no reasoning_tokens are reported", () => {
@@ -93,6 +125,27 @@ describe("openai-completions parseChunkUsage", () => {
 		expect(usage.cacheRead).toBe(5_800);
 		expect(usage.cacheWrite).toBe(0);
 		expect(usage.totalTokens).toBe(6_250);
+	});
+
+	it("reads Vertex/Gemini cachedContentTokenCount as a cache-read source", () => {
+		// Vertex AI (and gateways fronting it) report cache hits in
+		// usage.cachedContentTokenCount (camelCase) with no OpenAI-shaped
+		// cached_tokens field. promptTokenCount/prompt_tokens includes the
+		// cached portion, so input = prompt_tokens - cachedContentTokenCount.
+		const usage = parseChunkUsage(
+			{
+				prompt_tokens: 33_006,
+				completion_tokens: 110,
+				total_tokens: 33_116,
+				cachedContentTokenCount: 28_639,
+			},
+			OPENAI_MODEL,
+			undefined,
+		);
+
+		expect(usage.cacheRead).toBe(28_639);
+		expect(usage.input).toBe(4_367);
+		expect(usage.totalTokens).toBe(33_116);
 	});
 
 	it("maps DeepSeek prompt_cache_hit_tokens + prompt_cache_miss_tokens correctly", () => {
@@ -200,6 +253,124 @@ describe("openai-completions parseChunkUsage", () => {
 		expect(usage.cacheRead).toBe(200);
 		expect(usage.cacheWrite).toBe(5_000);
 		expect(usage.totalTokens).toBe(6_250);
+	});
+});
+
+describe("shared OpenAI usage accounting", () => {
+	it("uses provider cache-write details ahead of native DeepSeek passthrough fields", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 6_000,
+			outputTokens: 250,
+			cachedTokens: 200,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: 5_000,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(800);
+		expect(usage.cacheRead).toBe(200);
+		expect(usage.cacheWrite).toBe(5_000);
+		expect(usage.totalTokens).toBe(6_250);
+	});
+
+	it("does not emit DeepSeek cache misses as cache writes", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 150,
+			outputTokens: 200,
+			cachedTokens: 100,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: undefined,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(50);
+		expect(usage.cacheRead).toBe(100);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(350);
+	});
+
+	it("treats zero provider cache-write as present when native fields pass through", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 150,
+			outputTokens: 25,
+			cachedTokens: 100,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: 0,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(50);
+		expect(usage.cacheRead).toBe(100);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(175);
+	});
+});
+
+describe("openai-responses usage attribution", () => {
+	it("separates Responses orchestration tokens from conversation usage", () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "openai-responses",
+			provider: "sakana",
+			model: "fugu-ultra",
+			usage: blankUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+
+		populateResponsesUsageFromResponse(output, {
+			input_tokens: 120,
+			output_tokens: 80,
+			total_tokens: 270,
+			input_tokens_details: {
+				cached_tokens: 10,
+				orchestration_input_tokens: 30,
+				orchestration_input_cached_tokens: 5,
+			},
+			output_tokens_details: {
+				orchestration_output_tokens: 40,
+			},
+		});
+
+		expect(output.usage.input).toBe(110);
+		expect(output.usage.cacheRead).toBe(10);
+		expect(output.usage.output).toBe(80);
+		expect(output.usage.orchestration).toEqual({ input: 25, cacheRead: 5, output: 40 });
+		expect(output.usage.totalTokens).toBe(270);
+	});
+
+	it("does not label Codex orchestration input as an uncached prompt miss when primary totals include it", () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5.5",
+			usage: blankUsage(),
+			stopReason: "toolUse",
+			timestamp: 0,
+		};
+
+		populateResponsesUsageFromResponse(output, {
+			input_tokens: 185_853,
+			output_tokens: 29,
+			total_tokens: 185_882,
+			input_tokens_details: {
+				cached_tokens: 180_224,
+				orchestration_input_tokens: 5_629,
+				orchestration_input_cached_tokens: 0,
+			},
+		});
+
+		expect(output.usage.input).toBe(0);
+		expect(output.usage.cacheRead).toBe(180_224);
+		expect(output.usage.output).toBe(29);
+		expect(output.usage.orchestration).toEqual({ input: 5_629 });
+		expect(output.usage.totalTokens).toBe(185_882);
 	});
 });
 

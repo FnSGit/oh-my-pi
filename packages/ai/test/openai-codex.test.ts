@@ -1,12 +1,52 @@
 import { describe, expect, it } from "bun:test";
+import {
+	createOpenAICodexAuthorizationUrl,
+	formatOpenAICodexTokenEndpointError,
+} from "@oh-my-pi/pi-ai/oauth/openai-codex";
 import { type RequestBody, transformRequestBody } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
 import { CodexApiError, parseCodexError } from "@oh-my-pi/pi-ai/providers/openai-codex/response-handler";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { convertOpenAICodexResponsesTools } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type { Tool } from "@oh-my-pi/pi-ai/types";
+import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
+import { OPENAI_HEADER_VALUES } from "@oh-my-pi/pi-catalog/wire/codex";
 import { createCodexModel } from "./helpers";
 
 const DEFAULT_PROMPT_PREFIX =
 	"You are an expert coding assistant. You help users with coding tasks by reading files, executing commands";
+
+describe("openai-codex oauth", () => {
+	it("uses the same default originator for browser login and API requests", () => {
+		const authUrl = createOpenAICodexAuthorizationUrl({
+			state: "state",
+			redirectUri: "http://localhost:1455/auth/callback",
+			challenge: "challenge",
+		});
+
+		expect(new URL(authUrl).searchParams.get("originator")).toBe(OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+	});
+
+	it("requests Codex connector scopes during browser login", () => {
+		const authUrl = createOpenAICodexAuthorizationUrl({
+			state: "state",
+			redirectUri: "http://localhost:1455/auth/callback",
+			challenge: "challenge",
+		});
+
+		const scopes = new Set((new URL(authUrl).searchParams.get("scope") ?? "").split(" "));
+		expect(scopes.has("api.connectors.read")).toBe(true);
+		expect(scopes.has("api.connectors.invoke")).toBe(true);
+	});
+
+	it("formats object token endpoint errors without object coercion", () => {
+		const detail = formatOpenAICodexTokenEndpointError(
+			403,
+			JSON.stringify({ error: { code: "access_denied", message: "Connector scope missing" } }),
+		);
+
+		expect(detail).toBe("403 access_denied: Connector scope missing");
+	});
+});
 
 describe("openai-codex tool schemas", () => {
 	it("adds empty properties to no-argument object parameter schemas", () => {
@@ -26,6 +66,116 @@ describe("openai-codex tool schemas", () => {
 			description: "List outgoing messages",
 			parameters: { type: "object", properties: {} },
 		});
+	});
+	it("strips MCP regex lookaround patterns from function parameters", () => {
+		const tools: Tool[] = [
+			{
+				name: "get_design_context",
+				description: "Get Figma design context",
+				parameters: {
+					type: "object",
+					properties: {
+						fileKey: { type: "string", pattern: "^(?!undefined$|null$)" },
+					},
+					propertyNames: { pattern: "^(?!undefined$|null$)" },
+				},
+			},
+		];
+
+		const converted = convertOpenAICodexResponsesTools(tools, createCodexModel("gpt-5.5"));
+
+		expect(converted[0]).toEqual({
+			type: "function",
+			name: "get_design_context",
+			description: "Get Figma design context",
+			parameters: {
+				type: "object",
+				properties: {
+					fileKey: { type: "string" },
+				},
+				propertyNames: true,
+			},
+		});
+	});
+	it("strips MCP regex lookaround patternProperties from function parameters", () => {
+		const tools: Tool[] = [
+			{
+				name: "read_dynamic_values",
+				description: "Read dynamic values",
+				parameters: {
+					type: "object",
+					patternProperties: {
+						"^(?!secret_)": { type: "string" },
+						"^public_": { type: "string" },
+					},
+					additionalProperties: false,
+				},
+			},
+		];
+
+		const converted = convertOpenAICodexResponsesTools(tools, createCodexModel("gpt-5.5"));
+
+		expect(converted[0]).toEqual({
+			type: "function",
+			name: "read_dynamic_values",
+			description: "Read dynamic values",
+			parameters: {
+				type: "object",
+				patternProperties: {
+					".*": { type: "string" },
+					"^public_": { type: "string" },
+				},
+				additionalProperties: false,
+				properties: {},
+			},
+		});
+	});
+
+	it("preserves explicit strict:false on the wire (#4336)", () => {
+		const tools: Tool[] = [
+			{
+				name: "search",
+				description: "Search",
+				strict: false,
+				parameters: {
+					type: "object",
+					additionalProperties: false,
+					properties: {
+						name: { type: "string" },
+						target: { type: "string" },
+					},
+					required: ["name"],
+				},
+			},
+		];
+
+		const converted = convertOpenAICodexResponsesTools(tools, createCodexModel("gpt-5.5"));
+
+		// Author-set `strict: false` MUST survive to the wire so backends that
+		// distinguish it from an omitted flag stop over-filling optional args.
+		expect(converted[0]).toMatchObject({ type: "function", name: "search", strict: false });
+	});
+
+	it("omits strict when the tool leaves it unset (#4336)", () => {
+		const tools: Tool[] = [
+			{
+				name: "search",
+				description: "Search",
+				parameters: {
+					type: "object",
+					additionalProperties: false,
+					properties: { name: { type: "string" } },
+					required: ["name"],
+				},
+			},
+		];
+
+		const converted = convertOpenAICodexResponsesTools(tools, createCodexModel("gpt-5.5"));
+		const payload = converted[0] as { strict?: boolean };
+
+		// Codex responses only enforces strict when the tool opts in; leaving
+		// `strict` unset MUST NOT synthesize the field either way.
+		expect(payload.strict).toBeUndefined();
 	});
 });
 
@@ -164,6 +314,37 @@ describe("openai-codex reasoning effort validation", () => {
 			transformRequestBody({ ...body }, createCodexModel(body.model), { reasoningEffort: "xhigh" }),
 		).rejects.toThrow(/Supported efforts: medium, high/);
 	});
+
+	it("rejects gpt-5.6 minimal now that the wire floor is low", async () => {
+		const body: RequestBody = { model: "gpt-5.6-sol", input: [] };
+		await expect(
+			transformRequestBody(body, createCodexModel(body.model), { reasoningEffort: "minimal" }),
+		).rejects.toThrow(/Supported efforts: low, medium, high, xhigh, max/);
+	});
+});
+
+describe("openai-codex reasoning effort wire mapping", () => {
+	it("maps gpt-5.6 user efforts 1:1 onto wire tiers", async () => {
+		const model = createCodexModel("gpt-5.6-sol");
+		const efforts = ["low", "medium", "high", "xhigh", "max"] as const;
+
+		for (const effort of efforts) {
+			const transformed = await transformRequestBody({ model: model.id }, model, {
+				reasoningEffort: effort,
+			});
+			expect(transformed.reasoning?.effort).toBe(effort);
+		}
+	});
+
+	it("keeps pre-5.6 efforts 1:1 and passes none through unmapped", async () => {
+		const gpt55 = createCodexModel("gpt-5.5");
+		const unshifted = await transformRequestBody({ model: gpt55.id }, gpt55, { reasoningEffort: "xhigh" });
+		expect(unshifted.reasoning?.effort).toBe("xhigh");
+
+		const gpt56 = createCodexModel("gpt-5.6-sol");
+		const none = await transformRequestBody({ model: gpt56.id }, gpt56, { reasoningEffort: "none" });
+		expect(none.reasoning?.effort).toBe("none");
+	});
 });
 
 describe("openai-codex error parsing", () => {
@@ -202,5 +383,35 @@ describe("openai-codex error parsing", () => {
 		expect(error.code).toBe("rate_limit_exceeded");
 		expect(error.headers?.get("retry-after")).toBe("7");
 		expect(error.message).toContain("rate limit exceeded");
+	});
+
+	it.each([
+		// `turn_rate_limit_exceeded` is a transient capacity throttle. Borrowing a
+		// window's reset while it still has headroom made retry hints wait hours.
+		[
+			"keeps a capacity 429's Retry-After over a window with headroom",
+			{ code: "turn_rate_limit_exceeded", message: "Codex is at capacity, please try again later" },
+			{ "retry-after": "152", "x-codex-primary-used-percent": "14" },
+			152_000,
+		],
+		// With no Retry-After, an exhausted window's reset is the only timing hint.
+		[
+			"keeps an exhausted window's reset when the 429 has no Retry-After",
+			{ code: "rate_limit_exceeded", message: "slow down" },
+			{ "x-codex-primary-used-percent": "100" },
+			3 * 60 * 60 * 1000,
+		],
+	] as const)("%s", async (_label, error, headers, expectedHintMs) => {
+		const response = new Response(JSON.stringify({ error: { type: "rate_limit_error", ...error } }), {
+			status: 429,
+			headers: { ...headers, "x-codex-primary-reset-at": String(Math.floor(Date.now() / 1000) + 3 * 60 * 60) },
+		});
+
+		const result = await AIError.finalize(await CodexApiError.fromResponse(response), {
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			model: "gpt-5.6-sol",
+		});
+		expect(extractProviderRetryHint("openai-codex", result.message)).toBe(expectedHintMs);
 	});
 });

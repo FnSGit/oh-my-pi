@@ -1,9 +1,32 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, getPuppeteerDir, logger } from "@oh-my-pi/pi-utils";
-import type * as BrowsersNs from "@puppeteer/browsers";
-import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
+import {
+	$which,
+	getPuppeteerDir,
+	isEnoent,
+	isRecord,
+	logger,
+	removeWithRetries,
+	toError,
+	untilAborted,
+	withTimeout,
+} from "@oh-my-pi/pi-utils";
+import type * as BrowsersNs from "@oh-my-pi/pi-utils/browsers";
+import type { BunFile } from "bun";
+import type {
+	Browser,
+	CDPSession,
+	Connection,
+	ConnectOptions,
+	Device,
+	JSHandle,
+	NetworkConditions,
+	Page,
+	default as Puppeteer,
+	TimeoutError,
+	Target,
+} from "puppeteer-core";
 import stealthTamperingScript from "../puppeteer/00_stealth_tampering.txt" with { type: "text" };
 import stealthActivityScript from "../puppeteer/01_stealth_activity.txt" with { type: "text" };
 import stealthHairlineScript from "../puppeteer/02_stealth_hairline.txt" with { type: "text" };
@@ -18,102 +41,402 @@ import stealthPluginsScript from "../puppeteer/10_stealth_plugins.txt" with { ty
 import stealthHardwareScript from "../puppeteer/11_stealth_hardware.txt" with { type: "text" };
 import stealthCodecsScript from "../puppeteer/12_stealth_codecs.txt" with { type: "text" };
 import stealthWorkerScript from "../puppeteer/13_stealth_worker.txt" with { type: "text" };
-import { ToolError } from "../tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { withDownload } from "../../downloads/activity";
+import { TOOL_TIMEOUTS } from "../tool-timeouts";
+import { findUserDataDirInArgs, gracefulKillTreeOnce, probeCdpResponse } from "./attach";
 
 export const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
 
-/**
- * Per-CDP-message timeout applied to every puppeteer launch/connect. Set above
- * `TOOL_TIMEOUTS.browser.max` (30s) so the agent-side wall-clock is the canonical
- * limit; this constant only catches genuinely stuck CDP sockets (renderer wedged,
- * connection dropped, etc.).
- */
+/** Short handshake budget for launch and registry connections. */
 export const BROWSER_PROTOCOL_TIMEOUT_MS = 60_000;
+
+/**
+ * Keep CDP requests alive through the largest browser call budget; the
+ * supervisor owns the execution deadline and recovers a stalled worker.
+ */
+export const BROWSER_PAGE_PROTOCOL_TIMEOUT_MS = TOOL_TIMEOUTS.browser.max * 1000 + 1_000;
+const ENABLE_AUTOMATION_FLAG = "--enable-automation";
+// Automation-tell launch flags that puppeteer-core adds by default. We suppress
+// them via `ignoreDefaultArgs` (the supported escape hatch) to mirror xxxx's
+// chromiumSwitches patch. `--enable-automation` is the loudest: it normally sets
+// navigator.webdriver=true and shows the "controlled by automated software" infobar.
+// Edge is the launch-stability exception: it can exit before CDP opens when this
+// default flag is stripped, so Edge keeps Puppeteer's flag while our explicit
+// `--disable-blink-features=AutomationControlled` launch arg still handles
+// navigator.webdriver.
+// `ignoreDefaultArgs` does exact-string matching, so each entry must be a flag that
+// puppeteer emits verbatim. The default `--disable-features=...` string can't be
+// matched this way; it is neutralized in the puppeteer-core patch (ChromeLauncher).
 const STEALTH_IGNORE_DEFAULT_ARGS = [
+	ENABLE_AUTOMATION_FLAG,
 	"--disable-extensions",
 	"--disable-default-apps",
 	"--disable-component-extensions-with-background-pages",
+	"--disable-popup-blocking",
+	"--disable-client-side-phishing-detection",
+	"--allow-pre-commit-input",
+	"--disable-ipc-flooding-protection",
+	"--metrics-recording-only",
 ];
+
+function isMicrosoftEdgeExecutable(executablePath: string | undefined): boolean {
+	if (!executablePath) return false;
+	const normalizedPath = executablePath.replaceAll("\\", "/").toLowerCase();
+	const executableName = normalizedPath.slice(normalizedPath.lastIndexOf("/") + 1);
+	// Windows ships every channel as msedge.exe; macOS bundles use "Microsoft Edge[ Beta|Dev|Canary]",
+	// Linux packages "microsoft-edge[-stable|-beta|-dev]".
+	return executableName === "msedge.exe" || /^microsoft[ -]edge(?:$|[ -])/.test(executableName);
+}
+
+/**
+ * Puppeteer default args to pass as `ignoreDefaultArgs` so Chromium does not run in
+ * automation mode. Used by the browser tool and the sign-in browser, where Google
+ * rejects automation-controlled browsers as insecure.
+ */
+export function stealthIgnoreDefaultArgs(executablePath: string | undefined): string[] {
+	if (!isMicrosoftEdgeExecutable(executablePath)) return [...STEALTH_IGNORE_DEFAULT_ARGS];
+	return STEALTH_IGNORE_DEFAULT_ARGS.filter(arg => arg !== ENABLE_AUTOMATION_FLAG);
+}
+
+/** Launch arg that keeps `navigator.webdriver` false; pair with {@link stealthIgnoreDefaultArgs}. */
+export const DISABLE_AUTOMATION_CONTROLLED_ARG = "--disable-blink-features=AutomationControlled";
+
+/**
+ * Chromium switches that keep every renderer at normal scheduling priority. On macOS, Chromium up
+ * to M152 moves the renderers of background tabs and spare processes into the Darwin background
+ * band (priority 4) behind `MacAllowBackgroundingRenderProcesses`, ignoring Puppeteer's
+ * `--disable-renderer-backgrounding`. On a busy host the kernel then barely runs them: Tracing.start
+ * waits out Chromium's 10s ack timeout for them, and CDP calls into a tab opened beside another
+ * stall. Unknown feature names are ignored, so builds without the feature are unaffected; Puppeteer
+ * merges every `--disable-features` switch it is given.
+ */
+export const RENDERER_PRIORITY_ARGS: readonly string[] =
+	process.platform === "darwin" ? ["--disable-features=MacAllowBackgroundingRenderProcesses"] : [];
+
 const STEALTH_ACCEPT_LANGUAGE = "en-US,en";
 
 const USER_AGENT_TARGET_TIMEOUT_MS = 5_000;
 const USER_AGENT_TARGET_TYPES = new Set(["page", "webview", "background_page"]);
-const PUPPETEER_SOURCE_URL_SUFFIX = "//# sourceURL=__puppeteer_evaluation_script__";
+/** How long a pipe-launched Chromium may take to publish its DevTools port after launch. */
+const DEVTOOLS_ACTIVE_PORT_TIMEOUT_MS = 10_000;
+/** Upper bound on `browser.close()`, which resolves only once Chromium exits; a wedged one never does (issue #5260). */
+const HEADLESS_CLOSE_TIMEOUT_MS = 5_000;
 
 /**
- * Lazy-import puppeteer from a safe CWD so cosmiconfig doesn't choke
- * on malformed package.json files in the user's project tree.
- *
- * Dynamic import is required because puppeteer-core probes the cwd at module
- * load time; we must `process.chdir` to a safe scratch dir before loading and
- * restore cwd afterwards. A static import would run at module-init time before
- * cwd is safe.
+ * Lazy-import puppeteer while hiding the user's cwd from cosmiconfig. The
+ * import must not change the filesystem cwd: it is awaited and callers
+ * continue running on the main thread while it is pending.
  */
+let puppeteerCwdFailed = false;
+let puppeteerCwdFailure: unknown;
+let jsHandleConstructor: typeof JSHandle | undefined;
+let timeoutErrorConstructor: typeof TimeoutError | undefined;
+/** Puppeteer exports `TargetCloseError` at runtime but leaves it out of its public types. */
+let targetCloseErrorConstructor: unknown;
+let knownDevices: Readonly<Record<string, Device>> | undefined;
+let predefinedNetworkConditions: Readonly<Record<string, NetworkConditions>> | undefined;
+
+/** Identify handles using the lazily loaded Puppeteer instance without triggering an early import. */
+export function isPuppeteerHandle(value: unknown): value is JSHandle {
+	return jsHandleConstructor !== undefined && value instanceof jsHandleConstructor;
+}
+
+/**
+ * Recognize Puppeteer's `TimeoutError` by class identity: release builds minify class names,
+ * so its `name` reads like `Og` there and never equals "TimeoutError".
+ */
+export function isPuppeteerTimeout(error: unknown): boolean {
+	return timeoutErrorConstructor !== undefined && error instanceof timeoutErrorConstructor;
+}
+
+/** Recognize Puppeteer's error for a command whose session closed under it, by class identity like {@link isPuppeteerTimeout}. */
+export function isPuppeteerTargetClose(error: unknown): boolean {
+	return typeof targetCloseErrorConstructor === "function" && error instanceof targetCloseErrorConstructor;
+}
+
+/**
+ * Build Puppeteer's `TimeoutError` for a deadline omp enforces in place of one of Puppeteer's waits.
+ * Its `name` stays "TimeoutError" in release builds: back/forward/reload pass this error to the agent's cell as is.
+ */
+export function puppeteerTimeoutError(message: string): Error {
+	if (!timeoutErrorConstructor) throw new Error("Puppeteer is not loaded");
+	const error = new timeoutErrorConstructor(message);
+	error.name = "TimeoutError";
+	return error;
+}
+async function importPuppeteerWithSafeCwd(safeDir: string): Promise<typeof Puppeteer> {
+	const cwdDescriptor = Object.getOwnPropertyDescriptor(process, "cwd");
+	if (!cwdDescriptor || typeof cwdDescriptor.value !== "function") {
+		throw new Error("Unable to safely override process.cwd for Puppeteer import");
+	}
+
+	try {
+		Object.defineProperty(process, "cwd", { ...cwdDescriptor, value: () => safeDir });
+	} catch (overrideFailure) {
+		puppeteerCwdFailed = true;
+		puppeteerCwdFailure = overrideFailure;
+		throw overrideFailure;
+	}
+	let loaded: typeof Puppeteer | undefined;
+	let importFailure: unknown;
+	let importFailed = false;
+	let restorationFailure: unknown;
+	let restorationFailed = false;
+	try {
+		try {
+			// Dynamic import is intentional: Puppeteer probes cwd during module initialization.
+			const module = await import("puppeteer-core");
+			loaded = module.default;
+			jsHandleConstructor = module.JSHandle;
+			timeoutErrorConstructor = module.TimeoutError;
+			targetCloseErrorConstructor = Reflect.get(module, "TargetCloseError");
+			knownDevices = module.KnownDevices;
+			predefinedNetworkConditions = module.PredefinedNetworkConditions;
+		} catch (error) {
+			importFailed = true;
+			importFailure = error;
+		}
+	} finally {
+		try {
+			Object.defineProperty(process, "cwd", cwdDescriptor);
+		} catch (error) {
+			restorationFailed = true;
+			restorationFailure = error;
+		}
+	}
+	if (restorationFailed) {
+		const failure = importFailed
+			? new AggregateError([importFailure, restorationFailure], "Puppeteer import and cwd restoration failed")
+			: restorationFailure;
+		puppeteerCwdFailed = true;
+		puppeteerCwdFailure = failure;
+		throw failure;
+	}
+	if (importFailed) throw importFailure;
+	return loaded!;
+}
+
 let puppeteerModule: typeof Puppeteer | undefined;
+let puppeteerLoadPromise: Promise<typeof Puppeteer> | undefined;
+async function loadPuppeteerImport(safeDir: string, prepareSafeDir: boolean): Promise<typeof Puppeteer> {
+	if (puppeteerCwdFailed) throw puppeteerCwdFailure;
+	let loading = puppeteerLoadPromise;
+	if (!loading) {
+		loading = (async () => {
+			if (prepareSafeDir) await Bun.write(path.join(safeDir, "package.json"), "{}");
+			return importPuppeteerWithSafeCwd(safeDir);
+		})();
+		puppeteerLoadPromise = loading;
+	}
+	try {
+		return await loading;
+	} finally {
+		if (puppeteerLoadPromise === loading) puppeteerLoadPromise = undefined;
+	}
+}
+
 export async function loadPuppeteer(): Promise<typeof Puppeteer> {
 	if (puppeteerModule) return puppeteerModule;
-	const prev = process.cwd();
-	const safeDir = getPuppeteerDir();
-	await Bun.write(path.join(safeDir, "package.json"), "{}");
-	try {
-		process.chdir(safeDir);
-		puppeteerModule = (await import("puppeteer-core")).default;
-		return puppeteerModule;
-	} finally {
-		process.chdir(prev);
-	}
+	const loaded = await loadPuppeteerImport(getPuppeteerDir(), true);
+	puppeteerModule = loaded;
+	return loaded;
 }
 
 let puppeteerModuleWorker: typeof Puppeteer | undefined;
 export async function loadPuppeteerInWorker(safeDir: string): Promise<typeof Puppeteer> {
 	if (puppeteerModuleWorker) return puppeteerModuleWorker;
-	const orig = process.cwd;
-	Object.defineProperty(process, "cwd", { value: () => safeDir, configurable: true });
+	const loaded = await loadPuppeteerImport(safeDir, false);
+	puppeteerModuleWorker = loaded;
+	return loaded;
+}
+
+/** Normalize transport event rejections before they cross browser or worker boundaries. */
+export async function connectPuppeteer(puppeteer: typeof Puppeteer, options: ConnectOptions): Promise<Browser> {
 	try {
-		puppeteerModuleWorker = (await import("puppeteer-core")).default;
-		return puppeteerModuleWorker;
-	} finally {
-		Object.defineProperty(process, "cwd", { value: orig, configurable: true });
+		return await puppeteer.connect(options);
+	} catch (error) {
+		// The WebSocket transports can reject with ErrorEvent rather than Error.
+		// Its message includes the actual debugger endpoint and handshake failure.
+		const failure =
+			!(error instanceof Error) && isRecord(error) && typeof error.message === "string"
+				? new Error(error.message, { cause: error })
+				: toError(error);
+		// Bun's `ws` shim (1.4.4+) rejects a refused upgrade with only "Unexpected server response: <status>";
+		// name the debugger endpoint the way Bun's native WebSocket error does.
+		if (failure.message.startsWith("Unexpected server response: ")) {
+			const endpoint =
+				options.browserWSEndpoint ??
+				(options.browserURL && (await debuggerEndpointOf(options.browserURL))) ??
+				options.browserURL;
+			if (endpoint)
+				throw new Error(`WebSocket connection to '${endpoint}' failed: ${failure.message}`, { cause: failure });
+		}
+		throw failure;
 	}
+}
+
+/** The `webSocketDebuggerUrl` a CDP HTTP endpoint advertises, or undefined when it does not answer with one. */
+async function debuggerEndpointOf(browserURL: string): Promise<string | undefined> {
+	const response = await probeCdpResponse(`${browserURL.replace(/\/+$/, "")}/json/version`, { timeoutMs: 1500 });
+	if (response?.status !== 200) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(response.body);
+		return isRecord(parsed) && typeof parsed.webSocketDebuggerUrl === "string"
+			? parsed.webSocketDebuggerUrl
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The connection's root session, which answers browser-level `Target.*` commands. The omp relay serves
+ * those but exposes no attachable browser target, so `browser.target().createCDPSession()` fails there.
+ */
+export function browserConnection(browser: Browser): Connection {
+	// Puppeteer's CDP browser keeps its connection behind an internal getter.
+	const connection = "_connection" in browser ? browser._connection : undefined;
+	if (!isCdpConnection(connection)) throw new ToolError("Puppeteer browser exposes no CDP connection");
+	return connection;
+}
+
+function isCdpConnection(value: unknown): value is Connection {
+	return isRecord(value) && typeof value.send === "function" && typeof value.createSession === "function";
+}
+
+/** Return device descriptors from the already-loaded Puppeteer module. */
+export function loadedKnownDevices(): Readonly<Record<string, Device>> {
+	if (!knownDevices) throw new ToolError("Puppeteer device descriptors are not loaded");
+	return knownDevices;
+}
+
+/** Return network presets from the already-loaded Puppeteer module. */
+export function loadedNetworkConditions(): Readonly<Record<string, NetworkConditions>> {
+	if (!predefinedNetworkConditions) throw new ToolError("Puppeteer network presets are not loaded");
+	return predefinedNetworkConditions;
 }
 
 let browsersModule: typeof BrowsersNs | undefined;
 async function loadBrowsers(): Promise<typeof BrowsersNs> {
 	if (!browsersModule) {
-		browsersModule = await import("@puppeteer/browsers");
+		browsersModule = await import("@oh-my-pi/pi-utils/browsers");
 	}
 	return browsersModule;
 }
 
 /**
- * Lazily download Chromium on first browser launch via @puppeteer/browsers.
- * Skipped when a system Chromium (NixOS) or PUPPETEER_EXECUTABLE_PATH is set.
- * The browser is cached under ~/.omp/puppeteer (getPuppeteerDir).
+ * Resolve the Chromium executable puppeteer will launch.
+ *
+ * `PUPPETEER_EXECUTABLE_PATH` always wins. On macOS the isolated Chrome for
+ * Testing binary is preferred over a detected system Chrome: a headless
+ * daemon launched from a system `Google Chrome.app` bundle shares its
+ * LaunchServices bundle identity (`com.google.Chrome`), so macOS can deliver
+ * the user's open-URL Apple Events to the daemon and silently swallow their
+ * link clicks (#8673). Chrome for Testing uses a dedicated bundle id
+ * (`com.google.chrome.for.testing`) that is never a user's default handler;
+ * system Chrome is used on macOS only when Chrome for Testing cannot be
+ * obtained. Other platforms keep the download-avoiding system Chrome
+ * preference and fall back to Chrome for Testing. The managed browser is
+ * cached under ~/.omp/puppeteer (getPuppeteerDir). Returns undefined when
+ * platform detection fails (puppeteer default resolution takes over).
+ * Exported so real-browser tests can probe launchability and skip on hosts
+ * missing Chrome's system libraries.
  */
 let chromiumExecutablePromise: Promise<string | undefined> | undefined;
-async function ensureChromiumExecutable(): Promise<string | undefined> {
-	const sysChrome = resolveSystemChromium();
-	if (sysChrome) return sysChrome;
+export async function ensureChromiumExecutable(): Promise<string | undefined> {
 	const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
 	if (envPath) return envPath;
-	if (chromiumExecutablePromise) return chromiumExecutablePromise;
+	// macOS: never route a background daemon through the user's GUI Chrome
+	// bundle; prefer the isolated Chrome for Testing binary instead (#8673).
+	const preferManagedChromium = process.platform === "darwin";
+	if (!preferManagedChromium) {
+		const sysChrome = await resolveSystemChromium();
+		if (sysChrome) return sysChrome;
+	}
 
-	chromiumExecutablePromise = (async () => {
-		const browsers = await loadBrowsers();
-		const platform = browsers.detectBrowserPlatform();
-		if (!platform) {
+	chromiumExecutablePromise ??= ensureManagedChromium().catch(async err => {
+		// Cache a successful fallback too: the open preflight and the actual
+		// launch both resolve the executable. Otherwise an unavailable download
+		// is retried inside the open deadline immediately after preflight.
+		if (preferManagedChromium) {
+			const sysChrome = await resolveSystemChromium();
+			if (sysChrome) {
+				logger.warn(
+					"Chrome for Testing unavailable; falling back to the system Chrome bundle. On macOS this can let the " +
+						"headless browser daemon capture your link clicks (#8673). Set PUPPETEER_EXECUTABLE_PATH to a " +
+						"dedicated Chromium to avoid this.",
+					{ path: sysChrome, error: (err as Error).message },
+				);
+				return sysChrome;
+			}
+		}
+		chromiumExecutablePromise = undefined;
+		throw new ToolError(
+			`Failed to install Chromium for puppeteer: ${(err as Error).message}. ` +
+				"Set PUPPETEER_EXECUTABLE_PATH to use an existing Chrome/Chromium binary, or install one manually.",
+		);
+	});
+
+	return await chromiumExecutablePromise;
+}
+
+/**
+ * Resolve the executable for interactive sign-in windows. Microsoft Edge needs
+ * Puppeteer's `--enable-automation` to launch (see {@link stealthIgnoreDefaultArgs}),
+ * and Google sign-in rejects automation-controlled browsers, so an Edge
+ * resolution is replaced with Chrome for Testing.
+ *
+ * Throws when Edge is the only local browser and Chrome for Testing cannot be installed.
+ */
+export async function ensureSignInChromiumExecutable(): Promise<string | undefined> {
+	const executablePath = await ensureChromiumExecutable();
+	if (!isMicrosoftEdgeExecutable(executablePath)) return executablePath;
+	try {
+		return await ensureManagedChromium();
+	} catch (err) {
+		throw new Error(
+			`Browser sign-in cannot use Microsoft Edge and Chrome for Testing is unavailable: ${(err as Error).message}. ` +
+				"Set PUPPETEER_EXECUTABLE_PATH to a Chrome or Chromium binary.",
+		);
+	}
+}
+
+/**
+ * Whether launching managed Chromium would first download Chrome for Testing,
+ * as {@link ensureChromiumExecutable} decides: no `PUPPETEER_EXECUTABLE_PATH`,
+ * no usable system Chrome where one is preferred (every platform but macOS),
+ * and no Chrome for Testing under ~/.omp/puppeteer yet.
+ */
+export async function chromiumNeedsDownload(): Promise<boolean> {
+	if (process.env.PUPPETEER_EXECUTABLE_PATH) return false;
+	if (process.platform !== "darwin" && (await resolveSystemChromium())) return false;
+	const managed = await managedChromiumLocation();
+	return managed !== undefined && !fs.existsSync(managed.executablePath);
+}
+
+/** Where this host's Chrome for Testing build lives under ~/.omp/puppeteer; undefined when platform detection fails. */
+async function managedChromiumLocation() {
+	const browsers = await loadBrowsers();
+	const platform = browsers.detectBrowserPlatform();
+	if (!platform) return undefined;
+	const cacheDir = getPuppeteerDir();
+	const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
+	const buildId = PUPPETEER_REVISIONS.chrome;
+	const executablePath = browsers.computeExecutablePath({ buildId, cacheDir, platform });
+	return { browsers, platform, cacheDir, buildId, executablePath };
+}
+
+let managedChromiumPromise: Promise<string | undefined> | undefined;
+/** Chrome for Testing under ~/.omp/puppeteer, downloaded on first use; undefined when platform detection fails. */
+function ensureManagedChromium(): Promise<string | undefined> {
+	managedChromiumPromise ??= (async () => {
+		const managed = await managedChromiumLocation();
+		if (!managed) {
 			logger.warn("Could not detect browser platform; relying on puppeteer default resolution");
 			return undefined;
 		}
-		const cacheDir = getPuppeteerDir();
-		const { PUPPETEER_REVISIONS } = await import("puppeteer-core/internal/revisions.js");
-		const buildId = await browsers.resolveBuildId(browsers.Browser.CHROME, platform, PUPPETEER_REVISIONS.chrome);
-		const executablePath = browsers.computeExecutablePath({
-			browser: browsers.Browser.CHROME,
-			buildId,
-			cacheDir,
-			platform,
-		});
+		const { browsers, platform, cacheDir, buildId, executablePath } = managed;
 		if (fs.existsSync(executablePath)) return executablePath;
 
 		logger.warn("Downloading Chromium for puppeteer (first browser use)", {
@@ -121,32 +444,31 @@ async function ensureChromiumExecutable(): Promise<string | undefined> {
 			platform,
 			cacheDir,
 		});
-		let lastReportedPercent = -1;
-		await browsers.install({
-			browser: browsers.Browser.CHROME,
-			buildId,
-			cacheDir,
-			platform,
-			downloadProgressCallback: (downloaded, total) => {
-				if (total <= 0) return;
-				const pct = Math.floor((downloaded / total) * 100);
-				if (pct >= lastReportedPercent + 10 || downloaded === total) {
-					lastReportedPercent = pct;
-					logger.debug(
-						`Chromium download: ${pct}% (${Math.round(downloaded / 1_000_000)} / ${Math.round(total / 1_000_000)} MB)`,
+		await withDownload("Chromium", tracker =>
+			browsers.install({
+				buildId,
+				cacheDir,
+				platform,
+				downloadProgressCallback: ({ downloadedBytes, totalBytes }) => {
+					if (totalBytes <= 0) {
+						tracker.update({ loaded: downloadedBytes });
+						return;
+					}
+					// The archive is unpacked after the last byte arrives.
+					tracker.update(
+						downloadedBytes >= totalBytes
+							? { loaded: downloadedBytes, total: totalBytes, detail: "extracting" }
+							: { loaded: downloadedBytes, total: totalBytes },
 					);
-				}
-			},
-		});
+				},
+			}),
+		);
 		return executablePath;
 	})().catch(err => {
-		chromiumExecutablePromise = undefined;
-		throw new ToolError(
-			`Failed to install Chromium for puppeteer: ${(err as Error).message}. ` +
-				"Set PUPPETEER_EXECUTABLE_PATH to use an existing Chrome/Chromium binary, or install one manually.",
-		);
+		managedChromiumPromise = undefined;
+		throw err;
 	});
-	return chromiumExecutablePromise;
+	return managedChromiumPromise;
 }
 
 let resolvedChromium: string | null | undefined; // undefined = unchecked; null = not found
@@ -154,16 +476,56 @@ let resolvedChromium: string | null | undefined; // undefined = unchecked; null 
 function isExecutableFile(p: string): boolean {
 	try {
 		const st = fs.statSync(p);
-		return st.isFile();
+		if (!st.isFile()) return false;
+		if (process.platform === "win32") return true;
+		fs.accessSync(p, fs.constants.X_OK);
+		return true;
 	} catch {
 		return false;
 	}
 }
 
-function systemChromiumCandidates(): string[] {
-	const home = os.homedir();
+async function isChromiumExecutable(p: string): Promise<boolean> {
+	if (!isExecutableFile(p)) return false;
+	// The version probe below launches the candidate. It exists to reject
+	// non-Chromium `chrome`/`chromium` wrapper scripts that appear on a Linux
+	// PATH (ecb22957, "validate Linux browser executables"). On Windows and
+	// macOS the candidates are fixed GUI application paths, not PATH wrappers,
+	// and executing them is harmful: a GUI `chrome.exe --version` does not print
+	// to a detached stdout and can hand off to the user's running instance,
+	// opening/activating a normal browser window (#8445). Confine the probe to
+	// Linux and trust the executable-file check elsewhere.
+	if (process.platform !== "linux") return true;
+	try {
+		const probeTimeoutMs = 3000;
+		const proc = Bun.spawn([p, "--version"], {
+			stdout: "pipe",
+			stderr: "ignore",
+			signal: AbortSignal.timeout(probeTimeoutMs),
+			killSignal: "SIGKILL",
+		});
+		const stdout = await Promise.race([
+			new Response(proc.stdout).text(),
+			Bun.sleep(probeTimeoutMs + 500).then(() => null),
+		]);
+		if (stdout === null) return false;
+		await proc.exited;
+		return proc.exitCode === 0 && /Chrom|Edg/i.test(stdout);
+	} catch {
+		return false;
+	}
+}
+
+/** Flatpak application id published by the Ungoogled Chromium project. */
+const UNGOOGLED_CHROMIUM_FLATPAK_ID = "io.github.ungoogled_software.ungoogled_chromium";
+
+function systemChromiumCandidates(
+	platform: NodeJS.Platform = process.platform,
+	home = os.homedir(),
+	which: (name: string) => string | null | undefined = $which,
+): string[] {
 	const candidates: string[] = [];
-	switch (process.platform) {
+	switch (platform) {
 		case "darwin": {
 			for (const root of ["/Applications", path.join(home, "Applications")]) {
 				candidates.push(
@@ -180,7 +542,7 @@ function systemChromiumCandidates(): string[] {
 		case "linux": {
 			const names = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"];
 			for (const name of names) {
-				const found = $which(name);
+				const found = which(name);
 				if (found) candidates.push(found);
 			}
 			candidates.push(
@@ -199,6 +561,19 @@ function systemChromiumCandidates(): string[] {
 			if (onNixos) {
 				candidates.push(path.join(home, ".nix-profile/bin/chromium"), "/run/current-system/sw/bin/chromium");
 			}
+			for (const name of ["ungoogled-chromium", "ungoogled-chromium-browser"]) {
+				const found = which(name);
+				if (found) candidates.push(found);
+			}
+			candidates.push(
+				// Ungoogled Chromium. Distro and AUR packages that keep the plain
+				// `chromium` name are already covered above; these are the paths
+				// unique to it, including the system and per-user Flatpak shims.
+				"/usr/bin/ungoogled-chromium",
+				"/usr/bin/ungoogled-chromium-browser",
+				`/var/lib/flatpak/exports/bin/${UNGOOGLED_CHROMIUM_FLATPAK_ID}`,
+				path.join(home, ".local/share/flatpak/exports/bin", UNGOOGLED_CHROMIUM_FLATPAK_ID),
+			);
 			break;
 		}
 		case "win32": {
@@ -220,13 +595,13 @@ function systemChromiumCandidates(): string[] {
 	return candidates;
 }
 
-function resolveSystemChromium(): string | undefined {
+async function resolveSystemChromium(): Promise<string | undefined> {
 	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
 	const seen = new Set<string>();
 	for (const candidate of systemChromiumCandidates()) {
 		if (!candidate || seen.has(candidate)) continue;
 		seen.add(candidate);
-		if (isExecutableFile(candidate)) {
+		if (await isChromiumExecutable(candidate)) {
 			resolvedChromium = candidate;
 			logger.debug("Using system Chrome/Chromium", { path: candidate });
 			return candidate;
@@ -236,25 +611,55 @@ function resolveSystemChromium(): string | undefined {
 	return undefined;
 }
 
-export interface LaunchHeadlessOptions {
-	headless: boolean;
-	viewport?: { width: number; height: number; deviceScaleFactor?: number };
+/** Per-process launch features controlled by browser.open options. */
+export interface HeadlessLaunchFeatures {
+	/** Trust invalid HTTPS certificates in this Chromium process. */
+	insecure?: boolean;
 }
 
-export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<Browser> {
-	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
-	const initialViewport = {
-		width: vp.width,
-		height: vp.height,
-		deviceScaleFactor: vp.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
-	};
-	const puppeteer = await loadPuppeteer();
+/** Options shared by headless Chromium consumers. */
+export interface LaunchHeadlessOptions extends HeadlessLaunchFeatures {
+	headless: boolean;
+	viewport?: { width: number; height: number; deviceScaleFactor?: number };
+	/** Additional Chromium arguments merged with the centralized launch defaults. */
+	args?: readonly string[];
+	/** Additional exact Puppeteer default arguments to suppress. */
+	ignoreDefaultArgs?: readonly string[];
+}
+
+/** Result of a headless Chromium launch. */
+export interface LaunchHeadlessResult {
+	browser: Browser;
+	/** Browser-level WebSocket endpoint for other CDP clients, such as tab workers. */
+	wsEndpoint: string;
+	/**
+	 * OMP-owned temporary Chromium profile directory to remove after the browser
+	 * process tree exits, or `undefined` when the caller supplied its own
+	 * `--user-data-dir` (which OMP must not delete).
+	 */
+	userDataDir?: string;
+}
+
+/**
+ * Base Chromium argv shared by process-local puppeteer launches and the
+ * broker-owned shared browser: sandbox/stealth flags, window size, and
+ * PUPPETEER_PROXY* env-derived proxy flags.
+ */
+export function buildHeadlessLaunchArgs(
+	viewport: { width: number; height: number },
+	features: HeadlessLaunchFeatures = {},
+): string[] {
 	const launchArgs = [
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
-		"--disable-blink-features=AutomationControlled",
-		`--window-size=${initialViewport.width},${initialViewport.height}`,
+		DISABLE_AUTOMATION_CONTROLLED_ARG,
+		"--allow-file-access-from-files",
+		"--hide-scrollbars",
+		"--enable-features=WebMCPTesting,DevToolsWebMCPSupport",
+		`--window-size=${viewport.width},${viewport.height}`,
+		...RENDERER_PRIORITY_ARGS,
 	];
+	if (features.insecure) launchArgs.push("--ignore-certificate-errors");
 	const proxy = process.env.PUPPETEER_PROXY;
 	if (proxy) {
 		launchArgs.push(`--proxy-server=${proxy}`);
@@ -266,17 +671,245 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		}
 	}
 	const ignoreCert = process.env.PUPPETEER_PROXY_IGNORE_CERT_ERRORS?.toLowerCase();
-	if (ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") {
+	if (
+		(ignoreCert === "true" || ignoreCert === "1" || ignoreCert === "yes" || ignoreCert === "on") &&
+		!launchArgs.includes("--ignore-certificate-errors")
+	) {
 		launchArgs.push("--ignore-certificate-errors");
 	}
-	return await puppeteer.launch({
-		headless: opts.headless,
-		defaultViewport: opts.headless ? initialViewport : null,
-		executablePath: await ensureChromiumExecutable(),
-		args: launchArgs,
-		ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
-		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+	return launchArgs;
+}
+
+export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promise<LaunchHeadlessResult> {
+	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
+	const initialViewport = {
+		width: vp.width,
+		height: vp.height,
+		deviceScaleFactor: vp.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
+	};
+	const puppeteer = await loadPuppeteer();
+	const launchArgs = buildHeadlessLaunchArgs(initialViewport, {
+		insecure: opts.insecure,
 	});
+	for (const arg of opts.args ?? []) {
+		if (!launchArgs.includes(arg)) launchArgs.push(arg);
+	}
+	// Own the Chromium profile directory instead of letting puppeteer-core create
+	// (and delete) a temporary one. Passing `--user-data-dir` makes puppeteer
+	// treat the profile as non-temporary, so `ChromeLauncher.cleanUserDataDir`
+	// becomes a no-op and can no longer reject its eager process-exit hook with an
+	// unhandled EBUSY when Chromium still holds the profile lock on Windows
+	// (issue #7058). `removeUserDataDir` cleans it up on our terms instead.
+	let userDataDir: string | undefined;
+	let profileDir = findUserDataDirInArgs(launchArgs);
+	if (!profileDir) {
+		userDataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-chrome-profile-"));
+		profileDir = userDataDir;
+		launchArgs.push(`--user-data-dir=${userDataDir}`);
+	}
+	// Puppeteer picks the pipe transport from `--remote-debugging-pipe`. Chromium
+	// exits when the pipe closes, so it dies with this process even on SIGKILL;
+	// over a WebSocket it runs detached in its own process group and outlives
+	// it. The free port serves the WebSocket that tab workers attach through.
+	// A port the caller picked keeps the WebSocket launch, which fails when
+	// another process holds that port; over the pipe Chromium would run on
+	// without it, and the port would answer for the other process. Chromium
+	// reads the port only inline: after a bare switch the value is a URL to open.
+	if (!launchArgs.some(arg => arg.startsWith("--remote-debugging-port=") && Number(arg.split("=")[1]) > 0)) {
+		launchArgs.push("--remote-debugging-pipe", "--remote-debugging-port=0");
+	}
+	const pipe = launchArgs.includes("--remote-debugging-pipe");
+	const activePortFile = Bun.file(path.join(profileDir, "DevToolsActivePort"));
+	try {
+		// A reused profile can hold the file of a browser that was killed.
+		const staleActivePort = pipe ? await readActivePort(activePortFile) : undefined;
+		if (userDataDir) await seedOwnedProfilePreferences(userDataDir);
+		const executablePath = await ensureChromiumExecutable();
+		const browser = await puppeteer.launch({
+			headless: opts.headless,
+			defaultViewport: opts.headless ? initialViewport : null,
+			executablePath,
+			args: launchArgs,
+			ignoreDefaultArgs: [
+				...new Set([...stealthIgnoreDefaultArgs(executablePath), ...(opts.ignoreDefaultArgs ?? [])]),
+			],
+			protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+		});
+		try {
+			const wsEndpoint = pipe ? await activePortEndpoint(activePortFile, staleActivePort) : browser.wsEndpoint();
+			return { browser, wsEndpoint, userDataDir };
+		} catch (error) {
+			await closeLaunchedBrowser(browser);
+			throw error;
+		}
+	} catch (error) {
+		if (userDataDir) await removeUserDataDir(userDataDir);
+		throw error;
+	}
+}
+
+/** Close a browser {@link launchHeadlessBrowser} started, force-killing its process tree when the close hangs. */
+export async function closeLaunchedBrowser(browser: Browser): Promise<void> {
+	const proc = browser.process();
+	try {
+		await withTimeout(browser.close(), HEADLESS_CLOSE_TIMEOUT_MS, "Timed out closing headless browser");
+	} catch (err) {
+		logger.debug("Failed to close headless browser; force-killing", { error: toError(err).message });
+		if (proc?.pid !== undefined) await gracefulKillTreeOnce(proc.pid).catch(() => undefined);
+	}
+}
+
+/**
+ * The browser WebSocket endpoint Chromium publishes in `DevToolsActivePort` (port,
+ * then browser target path) once its `--remote-debugging-port=0` server listens.
+ * Every launch publishes a new browser target path, so `stale`, the file found
+ * before the launch, is never this browser's.
+ */
+async function activePortEndpoint(file: BunFile, stale: string | undefined): Promise<string> {
+	const deadline = Date.now() + DEVTOOLS_ACTIVE_PORT_TIMEOUT_MS;
+	for (;;) {
+		const published = await readActivePort(file);
+		if (published !== undefined && published !== stale) {
+			const [port, browserPath] = published.split("\n");
+			if (port && browserPath) return `ws://127.0.0.1:${port}${browserPath}`;
+		}
+		if (Date.now() >= deadline) throw new Error(`Chromium did not publish its DevTools port in ${file.name}`);
+		await Bun.sleep(50);
+	}
+}
+
+async function readActivePort(file: BunFile): Promise<string | undefined> {
+	try {
+		return await file.text();
+	} catch (error) {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	}
+}
+
+/**
+ * Pin automation-safe preferences in a Chromium profile OMP owns. Password leak
+ * detection answers a password form submit with a tab-modal "Change your
+ * password" dialog; while it is open Chromium drops `Input.dispatchMouseEvent`
+ * input for the tab, and a hidden browser offers no way to close it. A page's
+ * `window.print()` opens Chrome's print preview, which holds the page's script
+ * until someone closes it, so input, navigation and most evaluations stall;
+ * with printing off, `print()` returns at once and `Page.printToPDF` still works.
+ * Chromium reads `Preferences` only at startup and rewrites it from memory, so
+ * call this before a Chromium process starts on the profile. Best-effort: the
+ * preferences only suppress dialogs, so a failure is logged and never blocks the launch.
+ */
+export async function seedOwnedProfilePreferences(userDataDir: string): Promise<void> {
+	try {
+		await writeOwnedProfilePreferences(path.join(userDataDir, "Default", "Preferences"));
+	} catch (error) {
+		logger.warn("Could not seed browser profile preferences", {
+			userDataDir,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+async function writeOwnedProfilePreferences(file: string): Promise<void> {
+	let prefs: Record<string, unknown> = {};
+	try {
+		const parsed: unknown = JSON.parse(await fs.promises.readFile(file, "utf8"));
+		if (isRecord(parsed)) prefs = parsed;
+	} catch (error) {
+		// Fresh profiles have no file yet; Chromium discards an unparseable one on startup anyway.
+		if (!isEnoent(error) && !(error instanceof SyntaxError)) throw error;
+	}
+	const profile = isRecord(prefs.profile) ? prefs.profile : {};
+	const printing = isRecord(prefs.printing) ? prefs.printing : {};
+	if (profile.password_manager_leak_detection === false && printing.enabled === false) return;
+	profile.password_manager_leak_detection = false;
+	printing.enabled = false;
+	prefs.profile = profile;
+	prefs.printing = printing;
+	const staged = `${file}.omp-${process.pid}`;
+	try {
+		await Bun.write(staged, JSON.stringify(prefs));
+		await fs.promises.rename(staged, file);
+	} catch (error) {
+		await fs.promises.rm(staged, { force: true });
+		throw error;
+	}
+}
+
+/**
+ * Discard Chromium's session-restore state in a persistent profile OMP owns.
+ * When the first window of a new Chromium process opens, it reopens every page
+ * recorded in `Default/Sessions`, however the previous process exited. On the
+ * project-shared browser that resurrects whatever was open when its
+ * predecessor stopped or was killed, and no omp process owns those pages:
+ * target ownership dies with the browser instance, so neither idle-close nor
+ * the orphan reaper ever closes them. Call this before a Chromium process
+ * starts on the profile. Best-effort: a failure is logged and never blocks the
+ * launch.
+ */
+export async function discardOwnedProfileSessions(userDataDir: string): Promise<void> {
+	try {
+		await removeWithRetries(path.join(userDataDir, "Default", "Sessions"));
+	} catch (error) {
+		logger.warn("Could not discard browser profile session state", {
+			userDataDir,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+/** Fully resolved executable and argv for a broker-spawned shared Chromium. */
+export interface SharedBrowserLaunchSpec {
+	executablePath: string;
+	args: string[];
+}
+
+/**
+ * Resolve the executable and complete argv for a shared Chromium the daemon
+ * broker spawns directly (no puppeteer inside the broker). Mirrors
+ * `launchHeadlessBrowser` flag assembly — puppeteer's default args minus the
+ * stealth-suppressed set — suppresses Puppeteer's unowned startup window, and
+ * exposes CDP on an ephemeral port. Returns null when no executable resolves;
+ * callers fall back to a process-local launch.
+ */
+export async function resolveSharedBrowserLaunchSpec(opts: {
+	headless: boolean;
+	userDataDir: string;
+	viewport?: { width: number; height: number };
+}): Promise<SharedBrowserLaunchSpec | null> {
+	const executablePath = await ensureChromiumExecutable();
+	if (!executablePath) return null;
+	const puppeteer = await loadPuppeteer();
+	const vp = opts.viewport ?? DEFAULT_VIEWPORT;
+	const ignored = new Set(stealthIgnoreDefaultArgs(executablePath));
+	const defaults = await puppeteer.defaultArgs({
+		headless: opts.headless,
+		args: buildHeadlessLaunchArgs(vp),
+		userDataDir: opts.userDataDir,
+	});
+	return {
+		executablePath,
+		args: [...defaults.filter(arg => !ignored.has(arg)), "--no-startup-window", "--remote-debugging-port=0"],
+	};
+}
+
+/**
+ * Remove an OMP-owned headless Chromium profile directory, tolerating the brief
+ * window on Windows in which Chromium (or an orphaned browser subprocess) still
+ * holds the profile lock. The shared temp remover centralizes retry handling
+ * for EBUSY/EPERM/ENOTEMPTY; if the directory is still busy afterwards we warn
+ * and leave it for a later cleanup pass rather than throwing — a shutdown cleanup
+ * failure must never crash the process (issue #7058).
+ */
+export async function removeUserDataDir(dir: string): Promise<void> {
+	try {
+		await removeWithRetries(dir);
+	} catch (error) {
+		logger.warn("Left Chromium profile directory in place after cleanup failure", {
+			dir,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
 }
 
 export async function applyViewport(
@@ -294,6 +927,24 @@ export async function applyViewport(
 	});
 }
 
+/**
+ * The emulated viewport, else the window's own: connected and visible browsers emulate none, and an
+ * emulated scale of 0 keeps the window's own device scale.
+ */
+export async function readPageViewport(
+	page: Page,
+	signal?: AbortSignal,
+): Promise<{ width: number; height: number; deviceScaleFactor?: number }> {
+	const emulated = page.viewport();
+	if (emulated && emulated.deviceScaleFactor !== 0) return emulated;
+	return await untilAborted(signal, () =>
+		page.evaluate(() => {
+			const win = globalThis as unknown as { innerWidth: number; innerHeight: number; devicePixelRatio: number };
+			return { width: win.innerWidth, height: win.innerHeight, deviceScaleFactor: win.devicePixelRatio };
+		}),
+	);
+}
+
 // =====================================================================
 // Stealth patches
 // =====================================================================
@@ -309,9 +960,11 @@ export interface UserAgentOverride {
 	userAgentMetadata: {
 		brands: Array<{ brand: string; version: string }>;
 		fullVersion: string;
+		fullVersionList: Array<{ brand: string; version: string }>;
 		platform: string;
 		platformVersion: string;
 		architecture: string;
+		bitness: string;
 		model: string;
 		mobile: boolean;
 	};
@@ -325,50 +978,24 @@ function resolvePageClient(page: Page): PuppeteerCdpClient | null {
 	return typeof pageWithClient._client === "function" ? pageWithClient._client() : pageWithClient._client;
 }
 
-const patchedClients = new WeakSet<object>();
+async function resolveMacOsProductVersion(): Promise<string> {
+	if (os.platform() !== "darwin") return "";
+	try {
+		const plist = await Bun.file("/System/Library/CoreServices/SystemVersion.plist").text();
+		return plist.match(/<key>ProductVersion<\/key>\s*<string>([^<]+)<\/string>/)?.[1] ?? "";
+	} catch {
+		return "";
+	}
+}
 
-function patchSourceUrl(page: Page): void {
-	const client = resolvePageClient(page);
-	if (!client) return;
-	const clientKey = client as object;
-	if (patchedClients.has(clientKey)) return;
-	patchedClients.add(clientKey);
-	const originalSend = client.send.bind(client);
-	client.send = async (method: string, params?: Record<string, unknown>) => {
-		const next = async (payload?: Record<string, unknown>) => {
-			try {
-				return await originalSend(method, payload);
-			} catch (error) {
-				if (
-					error instanceof Error &&
-					error.message.includes(
-						"Protocol error (Network.getResponseBody): No resource with given identifier found",
-					)
-				) {
-					return undefined;
-				}
-				throw error;
-			}
-		};
-		if (!method || !params) {
-			return next(params);
-		}
-		const key =
-			method === "Runtime.evaluate"
-				? "expression"
-				: method === "Runtime.callFunctionOn"
-					? "functionDeclaration"
-					: null;
-		if (!key) {
-			return next(params);
-		}
-		const value = params[key];
-		if (typeof value !== "string" || !value.includes(PUPPETEER_SOURCE_URL_SUFFIX)) {
-			return next(params);
-		}
-		const patchedParams = { ...params, [key]: value.replace(PUPPETEER_SOURCE_URL_SUFFIX, "") };
-		return next(patchedParams);
-	};
+function resolveHostArchitecture(): string {
+	if (os.arch() === "arm64") return "arm";
+	if (os.arch().includes("64")) return "x86";
+	return "";
+}
+
+function resolveHostBitness(): string {
+	return os.arch().includes("64") ? "64" : "";
 }
 
 async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> {
@@ -379,32 +1006,24 @@ async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> 
 	}
 
 	const uaVersionMatch = userAgent.match(/Chrome\/([\d|.]+)/);
-	const fallbackVersionMatch = uaVersionMatch ?? (await page.browser().version()).match(/\/([\d|.]+)/);
-	const uaVersion = fallbackVersionMatch?.[1] ?? "0";
-	const majorVersion = Number.parseInt(uaVersion.split(".")[0] ?? "0", 10) || 0;
+	const browserVersionMatch = (await page.browser().version()).match(/\/([\d|.]+)/);
+	const legacyVersion = uaVersionMatch?.[1] ?? browserVersionMatch?.[1] ?? "0";
+	const fullVersion = browserVersionMatch?.[1] ?? legacyVersion;
+	const majorVersion = Number.parseInt(legacyVersion.split(".")[0] ?? "0", 10) || 0;
 	const isAndroid = userAgent.includes("Android");
-	const platform = userAgent.includes("Mac OS X")
-		? "MacIntel"
-		: isAndroid
-			? "Android"
-			: userAgent.includes("Linux")
-				? "Linux"
-				: "Win32";
-	const platformFull = userAgent.includes("Mac OS X")
-		? "Mac OS X"
-		: isAndroid
-			? "Android"
-			: userAgent.includes("Linux")
-				? "Linux"
-				: "Windows";
-	const platformVersion = userAgent.includes("Mac OS X ")
-		? (userAgent.match(/Mac OS X ([^)]+)/)?.[1] ?? "")
+	const isMac = userAgent.includes("Mac OS X");
+	const isWindows = userAgent.includes("Windows");
+	const platform = isMac ? "MacIntel" : isAndroid ? "Android" : userAgent.includes("Linux") ? "Linux" : "Win32";
+	const platformFull = isMac ? "macOS" : isAndroid ? "Android" : userAgent.includes("Linux") ? "Linux" : "Windows";
+	const platformVersion = isMac
+		? await resolveMacOsProductVersion()
 		: userAgent.includes("Android ")
 			? (userAgent.match(/Android ([^;]+)/)?.[1] ?? "")
-			: userAgent.includes("Windows ")
-				? (userAgent.match(/Windows .*?([\d|.]+);?/)?.[1] ?? "")
+			: isWindows
+				? (userAgent.match(/Windows NT ([\d.]+)/)?.[1] ?? "")
 				: "";
-	const architecture = isAndroid ? "" : "x86";
+	const architecture = isAndroid ? "" : resolveHostArchitecture();
+	const bitness = isAndroid ? "" : resolveHostBitness();
 	const model = isAndroid ? (userAgent.match(/Android.*?;\s([^)]+)/)?.[1] ?? "") : "";
 
 	const brandOrders = [
@@ -422,6 +1041,10 @@ async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> 
 	brands[order[0]!] = { brand: greaseyBrand, version: "99" };
 	brands[order[1]!] = { brand: "Chromium", version: String(majorVersion) };
 	brands[order[2]!] = { brand: "Google Chrome", version: String(majorVersion) };
+	const fullVersionList = brands.map(({ brand }) => ({
+		brand,
+		version: brand === greaseyBrand ? "99.0.0.0" : fullVersion,
+	}));
 
 	return {
 		userAgent,
@@ -429,10 +1052,12 @@ async function resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> 
 		acceptLanguage: STEALTH_ACCEPT_LANGUAGE,
 		userAgentMetadata: {
 			brands,
-			fullVersion: uaVersion,
+			fullVersion,
+			fullVersionList,
 			platform: platformFull,
 			platformVersion,
 			architecture,
+			bitness,
 			model,
 			mobile: isAndroid,
 		},
@@ -578,15 +1203,29 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 		.join(";\n");
 
 	return `(() => {
-				// Native function cache - captured before any tampering
-				const iframe = document.createElement("iframe");
-				iframe.style.display = "none";
+				const Page_Function_toString = Function.prototype.toString;
+				const Page_FunctionToStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, "toString");
+				const Page_Proxy = Proxy;
+				const Page_WeakMap = WeakMap;
+				const Page_WeakMap_get = Page_WeakMap.prototype.get;
+				const Page_WeakMap_set = Page_WeakMap.prototype.set;
+				// Native function cache - captured before any tampering.
+				// A same-origin iframe yields natives uncontaminated by page-level
+				// tampering, but at document-start (when this preload runs) there is
+				// no documentElement to attach it to. In that case the page itself
+				// hasn't executed yet, so window's own natives are still pristine —
+				// fall back to window instead of bailing, otherwise none of the
+				// fingerprint patches below would ever run.
+				let iframe = null;
 				const container = document.head ?? document.documentElement;
-				if (!container) return;
-				container.appendChild(iframe);
+				if (container) {
+					iframe = document.createElement("iframe");
+					iframe.style.display = "none";
+					container.appendChild(iframe);
+					if (!iframe.contentWindow) iframe = null;
+				}
 				try {
-					const nativeWindow = iframe.contentWindow;
-					if (!nativeWindow) return;
+					const nativeWindow = iframe ? iframe.contentWindow : window;
 
 					// Cache pristine native functions
 					const Function_toString = nativeWindow.Function.prototype.toString;
@@ -610,12 +1249,54 @@ function buildStealthInjectionScript(scripts: readonly string[] = STEALTH_PATCH_
 					const Promise_resolve = nativeWindow.Promise.resolve.bind(nativeWindow.Promise);
 					const Window_Blob = nativeWindow.Blob;
 					const Window_Proxy = nativeWindow.Proxy;
+					const Reflect_get = nativeWindow.Reflect.get;
+					const Reflect_set = nativeWindow.Reflect.set;
+					const Reflect_apply = nativeWindow.Reflect.apply;
+					const Reflect_construct = nativeWindow.Reflect.construct;
+					const Reflect_defineProperty = nativeWindow.Reflect.defineProperty;
+					const Reflect_deleteProperty = nativeWindow.Reflect.deleteProperty;
+					const Reflect_getOwnPropertyDescriptor = nativeWindow.Reflect.getOwnPropertyDescriptor;
+					const Reflect_getPrototypeOf = nativeWindow.Reflect.getPrototypeOf;
+					const Reflect_has = nativeWindow.Reflect.has;
+					const Reflect_isExtensible = nativeWindow.Reflect.isExtensible;
+					const Reflect_ownKeys = nativeWindow.Reflect.ownKeys;
+					const Reflect_preventExtensions = nativeWindow.Reflect.preventExtensions;
+					const Reflect_setPrototypeOf = nativeWindow.Reflect.setPrototypeOf;
 					const Intl_DateTimeFormat = nativeWindow.Intl.DateTimeFormat;
 					const Date_constructor = nativeWindow.Date;
 
+					const nativeFunctionSources = new Page_WeakMap();
+					const makeNativeString = (name) => "function " + (name || "") + "() { [native code] }";
+					const registerNativeSource = (fn, source) => {
+						if (typeof fn === "function") Reflect_apply(Page_WeakMap_set, nativeFunctionSources, [fn, source]);
+						return fn;
+					};
+					const patchToString = (fn, name) => registerNativeSource(fn, makeNativeString(name));
+					if (${scripts.length > 0 ? "true" : "false"}) {
+						const functionToStringProxy = new Page_Proxy(Page_Function_toString, {
+							apply(target, thisArg, args) {
+								const source = Reflect_apply(Page_WeakMap_get, nativeFunctionSources, [thisArg]);
+								if (source) return source;
+								return Reflect_apply(target, thisArg, args || []);
+							},
+							get(target, key, receiver) {
+								return Reflect_get(target, key, receiver);
+							},
+						});
+						registerNativeSource(functionToStringProxy, makeNativeString("toString"));
+						Object_defineProperty(Function.prototype, "toString", {
+							...(Page_FunctionToStringDescriptor || {
+								writable: true,
+								configurable: true,
+								enumerable: false,
+							}),
+							value: functionToStringProxy,
+						});
+					}
+
 					${joint}
 				} finally {
-					if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+					if (iframe && iframe.parentNode) iframe.parentNode.removeChild(iframe);
 				}})();`;
 }
 
@@ -634,10 +1315,11 @@ export async function applyStealthPatches(
 	page: Page,
 	state: { browserSession: CDPSession | null; override: UserAgentOverride | null },
 ): Promise<void> {
-	patchSourceUrl(page);
 	if (!state.override) {
 		state.override = await resolveUserAgentOverride(page);
 	}
+	// UA/language overrides are session-scoped; detached target sessions do not
+	// replace the primary client override, and setUserAgent has no language option.
 	const client = resolvePageClient(page);
 	if (client) {
 		await sendUserAgentOverride(client, state.override);
@@ -646,6 +1328,19 @@ export async function applyStealthPatches(
 	await configureUserAgentTargets(browser, targetState);
 	state.browserSession = targetState.browserSession;
 	await injectStealthScripts(page);
+}
+
+/** Exposes executable candidates for detection tests. */
+export function systemChromiumCandidatesForTest(
+	platform: NodeJS.Platform = process.platform,
+	home?: string,
+	which?: (name: string) => string | null | undefined,
+): string[] {
+	return systemChromiumCandidates(platform, home, which);
+}
+
+export async function chromiumExecutableProbeForTest(executablePath: string): Promise<boolean> {
+	return isChromiumExecutable(executablePath);
 }
 
 export function targetSupportsUserAgentOverrideForTest(target: Target): boolean {

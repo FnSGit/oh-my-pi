@@ -28,8 +28,17 @@ import { type Skill, skillCapability } from "../capability/skill";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
-import { buildRuleFromMarkdown, createSourceMeta, loadFilesFromDir, scanSkillsFromDir } from "./helpers";
+import { legacyProviderAllowed } from "./agent-plugin-format";
+import {
+	discoverRuleFromMarkdown,
+	createSourceMeta,
+	expandEnvVarsDeep,
+	loadFilesFromDir,
+	parseRequestIdFormat,
+	scanSkillsFromDir,
+} from "./helpers";
 import { listOmpExtensionRoots, type OmpExtensionRoot } from "./omp-extension-roots";
+import { resolvePluginStdioPaths } from "./substitute-plugin-root";
 
 const PROVIDER_ID = "omp-plugins";
 const DISPLAY_NAME = "OMP Extension Packages";
@@ -37,12 +46,24 @@ const DESCRIPTION =
 	"Sub-discovery (skills, hooks, tools, commands, rules, prompts, .mcp.json) inside extension packages";
 const PRIORITY = 90;
 
+/**
+ * Extension roots this legacy provider may process for a given surface. Roots
+ * whose root `plugin.json` targets the Agent Plugins standard keep their
+ * portable components (skills, MCP) exclusive to the `agent-plugins` provider;
+ * fatally invalid Agent Plugins packages are skipped entirely.
+ */
+async function allowedRoots(ctx: LoadContext, surface: "skills" | "mcp" | "other"): Promise<OmpExtensionRoot[]> {
+	const roots = await listOmpExtensionRoots(ctx);
+	const flags = await Promise.all(roots.map(root => legacyProviderAllowed(root.path, surface)));
+	return roots.filter((_, i) => flags[i]);
+}
+
 // =============================================================================
 // Skills
 // =============================================================================
 
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const roots = await listOmpExtensionRoots(ctx);
+	const roots = await allowedRoots(ctx, "skills");
 	const results = await Promise.all(
 		roots.map(root =>
 			scanSkillsFromDir(ctx, {
@@ -50,6 +71,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 				providerId: PROVIDER_ID,
 				level: root.level,
 				requireDescription: true,
+				pluginName: root.name,
 			}),
 		),
 	);
@@ -64,7 +86,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 // =============================================================================
 
 async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashCommand>> {
-	const roots = await listOmpExtensionRoots(ctx);
+	const roots = await allowedRoots(ctx, "other");
 	const results = await Promise.all(
 		roots.map(root =>
 			loadFilesFromDir<SlashCommand>(ctx, path.join(root.path, "commands"), PROVIDER_ID, root.level, {
@@ -90,13 +112,13 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 // =============================================================================
 
 async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
-	const roots = await listOmpExtensionRoots(ctx);
+	const roots = await allowedRoots(ctx, "other");
 	const results = await Promise.all(
 		roots.map(root =>
 			loadFilesFromDir<Rule>(ctx, path.join(root.path, "rules"), PROVIDER_ID, root.level, {
 				extensions: ["md", "mdc"],
 				transform: (name, content, filePath, source) =>
-					buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ }),
+					discoverRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ }),
 			}),
 		),
 	);
@@ -111,7 +133,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 // =============================================================================
 
 async function loadPrompts(ctx: LoadContext): Promise<LoadResult<Prompt>> {
-	const roots = await listOmpExtensionRoots(ctx);
+	const roots = await allowedRoots(ctx, "other");
 	const results = await Promise.all(
 		roots.map(root =>
 			loadFilesFromDir<Prompt>(ctx, path.join(root.path, "prompts"), PROVIDER_ID, root.level, {
@@ -138,7 +160,7 @@ async function loadPrompts(ctx: LoadContext): Promise<LoadResult<Prompt>> {
 const HOOK_TYPES: ReadonlyArray<"pre" | "post"> = ["pre", "post"];
 
 async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
-	const roots = await listOmpExtensionRoots(ctx);
+	const roots = await allowedRoots(ctx, "other");
 	const tasks: Array<{ root: OmpExtensionRoot; hookType: "pre" | "post" }> = [];
 	for (const root of roots) {
 		for (const hookType of HOOK_TYPES) {
@@ -176,7 +198,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 const TOOL_EXTENSIONS = ["json", "md", "ts", "js", "sh", "bash", "py"];
 
 async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
-	const roots = await listOmpExtensionRoots(ctx);
+	const roots = await allowedRoots(ctx, "other");
 	const perRoot = await Promise.all(
 		roots.map(async root => {
 			const toolsDir = path.join(root.path, "tools");
@@ -256,6 +278,8 @@ const MCP_FILENAMES = [".mcp.json", "mcp.json"] as const;
 interface RawMcpServer {
 	enabled?: boolean;
 	timeout?: number;
+	requestIdFormat?: unknown;
+	instructions?: unknown;
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
@@ -268,7 +292,7 @@ interface RawMcpServer {
 }
 
 async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
-	const roots = await listOmpExtensionRoots(ctx);
+	const roots = await allowedRoots(ctx, "mcp");
 	const items: MCPServer[] = [];
 	const warnings: string[] = [];
 
@@ -291,7 +315,10 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 			logger.warn(`[omp-plugins] Invalid JSON in ${mcpPath}`);
 			continue;
 		}
-		const servers = parsed.mcpServers;
+		const servers = expandEnvVarsDeep(parsed.mcpServers, {
+			CLAUDE_PLUGIN_ROOT: root.path,
+			OMP_PLUGIN_ROOT: root.path,
+		});
 		if (!servers || typeof servers !== "object" || Array.isArray(servers)) continue;
 
 		for (const [serverName, serverCfg] of Object.entries(servers)) {
@@ -301,14 +328,34 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				warnings.push(`[omp-plugins] Skipping MCP server "${serverName}" in ${mcpPath}: missing command or url`);
 				continue;
 			}
+			// Root relative command/cwd at the plugin's config directory, not the
+			// session cwd (MCP stdio spawning resolves relative values there).
+			const rooted = resolvePluginStdioPaths({ command: cfg.command, cwd: cfg.cwd }, root.path);
+			// Report a dropped value, as the native and standalone loaders do: a
+			// typo would otherwise silently revert the id encoding or re-enable
+			// the server's instructions.
+			const requestIdFormat = parseRequestIdFormat(cfg.requestIdFormat);
+			if (requestIdFormat === undefined && cfg.requestIdFormat != null) {
+				logger.warn(
+					`[omp-plugins] MCP server "${serverName}" in ${mcpPath}: invalid requestIdFormat ${JSON.stringify(cfg.requestIdFormat)}, ignoring`,
+				);
+			}
+			const instructions = typeof cfg.instructions === "boolean" ? cfg.instructions : undefined;
+			if (instructions === undefined && cfg.instructions != null) {
+				logger.warn(
+					`[omp-plugins] MCP server "${serverName}" in ${mcpPath}: invalid instructions ${JSON.stringify(cfg.instructions)}, ignoring`,
+				);
+			}
 			items.push({
 				name: serverName,
 				...(cfg.enabled !== undefined && { enabled: cfg.enabled }),
 				...(cfg.timeout !== undefined && { timeout: cfg.timeout }),
-				...(cfg.command !== undefined && { command: cfg.command }),
+				...(requestIdFormat !== undefined && { requestIdFormat }),
+				...(instructions !== undefined && { instructions }),
+				...(rooted.command !== undefined && { command: rooted.command }),
 				...(cfg.args !== undefined && { args: cfg.args }),
 				...(cfg.env !== undefined && { env: cfg.env }),
-				...(cfg.cwd !== undefined && { cwd: cfg.cwd }),
+				...(rooted.cwd !== undefined && { cwd: rooted.cwd }),
 				...(cfg.url !== undefined && { url: cfg.url }),
 				...(cfg.headers !== undefined && { headers: cfg.headers }),
 				...(cfg.auth !== undefined && { auth: cfg.auth }),

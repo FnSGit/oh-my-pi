@@ -1,13 +1,12 @@
 //! Structural source summaries powered by tree-sitter.
 
-use std::{collections::BTreeSet, path::Path};
+use std::path::Path;
 
-use anyhow::{Result, anyhow};
-use ast_grep_core::tree_sitter::LanguageExt;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Tree};
 
-use crate::language::SupportLang;
+use crate::{language::SupportLang, parse_cache::parse_cached};
 
 const DEFAULT_MIN_BODY_LINES: u32 = 4;
 const DEFAULT_MIN_COMMENT_LINES: u32 = 6;
@@ -108,10 +107,13 @@ impl ElidableForest {
 /// BFS unfold. Start with every root span folded (matches the legacy
 /// outermost-only behavior) and progressively replace folded spans with
 /// their elidable children, breadth-first, until the visible line count
-/// reaches `unfold_until`. A candidate unfold that would push the visible
-/// count past `unfold_limit` is rejected and aborts the loop ("revert the
-/// last unfold because it overflew"). `unfold_until == 0` short-circuits
-/// to the legacy behavior.
+/// reaches `unfold_until`. A candidate unfold whose revealed lines would
+/// push the visible count past `unfold_limit` is skipped — that span stays
+/// folded and its subtree is not explored — while the BFS keeps unfolding
+/// the remaining queued siblings. A single oversized, un-unfoldable leaf
+/// (e.g. a `<style>` raw-text block) therefore no longer aborts the whole
+/// pass and starve its siblings. `unfold_until == 0` short-circuits to the
+/// legacy behavior.
 fn select_folded_spans(
 	forest: &ElidableForest,
 	total_lines: u32,
@@ -145,7 +147,7 @@ fn select_folded_spans(
 		let revealed = node.span.lines().saturating_sub(child_line_total);
 		let new_visible = visible.saturating_add(revealed);
 		if new_visible > unfold_limit {
-			break;
+			continue;
 		}
 		folded.remove(&idx);
 		for &c in &node.children {
@@ -158,28 +160,45 @@ fn select_folded_spans(
 	folded.into_iter().map(|i| nodes[i].span).collect()
 }
 
+fn parse_clean_source(
+	source: &str,
+	lang: Option<&str>,
+	path: Option<&str>,
+) -> Result<Option<(SupportLang, Tree)>> {
+	if source.is_empty() {
+		return Ok(None);
+	}
+	let Some(language) = resolve_language(lang, path) else {
+		return Ok(None);
+	};
+	let Some(tree) = parse_cached(source, language, path)? else {
+		return Ok(None);
+	};
+	if tree.root_node().has_error() {
+		return Ok(None);
+	}
+	Ok(Some((language, tree)))
+}
+
+/// Return the language only when non-empty source parses without syntax errors.
+/// Uses the same cached parse and language precedence as [`summarize_code`].
+pub fn parse_code_status(
+	source: &str,
+	lang: Option<&str>,
+	path: Option<&str>,
+) -> Result<Option<SupportLang>> {
+	Ok(parse_clean_source(source, lang, path)?.map(|(language, _)| language))
+}
+
 pub fn summarize_code(options: SummaryOptions) -> Result<SummaryResult> {
 	let source = options.code;
 	let total_lines = count_lines(&source);
-	if source.is_empty() {
-		return Ok(unparsed_result(source, total_lines));
-	}
-
-	let Some(language) = resolve_language(options.lang.as_deref(), options.path.as_deref()) else {
-		return Ok(unparsed_result(source, total_lines));
-	};
-
-	let mut parser = Parser::new();
-	parser
-		.set_language(&language.get_ts_language())
-		.map_err(|err| anyhow!("Failed to load tree-sitter language: {err}"))?;
-	let Some(tree) = parser.parse(&source, None) else {
+	let Some((language, tree)) =
+		parse_clean_source(&source, options.lang.as_deref(), options.path.as_deref())?
+	else {
 		return Ok(unparsed_result(source, total_lines));
 	};
 	let root = tree.root_node();
-	if root.has_error() {
-		return Ok(unparsed_result(source, total_lines));
-	}
 
 	let min_body_lines = options
 		.min_body_lines
@@ -398,6 +417,7 @@ fn is_comment_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Rust => kind == "block_comment",
 		SupportLang::Python => kind == "comment",
 		SupportLang::Go => kind == "comment",
+		SupportLang::Fortran => kind == "comment",
 		SupportLang::Java => kind == "block_comment",
 		SupportLang::C | SupportLang::Cpp | SupportLang::ObjC => kind == "comment",
 		SupportLang::CSharp => kind == "comment",
@@ -407,6 +427,7 @@ fn is_comment_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Kotlin => kind == "block_comment",
 		SupportLang::Scala => kind == "block_comment",
 		SupportLang::Lua => kind == "comment",
+		SupportLang::EmacsLisp => kind == "comment",
 		_ => false,
 	}
 }
@@ -449,7 +470,8 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 			kind,
 			"block"
 				| "dictionary"
-				| "list" | "set"
+				| "list"
+				| "set"
 				| "string"
 				| "tuple"
 				| "argument_list"
@@ -539,8 +561,10 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "method"
 				| "do_block"
 				| "array"
-				| "hash" | "block"
-				| "case" | "heredoc_body"
+				| "hash"
+				| "block"
+				| "case"
+				| "heredoc_body"
 		),
 		SupportLang::Php => matches!(
 			kind,
@@ -585,9 +609,6 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "string"
 		),
 		SupportLang::Lua => matches!(kind, "block" | "table_constructor" | "string"),
-		SupportLang::Perl => {
-			matches!(kind, "block" | "list_expression" | "heredoc_content" | "regexp_content")
-		},
 		SupportLang::Dart => matches!(
 			kind,
 			"block"
@@ -628,9 +649,12 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "class"
 				| "instance"
 				| "function"
-				| "do" | "case"
-				| "let" | "local_binds"
-				| "list" | "tuple"
+				| "do"
+				| "case"
+				| "let"
+				| "local_binds"
+				| "list"
+				| "tuple"
 		),
 		SupportLang::Ocaml => matches!(
 			kind,
@@ -652,8 +676,21 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 				| "if_expr"
 				| "receive_expr"
 				| "record_decl"
-				| "list" | "map_expr"
+				| "list"
+				| "map_expr"
 				| "tuple"
+		),
+		SupportLang::EmacsLisp => matches!(
+			kind,
+			"function_definition"
+				| "macro_definition"
+				| "special_form"
+				| "list"
+				| "vector"
+				| "hash_table"
+				| "bytecode"
+				| "string_text_properties"
+				| "string"
 		),
 		SupportLang::Clojure => {
 			matches!(kind, "list_lit" | "map_lit" | "vec_lit" | "set_lit" | "str_lit")
@@ -717,6 +754,7 @@ fn is_elidable_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Cmake => matches!(kind, "argument_list" | "body"),
 		SupportLang::Make => kind == "recipe",
 		SupportLang::Just => kind == "recipe_body",
+		SupportLang::Fortran => false,
 		// Skip: data formats with no closing-token anchor (Yaml mappings,
 		// Toml tables, Ini sections), the diff format whose informational
 		// content IS the lines inside hunks, and the leaf-token-only Regex
@@ -752,7 +790,7 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		SupportLang::Solidity => kind == "import_directive",
 		SupportLang::Julia => matches!(kind, "import_statement" | "using_statement"),
 		SupportLang::Proto => kind == "import",
-		SupportLang::Perl => kind == "use_statement",
+		SupportLang::Fortran => kind == "use_statement",
 		// Languages where imports either have no run pattern, are wrapped in a
 		// single AST node already covered by `is_elidable_kind` (Kotlin's
 		// `import_list`, Haskell's `imports`), or live inside a too-generic
@@ -764,6 +802,7 @@ fn is_groupable_kind(language: SupportLang, kind: &str) -> bool {
 		| SupportLang::Lua
 		| SupportLang::Elixir
 		| SupportLang::Erlang
+		| SupportLang::EmacsLisp
 		| SupportLang::Clojure
 		| SupportLang::Sql
 		| SupportLang::Zig
@@ -800,10 +839,10 @@ fn normalize_spans(mut spans: Vec<LineSpan>, total_lines: u32) -> Vec<LineSpan> 
 	if total_lines == 0 {
 		return Vec::new();
 	}
-	spans.retain(|span| span.start <= span.end && span.start <= total_lines);
 	for span in &mut spans {
 		span.end = span.end.min(total_lines);
 	}
+	spans.retain(|span| span.start <= span.end && span.start <= total_lines);
 	spans.sort_by_key(|span| (span.start, span.end));
 	let mut merged: Vec<LineSpan> = Vec::new();
 	for span in spans {
@@ -823,55 +862,47 @@ fn build_segments(source: &str, total_lines: u32, spans: &[LineSpan]) -> Vec<Sum
 		return Vec::new();
 	}
 	let source_lines: Vec<&str> = source.lines().collect();
-	let elided_lines = spans
-		.iter()
-		.flat_map(|span| span.start..=span.end)
-		.collect::<BTreeSet<_>>();
-	let mut segments = Vec::new();
-	let mut current_kind: Option<&str> = None;
-	let mut current_start = 1;
-	let mut current_lines: Vec<&str> = Vec::new();
+	let mut segments = Vec::with_capacity(spans.len().saturating_mul(2).saturating_add(1));
+	let mut cursor = 1;
 
-	for line_number in 1..=total_lines {
-		let is_elided = elided_lines.contains(&line_number);
-		let kind = if is_elided { "elided" } else { "kept" };
-		if current_kind.is_some_and(|existing| existing != kind) {
-			push_segment(
-				&mut segments,
-				current_kind.expect("kind set"),
-				current_start,
-				line_number - 1,
-				&current_lines,
-			);
-			current_start = line_number;
-			current_lines.clear();
+	for span in spans {
+		debug_assert!(cursor <= span.start && span.start <= span.end && span.end <= total_lines);
+
+		if cursor < span.start {
+			let end_line = span.start - 1;
+			segments.push(SummarySegment {
+				kind: "kept".to_string(),
+				start_line: cursor,
+				end_line,
+				text: Some(join_line_range(&source_lines, cursor, end_line)),
+			});
 		}
-		current_kind = Some(kind);
-		if !is_elided {
-			let index = line_number.saturating_sub(1) as usize;
-			current_lines.push(source_lines.get(index).copied().unwrap_or_default());
-		}
+
+		segments.push(SummarySegment {
+			kind:       "elided".to_string(),
+			start_line: span.start,
+			end_line:   span.end,
+			text:       None,
+		});
+
+		cursor = span.end.saturating_add(1);
 	}
 
-	if let Some(kind) = current_kind {
-		push_segment(&mut segments, kind, current_start, total_lines, &current_lines);
+	if cursor <= total_lines {
+		segments.push(SummarySegment {
+			kind:       "kept".to_string(),
+			start_line: cursor,
+			end_line:   total_lines,
+			text:       Some(join_line_range(&source_lines, cursor, total_lines)),
+		});
 	}
+
 	segments
 }
 
-fn push_segment(
-	segments: &mut Vec<SummarySegment>,
-	kind: &str,
-	start_line: u32,
-	end_line: u32,
-	lines: &[&str],
-) {
-	segments.push(SummarySegment {
-		kind: kind.to_string(),
-		start_line,
-		end_line,
-		text: (kind == "kept").then(|| lines.join("\n")),
-	});
+fn join_line_range(source_lines: &[&str], start_line: u32, end_line: u32) -> String {
+	debug_assert!(end_line as usize <= source_lines.len());
+	source_lines[start_line as usize - 1..end_line as usize].join("\n")
 }
 
 #[cfg(test)]
@@ -966,6 +997,63 @@ mod tests {
 				.unwrap_or_default()
 				.contains("return")
 		);
+	}
+
+	#[test]
+	fn summarizes_fortran_program() {
+		let result = summarize("program hello\n  print *, 'hi'\nend program hello\n", "fixture.f90");
+
+		assert!(result.parsed);
+		assert_eq!(result.language.as_deref(), Some("fortran"));
+		assert!(!result.segments.is_empty());
+	}
+
+	#[test]
+	fn parses_go_new_with_expression_operand() {
+		// Go 1.26 `new(expr)` must parse alongside the classic `new(T)` form.
+		let result = summarize(
+			"package p\n\nfunc f() {\n\tframe.Due = new(work.Due.Add(delay))\n\tx := new(g(1))\n\ty \
+			 := new(T)\n\t_, _ = x, y\n}\n",
+			"fixture.go",
+		);
+
+		assert!(result.parsed);
+		assert_eq!(result.language.as_deref(), Some("go"));
+	}
+
+	#[test]
+	fn parses_markdown_nested_past_scanner_state_buffer() {
+		// 355 nested `- ` list items open more blocks than tree-sitter-md's
+		// scanner state fits in tree-sitter's 1024-byte serialization buffer;
+		// tree-sitter-md 0.5.3 overran it (abort in debug, SEGV in release).
+		let code = format!("{}**Total**: 4100\nTARGET_MARKER_XYZ\n", "- ".repeat(355));
+
+		let language = parse_code_status(&code, None, Some("notes.md")).unwrap();
+
+		assert_eq!(language, Some(SupportLang::Markdown));
+	}
+
+	#[test]
+	fn summarizes_emacs_lisp_defun_body() {
+		let code = "(defun greet (name)\n  \"Doc.\"\n  (let ((message (format \"Hello %s\" \
+		            name)))\n    (message \"%s\" message)\n    message)\n)\n";
+		let result = summarize(code, "fixture.el");
+
+		assert!(result.parsed);
+		assert!(result.elided);
+		assert_eq!(result.language.as_deref(), Some("emacs-lisp"));
+		assert_eq!(segment_kinds(&result), vec!["kept", "elided", "kept"]);
+	}
+
+	#[test]
+	fn summarizes_emacs_lisp_special_form() {
+		let code =
+			"(let ((count 0))\n  (setq count (1+ count))\n  (setq count (1+ count))\n  count\n)\n";
+		let result = summarize(code, "fixture.el");
+
+		assert!(result.parsed);
+		assert!(result.elided);
+		assert_eq!(segment_kinds(&result), vec!["kept", "elided", "kept"]);
 	}
 
 	#[test]
@@ -1274,5 +1362,102 @@ mod tests {
 				.count(),
 			1
 		);
+	}
+
+	#[test]
+	fn bfs_unfold_skips_unfoldable_leaf_and_continues_to_siblings() {
+		// Repro for the "useless HTML summary" report: a big <style> raw-text
+		// block (no elidable children) sits before a structured <body>. The
+		// style block's only unfold candidate is its entire 120-line body,
+		// which overflows unfold_limit. The BFS must SKIP it (leave it folded)
+		// and keep unfolding the sibling <body>/<div> subtree, instead of
+		// aborting the whole pass and collapsing the body into one dead `...`.
+		let css = (0..120)
+			.map(|i| format!("\t.rule{i} {{ color: #{i:06x}; }}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let sections = (0..6)
+			.map(|i| {
+				format!(
+					"<section class=\"sec{i}\">\n<h2>Heading {i}</h2>\n<p>para a {i}</p>\n<p>para b \
+					 {i}</p>\n<p>para c {i}</p>\n</section>"
+				)
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		let code = format!(
+			"<!doctype html>\n<html \
+			 lang=\"en\">\n<head>\n<title>T</title>\n<style>\n{css}\n</style>\n</head>\n<body>\n<div \
+			 class=\"page\">\n{sections}\n</div>\n</body>\n</html>\n"
+		);
+
+		let result = summarize_with_unfold(&code, "page.html", 50, 100);
+		assert!(result.parsed);
+		assert!(result.elided);
+		let kept_text = result
+			.segments
+			.iter()
+			.filter(|s| s.kind == "kept")
+			.filter_map(|s| s.text.as_deref())
+			.collect::<Vec<_>>()
+			.join("\n");
+		// The body div was unfolded: its child <section> structure is visible.
+		assert!(
+			kept_text.contains("<section class=\"sec0\">"),
+			"body div should unfold to show sections"
+		);
+		assert!(
+			kept_text.contains("<section class=\"sec5\">"),
+			"all sibling sections should surface"
+		);
+		// The <style> raw text stays folded as one elided span — no CSS interior
+		// leaks into kept content.
+		assert!(!kept_text.contains(".rule0 {"), "oversized style body must stay folded");
+	}
+
+	#[test]
+	fn summarizes_crlf_and_boundary_spans_without_trailing_newline() {
+		let crlf_code = [
+			"/* header comment 1",
+			" * header comment 2",
+			" * header comment 3",
+			" * header comment 4",
+			" * header comment 5",
+			" */",
+			"use std::collections::HashMap;",
+			"use std::collections::HashSet;",
+			"use std::fmt;",
+			"use std::io;",
+			"pub fn run() {",
+			"\tlet a = 1;",
+			"\tlet b = 2;",
+			"\tlet c = a + b;",
+			"\tprintln!(\"{c}\");",
+			"}",
+		]
+		.join("\r\n");
+
+		let result = summarize(&crlf_code, "fixture.rs");
+		assert!(result.parsed);
+		assert!(result.elided);
+		assert_eq!(result.total_lines, 16);
+		assert_eq!(segment_kinds(&result), vec![
+			"kept", "elided", "kept", "elided", "kept", "elided", "kept"
+		]);
+		assert_eq!(result.segments[0].start_line, 1);
+		assert_eq!(result.segments[0].end_line, 2);
+		assert_eq!(
+			result.segments[0].text.as_deref(),
+			Some("/* header comment 1\n * header comment 2")
+		);
+		assert_eq!(result.segments[1].start_line, 3);
+		assert_eq!(result.segments[1].end_line, 5);
+		assert_eq!(result.segments[2].text.as_deref(), Some(" */\nuse std::collections::HashMap;"));
+		assert_eq!(result.segments[3].start_line, 8);
+		assert_eq!(result.segments[3].end_line, 9);
+		assert_eq!(result.segments[4].text.as_deref(), Some("use std::io;\npub fn run() {"));
+		assert_eq!(result.segments[5].start_line, 12);
+		assert_eq!(result.segments[5].end_line, 15);
+		assert_eq!(result.segments[6].text.as_deref(), Some("}"));
 	}
 }

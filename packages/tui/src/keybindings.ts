@@ -27,6 +27,7 @@ export interface Keybindings {
 	"tui.editor.yank": true;
 	"tui.editor.yankPop": true;
 	"tui.editor.undo": true;
+	"tui.editor.spellingSuggestions": true;
 	// Generic input actions
 	"tui.input.newLine": true;
 	"tui.input.submit": true;
@@ -104,7 +105,7 @@ export const TUI_KEYBINDINGS = {
 		description: "Delete word backward",
 	},
 	"tui.editor.deleteWordForward": {
-		defaultKeys: ["alt+delete", "alt+d", "super+alt+delete", "super+alt+d"],
+		defaultKeys: ["alt+delete", "alt+d", "ctrl+delete", "super+alt+delete", "super+alt+d"],
 		description: "Delete word forward",
 	},
 	"tui.editor.deleteToLineStart": {
@@ -118,7 +119,11 @@ export const TUI_KEYBINDINGS = {
 	"tui.editor.yank": { defaultKeys: "ctrl+y", description: "Yank" },
 	"tui.editor.yankPop": { defaultKeys: "alt+y", description: "Yank pop" },
 	"tui.editor.undo": { defaultKeys: ["ctrl+-", "ctrl+_"], description: "Undo" },
-	"tui.input.newLine": { defaultKeys: "shift+enter", description: "Insert newline" },
+	"tui.editor.spellingSuggestions": {
+		defaultKeys: "ctrl+.",
+		description: "Show spelling replacements",
+	},
+	"tui.input.newLine": { defaultKeys: ["shift+enter", "ctrl+j"], description: "Insert newline" },
 	"tui.input.submit": { defaultKeys: "enter", description: "Submit input" },
 	"tui.input.tab": { defaultKeys: "tab", description: "Tab / autocomplete" },
 	"tui.input.copy": { defaultKeys: "ctrl+c", description: "Copy selection" },
@@ -288,8 +293,17 @@ export class KeybindingsManager {
 	matches(data: string, keybinding: Keybinding): boolean {
 		const parsed = parseKey(data);
 		if (parsed === undefined) return false;
-		const matchKeys = this.#matchKeysById.get(keybinding);
-		return matchKeys?.has(canonicalKeyId(parsed)) ?? false;
+		return this.matchesCanonical(canonicalKeyId(parsed), keybinding);
+	}
+
+	/**
+	 * Set-lookup variant of {@link matches} for hot input paths: the caller
+	 * parses `data` once (`parseKey` + `canonicalKeyId`) and probes many
+	 * bindings without re-parsing the raw sequence per probe.
+	 */
+	matchesCanonical(canonical: string | undefined, keybinding: Keybinding): boolean {
+		if (canonical === undefined) return false;
+		return this.#matchKeysById.get(keybinding)?.has(canonical) ?? false;
 	}
 
 	getKeys(keybinding: Keybinding): KeyId[] {

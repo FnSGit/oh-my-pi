@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
+import { popLoopPhase, pushLoopPhase, withLoopPhase } from "@oh-my-pi/pi-utils";
 
 import { dbPath as configuredDbPath } from "../config";
 import { closeQuietly } from "../db";
@@ -7,7 +8,15 @@ import type { MemoryInput, Metadata } from "../types";
 import { AnnotationStore } from "./annotations";
 import { BankManager } from "./banks";
 import { BeamMemory, initBeam } from "./beam/index";
-import type { RecallEnhancedOptions, RecallOptions, RecallResult, SleepResult } from "./beam/types";
+import { reconcileEmbeddingModel } from "./beam/store";
+import type {
+	MemoryIndexEntry,
+	MemoryIndexOptions,
+	RecallEnhancedOptions,
+	RecallOptions,
+	RecallResult,
+	SleepResult,
+} from "./beam/types";
 import { EpisodicGraph } from "./episodic-graph";
 import {
 	isPiAiModel,
@@ -42,14 +51,36 @@ export interface MnemopiOptions {
 	readonly llmApiKey?: ApiKey;
 	readonly llmModel?: string | Model<Api>;
 	readonly llm?: false | MnemopiLlmRuntimeOptions | Model<Api> | MnemopiLlmCompletion;
+	readonly proactiveLinking?: boolean;
+	/**
+	 * Route `recallEnhanced` through polyphonic recall for this instance. Unset
+	 * defers to `configureRecallFeatures`; `MNEMOPI_POLYPHONIC_RECALL` wins when set.
+	 */
+	readonly polyphonicRecall?: boolean;
+	/**
+	 * Cache `recallEnhanced` results for this instance. Unset defers to
+	 * `configureRecallFeatures`; `MNEMOPI_ENHANCED_RECALL` wins when set.
+	 */
+	readonly enhancedRecall?: boolean;
 	/** Escalate best-effort failure logs (embedding pipeline) from debug to warn. */
 	readonly debug?: boolean;
+	/**
+	 * When `false`, skip the embedding-model reconcile (wipe-and-rebuild) on open.
+	 * Read-only / ephemeral consumers (e.g. a stats snapshot) set this so an open
+	 * never triggers a destructive migration whose background rebuild the process
+	 * would exit before completing. Defaults to `true`.
+	 */
+	readonly reconcile?: boolean;
 }
 
 export interface RememberInput extends MemoryInput {
 	readonly extract?: boolean;
 	readonly extractEntities?: boolean;
 	readonly extract_entities?: boolean;
+	readonly extractText?: string | null;
+	readonly extract_text?: string | null;
+	readonly embedText?: string | null;
+	readonly embed_text?: string | null;
 	readonly trustTier?: string | null;
 	readonly trust_tier?: string | null;
 	readonly memoryType?: string | null;
@@ -66,6 +97,18 @@ export interface RememberFacadeOptions {
 	readonly extractEntities?: boolean;
 	readonly extract_entities?: boolean;
 	readonly extract?: boolean;
+	/**
+	 * Override the text passed to fact/entity extraction. When unset, the
+	 * stored content is used. See {@link RememberOptions.extractText}.
+	 */
+	readonly extractText?: string | null;
+	readonly extract_text?: string | null;
+	/**
+	 * Override the text passed to embeddings and FTS indexing. Stored content
+	 * remains unchanged; when unset, embeddings and FTS use stored content.
+	 */
+	readonly embedText?: string | null;
+	readonly embed_text?: string | null;
 	readonly trustTier?: string | null;
 	readonly trust_tier?: string | null;
 	readonly timestamp?: string | Date | null;
@@ -74,8 +117,10 @@ export interface RememberFacadeOptions {
 	readonly memory_type?: string | null;
 }
 
-export interface RecallFacadeOptions
-	extends Omit<RecallOptions, "temporalHalflife" | "vecWeight" | "ftsWeight" | "importanceWeight"> {
+export interface RecallFacadeOptions extends Omit<
+	RecallOptions,
+	"temporalHalflife" | "vecWeight" | "ftsWeight" | "importanceWeight"
+> {
 	readonly from_date?: string | null;
 	readonly to_date?: string | null;
 	readonly source?: string | null;
@@ -130,6 +175,8 @@ type FacadeRememberOptions = {
 	scope: string;
 	extractEntities: boolean;
 	extract: boolean;
+	extractText: string | undefined;
+	embedText: string | undefined;
 	trustTier: string | undefined;
 	veracity: string | undefined;
 	memoryType: string | undefined;
@@ -153,19 +200,25 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 	const embeddingApiUrl = options.embeddingApiUrl ?? nestedEmbeddings?.apiUrl;
 	const embeddingApiKey = options.embeddingApiKey ?? nestedEmbeddings?.apiKey;
 	const embeddingProvider = resolveEmbeddingProvider(nestedEmbeddings?.provider);
+	const embeddingMaxInputChars = nestedEmbeddings?.maxInputChars;
+	const embeddingBatchSize = nestedEmbeddings?.batchSize;
 
 	const embeddings =
 		embeddingDisabled !== undefined ||
 		embeddingModel !== undefined ||
 		embeddingApiUrl !== undefined ||
 		embeddingApiKey !== undefined ||
-		embeddingProvider !== undefined
+		embeddingProvider !== undefined ||
+		embeddingMaxInputChars !== undefined ||
+		embeddingBatchSize !== undefined
 			? {
 					disabled: embeddingDisabled,
 					model: embeddingModel,
 					apiUrl: embeddingApiUrl,
 					apiKey: embeddingApiKey,
 					provider: embeddingProvider,
+					maxInputChars: embeddingMaxInputChars,
+					batchSize: embeddingBatchSize,
 				}
 			: undefined;
 
@@ -182,7 +235,7 @@ function resolveRuntimeOptions(options: MnemopiOptions): ResolvedMnemopiRuntimeO
 		const llmEnabled = hasOwn(options, "llmEnabled")
 			? options.llmEnabled
 			: (nestedLlm?.enabled ??
-					(nestedLlm?.baseUrl !== undefined ||
+				  (nestedLlm?.baseUrl !== undefined ||
 						nestedLlm?.apiKey !== undefined ||
 						nestedLlm?.maxTokens !== undefined ||
 						nestedLlm?.complete !== undefined ||
@@ -247,6 +300,9 @@ function resolveDbPath(options: MnemopiOptions, bank: string): string | undefine
 function toRememberOptions(input: string | RememberInput, options: RememberFacadeOptions) {
 	const memory = typeof input === "string" ? null : input;
 	const timestamp = normalizeDate(options.timestamp ?? memory?.timestamp);
+	const extractText =
+		options.extractText ?? options.extract_text ?? memory?.extractText ?? memory?.extract_text ?? null;
+	const embedText = options.embedText ?? options.embed_text ?? memory?.embedText ?? memory?.embed_text ?? null;
 	const rememberOptions: FacadeRememberOptions = {
 		source: options.source ?? memory?.source ?? "conversation",
 		importance: options.importance ?? memory?.importance ?? 0.5,
@@ -260,6 +316,8 @@ function toRememberOptions(input: string | RememberInput, options: RememberFacad
 			memory?.extract_entities ??
 			false,
 		extract: options.extract ?? memory?.extract ?? false,
+		extractText: extractText ?? undefined,
+		embedText: embedText ?? undefined,
 		trustTier: options.trustTier ?? options.trust_tier ?? memory?.trustTier ?? memory?.trust_tier ?? undefined,
 		veracity: options.veracity ?? memory?.veracity ?? undefined,
 		memoryType: options.memoryType ?? options.memory_type ?? memory?.memoryType ?? memory?.memory_type ?? undefined,
@@ -284,6 +342,7 @@ function toRecallOptions(options: RecallFacadeOptions): BeamRecallFacadeOptions 
 		vecWeight: options.vecWeight ?? options.vec_weight ?? undefined,
 		ftsWeight: options.ftsWeight ?? options.fts_weight ?? undefined,
 		importanceWeight: options.importanceWeight ?? options.importance_weight ?? undefined,
+		contentPreviewChars: options.contentPreviewChars,
 	};
 	// Preserve the three-state semantics (`undefined` = auto-derive, `null` = explicitly
 	// FTS-only, `number[]` = caller-supplied) so callers can opt out of `recall()`'s
@@ -293,7 +352,8 @@ function toRecallOptions(options: RecallFacadeOptions): BeamRecallFacadeOptions 
 }
 
 function countRows(db: Database, sql: string, ...params: (string | number | null)[]): number {
-	const row = db.prepare(sql).get(...params) as { total?: number; count?: number } | null;
+	using statement = db.prepare(sql);
+	const row = statement.get(...params) as { total?: number; count?: number } | null;
 	return row?.total ?? row?.count ?? 0;
 }
 
@@ -308,9 +368,8 @@ function dataDirForDbPath(path: string): string | undefined {
 
 function sourceCounts(db: Database): Record<string, number> {
 	const counts: Record<string, number> = {};
-	for (const row of db
-		.prepare("SELECT source, COUNT(*) AS total FROM working_memory GROUP BY source")
-		.all() as Row[]) {
+	using statement = db.prepare("SELECT source, COUNT(*) AS total FROM working_memory GROUP BY source");
+	for (const row of statement.all() as Row[]) {
 		counts[String(row.source ?? "") || "conversation"] = Number(row.total ?? 0);
 	}
 	return counts;
@@ -358,42 +417,62 @@ export class Mnemopi {
 	#closed = false;
 
 	constructor(options: MnemopiOptions = {}) {
-		this.sessionId = options.sessionId ?? options.session_id ?? "default";
-		this.bank = options.bank ?? "default";
-		this.authorId = options.authorId ?? options.author_id ?? null;
-		this.authorType = options.authorType ?? options.author_type ?? null;
-		this.channelId = options.channelId ?? options.channel_id ?? this.sessionId;
-		this.dbPath = resolveDbPath(options, this.bank);
-		this.runtimeOptions = resolveRuntimeOptions(options);
+		pushLoopPhase("mnemopi.open");
+		try {
+			this.sessionId = options.sessionId ?? options.session_id ?? "default";
+			this.bank = options.bank ?? "default";
 
-		this.beam = new BeamMemory({
-			sessionId: this.sessionId,
-			dbPath: options.db === undefined ? this.dbPath : ":memory:",
-			authorId: this.authorId,
-			authorType: this.authorType,
-			channelId: this.channelId,
-		});
-		this.#ownsDb = options.db === undefined;
-		if (options.db !== undefined) {
-			const opened = this.beam.db;
-			initBeam(options.db);
-			Object.defineProperty(this.beam, "db", { value: options.db });
-			Object.defineProperty(this.beam, "annotations", {
-				value: buildBeamAnnotations(options.db, this.dbPath),
+			this.authorId = options.authorId ?? options.author_id ?? null;
+			this.authorType = options.authorType ?? options.author_type ?? null;
+			this.channelId = options.channelId ?? options.channel_id ?? this.sessionId;
+			this.dbPath = resolveDbPath(options, this.bank);
+			this.runtimeOptions = resolveRuntimeOptions(options);
+
+			this.beam = new BeamMemory({
+				sessionId: this.sessionId,
+				dbPath: options.db === undefined ? this.dbPath : ":memory:",
+				authorId: this.authorId,
+				authorType: this.authorType,
+				channelId: this.channelId,
+				proactiveLinking: options.proactiveLinking,
+				polyphonicRecall: options.polyphonicRecall,
+				enhancedRecall: options.enhancedRecall,
 			});
-			Object.defineProperty(this.beam, "episodicGraph", {
-				value: buildEpisodicGraph(options.db, this.dbPath),
-			});
-			closeQuietly(opened);
+			this.#ownsDb = options.db === undefined;
+			if (options.db !== undefined) {
+				const opened = this.beam.db;
+				initBeam(options.db);
+				Object.defineProperty(this.beam, "db", { value: options.db });
+				Object.defineProperty(this.beam, "annotations", {
+					value: buildBeamAnnotations(options.db, this.dbPath),
+				});
+				Object.defineProperty(this.beam, "episodicGraph", {
+					value: buildEpisodicGraph(options.db, this.dbPath),
+				});
+				closeQuietly(opened);
+			}
+			this.conn = this.beam.db;
+			this.db = this.beam.db;
+			// Wipe-and-rebuild stale embeddings when the configured model changed since
+			// the vectors were written. Runs inside the runtime scope so
+			// `currentEmbeddingModel()` reflects this instance's configured model.
+			// Skipped for read-only opens (`reconcile: false`) so an ephemeral stats
+			// reader never triggers a destructive migration whose async rebuild it would
+			// exit before completing — which would otherwise lose the embeddings.
+			if (options.reconcile !== false) {
+				withMnemopiRuntimeOptions(this.runtimeOptions, () => reconcileEmbeddingModel(this.beam));
+			}
+		} finally {
+			popLoopPhase();
 		}
-		this.conn = this.beam.db;
-		this.db = this.beam.db;
 	}
 
 	close(): void {
-		if (this.#closed) return;
-		this.#closed = true;
-		if (this.#ownsDb) this.beam.close();
+		withLoopPhase("mnemopi.close", () => {
+			if (this.#closed) return;
+			this.#closed = true;
+			if (this.#ownsDb) this.beam.close();
+		});
 	}
 
 	async flushExtractions(): Promise<void> {
@@ -401,12 +480,14 @@ export class Mnemopi {
 	}
 
 	remember(memory: string | RememberInput, options: RememberFacadeOptions = {}): string {
-		const content = typeof memory === "string" ? memory : memory.content;
-		return this.#withRuntimeOptions(() => this.beam.remember(content, toRememberOptions(memory, options)));
+		return this.#withRuntimeOptions("mnemopi.retain", () => {
+			const content = typeof memory === "string" ? memory : memory.content;
+			return this.beam.remember(content, toRememberOptions(memory, options));
+		});
 	}
 
 	recall(query: string, topK = 5, options: RecallFacadeOptions = {}): Promise<RecallResult[]> {
-		return this.#withRuntimeOptions(() => this.beam.recall(query, topK, toRecallOptions(options)));
+		return this.#withRuntimeOptions("mnemopi.recall", () => this.beam.recall(query, topK, toRecallOptions(options)));
 	}
 
 	recallEnhanced(
@@ -414,7 +495,7 @@ export class Mnemopi {
 		topK = 5,
 		options: RecallFacadeOptions & RecallEnhancedOptions = {},
 	): Promise<RecallResult[]> {
-		return this.#withRuntimeOptions(() =>
+		return this.#withRuntimeOptions("mnemopi.recall", () =>
 			this.beam.recallEnhanced(query, topK, {
 				...toRecallOptions(options),
 				useCache: options.useCache,
@@ -424,7 +505,12 @@ export class Mnemopi {
 	}
 
 	getContext(limit = 10): unknown[] {
-		return this.#withRuntimeOptions(() => this.beam.getContext(limit));
+		return this.#withRuntimeOptions("mnemopi.read", () => this.beam.getContext(limit));
+	}
+
+	/** Live rows for a compact prompt index; no embeddings or recall scoring. */
+	listIndex(options: MemoryIndexOptions = {}): MemoryIndexEntry[] {
+		return this.#withRuntimeOptions("mnemopi.read", () => this.beam.listIndex(options));
 	}
 
 	getStats(
@@ -432,61 +518,70 @@ export class Mnemopi {
 		authorType: string | null = null,
 		channelId: string | null = null,
 	): MemoryFacadeStats {
-		const working = this.#withRuntimeOptions(() => this.beam.getWorkingStats(authorId, authorType, channelId));
-		const episodic = this.#withRuntimeOptions(() => this.beam.getEpisodicStats(authorId, authorType, channelId));
-		const totalMemories = countRows(this.conn, "SELECT COUNT(*) AS total FROM working_memory");
-		const totalSessions = countRows(this.conn, "SELECT COUNT(DISTINCT session_id) AS total FROM working_memory");
-		const last = this.conn.prepare("SELECT timestamp FROM working_memory ORDER BY timestamp DESC LIMIT 1").get() as {
-			timestamp: string | null;
-		} | null;
-		const tripleTotal = countRows(this.conn, "SELECT COUNT(*) AS total FROM triples");
-		let banks = ["default"];
-		if (this.dbPath !== undefined && this.dbPath !== ":memory:") {
-			const dataDir = dataDirForDbPath(this.dbPath);
-			banks = new BankManager(dataDir).listBanks();
-		}
-		return {
-			total_memories: totalMemories,
-			total_sessions: totalSessions,
-			sources: sourceCounts(this.conn),
-			last_memory: last?.timestamp ?? null,
-			database: this.dbPath ?? ":memory:",
-			mode: "beam",
-			banks,
-			beam: { working_memory: working, episodic_memory: episodic, triples: { total: tripleTotal } },
-		};
+		return withLoopPhase("mnemopi.stats", () => {
+			const working = withMnemopiRuntimeOptions(this.runtimeOptions, () =>
+				this.beam.getWorkingStats(authorId, authorType, channelId),
+			);
+			const episodic = withMnemopiRuntimeOptions(this.runtimeOptions, () =>
+				this.beam.getEpisodicStats(authorId, authorType, channelId),
+			);
+			const totalMemories = countRows(this.conn, "SELECT COUNT(*) AS total FROM working_memory");
+			const totalSessions = countRows(this.conn, "SELECT COUNT(DISTINCT session_id) AS total FROM working_memory");
+			using lastStatement = this.conn.prepare(
+				"SELECT timestamp FROM working_memory ORDER BY timestamp DESC LIMIT 1",
+			);
+			const last = lastStatement.get() as {
+				timestamp: string | null;
+			} | null;
+			const tripleTotal = countRows(this.conn, "SELECT COUNT(*) AS total FROM triples");
+			let banks = ["default"];
+			if (this.dbPath !== undefined && this.dbPath !== ":memory:") {
+				const dataDir = dataDirForDbPath(this.dbPath);
+				banks = new BankManager(dataDir).listBanks();
+			}
+			return {
+				total_memories: totalMemories,
+				total_sessions: totalSessions,
+				sources: sourceCounts(this.conn),
+				last_memory: last?.timestamp ?? null,
+				database: this.dbPath ?? ":memory:",
+				mode: "beam",
+				banks,
+				beam: { working_memory: working, episodic_memory: episodic, triples: { total: tripleTotal } },
+			};
+		});
 	}
 
 	get(memoryId: string): unknown | null {
-		return this.#withRuntimeOptions(() => this.beam.get(memoryId));
+		return this.#withRuntimeOptions("mnemopi.read", () => this.beam.get(memoryId));
 	}
 
 	forget(memoryId: string): boolean {
-		return this.#withRuntimeOptions(() => this.beam.forgetWorking(memoryId));
+		return this.#withRuntimeOptions("mnemopi.edit", () => this.beam.forgetWorking(memoryId));
 	}
 
 	update(memoryId: string, content: string | null = null, importance: number | null = null): boolean {
-		return this.#withRuntimeOptions(() => this.beam.updateWorking(memoryId, content, importance));
+		return this.#withRuntimeOptions("mnemopi.edit", () => this.beam.updateWorking(memoryId, content, importance));
 	}
 
 	sleep(dryRun = false): SleepResult {
-		return this.#withRuntimeOptions(() => this.beam.sleep(dryRun));
+		return this.#withRuntimeOptions("mnemopi.consolidate", () => this.beam.sleep(dryRun));
 	}
 
 	sleepAllSessions(dryRun = false): SleepResult {
-		return this.#withRuntimeOptions(() => this.beam.sleepAllSessions(dryRun));
+		return this.#withRuntimeOptions("mnemopi.consolidate", () => this.beam.sleepAllSessions(dryRun));
 	}
 
 	scratchpadWrite(content: string): string {
-		return this.#withRuntimeOptions(() => this.beam.scratchpadWrite(content));
+		return this.#withRuntimeOptions("mnemopi.retain", () => this.beam.scratchpadWrite(content));
 	}
 
 	scratchpadRead(): unknown[] {
-		return this.#withRuntimeOptions(() => this.beam.scratchpadRead());
+		return this.#withRuntimeOptions("mnemopi.read", () => this.beam.scratchpadRead());
 	}
 
 	scratchpadClear(): void {
-		this.#withRuntimeOptions(() => this.beam.scratchpadClear());
+		this.#withRuntimeOptions("mnemopi.edit", () => this.beam.scratchpadClear());
 	}
 
 	addMemory(memory: string | RememberInput, options: RememberFacadeOptions = {}): string {
@@ -512,8 +607,8 @@ export class Mnemopi {
 	consolidate(dryRun = false): SleepResult {
 		return this.sleep(dryRun);
 	}
-	#withRuntimeOptions<T>(fn: () => T): T {
-		return withMnemopiRuntimeOptions(this.runtimeOptions, fn);
+	#withRuntimeOptions<T>(label: string, fn: () => T): T {
+		return withLoopPhase(label, () => withMnemopiRuntimeOptions(this.runtimeOptions, fn));
 	}
 }
 

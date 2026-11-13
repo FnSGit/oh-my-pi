@@ -1,145 +1,34 @@
-/**
- * Web Search Types
- *
- * Unified types for web search responses across supported providers.
- */
+import type { WebSearchGrounding } from "@oh-my-pi/pi-catalog/types";
+import type { SearchProviderId, SearchResponse } from "@oh-my-pi/pi-tui/tools/web-search-types";
 
-export const SEARCH_PROVIDER_ORDER = [
-	"tavily",
-	"perplexity",
-	"brave",
-	"jina",
-	"kimi",
-	"anthropic",
-	"gemini",
-	"codex",
-	"zai",
-	"exa",
-	"parallel",
-	"kagi",
-	"synthetic",
-	"searxng",
-] as const;
+export * from "@oh-my-pi/pi-tui/tools/web-search-types";
 
-/** Supported web search providers */
-export type SearchProviderId = (typeof SEARCH_PROVIDER_ORDER)[number];
-
-export const SEARCH_PROVIDER_PREFERENCES = ["auto", ...SEARCH_PROVIDER_ORDER] as const;
-
-export const SEARCH_PROVIDER_OPTIONS = [
-	{
-		value: "auto",
-		label: "Auto",
-		description: "Automatically uses the first configured web-search provider",
-	},
-	{ value: "tavily", label: "Tavily", description: "Requires TAVILY_API_KEY" },
-	{
-		value: "perplexity",
-		label: "Perplexity",
-		description: "Uses auth when configured; explicit selection falls back to anonymous search",
-	},
-	{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },
-	{ value: "jina", label: "Jina", description: "Requires JINA_API_KEY" },
-	{ value: "kimi", label: "Kimi", description: "Requires MOONSHOT_SEARCH_API_KEY or MOONSHOT_API_KEY" },
-	{
-		value: "anthropic",
-		label: "Anthropic",
-		description: "Claude's native web_search tool (uses Anthropic OAuth or ANTHROPIC_API_KEY)",
-	},
-	{
-		value: "gemini",
-		label: "Gemini",
-		description: "Google Search grounding via Gemini (uses google-gemini-cli or google-antigravity OAuth)",
-	},
-	{
-		value: "codex",
-		label: "OpenAI",
-		description: "OpenAI's native web_search (uses ChatGPT OAuth via /login openai-codex)",
-	},
-	{ value: "zai", label: "Z.AI", description: "Calls Z.AI webSearchPrime MCP" },
-	{ value: "exa", label: "Exa", description: "Uses Exa API when EXA_API_KEY is set; falls back to Exa MCP" },
-	{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
-	{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY and Kagi Search API beta access" },
-	{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
-	{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
-] as const;
-
-export const SEARCH_PROVIDER_LABELS: Record<SearchProviderId, string> = {
-	tavily: "Tavily",
-	perplexity: "Perplexity",
-	brave: "Brave",
-	jina: "Jina",
-	kimi: "Kimi",
-	anthropic: "Anthropic",
-	gemini: "Gemini",
-	codex: "OpenAI",
-	zai: "Z.AI",
-	exa: "Exa",
-	parallel: "Parallel",
-	kagi: "Kagi",
-	synthetic: "Synthetic",
-	searxng: "SearXNG",
-};
-
-export function isSearchProviderId(value: string): value is SearchProviderId {
-	return SEARCH_PROVIDER_ORDER.includes(value as SearchProviderId);
+/** One provider that failed before another answered, or before the search gave up. */
+export interface SearchFailureDetail {
+	/** Provider id (`brave`, `openai`, …), or the catalog model id when the provider never loaded. */
+	provider: string;
+	label: string;
+	/** Flattened, length-capped reason, as the LLM-facing fallback note quotes it. */
+	reason: string;
+	/** HTTP-style status the provider error carried (204 marks a sourceless answer, e.g. a refusal). */
+	status?: number;
 }
 
-export function isSearchProviderPreference(value: string): value is SearchProviderId | "auto" {
-	return SEARCH_PROVIDER_PREFERENCES.includes(value as SearchProviderId | "auto");
+export interface SearchResultDetails {
+	response: SearchResponse;
+	error?: string;
+	/** Providers that failed, in chain order; absent when the first candidate answered. */
+	failures?: SearchFailureDetail[];
 }
 
-/** Source returned by search (all providers) */
-export interface SearchSource {
-	title: string;
-	url: string;
-	snippet?: string;
-	/** ISO date string or relative ("2d ago") */
-	publishedDate?: string;
-	/** Age in seconds for consistent formatting */
-	ageSeconds?: number;
-	author?: string;
-}
+/** Default hard timeout for each web-search provider transport. */
+export const DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 60;
 
-/** Citation with text reference (anthropic, perplexity) */
-export interface SearchCitation {
-	url: string;
-	title: string;
-	citedText?: string;
-}
+/** Maximum configurable hard timeout for each web-search provider transport. */
+export const MAX_WEB_SEARCH_TIMEOUT_SECONDS = 300;
 
-/** Usage metrics */
-export interface SearchUsage {
-	inputTokens?: number;
-	outputTokens?: number;
-	/** Anthropic: number of web search requests made */
-	searchRequests?: number;
-	/** Perplexity: combined token count */
-	totalTokens?: number;
-}
-
-/** Unified response across providers */
-export interface SearchResponse {
-	provider: SearchProviderId | "none";
-	/** Synthesized answer text (anthropic, perplexity) */
-	answer?: string;
-	/** Search result sources */
-	sources: SearchSource[];
-	/** Text citations with context */
-	citations?: SearchCitation[];
-	/** Intermediate search queries (anthropic) */
-	searchQueries?: string[];
-	/** Follow-up question suggestions (provider-dependent) */
-	relatedQuestions?: string[];
-	/** Token usage metrics */
-	usage?: SearchUsage;
-	/** Model used */
-	model?: string;
-	/** Request ID for debugging */
-	requestId?: string;
-	/** Authentication mode used by the provider (e.g. oauth, api-key) */
-	authMode?: string;
-}
+/** Pure search engines represented by `web/*` catalog models. */
+export type SearchEngineId = Exclude<SearchProviderId, WebSearchGrounding>;
 
 /** Provider-specific error with optional HTTP status */
 export class SearchProviderError extends Error {

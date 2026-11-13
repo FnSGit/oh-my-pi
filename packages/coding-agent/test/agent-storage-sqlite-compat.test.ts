@@ -1,9 +1,8 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
-import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { AgentStorage, SCHEMA_VERSION } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { readTableSql } from "./helpers/sqlite-inspect";
 
 const LEGACY_TIMESTAMP = 1_700_000_000;
@@ -34,24 +33,27 @@ function readSettingsRows(dbPath: string): Array<{ key: string; value: string; u
 }
 
 describe("AgentStorage SQLite compatibility", () => {
-	let tempDir = "";
+	let tempDir: TempDir;
 
 	afterEach(async () => {
+		AgentStorage.close();
 		if (tempDir) {
-			await fs.rm(tempDir, { recursive: true, force: true });
-			tempDir = "";
+			try {
+				await tempDir.remove();
+			} catch {}
+			tempDir = undefined as unknown as TempDir;
 		}
 	});
 
 	it("creates fresh storage without unixepoch defaults", async () => {
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-agent-storage-fresh-"));
-		const dbPath = path.join(tempDir, "agent.db");
+		tempDir = TempDir.createSync("@omp-agent-storage-fresh-");
+		const dbPath = path.join(tempDir.path(), "agent.db");
 
 		const storage = await AgentStorage.open(dbPath);
 		storage.recordModelUsage("openai/gpt-5");
 
 		expect(storage.getModelUsageOrder()).toEqual(["openai/gpt-5"]);
-		expect(readSchemaVersion(dbPath)).toBe(5);
+		expect(readSchemaVersion(dbPath)).toBe(SCHEMA_VERSION);
 		expect(readTableSql(dbPath, "settings")).not.toContain("unixepoch(");
 		expect(readTableSql(dbPath, "settings")).toContain("strftime('%s','now')");
 		expect(readTableSql(dbPath, "model_usage")).not.toContain("unixepoch(");
@@ -59,8 +61,8 @@ describe("AgentStorage SQLite compatibility", () => {
 	});
 
 	it("migrates legacy settings and model usage schemas away from unixepoch defaults", async () => {
-		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-agent-storage-legacy-"));
-		const dbPath = path.join(tempDir, "agent.db");
+		tempDir = TempDir.createSync("@omp-agent-storage-legacy-");
+		const dbPath = path.join(tempDir.path(), "agent.db");
 		const legacyDb = new Database(dbPath);
 		legacyDb.exec(`
 			CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
@@ -85,7 +87,7 @@ describe("AgentStorage SQLite compatibility", () => {
 
 		const storage = await AgentStorage.open(dbPath);
 
-		expect(readSchemaVersion(dbPath)).toBe(5);
+		expect(readSchemaVersion(dbPath)).toBe(SCHEMA_VERSION);
 		expect(readTableSql(dbPath, "settings")).not.toContain("unixepoch(");
 		expect(readTableSql(dbPath, "settings")).toContain("strftime('%s','now')");
 		expect(readTableSql(dbPath, "model_usage")).not.toContain("unixepoch(");
@@ -93,5 +95,28 @@ describe("AgentStorage SQLite compatibility", () => {
 		expect(storage.getSettings()).toEqual({ theme: "dark" });
 		expect(storage.getModelUsageOrder()).toEqual(["anthropic/claude-sonnet-4-5"]);
 		expect(readSettingsRows(dbPath)).toEqual([{ key: "theme", value: '"dark"', updated_at: LEGACY_TIMESTAMP }]);
+	});
+
+	it("clears migrated settings rows", async () => {
+		tempDir = TempDir.createSync("@omp-agent-storage-clear-settings-");
+		const dbPath = path.join(tempDir.path(), "agent.db");
+		const seed = new Database(dbPath);
+		seed.exec(`
+			CREATE TABLE settings (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL,
+				updated_at INTEGER NOT NULL DEFAULT 0
+			);
+		`);
+		seed
+			.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+			.run("theme", '"dark"', LEGACY_TIMESTAMP);
+		seed.close();
+
+		const storage = await AgentStorage.open(dbPath);
+		expect(storage.getSettings()).toEqual({ theme: "dark" });
+		storage.clearMigratedSettings();
+		expect(storage.getSettings()).toBeNull();
+		expect(readSettingsRows(dbPath)).toEqual([]);
 	});
 });

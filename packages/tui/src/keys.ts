@@ -24,34 +24,35 @@ import {
 	parseKey as parseKeyNative,
 	parseKittySequence as parseKittySequenceNative,
 } from "@oh-my-pi/pi-natives";
+import { isInsideTerminalMultiplexer, isSshSession } from "./terminal-capabilities";
 
 // =============================================================================
 // Platform Detection
 // =============================================================================
 
-function isWindowsTerminalSession(): boolean {
-	return (
-		Boolean(process.env.WT_SESSION) && !process.env.SSH_CONNECTION && !process.env.SSH_CLIENT && !process.env.SSH_TTY
-	);
+/** Whether the local process is running directly under Windows Terminal. */
+export function isWindowsTerminalSession(): boolean {
+	return Boolean(process.env.WT_SESSION) && !isSshSession();
 }
 
 /**
- * Raw 0x08 (BS) is ambiguous in legacy terminals.
+ * Match ambiguous legacy Backspace bytes against an expected modifier mask.
  *
- * - Windows Terminal uses it for Ctrl+Backspace.
- * - Some legacy terminals and tmux setups send it for plain Backspace.
- *
- * Prefer explicit Kitty / CSI-u / modifyOtherKeys sequences whenever they are
- * available. Fall back to a Windows Terminal heuristic only for raw BS bytes.
+ * Windows Terminal encodes Ctrl+Backspace as raw `0x08` (BS) and plain
+ * Backspace as `0x7f` (DEL). Remote/container sessions lose terminal identity,
+ * and multiplexers (tmux/screen/Zellij) inherit `WT_SESSION` while emitting
+ * raw `0x08` for plain Backspace themselves, so the automatic heuristic is
+ * limited to direct Windows Terminal sessions. `PI_TUI_RAW_BACKSPACE_IS_CTRL=1`
+ * explicitly opts into the mapping everywhere.
  */
-function matchesRawBackspace(data: string, expectedModifier: number): boolean {
+export function matchesRawBackspace(data: string, expectedModifier: number): boolean {
 	if (data === "\x7f") return expectedModifier === 0;
 	if (data !== "\x08") return false;
-	// On Windows Terminal, 0x08 = Ctrl+Backspace. On others, it's plain Backspace.
-	return isWindowsTerminalSession() ? expectedModifier === 4 : expectedModifier === 0;
+	const rawBackspaceIsCtrl =
+		process.env.PI_TUI_RAW_BACKSPACE_IS_CTRL === "1" ||
+		(isWindowsTerminalSession() && !isInsideTerminalMultiplexer(process.env));
+	return rawBackspaceIsCtrl ? expectedModifier === 4 : expectedModifier === 0;
 }
-
-export { isWindowsTerminalSession, matchesRawBackspace };
 
 // =============================================================================
 // Global Kitty Protocol State
@@ -108,7 +109,7 @@ type Letter =
 
 type Digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
 
-type SymbolKey =
+type KeySymbol =
 	| "`"
 	| "-"
 	| "="
@@ -173,8 +174,9 @@ type SpecialKey =
 	| "f11"
 	| "f12";
 
-type BaseKey = Letter | Digit | SymbolKey | SpecialKey;
-type ModifierName = "ctrl" | "shift" | "alt" | "super";
+type BaseKey = Letter | Digit | KeySymbol | SpecialKey;
+/** Modifier key names as they appear in {@link KeyId} chords. */
+export type ModifierName = "ctrl" | "shift" | "alt" | "super";
 
 type ModifiedKeyId<Key extends string, RemainingModifiers extends ModifierName = ModifierName> = {
 	[M in RemainingModifiers]: `${M}+${Key}` | `${M}+${ModifiedKeyId<Key, Exclude<RemainingModifiers, M>>}`;
@@ -303,7 +305,7 @@ const KITTY_MOD_ALT = 2;
 const KITTY_MOD_CTRL = 4;
 const KITTY_MOD_SUPER = 8;
 const KITTY_MOD_NUM_LOCK = 128;
-const KITTY_LOCK_MASK = 64 + 128; // Caps Lock + Num Lock
+const KITTY_LOCK_MASK = 64 + KITTY_MOD_NUM_LOCK; // Caps Lock + Num Lock
 const MODIFY_OTHER_KEYS_PATTERN = /^\x1b\[27;(\d+);(\d+)~$/;
 const KITTY_KEYPAD_OPERATOR_TEXT: Record<number, string> = {
 	57410: "/",
@@ -409,7 +411,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 			.split(":")
 			.filter(Boolean)
 			.map(value => Number.parseInt(value, 10))
-			.filter(value => Number.isFinite(value) && value >= 32);
+			.filter(value => Number.isFinite(value) && value >= 32 && value !== 127);
 		if (codepoints.length > 0) {
 			try {
 				return String.fromCodePoint(...codepoints);
@@ -421,7 +423,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 	const keypadOperatorText = KITTY_KEYPAD_OPERATOR_TEXT[codepoint];
 	if (keypadOperatorText) return keypadOperatorText;
 
-	if (effectiveMod === 0 && modifier & KITTY_MOD_NUM_LOCK) {
+	if (effectiveMod === 0) {
 		const numpadText = KITTY_NUMPAD_TEXT[codepoint];
 		if (numpadText) return numpadText;
 	}
@@ -435,7 +437,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 		return undefined;
 	}
 
-	if (!Number.isFinite(effectiveCodepoint) || effectiveCodepoint < 32) return undefined;
+	if (!Number.isFinite(effectiveCodepoint) || effectiveCodepoint < 32 || effectiveCodepoint === 127) return undefined;
 
 	try {
 		return String.fromCodePoint(effectiveCodepoint);
@@ -486,7 +488,7 @@ function decodeModifyOtherKeysPrintable(data: string): string | undefined {
 	if (!parsed) return undefined;
 	const modifier = parsed.modifier & ~KITTY_LOCK_MASK;
 	if ((modifier & ~KITTY_MOD_SHIFT) !== 0) return undefined;
-	if (!Number.isFinite(parsed.codepoint) || parsed.codepoint < 32) return undefined;
+	if (!Number.isFinite(parsed.codepoint) || parsed.codepoint < 32 || parsed.codepoint === 127) return undefined;
 	try {
 		return String.fromCodePoint(parsed.codepoint);
 	} catch {
@@ -502,6 +504,30 @@ function decodeModifyOtherKeysPrintable(data: string): string | undefined {
  */
 export function decodePrintableKey(data: string): string | undefined {
 	return decodeKittyPrintable(data) ?? decodeModifyOtherKeysPrintable(data);
+}
+
+/**
+ * Decode a Kitty CSI-u keypad sequence (numpad digits / keypad operators) into the
+ * text it produces, or `undefined` for any non-keypad sequence.
+ *
+ * The native key matcher classifies bare numpad codepoints (those without a NumLock
+ * modifier bit) as navigation keys, but terminals such as the VS Code integrated
+ * terminal emit those codepoints for real digit input. Restricting the fast path to
+ * keypad codepoints keeps canonical named keys (space, backspace, shifted keys, and
+ * modifyOtherKeys sequences) flowing through native normalization.
+ */
+function decodeKittyKeypadText(data: string): string | undefined {
+	const match = data.match(KITTY_CSI_U_PATTERN);
+	if (!match) return undefined;
+	const codepoint = Number.parseInt(match[1] ?? "", 10);
+	if (!(codepoint in KITTY_NUMPAD_TEXT) && !(codepoint in KITTY_KEYPAD_OPERATOR_TEXT)) return undefined;
+	return decodeKittyPrintable(data);
+}
+
+function matchesKeypadKey(data: string, keyId: KeyId): boolean | undefined {
+	const printable = decodeKittyKeypadText(data);
+	if (printable === undefined) return undefined;
+	return printable === keyId;
 }
 
 /**
@@ -521,7 +547,8 @@ export function decodePrintableKey(data: string): string | undefined {
  * @param keyId - Key identifier (e.g., "ctrl+c", "escape", Key.ctrl("c"))
  */
 export function matchesKey(data: string, keyId: KeyId): boolean {
-	return matchesKeyNative(data, keyId, kittyProtocolActive);
+	if (matchesRawBackspace(data, 4)) return keyId === "ctrl+backspace";
+	return matchesKeypadKey(data, keyId) ?? matchesKeyNative(data, keyId, kittyProtocolActive);
 }
 
 /**
@@ -533,5 +560,6 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
  * @param data - Raw input data from terminal
  */
 export function parseKey(data: string): string | undefined {
-	return parseKeyNative(data, kittyProtocolActive) ?? undefined;
+	if (matchesRawBackspace(data, 4)) return "ctrl+backspace";
+	return decodeKittyKeypadText(data) ?? parseKeyNative(data, kittyProtocolActive) ?? undefined;
 }

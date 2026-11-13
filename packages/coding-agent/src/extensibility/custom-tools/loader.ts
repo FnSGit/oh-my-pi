@@ -1,70 +1,132 @@
 /**
- * Custom tool loader - loads TypeScript tool modules using native Bun import.
+ * Custom tool loader - loads TypeScript tool modules through the same loader
+ * as extensions, so `@oh-my-pi/*` imports resolve to the host's bundled copy
+ * (in the compiled binary there is no other copy to resolve).
  *
- * Dependencies (the zod-backed typebox shim and pi-coding-agent) are injected via the
- * CustomToolAPI to avoid import resolution issues with custom tools loaded from user directories.
+ * Dependencies are also injected through CustomToolAPI so tools loaded from
+ * user directories need no workspace module resolution.
  */
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
+import * as zod from "@oh-my-pi/omptype/zod";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
 import { toolCapability } from "../../capability/tool";
 import { type CustomTool, loadCapability } from "../../discovery";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
 import { getAllPluginToolPaths } from "../../extensibility/plugins/loader";
-// Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
-import * as PiCodingAgent from "../../index";
-import * as typebox from "../typebox";
-import { createNoOpUIContext, resolvePath } from "../utils";
+import { loadLegacyPiModule } from "../plugins/legacy-pi-compat";
+import { getCodingAgentApi } from "../host-api";
+import * as typebox from "../legacy-typebox";
+import { createNoOpUIContext, resolvePath, withHostGuard } from "../utils";
 import type { CustomToolAPI, CustomToolFactory, LoadedCustomTool, ToolLoadError } from "./types";
 
+interface LoadToolResult {
+	tools: LoadedCustomTool[];
+	errors: ToolLoadError[];
+}
+
+function isLoadableCustomTool(value: unknown): value is LoadedCustomTool["tool"] {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"name" in value &&
+		typeof value.name === "string" &&
+		value.name.length > 0 &&
+		"description" in value &&
+		typeof value.description === "string" &&
+		"parameters" in value &&
+		"execute" in value &&
+		typeof value.execute === "function"
+	);
+}
+
+function invalidToolError(path: string, index: number, source: ToolLoadError["source"]): ToolLoadError {
+	return {
+		path,
+		error: `Tool factory returned invalid tool at index ${index}: expected object with string name, string description, parameters, and execute function`,
+		source,
+	};
+}
+
 /**
- * Load a single tool module using native Bun import.
+ * The factory a tool module exports. A CommonJS module's namespace `default` is
+ * its whole `module.exports`, so transpiled output (`exports.default = factory`
+ * with `__esModule`) carries the factory one level down.
+ */
+function customToolFactoryOf(module: { default?: unknown }): CustomToolFactory | undefined {
+	const candidate = module.default ?? module;
+	if (typeof candidate === "function") return candidate as CustomToolFactory;
+	if (typeof candidate === "object" && candidate !== null && "default" in candidate) {
+		const nested = candidate.default;
+		if (typeof nested === "function") return nested as CustomToolFactory;
+	}
+	return undefined;
+}
+
+/**
+ * Load a single tool module through the host-package loader.
  */
 async function loadTool(
 	toolPath: string,
 	cwd: string,
 	sharedApi: CustomToolAPI,
 	source?: { provider: string; providerName: string; level: "user" | "project" },
-): Promise<{ tools: LoadedCustomTool[] | null; error: ToolLoadError | null }> {
+): Promise<LoadToolResult> {
 	const resolvedPath = resolvePath(toolPath, cwd);
 
 	// Skip declarative tool files (.md, .json) - these are metadata only, not executable modules
 	if (resolvedPath.endsWith(".md") || resolvedPath.endsWith(".json")) {
 		return {
-			tools: null,
-			error: {
-				path: toolPath,
-				error: "Declarative tool files (.md, .json) cannot be loaded as executable modules",
-				source,
-			},
+			tools: [],
+			errors: [
+				{
+					path: toolPath,
+					error: "Declarative tool files (.md, .json) cannot be loaded as executable modules",
+					source,
+				},
+			],
 		};
 	}
 
 	try {
-		const module = await import(resolvedPath);
-		const factory = (module.default ?? module) as CustomToolFactory;
+		// `reload: false`: a tool module and its helpers are evaluated once per
+		// process and shared, as with a native import; each session still calls
+		// the factory with its own API.
+		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath, { reload: false }))) as {
+			default?: unknown;
+		};
+		const factory = customToolFactoryOf(module);
 
 		if (typeof factory !== "function") {
-			return { tools: null, error: { path: toolPath, error: "Tool must export a default function", source } };
+			return { tools: [], errors: [{ path: toolPath, error: "Tool must export a default function", source }] };
 		}
 
-		const toolResult = await factory(sharedApi);
+		const toolResult: unknown = await withHostGuard(async () => factory(sharedApi));
 		const toolsArray = Array.isArray(toolResult) ? toolResult : [toolResult];
 
-		const loadedTools: LoadedCustomTool[] = toolsArray.map(tool => ({
-			path: toolPath,
-			resolvedPath,
-			tool,
-			source,
-		}));
+		const loadedTools: LoadedCustomTool[] = [];
+		const errors: ToolLoadError[] = [];
+		for (const [index, tool] of toolsArray.entries()) {
+			if (!isLoadableCustomTool(tool)) {
+				errors.push(invalidToolError(toolPath, index, source));
+				continue;
+			}
 
-		return { tools: loadedTools, error: null };
+			loadedTools.push({
+				path: toolPath,
+				resolvedPath,
+				tool,
+				source,
+			});
+		}
+
+		return { tools: loadedTools, errors };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { tools: null, error: { path: toolPath, error: `Failed to load tool: ${message}`, source } };
+		return { tools: [], errors: [{ path: toolPath, error: `Failed to load tool: ${message}`, source }] };
 	}
 }
 
@@ -90,7 +152,6 @@ export class CustomToolLoader {
 	#seenNames: Set<string>;
 
 	constructor(
-		pi: typeof PiCodingAgent,
 		cwd: string,
 		builtInToolNames: string[],
 		pushPendingAction?: (action: {
@@ -108,8 +169,11 @@ export class CustomToolLoader {
 			hasUI: false,
 			logger,
 			typebox,
-			zod: z,
-			pi,
+			arktype: type,
+			zod,
+			get pi() {
+				return getCodingAgentApi();
+			},
 			pushPendingAction: action => {
 				if (!pushPendingAction) {
 					throw new Error("Pending action store unavailable for custom tools in this runtime.");
@@ -127,28 +191,22 @@ export class CustomToolLoader {
 
 	async load(pathsWithSources: ToolPathWithSource[]): Promise<void> {
 		for (const { path: toolPath, source } of pathsWithSources) {
-			const { tools: loadedTools, error } = await loadTool(toolPath, this.#sharedApi.cwd, this.#sharedApi, source);
+			const { tools: loadedTools, errors } = await loadTool(toolPath, this.#sharedApi.cwd, this.#sharedApi, source);
+			this.errors.push(...errors);
 
-			if (error) {
-				this.errors.push(error);
-				continue;
-			}
-
-			if (loadedTools) {
-				for (const loadedTool of loadedTools) {
-					// Check for name conflicts
-					if (this.#seenNames.has(loadedTool.tool.name)) {
-						this.errors.push({
-							path: toolPath,
-							error: `Tool name "${loadedTool.tool.name}" conflicts with existing tool`,
-							source,
-						});
-						continue;
-					}
-
-					this.#seenNames.add(loadedTool.tool.name);
-					this.tools.push(loadedTool);
+			for (const loadedTool of loadedTools) {
+				// Check for name conflicts
+				if (this.#seenNames.has(loadedTool.tool.name)) {
+					this.errors.push({
+						path: toolPath,
+						error: `Tool name "${loadedTool.tool.name}" conflicts with existing tool`,
+						source,
+					});
+					continue;
 				}
+
+				this.#seenNames.add(loadedTool.tool.name);
+				this.tools.push(loadedTool);
 			}
 		}
 	}
@@ -176,7 +234,7 @@ export async function loadCustomTools(
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 	}) => void,
 ) {
-	const loader = new CustomToolLoader(PiCodingAgent, cwd, builtInToolNames, pushPendingAction);
+	const loader = new CustomToolLoader(cwd, builtInToolNames, pushPendingAction);
 	await loader.load(pathsWithSources);
 	return {
 		tools: loader.tools,
@@ -199,8 +257,13 @@ export async function loadCustomTools(
  *
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory
+ * @param agentDir - Native user config dir. Default: getAgentDir()
  */
-export async function discoverCustomToolPaths(configuredPaths: string[], cwd: string): Promise<ToolPathWithSource[]> {
+export async function discoverCustomToolPaths(
+	configuredPaths: string[],
+	cwd: string,
+	agentDir?: string,
+): Promise<ToolPathWithSource[]> {
 	const allPathsWithSources: ToolPathWithSource[] = [];
 	const seen = new Set<string>();
 
@@ -213,8 +276,13 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
 		}
 	};
 
-	// 1. Discover tools via capability system (user + project from all providers)
-	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd });
+	// Capability providers also expose metadata and scripts. Filter before deduplication
+	// so those entries cannot shadow executable modules with the same name.
+	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, {
+		cwd,
+		agentDir,
+		filter: tool => /\.(ts|js|mjs|cjs)$/.test(tool.path) && !tool.path.endsWith(".d.ts"),
+	});
 	for (const tool of discoveredTools.items) {
 		addPath(tool.path, {
 			provider: tool._source.provider,
@@ -249,6 +317,7 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory
  * @param builtInToolNames - Names of built-in tools to check for conflicts
+ * @param agentDir - Native user config dir. Default: getAgentDir()
  */
 export async function discoverAndLoadCustomTools(
 	configuredPaths: string[],
@@ -260,7 +329,8 @@ export async function discoverAndLoadCustomTools(
 		apply(reason: string): Promise<AgentToolResult<unknown>>;
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 	}) => void,
+	agentDir?: string,
 ) {
-	const pathsWithSources = await discoverCustomToolPaths(configuredPaths, cwd);
+	const pathsWithSources = await discoverCustomToolPaths(configuredPaths, cwd, agentDir);
 	return loadCustomTools(pathsWithSources, cwd, builtInToolNames, pushPendingAction);
 }

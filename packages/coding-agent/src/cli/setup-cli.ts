@@ -4,12 +4,24 @@
  * Handles `omp setup` for onboarding and `omp setup <component>` for optional dependencies.
  */
 import * as path from "node:path";
-import { $which, APP_NAME, getPythonEnvDir } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
-import chalk from "chalk";
-import { theme } from "../modes/theme/theme";
+import { APP_NAME, getProjectDir, getPythonEnvDir } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
+import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
+import { Settings } from "../config/settings";
+import { ModelRegistry } from "../config/model-registry";
+import { resolveRoleChain } from "../config/model-resolver";
+import { roleCandidatePool } from "../config/model-roles";
+import { checkPythonKernelAvailability } from "../eval/py/kernel";
+import { discoverAuthStorage } from "../sdk";
+import { theme } from "@oh-my-pi/pi-tui/theme";
+import { downloadSttModel, isSttModelCached } from "../stt/downloader";
+import { isSttModelKey, STT_MODEL_OPTIONS } from "../stt/models";
+import { downloadTtsModel, isTtsLocalModelKey, isTtsModelCached, TTS_LOCAL_MODELS } from "../tts";
+import { selectSetupModel } from "@oh-my-pi/pi-tui/apps/setup-model-picker";
 
-export type SetupComponent = "python" | "stt";
+import { cfgPythonInterpreter } from "../eval/settings";
+
+export type SetupComponent = "python" | "speech";
 
 export interface SetupCommandArgs {
 	component: SetupComponent;
@@ -19,7 +31,7 @@ export interface SetupCommandArgs {
 	};
 }
 
-const VALID_COMPONENTS: SetupComponent[] = ["python", "stt"];
+const VALID_COMPONENTS: SetupComponent[] = ["python", "speech"];
 
 const MANAGED_PYTHON_ENV = getPythonEnvDir();
 
@@ -61,7 +73,7 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 	};
 }
 
-interface PythonCheckResult {
+export interface PythonCheckResult {
 	available: boolean;
 	pythonPath?: string;
 	usingManagedEnv?: boolean;
@@ -77,25 +89,14 @@ function managedPythonPath(): string {
 /**
  * Check Python environment and kernel dependencies.
  */
-async function checkPythonSetup(): Promise<PythonCheckResult> {
-	const result: PythonCheckResult = {
-		available: false,
+export async function checkPythonSetup(cwd: string, interpreter?: string): Promise<PythonCheckResult> {
+	const availability = await checkPythonKernelAvailability(cwd, interpreter, { forceProbe: true });
+	return {
+		available: availability.ok,
+		pythonPath: availability.pythonPath,
+		usingManagedEnv: availability.pythonPath === managedPythonPath(),
 		managedEnvPath: MANAGED_PYTHON_ENV,
 	};
-
-	const systemPythonPath = $which("python") ?? $which("python3");
-	const managedPath = managedPythonPath();
-	const hasManagedEnv = await Bun.file(managedPath).exists();
-
-	const pythonPath = systemPythonPath ?? (hasManagedEnv ? managedPath : undefined);
-	if (!pythonPath) {
-		return result;
-	}
-	const probe = await $`${pythonPath} -c "import sys;sys.exit(0)"`.quiet().nothrow();
-	result.pythonPath = pythonPath;
-	result.available = probe.exitCode === 0;
-	result.usingManagedEnv = pythonPath === managedPath;
-	return result;
 }
 
 /**
@@ -114,14 +115,17 @@ export async function runSetupCommand(cmd: SetupCommandArgs): Promise<void> {
 		case "python":
 			await handlePythonSetup(cmd.flags);
 			break;
-		case "stt":
-			await handleSttSetup(cmd.flags);
+		case "speech":
+			await handleSpeechSetup(cmd.flags);
 			break;
 	}
 }
 
 async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
-	const check = await checkPythonSetup();
+	const cwd = getProjectDir();
+	const projectSettings = await Settings.init({ cwd });
+	const interpreter = cfgPythonInterpreter.get(projectSettings)?.trim() || undefined;
+	const check = await checkPythonSetup(cwd, interpreter);
 
 	if (flags.json) {
 		console.log(JSON.stringify(check, null, 2));
@@ -131,7 +135,7 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 
 	if (!check.pythonPath) {
 		console.error(chalk.red(`${theme.status.error} Python not found`));
-		console.error(chalk.dim("Install Python 3.8+ and ensure it's in your PATH"));
+		console.error(chalk.dim("Install Python 3.8+ or set python.interpreter to its executable path"));
 		process.exit(1);
 	}
 
@@ -149,58 +153,157 @@ async function handlePythonSetup(flags: { json?: boolean; check?: boolean }): Pr
 	process.exit(1);
 }
 
-async function handleSttSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
-	const { checkDependencies, formatDependencyStatus } = await import("../stt/setup");
-	const status = await checkDependencies();
+/**
+ * One installable speech dependency. `isReady`/`status` are read-only probes;
+ * `pick` (optional) lets an interactive user choose + persist a model; `ensure`
+ * performs the download, streaming a normalized progress event.
+ */
+interface SpeechComponent {
+	name: string;
+	isReady(): Promise<boolean>;
+	status(): Promise<string>;
+	pick?(): Promise<boolean>;
+	ensure(onProgress: (progress: { stage: string; percent?: number }) => void): Promise<void>;
+}
+
+function resolveLocalSpeechModelId(role: "speech" | "dictation", settings: Settings, registry: ModelRegistry): string {
+	const candidate = resolveRoleChain(role, settings, roleCandidatePool(role, settings, registry)).find(
+		entry => entry.model.provider === "local",
+	);
+	if (!candidate) throw new Error(`No local model is available for the ${role} role.`);
+	return candidate.model.id;
+}
+
+function buildSpeechComponents(settings: Settings, registry: ModelRegistry): SpeechComponent[] {
+	const localRoleModelIds = (role: "speech" | "dictation") =>
+		new Set(
+			roleCandidatePool(role, settings, registry)
+				.filter(model => model.provider === "local")
+				.map(model => model.id),
+		);
+	const sttOptions = STT_MODEL_OPTIONS.filter(option => localRoleModelIds("dictation").has(option.value));
+	const ttsOptions = TTS_LOCAL_MODELS.filter(model => localRoleModelIds("speech").has(model.key)).map(
+		({ key, label, description }) => ({ value: key, label, description }),
+	);
+
+	return [
+		{
+			name: "Speech-to-Text model",
+			isReady: () => isSttModelCached(resolveLocalSpeechModelId("dictation", settings, registry)),
+			status: async () => {
+				const key = resolveLocalSpeechModelId("dictation", settings, registry);
+				return (await isSttModelCached(key)) ? key : `${key} — not downloaded`;
+			},
+			pick: async () => {
+				const current = resolveLocalSpeechModelId("dictation", settings, registry);
+				const chosen = await selectSetupModel("Speech-to-Text model", sttOptions, current);
+				if (chosen === null) return false;
+				if (isSttModelKey(chosen)) {
+					settings.setModelRole("dictation", `local/${chosen}`);
+					await settings.flush();
+				}
+				return true;
+			},
+			ensure: onProgress =>
+				downloadSttModel(resolveLocalSpeechModelId("dictation", settings, registry), progress =>
+					onProgress({ stage: `Downloading ${progress.label} model`, percent: progress.percent }),
+				),
+		},
+		{
+			name: "Text-to-Speech model",
+			isReady: () => isTtsModelCached(resolveLocalSpeechModelId("speech", settings, registry)),
+			status: async () => {
+				const key = resolveLocalSpeechModelId("speech", settings, registry);
+				return (await isTtsModelCached(key)) ? key : `${key} — model/runtime not installed`;
+			},
+			pick: async () => {
+				const current = resolveLocalSpeechModelId("speech", settings, registry);
+				const chosen = await selectSetupModel("Text-to-Speech model", ttsOptions, current);
+				if (chosen === null) return false;
+				if (isTtsLocalModelKey(chosen)) {
+					settings.setModelRole("speech", `local/${chosen}`);
+					await settings.flush();
+				}
+				return true;
+			},
+			ensure: async onProgress => {
+				const ok = await downloadTtsModel(resolveLocalSpeechModelId("speech", settings, registry), progress =>
+					onProgress({ stage: progress.stage, percent: progress.percent }),
+				);
+				if (!ok) throw new Error("Failed to download the local text-to-speech model.");
+			},
+		},
+	];
+}
+
+/**
+ * Unified `omp setup speech` flow. Drives every {@link SpeechComponent} through
+ * one path: report (`--json`/`--check`) or install (interactive pick + ensure
+ * with single-line progress; non-TTY skips pickers and installs configured
+ * values).
+ */
+async function handleSpeechSetup(flags: { json?: boolean; check?: boolean }): Promise<void> {
+	const settings = await Settings.init({ cwd: getProjectDir() });
+	const authStorage = await discoverAuthStorage(undefined, { settings });
+	const registry = new ModelRegistry(authStorage, undefined, { settings });
+	const components = buildSpeechComponents(settings, registry);
 
 	if (flags.json) {
-		console.log(JSON.stringify(status, null, 2));
-		if (!status.recorder.available || !status.python.available || !status.whisper.available) process.exit(1);
-		return;
-	}
-
-	console.log(formatDependencyStatus(status));
-
-	if (status.recorder.available && status.python.available && status.whisper.available) {
-		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
+		const report: Record<string, { ready: boolean; status: string }> = {};
+		let allReady = true;
+		for (const component of components) {
+			const ready = await component.isReady();
+			if (!ready) allReady = false;
+			report[component.name] = { ready, status: await component.status() };
+		}
+		console.log(JSON.stringify(report, null, 2));
+		if (!allReady) process.exit(1);
 		return;
 	}
 
 	if (flags.check) {
-		process.exit(1);
+		console.log(chalk.bold("Speech dependencies:"));
+		let allReady = true;
+		for (const component of components) {
+			const ready = await component.isReady();
+			if (!ready) allReady = false;
+			const mark = ready ? chalk.green("[ok]") : chalk.yellow("[missing]");
+			console.log(`  ${mark} ${component.name}: ${await component.status()}`);
+		}
+		if (!allReady) process.exit(1);
+		return;
 	}
 
-	if (!status.python.available) {
-		console.error(chalk.red(`\n${theme.status.error} Python not found`));
-		console.error(chalk.dim("Install Python 3.8+ and ensure it's in your PATH"));
-		process.exit(1);
-	}
-
-	if (!status.recorder.available) {
-		console.error(chalk.yellow(`\n${theme.status.warning} No recording tool found`));
-		console.error(chalk.dim(status.recorder.installHint));
-	}
-
-	if (!status.whisper.available) {
-		console.log(chalk.dim(`\nInstalling openai-whisper...`));
-		const { resolvePython } = await import("../stt/transcriber");
-		const pythonCmd = resolvePython()!;
-		const result = await $`${pythonCmd} -m pip install -q openai-whisper`.nothrow();
-		if (result.exitCode !== 0) {
-			console.error(chalk.red(`\n${theme.status.error} Failed to install openai-whisper`));
-			console.error(chalk.dim("Try manually: pip install openai-whisper"));
+	const interactive = Boolean(process.stdout.isTTY);
+	for (const component of components) {
+		if (interactive && component.pick) {
+			await component.pick();
+		}
+		if (await component.isReady()) {
+			console.log(chalk.green(`${theme.status.success} ${component.name} ready`));
+			continue;
+		}
+		console.log(chalk.dim(`Preparing ${component.name}...`));
+		try {
+			await component.ensure(progress => {
+				const percent = typeof progress.percent === "number" ? ` (${progress.percent}%)` : "";
+				process.stdout.write(`\r${chalk.dim(`${progress.stage}${percent}`)}\x1b[K`);
+			});
+			process.stdout.write("\n");
+		} catch (err) {
+			process.stdout.write("\n");
+			const msg = err instanceof Error ? err.message : `Failed to set up ${component.name}`;
+			console.error(chalk.red(`${theme.status.error} ${msg}`));
 			process.exit(1);
 		}
 	}
 
-	const recheck = await checkDependencies();
-	if (recheck.recorder.available && recheck.python.available && recheck.whisper.available) {
-		console.log(chalk.green(`\n${theme.status.success} Speech-to-text is ready`));
-	} else {
-		console.error(chalk.red(`\n${theme.status.error} Setup incomplete`));
-		console.log(formatDependencyStatus(recheck));
-		process.exit(1);
-	}
+	console.log(chalk.green(`\n${theme.status.success} Speech is ready`));
+	console.log(
+		chalk.dim(
+			`Enable speech-to-text via stt.enabled, then hold ${formatKeyHint("space")} by default to talk (remap or disable it with app.stt.pushToTalk, or bind app.stt.toggle separately); enable the speech-generation tool via speechgen.enabled; speak replies aloud via speech.enabled.`,
+		),
+	);
 }
 
 /**
@@ -215,7 +318,7 @@ ${chalk.bold("Usage:")}
 
 ${chalk.bold("Components:")}
   python    Verify a Python 3 interpreter is reachable for code execution
-  stt       Install speech-to-text dependencies (openai-whisper, recording tools)
+  speech    Pick and download speech-to-text and text-to-speech models
 
 ${chalk.bold("Options:")}
   -c, --check   Check if dependencies are installed without installing
@@ -224,8 +327,8 @@ ${chalk.bold("Options:")}
 ${chalk.bold("Examples:")}
   ${APP_NAME} setup                  Run the onboarding wizard
   ${APP_NAME} setup python           Check Python execution dependencies
-  ${APP_NAME} setup stt              Install speech-to-text dependencies
-  ${APP_NAME} setup stt --check      Check if STT dependencies are available
+  ${APP_NAME} setup speech           Pick and download the STT and TTS models
+  ${APP_NAME} setup speech --check   Check if speech dependencies are available
   ${APP_NAME} setup python --check   Check if Python execution is available
 `);
 }

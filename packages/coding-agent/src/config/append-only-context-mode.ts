@@ -1,3 +1,4 @@
+import { prefersAppendOnlyContext } from "@oh-my-pi/pi-catalog/compat/behavior";
 import { hostMatchesUrl } from "@oh-my-pi/pi-catalog/hosts";
 
 /** Provider metadata needed to resolve append-only context mode. */
@@ -8,10 +9,44 @@ export interface AppendOnlyContextModel {
 	compatConfig?: object;
 }
 
+/** True when `baseUrl` resolves to a loopback or RFC1918 host — covers
+ * llama.cpp/vLLM/sglang servers registered under a user-defined provider id
+ * via `models.yaml`. Built-in local provider ids (`ollama`, `lm-studio`,
+ * `llama.cpp`) are already handled by the catalog provider policy.
+ * Substring match on the parsed hostname only; ports, paths, and unparseable
+ * URLs return false.
+ */
+function hasLocalLoopbackBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl) return false;
+	let hostname: string;
+	try {
+		hostname = new URL(baseUrl).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	if (
+		hostname === "localhost" ||
+		hostname === "127.0.0.1" ||
+		hostname === "0.0.0.0" ||
+		hostname === "::1" ||
+		hostname === "[::1]"
+	) {
+		return true;
+	}
+	// RFC1918 private IPv4 ranges.
+	if (hostname.startsWith("10.")) return true;
+	if (hostname.startsWith("192.168.")) return true;
+	if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(hostname)) return true;
+	// Common ".local" mDNS hostnames used for home-LAN llama.cpp boxes.
+	if (hostname.endsWith(".local")) return true;
+	return false;
+}
+
 function shouldAutoEnableAppendOnlyContext(model: AppendOnlyContextModel | null | undefined): boolean {
 	if (!model) return false;
-	if (model.provider === "deepseek") return true;
+	if (prefersAppendOnlyContext(model.provider)) return true;
 	if (hostMatchesUrl(model.baseUrl, "xiaomi")) return true;
+	if (hasLocalLoopbackBaseUrl(model.baseUrl)) return true;
 	return !!model.compatConfig && "supportsStore" in model.compatConfig && model.compatConfig.supportsStore === true;
 }
 

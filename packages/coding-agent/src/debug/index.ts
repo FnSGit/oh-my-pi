@@ -7,9 +7,9 @@ import * as fs from "node:fs/promises";
 import * as url from "node:url";
 import { getWorkProfile } from "@oh-my-pi/pi-natives";
 import {
-	Container,
 	isNotificationSuppressed,
 	Loader,
+	type OverlayHandle,
 	type SelectItem,
 	SelectList,
 	Spacer,
@@ -18,20 +18,24 @@ import {
 	Text,
 } from "@oh-my-pi/pi-tui";
 import { getSessionsDir } from "@oh-my-pi/pi-utils";
-import { DynamicBorder } from "../modes/components/dynamic-border";
-import { TranscriptBlock } from "../modes/components/transcript-container";
-import { getSelectListTheme, getSymbolTheme, theme } from "../modes/theme/theme";
+import { editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
+import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
+import { OverlayPanel } from "@oh-my-pi/pi-tui/chrome/overlay-box";
+import { TranscriptBlock } from "@oh-my-pi/pi-tui/chrome/transcript-container";
+import { getSelectListTheme, getSymbolTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../modes/types";
-import { formatBytes } from "../tools/render-utils";
+import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { openPath } from "../utils/open";
-import { DebugLogViewerComponent } from "./log-viewer";
-import { generateHeapSnapshotData, type ProfilerSession, startCpuProfile } from "./profiler";
-import { buildSampleImage, ProtocolProbeComponent } from "./protocol-probe";
-import { RawSseViewerComponent } from "./raw-sse";
-import { resolveRawSseDebugBuffer } from "./raw-sse-buffer";
+import { copyToClipboard } from "../utils/clipboard";
+import { DebugLogViewerComponent } from "@oh-my-pi/pi-tui/apps/debug/log-viewer";
+import { collectMemoryStats, type ProfilerSession, startCpuProfile } from "./profiler";
+import { buildSampleImage, ProtocolProbeComponent } from "@oh-my-pi/pi-tui/apps/debug/protocol-probe";
+import { RawSseViewerComponent } from "@oh-my-pi/pi-tui/apps/debug/raw-sse";
+import { resolveRawSseDebugBuffer } from "@oh-my-pi/pi-tui/apps/debug/raw-sse-buffer";
+import { getRemoteDebugger, type RemoteDebuggerInfo, startRemoteDebuggerServer } from "./remote-debugger";
 import { clearArtifactCache, createDebugLogSource, createReportBundle, getArtifactCacheStats } from "./report-bundle";
 import { collectSystemInfo, formatSystemInfo } from "./system-info";
-import { collectTerminalState, formatTerminalState } from "./terminal-info";
+import { collectTerminalState, formatTerminalState } from "@oh-my-pi/pi-tui/apps/debug/terminal-info";
 
 /** Debug menu options */
 const DEBUG_MENU_ITEMS: SelectItem[] = [
@@ -39,7 +43,7 @@ const DEBUG_MENU_ITEMS: SelectItem[] = [
 	{ value: "performance", label: "Report: performance issue", description: "Profile CPU, reproduce, then bundle" },
 	{ value: "work", label: "Profile: work scheduling", description: "Open flamegraph of last 30s" },
 	{ value: "dump", label: "Report: dump session", description: "Create report bundle immediately" },
-	{ value: "memory", label: "Report: memory issue", description: "Heap snapshot + bundle" },
+	{ value: "memory", label: "Report: memory issue", description: "Memory statistics + bundle" },
 	{ value: "logs", label: "View: recent logs", description: "Show last 50 log entries" },
 	{ value: "system", label: "View: system info", description: "Show environment details" },
 	{ value: "terminal", label: "View: terminal state", description: "Subprotocols, geometry, scrollback strategy" },
@@ -49,6 +53,11 @@ const DEBUG_MENU_ITEMS: SelectItem[] = [
 		description: "Styling, links, text sizing, graphics, notify",
 	},
 	{ value: "raw-sse", label: "View: raw SSE stream", description: "Show live provider SSE frames" },
+	{
+		value: "remote-debugger",
+		label: "Start: JS remote debugger",
+		description: "Expose JavaScriptCore inspector socket (experimental)",
+	},
 	{
 		value: "transcript",
 		label: "Export: TUI transcript",
@@ -65,18 +74,15 @@ const formatFileHyperlink = (path: string): string => {
 /**
  * Debug selector component.
  */
-export class DebugSelectorComponent extends Container {
+export class DebugSelectorComponent extends OverlayPanel {
 	#selectList: SelectList;
 
 	constructor(
 		private ctx: InteractiveModeContext,
 		onDone: () => void,
 	) {
-		super();
+		super("Debug Tools");
 
-		// Title
-		this.addChild(new DynamicBorder());
-		this.addChild(new Text(theme.bold(theme.fg("accent", "Debug Tools")), 1, 0));
 		this.addChild(new Spacer(1));
 
 		// Select list
@@ -92,7 +98,6 @@ export class DebugSelectorComponent extends Container {
 		};
 
 		this.addChild(this.#selectList);
-		this.addChild(new DynamicBorder());
 	}
 
 	handleInput(keyData: string): void {
@@ -121,6 +126,9 @@ export class DebugSelectorComponent extends Container {
 				break;
 			case "raw-sse":
 				await this.#handleViewRawSse();
+				break;
+			case "remote-debugger":
+				await this.#handleStartRemoteDebugger();
 				break;
 			case "system":
 				await this.#handleViewSystemInfo();
@@ -155,7 +163,14 @@ export class DebugSelectorComponent extends Container {
 		block.addChild(new Text(theme.fg("accent", `${theme.status.info} CPU profiling started`), 1, 0));
 		block.addChild(new Spacer(1));
 		block.addChild(
-			new Text(theme.fg("muted", "Reproduce the performance issue, then press Enter to stop profiling."), 1, 0),
+			new Text(
+				theme.fg(
+					"muted",
+					`Reproduce the performance issue, then press ${editorKey("tui.input.submit")} to stop profiling.`,
+				),
+				1,
+				0,
+			),
 		);
 		this.ctx.present(block);
 
@@ -277,21 +292,21 @@ export class DebugSelectorComponent extends Container {
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
 			text => theme.fg("muted", text),
-			"Generating heap snapshot...",
+			"Collecting memory statistics...",
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(loader);
 		this.ctx.ui.requestRender();
 
 		try {
-			const heapSnapshot = generateHeapSnapshotData();
+			const memoryStats = collectMemoryStats();
 			loader.setText("Creating report bundle...");
 
 			const result = await createReportBundle({
 				sessionFile: this.ctx.sessionManager.getSessionFile(),
 				settings: this.#getResolvedSettings(),
 				rawSseText: this.#getRawSseText(),
-				heapSnapshot,
+				memoryStats,
 			});
 
 			loader.stop();
@@ -301,6 +316,16 @@ export class DebugSelectorComponent extends Container {
 			block.addChild(new Text(theme.fg("success", `+ Memory report saved`), 1, 0));
 			block.addChild(new Text(theme.fg("dim", formatFileHyperlink(result.path)), 1, 0));
 			block.addChild(new Text(theme.fg("dim", `Files: ${result.files.length}`), 1, 0));
+			block.addChild(
+				new Text(
+					theme.fg(
+						"warning",
+						"Review before sharing: session data, artifacts, logs and settings may contain secrets.",
+					),
+					1,
+					0,
+				),
+			);
 			this.ctx.present(block);
 		} catch (err) {
 			loader.stop();
@@ -318,18 +343,33 @@ export class DebugSelectorComponent extends Container {
 				return;
 			}
 
+			let overlay: OverlayHandle | undefined;
+			const close = (): void => {
+				overlay?.hide();
+				overlay = undefined;
+				void this.ctx.showDebugSelector();
+			};
 			const viewer = new DebugLogViewerComponent({
 				logs,
 				terminalRows: this.ctx.ui.terminal.rows,
-				onExit: () => this.ctx.showDebugSelector(),
+				onExit: close,
 				onStatus: message => this.ctx.showStatus(message, { dim: true }),
 				onError: message => this.ctx.showError(message),
 				onUpdate: () => this.ctx.ui.requestRender(),
-				logSource,
+				deps: {
+					copyToClipboard,
+					hasOlderLogs: () => logSource.hasOlderLogs(),
+					loadOlderLogs: limitDays => logSource.loadOlderLogs(limitDays),
+				},
 			});
 
-			this.ctx.editorContainer.clear();
-			this.ctx.editorContainer.addChild(viewer);
+			overlay = this.ctx.ui.showOverlay(viewer, {
+				anchor: "top-left",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
 			this.ctx.ui.setFocus(viewer);
 		} catch (err) {
 			this.ctx.showError(`Failed to read logs: ${err instanceof Error ? err.message : String(err)}`);
@@ -339,18 +379,66 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	async #handleViewRawSse(): Promise<void> {
+		let overlay: OverlayHandle | undefined;
+		const close = (): void => {
+			viewer?.dispose();
+			overlay?.hide();
+			overlay = undefined;
+			void this.ctx.showDebugSelector();
+		};
 		const viewer = new RawSseViewerComponent({
+			deps: { copyToClipboard },
 			buffer: resolveRawSseDebugBuffer(this.ctx.session),
 			terminalRows: this.ctx.ui.terminal.rows,
-			onExit: () => this.ctx.showDebugSelector(),
+			onExit: close,
 			onStatus: message => this.ctx.showStatus(message, { dim: true }),
 			onUpdate: () => this.ctx.ui.requestRender(),
 		});
 
-		this.ctx.editorContainer.clear();
-		this.ctx.editorContainer.addChild(viewer);
+		overlay = this.ctx.ui.showOverlay(viewer, {
+			anchor: "top-left",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+			fullscreen: true,
+		});
 		this.ctx.ui.setFocus(viewer);
 		this.ctx.ui.requestRender();
+	}
+
+	async #handleStartRemoteDebugger(): Promise<void> {
+		const existing = getRemoteDebugger();
+		let info: RemoteDebuggerInfo;
+		try {
+			info = existing ?? (await startRemoteDebuggerServer());
+		} catch (err) {
+			this.ctx.showError(`Failed to start remote debugger: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		}
+
+		const block = new TranscriptBlock();
+		block.addChild(
+			new Text(
+				theme.fg(
+					"success",
+					`${theme.status.success} JavaScriptCore remote inspector ${existing ? "already running" : "started"}`,
+				),
+				1,
+				0,
+			),
+		);
+		block.addChild(new Text(theme.fg("dim", `Listening on ${info.host}:${info.port}`), 1, 0));
+		block.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					"Experimental WebKit RemoteInspectorServer socket (Bun marks it untested on macOS). One-way for this process — there is no stop. Attach a compatible WebKit/Safari Web Inspector client.",
+				),
+				1,
+				0,
+			),
+		);
+		this.ctx.present(block);
 	}
 
 	async #handleViewSystemInfo(): Promise<void> {
@@ -391,7 +479,7 @@ export class DebugSelectorComponent extends Container {
 		if (!suppressed) {
 			const sessionName = this.ctx.sessionManager.getSessionName();
 			const notification: TerminalNotification = {
-				title: sessionName || "Oh My Pi",
+				title: sessionName || "omp",
 				body: "Terminal protocol test",
 				type: "test",
 				actions: "focus",

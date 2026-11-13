@@ -13,15 +13,18 @@ scheduled onto the parent loop complete (`asyncio.run_coroutine_threadsafe`).
 from __future__ import annotations
 
 import asyncio
+import grp
 import logging
 import os
 import shutil
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from omp_rpc import (
+    HostToolCompletedEvent,
     MessageUpdateEvent,
     RpcClient,
     RpcError,
@@ -36,12 +39,26 @@ from robomp.db import Database, issue_key
 from robomp.git_ops import DirtyState, inspect_dirty_state
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
-from robomp.host_tools import AbortController, ToolBindings, _git_identity_env
+from robomp.host_tools import AbortController, ReleaseToolContext, ToolBindings, _git_identity_env
 from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
 from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class ReleaseTaskContext:
+    """Release verdict and failure context supplied to an agent round."""
+
+    tag: str
+    version: str
+    round: int
+    max_rounds: int
+    head_sha: str
+    default_branch: str
+    failures_text: str
+    run_urls: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -53,12 +70,13 @@ class TaskInputs:
     github: GitHubBackend
     git_transport: GitTransport
     repo: RepoInfo
-    issue: IssueInfo
     workspace: Workspace
     delivery_id: str
     attempts: int = 0
     slot_uid: int | None = None
     natives_cache: NativesCache | None = None
+    issue: IssueInfo | None = None
+    release: ReleaseTaskContext | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -149,6 +167,10 @@ def _stage_agent_home() -> None:
     chown_to_root = os.geteuid() == 0
     for root, dirs, files in os.walk(_AGENT_HOME):
         root_path = Path(root)
+        if root_path == _AGENT_HOME / ".omp":
+            # ~/.omp/run is slot-writable daemon presence state, not template
+            # config; keep it out of the read-only normalization below.
+            dirs[:] = [d for d in dirs if d != "run"]
         try:
             root_path.chmod(0o755)
             if chown_to_root:
@@ -175,6 +197,36 @@ def _stage_agent_home() -> None:
                 log.warning("Failed to normalize agent home file %s: %s", path, exc)
 
 
+def _ensure_agent_run_dir() -> None:
+    """Keep ``~/.omp/run`` writable by every sandbox slot.
+
+    omp registers daemon project presence under ``~/.omp/run`` at startup,
+    nesting per-project dirs (``daemons/<hash>/clients``) that any slot user
+    must be able to create or enter regardless of which slot made them first.
+    The tree stays group ``omp``, setgid, group-writable; slot subprocesses
+    spawn with umask 0002 so their entries inherit group write.
+    """
+    if os.geteuid() != 0:
+        return
+    run_dir = _AGENT_HOME / ".omp" / "run"
+    try:
+        gid = grp.getgrnam("omp").gr_gid
+    except KeyError:
+        return
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        for root, _dirs, files in os.walk(run_dir):
+            root_path = Path(root)
+            os.chown(root_path, -1, gid)
+            root_path.chmod(0o2770)
+            for name in files:
+                file_path = root_path / name
+                os.chown(file_path, -1, gid)
+                file_path.chmod(0o660)
+    except OSError as exc:
+        log.warning("Failed to prepare agent run dir %s: %s", run_dir, exc)
+
+
 def _build_extra_env(settings: Settings) -> dict[str, str]:
     """Build the env overlay passed to the omp subprocess.
 
@@ -184,7 +236,12 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     """
     del settings  # kept for future hooks (model-specific env, etc.)
     _stage_agent_home()
+    _ensure_agent_run_dir()
     env = dict.fromkeys(_SCRUBBED_ENV_KEYS, "")
+    # Usage attribution: the pi-native gateway transport forwards this label
+    # (x-omp-app) so broker-side per-client burn tracking shows `robomp`
+    # instead of an anonymous gateway client.
+    env["OMP_APP_NAME"] = "robomp"
     if _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     return env
@@ -192,7 +249,13 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
 
 _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
 _TERMINAL_REVIEW_TOOLS: frozenset[str] = frozenset({"submit_pr_review", "abort_task"})
+_TERMINAL_RELEASE_TOOLS: frozenset[str] = frozenset({"release_retag", "abort_task"})
 _PR_REQUIRING_CLASSIFICATIONS: frozenset[str] = frozenset({"bug", "documentation"})
+
+
+def _task_timeout(settings: Settings, task_kind: str) -> float:
+    """Return the turn timeout for a task kind."""
+    return settings.release_task_timeout_seconds if task_kind == "handle_release_ci" else settings.task_timeout_seconds
 
 
 def _needs_completion_reminder(
@@ -207,6 +270,8 @@ def _needs_completion_reminder(
         return False
     if task_kind == "review_pr":
         return not (tools_called & _TERMINAL_REVIEW_TOOLS)
+    if task_kind == "handle_release_ci":
+        return not (tools_called & _TERMINAL_RELEASE_TOOLS)
     if task_kind != "triage_issue":
         return False
     row = inputs.db.get_issue(bindings.issue_key)
@@ -254,7 +319,7 @@ def _drive_turn(
 
     def _run(prompt: str) -> Any:
         try:
-            return client.prompt_and_wait(prompt, timeout=settings.task_timeout_seconds)
+            return client.prompt_and_wait(prompt, timeout=_task_timeout(settings, task_kind))
         except (RpcError, RpcProcessExitError):
             # Did the agent intentionally pull the plug via `abort_task`?
             # If so, swallow — the abort path is a clean exit, not a
@@ -294,11 +359,27 @@ def _drive_turn(
                     "max": max_reminders,
                 },
             )
-            reminder = (
-                persona.review_completion_reminder(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
-                if task_kind == "review_pr"
-                else persona.completion_reminder(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
-            )
+            if task_kind == "handle_release_ci":
+                assert inputs.release is not None
+                reminder = persona.followup_release(
+                    repo=inputs.repo,
+                    release=inputs.release,
+                    workspace=inputs.workspace,
+                )
+            elif task_kind == "review_pr":
+                assert inputs.issue is not None
+                reminder = persona.review_completion_reminder(
+                    repo=inputs.repo,
+                    issue=inputs.issue,
+                    workspace=inputs.workspace,
+                )
+            else:
+                assert inputs.issue is not None
+                reminder = persona.completion_reminder(
+                    repo=inputs.repo,
+                    issue=inputs.issue,
+                    workspace=inputs.workspace,
+                )
         else:
             assert dirty is not None
             log.warning(
@@ -312,12 +393,21 @@ def _drive_turn(
                     "unpushed": dirty.unpushed,
                 },
             )
-            reminder = persona.dirty_state_reminder(
-                repo=inputs.repo,
-                issue=inputs.issue,
-                workspace=inputs.workspace,
-                dirty=dirty,
-            )
+            if task_kind == "handle_release_ci":
+                assert inputs.release is not None
+                reminder = persona.followup_release(
+                    repo=inputs.repo,
+                    release=inputs.release,
+                    workspace=inputs.workspace,
+                )
+            else:
+                assert inputs.issue is not None
+                reminder = persona.dirty_state_reminder(
+                    repo=inputs.repo,
+                    issue=inputs.issue,
+                    workspace=inputs.workspace,
+                    dirty=dirty,
+                )
         next_turn = _run(reminder)
         if next_turn is None:
             return None
@@ -377,7 +467,12 @@ def _build_prompt(
     thread: tuple[ThreadMessage, ...] = (),
     resuming: bool = False,
 ) -> str:
+    if task_kind == "handle_release_ci":
+        assert inputs.release is not None
+        renderer = persona.followup_release if resuming else persona.kickoff_release
+        return renderer(repo=inputs.repo, release=inputs.release, workspace=inputs.workspace)
     if task_kind == "triage_issue":
+        assert inputs.issue is not None
         if resuming:
             return persona.resume_triage(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
         if directive is not None:
@@ -389,9 +484,11 @@ def _build_prompt(
             )
         return persona.kickoff(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
     if task_kind == "review_pr":
+        assert inputs.issue is not None
         assert pr is not None
         return persona.kickoff_pr_review(repo=inputs.repo, pr=pr, workspace=inputs.workspace)
     if task_kind == "handle_comment":
+        assert inputs.issue is not None
         assert comment is not None
         issue_row = inputs.db.get_issue(issue_key(inputs.repo.full_name, inputs.issue.number))
         if issue_row is None:
@@ -464,15 +561,31 @@ def _run_rpc_blocking(
 
     def _on_tool_end(event: ToolExecutionEndEvent) -> None:
         tool_name = event.tool_name
-        if event.result is not None:
+        # `tool_name` is transport-normalized by omp_rpc for top-level and
+        # xd:// device dispatches, but an eval-bridged host tool only surfaces
+        # as the enclosing `eval`; terminal-action detection therefore relies
+        # on `_on_host_tool_completed`. A failed execution (`is_error`) does
+        # not count — a rejected submit must still trigger the reminder.
+        ok = event.result is not None and not event.is_error
+        if ok:
             tools_called.add(tool_name)
         log.info(
             "tool_end",
             extra={
                 "issue": bindings.issue_key,
                 "tool": tool_name,
-                "ok": event.result is not None,
+                "ok": ok,
             },
+        )
+
+    def _on_host_tool_completed(event: HostToolCompletedEvent) -> None:
+        # Fires for every dispatch path (top-level, `write xd://X`, eval
+        # bridge) once the host tool's `execute()` returned, so a terminal
+        # action reached from inside `eval` still ends the task (#13583).
+        tools_called.add(event.tool_name)
+        log.info(
+            "host_tool_completed",
+            extra={"issue": bindings.issue_key, "tool": event.tool_name},
         )
 
     def _on_msg(event: MessageUpdateEvent) -> None:
@@ -484,6 +597,9 @@ def _run_rpc_blocking(
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
     rpc_env.update(_safe_directory_env(bindings.workspace.repo_dir))
     rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
+    # Bare worktrees have no node_modules; install (idempotently) so the agent
+    # can resolve workspace packages (@oh-my-pi/pi-*) and actually run tests.
+    host_tools.ensure_workspace_dependencies(bindings)
     resuming = _has_prior_session(bindings.workspace.session_dir)
     extra_args: tuple[str, ...] = ("--continue",) if resuming else ()
     log.info(
@@ -497,35 +613,46 @@ def _run_rpc_blocking(
         },
     )
     model_override, thinking_override = _resolve_pragma_overrides(directive, settings)
-    chosen_model = model_override or settings.pick_model()
+    chosen_model = model_override or (
+        settings.pick_release_model() if task_kind == "handle_release_ci" else settings.pick_model()
+    )
     chosen_thinking = thinking_override or settings.thinking_level
     log.info(
         "rpc_model_pick",
         extra={
             "issue": bindings.issue_key,
             "model": chosen_model,
-            "pool": list(settings.model_pool),
+            "pool": list(settings.release_model_pool if task_kind == "handle_release_ci" else settings.model_pool),
             "thinking": chosen_thinking,
             "pragma_model": model_override,
             "pragma_thinking": thinking_override,
         },
     )
     inputs.db.set_event_model(inputs.delivery_id, chosen_model)
-    append_system_prompt = (
-        persona.system_append_pr_review(
+    if task_kind == "handle_release_ci":
+        assert inputs.release is not None
+        append_system_prompt = persona.system_append_release(
+            repo=inputs.repo,
+            release=inputs.release,
+            workspace=inputs.workspace,
+            release_commit_prefix=inputs.settings.release_commit_prefix,
+        )
+    elif task_kind == "review_pr":
+        assert inputs.issue is not None
+        append_system_prompt = persona.system_append_pr_review(
             repo=inputs.repo,
             issue=inputs.issue,
             workspace=inputs.workspace,
             bot_login=inputs.settings.bot_login,
         )
-        if task_kind == "review_pr"
-        else persona.system_append(
+    else:
+        assert inputs.issue is not None
+        append_system_prompt = persona.system_append(
             repo=inputs.repo,
             issue=inputs.issue,
             workspace=inputs.workspace,
             bot_login=inputs.settings.bot_login,
         )
-    )
 
     with RpcClient(
         executable=settings.omp_command,
@@ -575,6 +702,7 @@ def _run_rpc_blocking(
         try:
             client.install_headless_ui()
             client.on_tool_execution_end(_on_tool_end)
+            client.on_host_tool_completed(_on_host_tool_completed)
             client.on_message_update(_on_msg)
 
             phases = persona.seed_phases(task_kind)
@@ -594,25 +722,7 @@ def _run_rpc_blocking(
                         # Follow-up: keep prior phases (e.g. Reproduce / Fix / PR)
                         # so the agent still sees the context, but append the
                         # follow-up phase at the end.
-                        existing = list(client.get_todos())
-                        merged = [
-                            {
-                                "id": p.id,
-                                "name": p.name,
-                                "tasks": [
-                                    {
-                                        "id": t.id,
-                                        "content": t.content,
-                                        "status": t.status,
-                                        "notes": t.notes,
-                                        "details": t.details,
-                                    }
-                                    for t in p.tasks
-                                ],
-                            }
-                            for p in existing
-                        ] + phases
-                        client.set_todos(merged)
+                        client.set_todos([*client.get_todos(), *phases])
                 except RpcError as exc:
                     log.warning("set_todos failed", extra={"err": str(exc)})
 
@@ -620,7 +730,7 @@ def _run_rpc_blocking(
                 "rpc_start",
                 extra={"issue": bindings.issue_key, "task": task_kind, "branch": bindings.workspace.branch},
             )
-            hard_timeout_seconds = settings.task_timeout_seconds + settings.task_timeout_hard_grace_seconds
+            hard_timeout_seconds = _task_timeout(settings, task_kind) + settings.task_timeout_hard_grace_seconds
             hard_timeout_fired = threading.Event()
 
             def _hard_stop() -> None:
@@ -658,9 +768,7 @@ def _run_rpc_blocking(
                 stop_reason = turn.assistant_message.get("stopReason")
                 if stop_reason == "error":
                     error_msg = turn.assistant_message.get("errorMessage") or "model returned error"
-                    raise RuntimeError(
-                        f"omp agent error (stopReason=error): {error_msg}"
-                    )
+                    raise RuntimeError(f"omp agent error (stopReason=error): {error_msg}")
             log.info(
                 "rpc_done",
                 extra={
@@ -689,6 +797,20 @@ async def run_task(
     """Async wrapper that runs the synchronous RPC driver on a worker thread."""
     review_mode = task_kind == "review_pr" or inputs.workspace.branch.startswith("review/pr-")
     loop = asyncio.get_running_loop()
+    release_binding: ReleaseToolContext | None = None
+    if inputs.release is not None:
+        release_key = f"{inputs.repo.full_name}#{inputs.release.tag}"
+        release_row = inputs.db.get_release(release_key)
+        if release_row is None:
+            raise RuntimeError(f"release state missing for {release_key}")
+        release_binding = ReleaseToolContext(
+            repo=inputs.repo.full_name,
+            tag=inputs.release.tag,
+            version=inputs.release.version,
+            key=release_key,
+            expected_sha=release_row.current_sha,
+            default_branch=inputs.release.default_branch,
+        )
     bindings = ToolBindings(
         db=inputs.db,
         github=inputs.github,
@@ -706,6 +828,7 @@ async def run_task(
         impl_authorized=bool(directive is not None and directive.authorizes_impl),
         slot_uid=inputs.slot_uid,
         abort=AbortController(),
+        release=release_binding,
     )
     resuming = _has_prior_session(inputs.workspace.session_dir)
     prompt = _build_prompt(
@@ -740,7 +863,6 @@ async def run_task(
 
 def _capture_natives_cache(inputs: TaskInputs) -> None:
     """Best-effort: store the workspace's fresh natives under its current key.
-
     Runs after a successful task on a worker thread. ANY failure is logged
     and swallowed — cache errors NEVER fail a task.
     """
@@ -765,6 +887,9 @@ def _capture_natives_cache(inputs: TaskInputs) -> None:
             key,
             native_dir,
             source_workspace=workspace.workspace_key,
+            expected_uid=inputs.slot_uid
+            if inputs.slot_uid is not None and os.geteuid() == 0 and sys.platform == "linux"
+            else os.geteuid(),
         )
     except Exception as exc:
         log.warning(
@@ -784,4 +909,4 @@ def _capture_natives_cache(inputs: TaskInputs) -> None:
     )
 
 
-__all__ = ["DirectiveInfo", "TaskInputs", "ThreadMessage", "run_task"]
+__all__ = ["DirectiveInfo", "ReleaseTaskContext", "TaskInputs", "ThreadMessage", "run_task"]

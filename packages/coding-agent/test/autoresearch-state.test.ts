@@ -1,34 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import { createAutoresearchExtension } from "@oh-my-pi/pi-coding-agent/autoresearch";
 import {
 	buildExperimentState,
 	computeConfidence,
-	findBaselineMetric,
-	findBaselineRunNumber,
 	findBestKeptMetric,
 	reconstructControlState,
 } from "@oh-my-pi/pi-coding-agent/autoresearch/state";
-import { AutoresearchStorage } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
-import type { ExperimentResult } from "@oh-my-pi/pi-coding-agent/autoresearch/types";
+import { AutoresearchStorage, closeAllAutoresearchStorages } from "@oh-my-pi/pi-coding-agent/autoresearch/storage";
+import type { ExperimentResult } from "@oh-my-pi/pi-tui/tools/autoresearch";
+import { findBaselineMetric, findBaselineRunNumber } from "@oh-my-pi/pi-tui/apps/autoresearch-data";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	RegisteredCommand,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import type { VcsGitRepo, VcsGitRepoInfo } from "@oh-my-pi/pi-natives";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-function makeTempDir(): string {
-	const dir = path.join(os.tmpdir(), `pi-autoresearch-test-${Snowflake.next()}`);
-	fs.mkdirSync(dir, { recursive: true });
-	return dir;
+function makeTempDir(): TempDir {
+	return TempDir.createSync("@pi-autoresearch-test-");
 }
 
 function makeResult(partial: Partial<ExperimentResult>): ExperimentResult {
@@ -113,18 +108,19 @@ describe("autoresearch state math", () => {
 });
 
 describe("AutoresearchStorage round-trip", () => {
-	let dbDir: string;
+	let dbDir: TempDir;
 
 	beforeEach(() => {
 		dbDir = makeTempDir();
 	});
 
-	afterEach(() => {
-		fs.rmSync(dbDir, { recursive: true, force: true });
+	afterEach(async () => {
+		await Bun.sleep(0);
+		await dbDir.remove().catch(() => {});
 	});
 
 	function openStorage(): AutoresearchStorage {
-		return new AutoresearchStorage(path.join(dbDir, "test.db"), dbDir);
+		return new AutoresearchStorage(dbDir.join("test.db"), dbDir.path());
 	}
 
 	it("persists sessions and exposes the active session", () => {
@@ -414,39 +410,44 @@ function createCommandHarness(
 		return execImpl ? execImpl("git", args) : { code: 0, stderr: "", stdout: "" };
 	};
 
-	vi.spyOn(git.repo, "root").mockImplementation(async () => {
-		const result = await runGitMock(["rev-parse", "--show-toplevel"]);
-		if (result.code !== 0) return null;
-		const repoRoot = result.stdout.trim();
-		return repoRoot.length > 0 ? repoRoot : null;
-	});
-	vi.spyOn(git.show, "prefix").mockImplementation(async () => {
-		const result = await runGitMock(["rev-parse", "--show-prefix"]);
-		return result.code === 0 ? result.stdout.trim() : "";
-	});
-	vi.spyOn(git.branch, "current").mockImplementation(async () => {
-		const result = await runGitMock(["branch", "--show-current"]);
-		if (result.code !== 0) return null;
-		const branch = result.stdout.trim();
-		return branch.length > 0 ? branch : null;
-	});
-	const mockStatus = Object.assign(
-		async (_cwd: string) => {
+	const repoInfo: VcsGitRepoInfo = {
+		commonDir: `${cwd}/.git`,
+		gitDir: `${cwd}/.git`,
+		gitEntryPath: `${cwd}/.git`,
+		headPath: `${cwd}/.git/HEAD`,
+		isReftable: false,
+		repoRoot: cwd,
+	};
+	const repository = {
+		checkoutNewBranch: async (branchName: string) => {
+			const result = await runGitMock(["checkout", "-b", branchName]);
+			if (result.code !== 0) throw new Error(result.stderr || "git checkout failed");
+		},
+		currentBranch: async () => {
+			const result = await runGitMock(["branch", "--show-current"]);
+			if (result.code !== 0) return null;
+			const branch = result.stdout.trim();
+			return branch.length > 0 ? branch : null;
+		},
+		info: () => repoInfo,
+		prefixOf: () => {
+			execCalls.push({ args: ["rev-parse", "--show-prefix"], command: "git" });
+			return "";
+		},
+		refExists: async (refName: string) => {
+			const result = await runGitMock(["show-ref", "--verify", "--quiet", refName]);
+			return result.code === 0;
+		},
+		statusPorcelain: async () => {
 			const result = await runGitMock(["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
 			if (result.code !== 0) throw new Error(result.stderr || "git status failed");
 			return result.stdout;
 		},
-		{ parse: git.status.parse, summary: git.status.summary },
-	);
-	vi.spyOn(git, "status").mockImplementation(mockStatus);
-	vi.spyOn(git.ref, "exists").mockImplementation(async (_workDir, refName) => {
-		const result = await runGitMock(["show-ref", "--verify", "--quiet", refName]);
-		return result.code === 0;
-	});
-	vi.spyOn(git.branch, "checkoutNew").mockImplementation(async (_workDir, branchName) => {
-		const result = await runGitMock(["checkout", "-b", branchName]);
-		if (result.code !== 0) throw new Error(result.stderr || "git checkout failed");
-	});
+	} as unknown as VcsGitRepo;
+	vi.spyOn(vcs, "git").mockReturnValue(repository);
+	vi.spyOn(vcs, "requireGit").mockReturnValue(repository);
+	vi.spyOn(vcs, "gitInfo").mockReturnValue(repoInfo);
+	vi.spyOn(vcs, "isPureJj").mockReturnValue(false);
 
 	const api = {
 		appendEntry(): void {},
@@ -516,25 +517,25 @@ function createCommandHarness(
 }
 
 describe("autoresearch slash command", () => {
-	const cleanups: string[] = [];
-	let dbOverride: string | undefined;
+	const cleanups: TempDir[] = [];
+	let dbOverride: TempDir | undefined;
 
 	beforeEach(() => {
-		dbOverride = path.join(os.tmpdir(), `pi-autoresearch-cmd-${Snowflake.next()}`);
-		fs.mkdirSync(dbOverride, { recursive: true });
-		process.env.OMP_AUTORESEARCH_DB_DIR = dbOverride;
+		dbOverride = TempDir.createSync("@pi-autoresearch-cmd-");
+		process.env.OMP_AUTORESEARCH_DB_DIR = dbOverride.path();
 		cleanups.push(dbOverride);
 	});
 
 	afterEach(() => {
 		delete process.env.OMP_AUTORESEARCH_DB_DIR;
+		closeAllAutoresearchStorages();
 		for (const dir of cleanups.splice(0)) {
-			fs.rmSync(dir, { recursive: true, force: true });
+			dir.removeSync();
 		}
 	});
 
 	it("enables autoresearch with a notify when invoked bare in a clean repo", async () => {
-		const dir = makeTempDir();
+		const dir = makeTempDir().path();
 		const harness = createCommandHarness(dir, async (_command, args) => {
 			if (args[0] === "rev-parse") return { code: 0, stderr: "", stdout: `${dir}\n` };
 			if (args[0] === "branch" && args[1] === "--show-current") return { code: 0, stderr: "", stdout: "main\n" };
@@ -549,7 +550,7 @@ describe("autoresearch slash command", () => {
 	});
 
 	it("forwards a slash argument as the user message and creates a slug branch", async () => {
-		const dir = makeTempDir();
+		const dir = makeTempDir().path();
 		const harness = createCommandHarness(dir, async (_command, args) => {
 			if (args[0] === "rev-parse") return { code: 0, stderr: "", stdout: `${dir}\n` };
 			if (args[0] === "branch" && args[1] === "--show-current") return { code: 0, stderr: "", stdout: "main\n" };
@@ -565,7 +566,7 @@ describe("autoresearch slash command", () => {
 	});
 
 	it("aborts with an error when the worktree is dirty", async () => {
-		const dir = makeTempDir();
+		const dir = makeTempDir().path();
 		const harness = createCommandHarness(dir, async (_command, args) => {
 			if (args[0] === "rev-parse") return { code: 0, stderr: "", stdout: `${dir}\n` };
 			if (args[0] === "branch" && args[1] === "--show-current") return { code: 0, stderr: "", stdout: "main\n" };
@@ -583,20 +584,20 @@ describe("autoresearch slash command", () => {
 });
 
 describe("autoresearch tool-call hook", () => {
-	const cleanups: string[] = [];
-	let dbOverride: string;
+	const cleanups: TempDir[] = [];
+	let dbOverride: TempDir;
 
 	beforeEach(() => {
-		dbOverride = path.join(os.tmpdir(), `pi-autoresearch-hook-${Snowflake.next()}`);
-		fs.mkdirSync(dbOverride, { recursive: true });
-		process.env.OMP_AUTORESEARCH_DB_DIR = dbOverride;
+		dbOverride = TempDir.createSync("@pi-autoresearch-hook-");
+		process.env.OMP_AUTORESEARCH_DB_DIR = dbOverride.path();
 		cleanups.push(dbOverride);
 	});
 
 	afterEach(() => {
 		delete process.env.OMP_AUTORESEARCH_DB_DIR;
+		closeAllAutoresearchStorages();
 		for (const dir of cleanups.splice(0)) {
-			fs.rmSync(dir, { recursive: true, force: true });
+			dir.removeSync();
 		}
 	});
 

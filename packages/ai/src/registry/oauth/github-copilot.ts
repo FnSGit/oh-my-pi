@@ -1,28 +1,63 @@
 /**
- * GitHub Copilot OAuth flow (opencode OAuth app)
+ * GitHub Copilot OAuth flow (OpenCode OAuth app, minimal read:user grant).
+ *
+ * The device flow intentionally uses the OpenCode app identity rather than
+ * the official Copilot CLI app: GitHub renders each app's existing per-user
+ * grant (Existing access) on the consent page, and Enterprise orgs that
+ * restrict OAuth apps block the CLI app's broad historic grant
+ * (repo/gist/codespace) no matter what scope this request asks for
+ * (issue #11275). API request identity still mimics the Copilot CLI via
+ * COPILOT_API_HEADERS. Enterprise domains keep the GitHub-owned Copilot CLI
+ * client: private instances run their own OAuth registry and reject the
+ * github.com-registered OpenCode client.
  */
 import { scheduler } from "node:timers/promises";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
 	COPILOT_API_HEADERS,
+	COPILOT_CHAT_INTEGRATION_ID,
+	discoverGitHubCopilotApiEndpoint,
 	getGitHubCopilotBaseUrl,
 	isPublicGitHubHost,
+	normalizeCopilotIntegrationId,
 	normalizeDomain,
 	normalizeGitHubCopilotEnterpriseDomain,
-	OPENCODE_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/github-copilot";
+import {
+	resolveCopilotIntegrationIdOverride,
+	wrapFetchForCopilotFallback,
+} from "../../providers/github-copilot-headers";
+import * as AIError from "../../error";
 import type { FetchImpl } from "../../types";
-import type { OAuthCredentials } from "./types";
+import type { OAuthController, OAuthCredentials, OAuthPrompt } from "./types";
 
-const CLIENT_ID = "Ov23li8tweQw6odWQebz";
+const OPENCODE_CLIENT_ID = "Ov23li8tweQw6odWQebz";
+const COPILOT_CLI_CLIENT_ID = "Ov23ctDVkRmgkPke0Mmm";
+
+/**
+ * OAuth client for the device flow. Public github.com uses the minimal-grant
+ * OpenCode app (narrow consent, issue #11275); private GitHub Enterprise
+ * instances run their own OAuth registry, which does not know that github.com
+ * registration, so they keep the GitHub-owned Copilot CLI client.
+ */
+function resolveOAuthClientId(domain: string): string {
+	return isPublicGitHubHost(domain) ? OPENCODE_CLIENT_ID : COPILOT_CLI_CLIENT_ID;
+}
+const OAUTH_SCOPE = "read:user";
+const OAUTH_HEADERS = {
+	Accept: "application/json",
+	"Content-Type": "application/x-www-form-urlencoded",
+	"User-Agent": "copilot-developer-action/0.0.1",
+} as const;
 
 const INITIAL_POLL_INTERVAL_MULTIPLIER = 1.2;
 const SLOW_DOWN_POLL_INTERVAL_MULTIPLIER = 1.4;
 
 type GitHubCopilotLoginOptions = {
 	onAuth: (url: string, instructions?: string) => void;
-	onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
+	onPrompt: (prompt: OAuthPrompt) => Promise<string>;
 	onProgress?: (message: string) => void;
+	copilotIntegrationId?: unknown;
 	signal?: AbortSignal;
 	pollIntervalFloorMs?: number;
 	pollIntervalScaleMs?: number;
@@ -62,7 +97,7 @@ async function fetchJson(url: string, init: RequestInit, fetchImpl: FetchImpl): 
 	const response = await fetchImpl(url, init);
 	if (!response.ok) {
 		const text = await response.text();
-		throw new Error(`${response.status} ${response.statusText}: ${text}`);
+		throw new AIError.ProviderHttpError(`${response.status} ${response.statusText}: ${text}`, response.status);
 	}
 	return response.json();
 }
@@ -73,21 +108,17 @@ async function startDeviceFlow(domain: string, fetchImpl: FetchImpl): Promise<De
 		urls.deviceCodeUrl,
 		{
 			method: "POST",
-			headers: {
-				Accept: "application/json",
-				"Content-Type": "application/json",
-				...OPENCODE_HEADERS,
-			},
-			body: JSON.stringify({
-				client_id: CLIENT_ID,
-				scope: "read:user",
+			headers: OAUTH_HEADERS,
+			body: new URLSearchParams({
+				client_id: resolveOAuthClientId(domain),
+				scope: OAUTH_SCOPE,
 			}),
 		},
 		fetchImpl,
 	);
 
 	if (!data || typeof data !== "object") {
-		throw new Error("Invalid device code response");
+		throw new AIError.OAuthError("Invalid device code response", { kind: "validation", provider: "github-copilot" });
 	}
 
 	const deviceCode = (data as Record<string, unknown>).device_code;
@@ -103,7 +134,10 @@ async function startDeviceFlow(domain: string, fetchImpl: FetchImpl): Promise<De
 		typeof interval !== "number" ||
 		typeof expiresIn !== "number"
 	) {
-		throw new Error("Invalid device code response fields");
+		throw new AIError.OAuthError("Invalid device code response fields", {
+			kind: "validation",
+			provider: "github-copilot",
+		});
 	}
 
 	return {
@@ -133,7 +167,7 @@ async function pollForGitHubAccessToken(
 
 	while (Date.now() < deadline) {
 		if (signal?.aborted) {
-			throw new Error("Login cancelled");
+			throw new AIError.LoginCancelledError();
 		}
 
 		const remainingMs = deadline - Date.now();
@@ -141,20 +175,16 @@ async function pollForGitHubAccessToken(
 		try {
 			await scheduler.wait(waitMs, { signal });
 		} catch {
-			throw new Error("Login cancelled");
+			throw new AIError.LoginCancelledError();
 		}
 
 		const raw = await fetchJson(
 			urls.accessTokenUrl,
 			{
 				method: "POST",
-				headers: {
-					Accept: "application/json",
-					"Content-Type": "application/json",
-					...OPENCODE_HEADERS,
-				},
-				body: JSON.stringify({
-					client_id: CLIENT_ID,
+				headers: OAUTH_HEADERS,
+				body: new URLSearchParams({
+					client_id: resolveOAuthClientId(domain),
 					device_code: deviceCode,
 					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 				}),
@@ -183,17 +213,21 @@ async function pollForGitHubAccessToken(
 			}
 
 			const descriptionSuffix = description ? `: ${description}` : "";
-			throw new Error(`Device flow failed: ${error}${descriptionSuffix}`);
+			throw new AIError.OAuthError(`Device flow failed: ${error}${descriptionSuffix}`, {
+				kind: "polling",
+				provider: "github-copilot",
+			});
 		}
 	}
 
 	if (slowDownResponses > 0) {
-		throw new Error(
+		throw new AIError.OAuthError(
 			"Device flow timed out after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments. Please sync or restart the VM clock and try again.",
+			{ kind: "timeout", provider: "github-copilot" },
 		);
 	}
 
-	throw new Error("Device flow timed out");
+	throw new AIError.OAuthError("Device flow timed out", { kind: "timeout", provider: "github-copilot" });
 }
 
 /** Far-future expiry (10 years). GitHub OAuth tokens are long-lived; no JWT exchange needed. */
@@ -201,15 +235,25 @@ const FAR_FUTURE_MS = Date.now() + 10 * 365.25 * 24 * 60 * 60 * 1000;
 
 /**
  * Refresh GitHub Copilot token.
- * With the opencode OAuth flow, the GitHub token is used directly — no JWT exchange needed.
+ * GitHub OAuth tokens from both the OpenCode app and the Copilot CLI app
+ * remain directly usable, so existing logins need no token exchange or migration.
  */
-export function refreshGitHubCopilotToken(refreshToken: string, enterpriseDomain?: string): OAuthCredentials {
+export function refreshGitHubCopilotToken(
+	refreshToken: string,
+	enterpriseDomain?: string,
+	apiEndpoint?: string,
+): OAuthCredentials {
 	return {
 		refresh: refreshToken,
 		access: refreshToken,
 		expires: FAR_FUTURE_MS,
 		enterpriseUrl: enterpriseDomain,
+		apiEndpoint,
 	};
+}
+
+export async function refreshGitHubCopilotHook(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+	return refreshGitHubCopilotToken(credentials.refresh, credentials.enterpriseUrl, credentials.apiEndpoint);
 }
 
 /**
@@ -220,9 +264,11 @@ async function enableGitHubCopilotModel(
 	token: string,
 	modelId: string,
 	fetchImpl: FetchImpl,
-	enterpriseDomain?: string,
+	enterpriseDomain: string | undefined,
+	apiEndpoint: string | undefined,
+	integrationId?: string,
 ): Promise<boolean> {
-	const baseUrl = getGitHubCopilotBaseUrl(enterpriseDomain);
+	const baseUrl = apiEndpoint ?? getGitHubCopilotBaseUrl(enterpriseDomain);
 	const url = `${baseUrl}/models/${modelId}/policy`;
 
 	try {
@@ -232,8 +278,10 @@ async function enableGitHubCopilotModel(
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${token}`,
 				...COPILOT_API_HEADERS,
-				"openai-intent": "chat-policy",
-				"x-interaction-type": "chat-policy",
+				"Copilot-Integration-Id": integrationId ?? COPILOT_CHAT_INTEGRATION_ID,
+				"Openai-Intent": "chat-policy",
+				"X-Initiator": "user",
+				"X-Interaction-Type": "chat-policy",
 			},
 			body: JSON.stringify({ state: "enabled" }),
 		});
@@ -250,18 +298,27 @@ async function enableGitHubCopilotModel(
 async function enableAllGitHubCopilotModels(
 	token: string,
 	enterpriseDomain: string | undefined,
+	apiEndpoint: string | undefined,
 	fetchImpl: FetchImpl,
 	onProgress?: (model: string, success: boolean) => void,
+	integrationId?: unknown,
 ): Promise<void> {
-	// Synthesized catalog variants (Copilot long-context `-1m` entries) share
-	// the upstream model id; enable each wire id exactly once.
 	const wireModelIds = [...new Set(getBundledModels("github-copilot").map(model => model.requestModelId ?? model.id))];
+	const resolvedId = normalizeCopilotIntegrationId(integrationId) ?? resolveCopilotIntegrationIdOverride();
+	const copilotFetch = wrapFetchForCopilotFallback(fetchImpl, true, resolvedId);
 	const BATCH_SIZE = 5;
 	for (let i = 0; i < wireModelIds.length; i += BATCH_SIZE) {
 		const batch = wireModelIds.slice(i, i + BATCH_SIZE);
 		await Promise.all(
 			batch.map(async modelId => {
-				const success = await enableGitHubCopilotModel(token, modelId, fetchImpl, enterpriseDomain);
+				const success = await enableGitHubCopilotModel(
+					token,
+					modelId,
+					copilotFetch,
+					enterpriseDomain,
+					apiEndpoint,
+					resolvedId,
+				);
 				onProgress?.(modelId, success);
 			}),
 		);
@@ -285,13 +342,16 @@ export async function loginGitHubCopilot(options: GitHubCopilotLoginOptions): Pr
 	});
 
 	if (options.signal?.aborted) {
-		throw new Error("Login cancelled");
+		throw new AIError.LoginCancelledError();
 	}
 
 	const trimmed = input.trim();
 	const normalizedDomain = normalizeDomain(input);
 	if (trimmed && !normalizedDomain) {
-		throw new Error("Invalid GitHub Enterprise URL/domain");
+		throw new AIError.OAuthError("Invalid GitHub Enterprise URL/domain", {
+			kind: "validation",
+			provider: "github-copilot",
+		});
 	}
 	const enterpriseDomain = normalizeGitHubCopilotEnterpriseDomain(normalizedDomain ?? undefined);
 	const domain =
@@ -311,16 +371,39 @@ export async function loginGitHubCopilot(options: GitHubCopilotLoginOptions): Pr
 		options.pollIntervalScaleMs,
 	);
 
-	// With opencode OAuth, the GitHub token is used directly for all API requests
+	const apiEndpoint = await discoverGitHubCopilotApiEndpoint(githubAccessToken, fetchImpl);
+
+	// Keep storing the GitHub token directly so credentials minted by the
+	// Copilot CLI OAuth app remain valid alongside new OpenCode app logins.
 	const credentials: OAuthCredentials = {
 		refresh: githubAccessToken,
 		access: githubAccessToken,
 		expires: FAR_FUTURE_MS,
 		enterpriseUrl: enterpriseDomain ?? undefined,
+		apiEndpoint,
 	};
 
 	// Enable all models after successful login
 	options.onProgress?.("Enabling models...");
-	await enableAllGitHubCopilotModels(githubAccessToken, enterpriseDomain ?? undefined, fetchImpl);
+	await enableAllGitHubCopilotModels(
+		githubAccessToken,
+		enterpriseDomain ?? undefined,
+		apiEndpoint,
+		fetchImpl,
+		undefined,
+		options.copilotIntegrationId,
+	);
 	return credentials;
+}
+
+export async function loginGitHubCopilotHook(callbacks: OAuthController): Promise<OAuthCredentials> {
+	const onPrompt = callbacks.onPrompt;
+	if (!onPrompt) throw new AIError.OnPromptRequiredError("GitHub Copilot");
+	return loginGitHubCopilot({
+		onAuth: (url, instructions) => callbacks.onAuth?.({ url, instructions }),
+		onPrompt,
+		onProgress: callbacks.onProgress,
+		signal: callbacks.signal,
+		fetch: callbacks.fetch,
+	});
 }

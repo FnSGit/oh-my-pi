@@ -5,12 +5,14 @@
  * any whose `expires - Date.now() < refreshSkewMs`. Refresh single-flight
  * lives in {@link AuthStorage} so manual and background refreshes share the
  * same upstream attempt.
- * Definitively-failed credentials (invalid_grant / 401 not from network blip)
- * are disabled via {@link AuthStorage.disableCredentialById} so the next
- * snapshot pull surfaces a clean delete on the client.
+ * Definitively-failed credentials (invalid_grant / bare 401, not a network
+ * blip) are torn down inside {@link AuthStorage.oauth.refresh} via a
+ * compare-and-set disable — only when no peer/login rotated the row first — so
+ * the next snapshot pull surfaces a clean delete on the client.
  */
 import { logger } from "@oh-my-pi/pi-utils";
-import { type AuthStorage, isDefinitiveOAuthFailure } from "../auth-storage";
+import type { AuthStorage } from "../auth-storage";
+import { isDefinitiveOAuthFailure } from "../error/auth-classify";
 import { DEFAULT_REFRESH_INTERVAL_MS, DEFAULT_REFRESH_SKEW_MS } from "./types";
 
 export interface AuthBrokerRefresherOptions {
@@ -73,14 +75,19 @@ export class AuthBrokerRefresher {
 		};
 	}
 
-	/** Run one sweep. Exposed for tests. */
+	/**
+	 * Run one sweep. Exposed for tests.
+	 *
+	 * Never rejects: callers fire it unawaited from a timer, so a failed sweep
+	 * (e.g. an unreadable credential store) is logged and retried next interval.
+	 */
 	async tick(): Promise<void> {
 		if (this.#running) return;
 		this.#running = true;
 		this.#nextSweepAt = this.#now();
 		try {
-			await this.#storage.reload();
-			const snapshot = this.#storage.exportSnapshot();
+			await this.#storage.credentials.reload();
+			const snapshot = this.#storage.credentials.snapshot();
 			const now = this.#now();
 			const deadline = now + this.#refreshSkewMs;
 			const targets: number[] = [];
@@ -92,6 +99,8 @@ export class AuthBrokerRefresher {
 				targets.push(entry.id);
 			}
 			await Promise.all(targets.map(id => this.#refreshOne(id)));
+		} catch (error) {
+			logger.warn("auth-broker refresh sweep failed", { error: String(error) });
 		} finally {
 			this.#running = false;
 			this.#nextSweepAt = this.#now() + this.#refreshIntervalMs;
@@ -100,15 +109,14 @@ export class AuthBrokerRefresher {
 
 	async #refreshOne(id: number): Promise<void> {
 		try {
-			await this.#storage.refreshCredentialById(id);
+			await this.#storage.oauth.refresh(id);
 		} catch (error) {
 			const errorMsg = String(error);
 			if (isDefinitiveOAuthFailure(errorMsg)) {
-				logger.warn("auth-broker refresh failed definitively; disabling credential", {
-					id,
-					error: errorMsg,
-				});
-				this.#storage.disableCredentialById(id, `auth-broker refresh failed: ${errorMsg}`);
+				// AuthStorage.oauth.refresh already CAS-disabled the row
+				// (unless a peer/login rotated it first, in which case the live
+				// credential is intentionally kept). Nothing to do here but record it.
+				logger.warn("auth-broker refresh failed definitively", { id, error: errorMsg });
 			} else {
 				logger.debug("auth-broker refresh failed (transient)", { id, error: errorMsg });
 			}

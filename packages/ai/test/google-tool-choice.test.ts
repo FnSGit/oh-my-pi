@@ -5,12 +5,6 @@ import type { Context, Tool, ToolChoice } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 describe("mapGoogleToolChoice (F7)", () => {
-	it("returns string passthrough for auto/none/any", () => {
-		expect(mapGoogleToolChoice("auto" as unknown as ToolChoice)).toBe("auto");
-		expect(mapGoogleToolChoice("none" as unknown as ToolChoice)).toBe("none");
-		expect(mapGoogleToolChoice("any" as unknown as ToolChoice)).toBe("any");
-	});
-
 	it("maps 'required' to 'any'", () => {
 		expect(mapGoogleToolChoice("required" as unknown as ToolChoice)).toBe("any");
 	});
@@ -61,6 +55,15 @@ describe("buildGoogleGenerateContentParams toolConfig serialization (F7)", () =>
 		expect(params.config!.toolConfig).toEqual({
 			functionCallingConfig: { mode: "ANY" },
 		});
+	});
+
+	it("omits toolConfig for auto toolChoice because Google defaults tools to AUTO", () => {
+		const params = buildGoogleGenerateContentParams(model, ctx(), {
+			apiKey: "fake",
+			toolChoice: "auto",
+		});
+		expect(params.config!.tools).toBeDefined();
+		expect(params.config!.toolConfig).toBeUndefined();
 	});
 
 	it("emits allowedFunctionNames for named-tool object toolChoice", () => {

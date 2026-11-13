@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai/types";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { minimaxTokenPlanOpenAIModel } from "./helpers";
 
 function createSseResponse(events: unknown[]): Response {
 	const payload = `${events
@@ -73,41 +73,8 @@ function stopChunk(model: Model<"openai-completions">): unknown {
 // looked like the applier had widened the range. The accumulator now
 // merges chunks and handles both cumulative and per-chunk-delta semantics.
 describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
-	it("appends per-chunk-delta string fragments instead of overwriting the previous chunk", async () => {
-		const model = getBundledModel<"openai-completions">("minimax-code-cn", "MiniMax-M3");
-		// Two chunks; each carries a slice of the `input` string. The
-		// concatenation forms the real hashline patch.
-		const fetchMock = createMockFetch([
-			toolCallChunk(model, {
-				name: "edit",
-				arguments: { input: "[foo.ts#A1B2]\nreplace 91..91:\n+    " },
-			}),
-			toolCallChunk(model, {
-				arguments: { input: 'const out = await executeTool("nuke", { path: "x" }, ctx);' },
-			}),
-			stopChunk(model),
-			"[DONE]",
-		]);
-
-		const result = await streamOpenAICompletions(model, baseContext(), {
-			apiKey: "test-key",
-			fetch: fetchMock,
-		}).result();
-
-		expect(result.content).toEqual([
-			{
-				type: "toolCall",
-				id: "call-minimax-1",
-				name: "edit",
-				arguments: {
-					input: '[foo.ts#A1B2]\nreplace 91..91:\n+    const out = await executeTool("nuke", { path: "x" }, ctx);',
-				},
-			},
-		]);
-	});
-
 	it("does not double cumulative chunks where each delta restates everything seen so far", async () => {
-		const model = getBundledModel<"openai-completions">("minimax-code-cn", "MiniMax-M3");
+		const model = minimaxTokenPlanOpenAIModel("minimax-code-cn", "MiniMax-M3");
 		// Second chunk strictly extends the first — common shape for hosts
 		// that re-emit the full args on every delta. `startsWith` collapses
 		// the merge to the latest cumulative snapshot instead of duplicating
@@ -115,10 +82,10 @@ describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
 		const fetchMock = createMockFetch([
 			toolCallChunk(model, {
 				name: "edit",
-				arguments: { input: "[foo.ts#A1B2]\nreplace 91..91:" },
+				arguments: { input: "[foo.ts#A1B2]\nSWAP 91.=91:" },
 			}),
 			toolCallChunk(model, {
-				arguments: { input: "[foo.ts#A1B2]\nreplace 91..91:\n+new" },
+				arguments: { input: "[foo.ts#A1B2]\nSWAP 91.=91:\n+new" },
 			}),
 			stopChunk(model),
 			"[DONE]",
@@ -134,15 +101,15 @@ describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
 				type: "toolCall",
 				id: "call-minimax-1",
 				name: "edit",
-				arguments: { input: "[foo.ts#A1B2]\nreplace 91..91:\n+new" },
+				arguments: { input: "[foo.ts#A1B2]\nSWAP 91.=91:\n+new" },
 			},
 		]);
 	});
 
 	it("preserves keys that only appear in earlier chunks instead of dropping them with later chunks", async () => {
-		const model = getBundledModel<"openai-completions">("minimax-code-cn", "MiniMax-M3");
+		const model = minimaxTokenPlanOpenAIModel("minimax-code-cn", "MiniMax-M3");
 		const fetchMock = createMockFetch([
-			toolCallChunk(model, { name: "edit", arguments: { input: "[foo.ts#A1B2]\ndelete 5" } }),
+			toolCallChunk(model, { name: "edit", arguments: { input: "[foo.ts#A1B2]\nDEL 5" } }),
 			toolCallChunk(model, { arguments: { dryRun: true } }),
 			stopChunk(model),
 			"[DONE]",
@@ -158,9 +125,62 @@ describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
 				type: "toolCall",
 				id: "call-minimax-1",
 				name: "edit",
-				arguments: { input: "[foo.ts#A1B2]\ndelete 5", dryRun: true },
+				arguments: { input: "[foo.ts#A1B2]\nDEL 5", dryRun: true },
 			},
 		]);
+	});
+	it("deep-merges object and array fragments for large task arguments", async () => {
+		const model = minimaxTokenPlanOpenAIModel("minimax-code-cn", "MiniMax-M3");
+		const fetchMock = createMockFetch([
+			toolCallChunk(model, {
+				name: "task",
+				arguments: {
+					tasks: [{ id: "A", assignment: "first" }],
+					options: { env: { first: true } },
+				},
+			}),
+			toolCallChunk(model, {
+				arguments: {
+					tasks: [
+						{ id: "A", assignment: "first" },
+						{ id: "B", assignment: "second" },
+					],
+					options: { env: { second: true }, constructor: { polluted: true } },
+				},
+			}),
+			toolCallChunk(model, {
+				arguments: {
+					tasks: [{ id: "C", assignment: "third" }],
+					options: { flags: ["fast"], prototype: { polluted: true } },
+					["__proto__"]: { polluted: true },
+				},
+			}),
+			stopChunk(model),
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
+
+		expect(result.content).toEqual([
+			{
+				type: "toolCall",
+				id: "call-minimax-1",
+				name: "task",
+				arguments: {
+					tasks: [
+						{ id: "A", assignment: "first" },
+						{ id: "B", assignment: "second" },
+						{ id: "C", assignment: "third" },
+					],
+					options: { env: { first: true, second: true }, flags: ["fast"] },
+				},
+			},
+		]);
+		const objectPrototype = Object.prototype as { polluted?: unknown };
+		expect(objectPrototype.polluted).toBeUndefined();
 	});
 
 	it("emits a concat-safe `toolcall_delta` sequence — accumulated deltas parse to the merged args", async () => {
@@ -171,11 +191,11 @@ describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
 		// flushes one delta carrying the full merged JSON. Verify that contract by
 		// reconstructing the args the way the proxy does (concat + parse) and comparing
 		// against the source-side merged result.
-		const model = getBundledModel<"openai-completions">("minimax-code-cn", "MiniMax-M3");
+		const model = minimaxTokenPlanOpenAIModel("minimax-code-cn", "MiniMax-M3");
 		const fetchMock = createMockFetch([
 			toolCallChunk(model, {
 				name: "edit",
-				arguments: { input: "[foo.ts#A1B2]\nreplace 91..91:\n+    " },
+				arguments: { input: "[foo.ts#A1B2]\nSWAP 91.=91:\n+    " },
 			}),
 			toolCallChunk(model, {
 				arguments: { input: 'const out = await executeTool("nuke", { path: "x" }, ctx);' },
@@ -193,7 +213,7 @@ describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
 		}
 
 		const expected = {
-			input: '[foo.ts#A1B2]\nreplace 91..91:\n+    const out = await executeTool("nuke", { path: "x" }, ctx);',
+			input: '[foo.ts#A1B2]\nSWAP 91.=91:\n+    const out = await executeTool("nuke", { path: "x" }, ctx);',
 		};
 		// Source-side merged result (what `block.arguments` is set to in `finishToolCallBlock`).
 		expect(toolCallEndArgs).toEqual(expected);
@@ -206,9 +226,9 @@ describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
 		// The #1776 fix sent the full JSON as one delta during streaming. The PR #2082 follow-up
 		// moves emission to `finishToolCallBlock`. The single-chunk path stays correct end-to-end:
 		// the proxy still concatenates ("" then the final delta) and parses to the same args.
-		const model = getBundledModel<"openai-completions">("minimax-code-cn", "MiniMax-M3");
+		const model = minimaxTokenPlanOpenAIModel("minimax-code-cn", "MiniMax-M3");
 		const fetchMock = createMockFetch([
-			toolCallChunk(model, { name: "edit", arguments: { input: "[foo.ts#A1B2]\ndelete 5" } }),
+			toolCallChunk(model, { name: "edit", arguments: { input: "[foo.ts#A1B2]\nDEL 5" } }),
 			stopChunk(model),
 			"[DONE]",
 		]);
@@ -218,6 +238,6 @@ describe("issue #2080 - MiniMax multi-chunk object tool arguments", () => {
 		for await (const event of s) {
 			if (event.type === "toolcall_delta") accumulated += event.delta;
 		}
-		expect(JSON.parse(accumulated)).toEqual({ input: "[foo.ts#A1B2]\ndelete 5" });
+		expect(JSON.parse(accumulated)).toEqual({ input: "[foo.ts#A1B2]\nDEL 5" });
 	});
 });

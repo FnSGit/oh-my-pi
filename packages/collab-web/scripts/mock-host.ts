@@ -106,7 +106,10 @@ function buildState(): SessionState {
 		contextUsage: {
 			tokens,
 			contextWindow: fixtureModel.contextWindow,
-			percent: (tokens / fixtureModel.contextWindow) * 100,
+			percent:
+				fixtureModel.contextWindow !== null && fixtureModel.contextWindow > 0
+					? (tokens / fixtureModel.contextWindow) * 100
+					: null,
 		},
 		participants,
 	};
@@ -194,12 +197,13 @@ function handleHello(name: string, proto: number, fromPeer: number): void {
 			t: "welcome",
 			proto: COLLAB_PROTO,
 			header: fixtureHeader,
-			entries: [...entries],
 			state: buildState(),
 			agents: agents.map(agent => ({ ...agent })),
+			entryCount: entries.length,
 		},
 		fromPeer,
 	);
+	sendFrame({ t: "snapshot-chunk", entries: [...entries], final: true }, fromPeer);
 	console.log(`mock-host: ${cleanName} joined (peer ${fromPeer})`);
 	broadcastState();
 }

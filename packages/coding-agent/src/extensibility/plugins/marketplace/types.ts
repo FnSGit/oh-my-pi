@@ -11,13 +11,18 @@
 
 // ── Plugin ID helpers ────────────────────────────────────────────────
 
-const NAME_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
+const NAME_RE = /^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/;
 const MAX_NAME_LENGTH = 64;
 const MAX_ID_LENGTH = 128;
 
 /** Validate a plugin or marketplace name segment. */
 export function isValidNameSegment(s: string): boolean {
 	return s.length > 0 && s.length <= MAX_NAME_LENGTH && NAME_RE.test(s);
+}
+
+/** Return the case-insensitive key used to detect cache-path name collisions. */
+export function nameSegmentCollisionKey(s: string): string {
+	return s.toLowerCase();
 }
 
 /** Build canonical plugin ID: `"name@marketplace"`. Both segments are validated. */
@@ -48,6 +53,10 @@ export function parsePluginId(id: string): { name: string; marketplace: string }
 	return { name, marketplace };
 }
 
+export function isBarePluginSourceName(source: string): boolean {
+	return source.length > 0 && source !== "." && source !== ".." && !/[/\\]/.test(source);
+}
+
 // ── Marketplace catalog (from marketplace.json in a marketplace repo) ─
 
 export interface MarketplaceCatalogOwner {
@@ -58,7 +67,7 @@ export interface MarketplaceCatalogOwner {
 export interface MarketplaceCatalogMetadata {
 	description?: string;
 	version?: string;
-	/** If set, prepended to relative plugin source paths. */
+	/** Directory for bare-name sources and the legacy fallback for missing `./` sources. */
 	pluginRoot?: string;
 }
 
@@ -92,12 +101,13 @@ export interface MarketplacePluginEntry {
 	hooks?: string | Record<string, unknown>;
 	mcpServers?: string | Record<string, unknown>;
 	lspServers?: string | Record<string, unknown>;
+	dapAdapters?: string | Record<string, unknown>;
 }
 
 // ── Plugin source variants ───────────────────────────────────────────
 
 export type PluginSource =
-	| string // relative path "./plugins/foo"
+	| string // relative path "./plugins/foo", or bare name "foo" under metadata.pluginRoot
 	| PluginSourceGitHub
 	| PluginSourceUrl
 	| PluginSourceGitSubdir

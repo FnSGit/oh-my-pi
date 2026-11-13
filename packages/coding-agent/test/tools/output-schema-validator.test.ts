@@ -28,6 +28,15 @@ describe("buildOutputValidator", () => {
 		expect(result.validator).toBeUndefined();
 	});
 
+	it("validates against a reused schema object's current declaration after it is edited", () => {
+		const schema = { properties: { result: { type: "string" } } };
+		expect(buildOutputValidator(schema).validator?.validate({ result: "ok" }).success).toBe(true);
+		schema.properties.result.type = "int32";
+		const { validator } = buildOutputValidator(schema);
+		expect(validator?.validate({ result: 7 }).success).toBe(true);
+		expect(validator?.validate({ result: "ok" }).success).toBe(false);
+	});
+
 	it("errors on a malformed JSON Schema", () => {
 		const result = buildOutputValidator({
 			type: "object",
@@ -68,6 +77,48 @@ describe("buildOutputValidator", () => {
 			"required",
 			"required",
 		]);
+	});
+
+	it("honors explicit JTD nullable properties and still rejects null for required non-nullable fields", () => {
+		const { validator } = buildOutputValidator({
+			properties: {
+				name: { type: "string" },
+				receipt: { properties: { id: { type: "string" } }, nullable: true },
+			},
+			optionalProperties: { blocker: { type: "string", nullable: true } },
+		});
+		expect(validator?.validate({ name: "done", receipt: null, blocker: null }).success).toBe(true);
+		expect(validator?.validate({ name: null, receipt: null }).success).toBe(false);
+	});
+
+	it("exposes per-label sub-validators that accept items (not whole arrays) for elements properties", () => {
+		const { validator } = buildOutputValidator({
+			properties: {
+				overall_correctness: { enum: ["correct", "incorrect"] },
+				explanation: { type: "string" },
+			},
+			optionalProperties: {
+				findings: {
+					elements: {
+						properties: { title: { type: "string" }, body: { type: "string" } },
+					},
+				},
+			},
+		});
+		expect(validator).toBeDefined();
+		const sections = validator?.validateSection;
+		expect(sections).toBeDefined();
+		// Scalar enum: per-section validator enforces the enum directly.
+		expect(sections?.get("overall_correctness")?.("correct").success).toBe(true);
+		expect(sections?.get("overall_correctness")?.("Correct").success).toBe(false);
+		// String property: any string passes, non-strings fail.
+		expect(sections?.get("explanation")?.("ok").success).toBe(true);
+		expect(sections?.get("explanation")?.(123).success).toBe(false);
+		// Array property: each section validates ONE item against the items schema, not the whole array.
+		expect(sections?.get("findings")?.({ title: "t", body: "b" }).success).toBe(true);
+		expect(sections?.get("findings")?.([{ title: "t", body: "b" }]).success).toBe(false);
+		// Unknown labels have no validator so user-defined sections stay loose.
+		expect(sections?.has("scratchpad")).toBe(false);
 	});
 });
 describe("summarizeValidationFailure", () => {

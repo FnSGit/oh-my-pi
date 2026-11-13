@@ -5,9 +5,10 @@
  */
 import * as path from "node:path";
 import * as url from "node:url";
-import { getProjectDir, logger, withTimeout } from "@oh-my-pi/pi-utils";
+import { getProjectDir, logger, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
 import { describeMCPTimeout, isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "./timeout";
 import { createHttpTransport } from "./transports/http";
+import { LegacySseConnectionTimeoutError, createSseTransport } from "./transports/sse";
 import { createStdioTransport } from "./transports/stdio";
 import type {
 	MCPGetPromptParams,
@@ -37,8 +38,7 @@ import type {
 	MCPTransport,
 } from "./types";
 
-/** MCP protocol version we support */
-const PROTOCOL_VERSION = "2025-03-26";
+import { MCP_PROTOCOL_VERSION } from "./types";
 
 /** Client info sent during initialization */
 const CLIENT_INFO = {
@@ -70,15 +70,16 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
 /**
  * Create a transport for the given server config.
  */
-async function createTransport(config: MCPServerConfig): Promise<MCPTransport> {
+async function createTransport(config: MCPServerConfig, signal?: AbortSignal): Promise<MCPTransport> {
 	const serverType = config.type ?? "stdio";
 
 	switch (serverType) {
 		case "stdio":
-			return createStdioTransport(config as MCPStdioServerConfig);
+			return createStdioTransport(config as MCPStdioServerConfig, signal);
 		case "http":
+			return createHttpTransport(config as MCPHttpServerConfig);
 		case "sse":
-			return createHttpTransport(config as MCPHttpServerConfig | MCPSseServerConfig);
+			return createSseTransport(config as MCPSseServerConfig, signal);
 		default:
 			throw new Error(`Unknown server type: ${serverType}`);
 	}
@@ -91,12 +92,12 @@ async function initializeConnection(
 	transport: MCPTransport,
 	options?: {
 		signal?: AbortSignal;
-		/** Called after the initialize response (which sets the session ID) but before notifications/initialized. */
+		/** Called after notifications/initialized succeeds. */
 		onInitialized?: () => void | Promise<void>;
 	},
 ): Promise<MCPInitializeResult> {
 	const params: MCPInitializeParams = {
-		protocolVersion: PROTOCOL_VERSION,
+		protocolVersion: MCP_PROTOCOL_VERSION,
 		capabilities: {
 			roots: { listChanged: false },
 		},
@@ -113,15 +114,33 @@ async function initializeConnection(
 		throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
 	}
 
-	// Hook point: the transport now has the session ID from the initialize response.
-	// For HTTP, this is the moment to open the SSE stream so server-to-client requests
-	// triggered by notifications/initialized (e.g. roots/list) can be delivered.
+	// Echo the negotiated protocol version on every subsequent request. The MCP
+	// Streamable HTTP spec requires the MCP-Protocol-Version header after
+	// initialize; transports that don't need it ignore this.
+	transport.setProtocolVersion?.(result.protocolVersion);
+
+	// Send initialized before opening the optional GET SSE stream. Servers may
+	// reject or terminate sessions that receive session traffic before this
+	// notification; POST response streams already carry messages during setup.
+	await transport.notify("notifications/initialized");
+	options?.signal?.throwIfAborted();
+
 	await options?.onInitialized?.();
 
-	// Send initialized notification
-	await transport.notify("notifications/initialized");
-
 	return result;
+}
+
+/** Identifies an MCP server whose initial handshake exceeded its configured timeout. */
+export class MCPConnectionTimeoutError extends Error {
+	readonly serverName: string;
+	readonly timeoutMs: number;
+
+	constructor(serverName: string, timeoutMs: number) {
+		super(`Connection to MCP server "${serverName}" timed out after ${describeMCPTimeout(timeoutMs)}`);
+		this.name = "MCPConnectionTimeoutError";
+		this.serverName = serverName;
+		this.timeoutMs = timeoutMs;
+	}
 }
 
 /**
@@ -138,11 +157,21 @@ export async function connectToServer(
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
 	},
 ): Promise<MCPServerConnection> {
+	// `withTimeout` rejects a pre-aborted signal without observing `connect()`; never start one.
+	options?.signal?.throwIfAborted();
 	const timeoutMs = resolveMCPTimeoutMs(config.timeout);
+	const timeoutError = new MCPConnectionTimeoutError(name, timeoutMs);
+	const controller = new AbortController();
+	const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 	let transport: MCPTransport | undefined;
+	let closePromise: Promise<void> | undefined;
+	const closeTransport = () => {
+		if (transport) closePromise ??= transport.close();
+		return closePromise;
+	};
 
 	const connect = async (): Promise<MCPServerConnection> => {
-		transport = await createTransport(config);
+		transport = await createTransport(config, signal);
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
 		}
@@ -153,11 +182,12 @@ export async function connectToServer(
 		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
 
 		try {
+			signal.throwIfAborted();
 			const initResult = await initializeConnection(transport, {
-				signal: options?.signal,
+				signal,
 				async onInitialized() {
-					// Open the SSE stream before sending initialized, so server-to-client
-					// requests triggered by on_initialized (e.g. roots/list) are delivered.
+					// Open the optional GET SSE stream only after the initialized
+					// notification makes the session ready for further traffic.
 					if ("startSSEListener" in transport! && typeof transport!.startSSEListener === "function") {
 						await (transport as { startSSEListener(): Promise<void> }).startSSEListener();
 					}
@@ -173,28 +203,23 @@ export async function connectToServer(
 				instructions: initResult.instructions,
 			};
 		} catch (error) {
-			await transport.close();
+			await closeTransport();
 			throw error;
 		}
 	};
 
 	try {
+		// Race the whole handshake against the signal: the steps after `initialize` (the
+		// initialized notification, the SSE listener) do not observe it themselves.
 		if (!isMCPTimeoutEnabled(timeoutMs)) {
-			return await connect();
+			return await untilAborted(options?.signal, connect());
 		}
-		return await withTimeout(
-			connect(),
-			timeoutMs,
-			`Connection to MCP server "${name}" timed out after ${describeMCPTimeout(timeoutMs)}`,
-			options?.signal,
-		);
+		return await withTimeout(connect(), timeoutMs, timeoutError, options?.signal);
 	} catch (error) {
-		// If withTimeout rejected (timeout/abort) while connect() was still pending,
-		// the transport may be alive with an open SSE listener. Close it.
-		if (transport) {
-			void transport.close().catch(() => {});
-		}
-		throw error;
+		controller.abort(error);
+		// Close an existing transport; in-flight creation observes the aborted signal.
+		void closeTransport()?.catch(() => {});
+		throw error instanceof LegacySseConnectionTimeoutError ? timeoutError : error;
 	}
 }
 
@@ -303,8 +328,22 @@ export async function listResources(
 	return allResources;
 }
 
+/** True when an error is a JSON-RPC "method not found" (-32601) response. */
+function isMethodNotFoundError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes("-32601") || /method not found/i.test(message);
+}
+
 /**
  * List resource templates from a connected server.
+ *
+ * A server MAY advertise the `resources` capability without implementing the
+ * optional `resources/templates/list` method (it is optional in the MCP spec).
+ * Such servers reject the request with JSON-RPC -32601 ("Method not found").
+ * Treat that as "no templates" and return `[]` rather than throwing — otherwise
+ * a caller that loads resources and templates together (see `MCPManager`'s
+ * `Promise.all([listResources, listResourceTemplates])`) would discard the
+ * server's concrete resources too. Any other error still propagates.
  */
 export async function listResourceTemplates(
 	connection: MCPServerConnection,
@@ -321,20 +360,31 @@ export async function listResourceTemplates(
 	const allTemplates: MCPResourceTemplate[] = [];
 	let cursor: string | undefined;
 
-	do {
-		const params: Record<string, unknown> = {};
-		if (cursor) {
-			params.cursor = cursor;
-		}
+	try {
+		do {
+			const params: Record<string, unknown> = {};
+			if (cursor) {
+				params.cursor = cursor;
+			}
 
-		const result = await connection.transport.request<MCPResourceTemplatesListResult>(
-			"resources/templates/list",
-			params,
-			options,
-		);
-		allTemplates.push(...result.resourceTemplates);
-		cursor = result.nextCursor;
-	} while (cursor);
+			const result = await connection.transport.request<MCPResourceTemplatesListResult>(
+				"resources/templates/list",
+				params,
+				options,
+			);
+			allTemplates.push(...result.resourceTemplates);
+			cursor = result.nextCursor;
+		} while (cursor);
+	} catch (error) {
+		// A server that doesn't implement the optional templates method answers
+		// -32601; cache an empty list so we neither retry nor let the failure
+		// bubble up and discard the server's concrete resources.
+		if (isMethodNotFoundError(error)) {
+			connection.resourceTemplates = [];
+			return [];
+		}
+		throw error;
+	}
 
 	connection.resourceTemplates = allTemplates;
 	return allTemplates;

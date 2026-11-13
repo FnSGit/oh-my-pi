@@ -13,15 +13,25 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 interface StubEditor {
 	setText: (text: string) => void;
 	getText: () => string;
+	getExpandedText: () => string;
+	setCollapsedText: (text: string) => void;
+	composerChips: () => unknown[];
 	addToHistory: (text: string) => void;
 	imageLinks?: unknown;
+	pendingImages: ImageContent[];
+	pendingImageLinks: (string | undefined)[];
+	clearDraft: (text?: string) => void;
 }
 interface PromptOptionsLike {
 	streamingBehavior?: "steer" | "followUp";
 	images?: ImageContent[];
 }
 
-function createContext(opts: { isStreaming: boolean; pendingImages: ImageContent[] }) {
+function createContext(opts: {
+	isStreaming: boolean;
+	pendingImages: ImageContent[];
+	pendingImageLinks?: (string | undefined)[];
+}) {
 	let editorText = "";
 	const editor: StubEditor = {
 		setText(text) {
@@ -30,12 +40,34 @@ function createContext(opts: { isStreaming: boolean; pendingImages: ImageContent
 		getText() {
 			return editorText;
 		},
+		getExpandedText() {
+			return editorText;
+		},
+		setCollapsedText(text) {
+			editorText = text;
+		},
+		composerChips() {
+			return [];
+		},
 		addToHistory: vi.fn(),
+		pendingImages: opts.pendingImages,
+		pendingImageLinks: opts.pendingImageLinks ? [...opts.pendingImageLinks] : opts.pendingImages.map(() => undefined),
+		clearDraft(text?: string) {
+			if (text !== undefined) this.addToHistory(text);
+			this.setText("");
+			this.imageLinks = undefined;
+			this.pendingImages = [];
+			this.pendingImageLinks = [];
+		},
 	};
 	const prompt = vi.fn(async (_text: string, _options?: PromptOptionsLike) => {});
 	const updatePendingMessagesDisplay = vi.fn();
 	const requestRender = vi.fn();
+	const showError = vi.fn();
 
+	const handleGoalModeCommand = vi.fn(async (_prompt?: string, _input?: unknown) => true);
+	const handlePlanModeCommand = vi.fn(async (_prompt?: string, _input?: unknown) => true);
+	const handleVibeModeCommand = vi.fn(async (_prompt?: string, _input?: unknown) => true);
 	const ctx = {
 		editor,
 		ui: { requestRender },
@@ -48,16 +80,24 @@ function createContext(opts: { isStreaming: boolean; pendingImages: ImageContent
 			extensionRunner: undefined,
 			prompt,
 		},
-		pendingImages: opts.pendingImages,
-		pendingImageLinks: opts.pendingImages.map(() => undefined),
 		loopModeEnabled: false,
 		compactionQueuedMessages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		updatePendingMessagesDisplay,
+		showError,
+		planModeEnabled: false,
+		planModePaused: false,
+		vibeModeEnabled: false,
+		goalModeEnabled: false,
+		goalModePaused: false,
+		handleGoalModeCommand,
+		handlePlanModeCommand,
+		handleVibeModeCommand,
 		withLocalSubmission: async (_text: string, fn: () => unknown) => fn(),
+		sessionManager: { getSessionId: () => "session", getLeafId: () => null },
 	} as unknown as InteractiveModeContext;
 
-	return { ctx, editor, prompt };
+	return { ctx, editor, handleGoalModeCommand, handlePlanModeCommand, handleVibeModeCommand, prompt, showError };
 }
 
 describe("InputController.handleFollowUp image forwarding", () => {
@@ -81,8 +121,25 @@ describe("InputController.handleFollowUp image forwarding", () => {
 		expect(call[1]?.images).toEqual([image]);
 
 		// Pending image state is consumed so the next message does not resend it.
-		expect(ctx.pendingImages).toEqual([]);
-		expect(ctx.pendingImageLinks).toEqual([]);
+		expect(ctx.editor.pendingImages).toEqual([]);
+		expect(ctx.editor.pendingImageLinks).toEqual([]);
+	});
+
+	it("queues image-only follow-ups while streaming", async () => {
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+		const { ctx, editor, prompt } = createContext({ isStreaming: true, pendingImages: [image] });
+
+		const controller = new InputController(ctx);
+		editor.setText("[Image #1]");
+		await controller.handleFollowUp();
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		const call = prompt.mock.calls[0];
+		if (!call) throw new Error("expected session.prompt to be called");
+		expect(call[0]).toBe("[Image #1]");
+		expect(call[1]?.streamingBehavior).toBe("followUp");
+		expect(call[1]?.images).toEqual([image]);
+		expect(ctx.editor.pendingImages).toEqual([]);
 	});
 
 	it("forwards pending images when not streaming", async () => {
@@ -98,7 +155,7 @@ describe("InputController.handleFollowUp image forwarding", () => {
 		if (!call) throw new Error("expected session.prompt to be called");
 		expect(call[1]?.images).toEqual([image]);
 		expect(call[1]?.streamingBehavior).toBeUndefined();
-		expect(ctx.pendingImages).toEqual([]);
+		expect(ctx.editor.pendingImages).toEqual([]);
 	});
 
 	it("omits images when none are pending", async () => {
@@ -113,5 +170,103 @@ describe("InputController.handleFollowUp image forwarding", () => {
 		if (!call) throw new Error("expected session.prompt to be called");
 		expect(call[1]?.images).toBeUndefined();
 		expect(call[1]?.streamingBehavior).toBe("followUp");
+	});
+
+	it("restores text and pending images when streaming follow-up dispatch rejects", async () => {
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aGVsbG8=" };
+		const { ctx, editor, prompt, showError } = createContext({
+			isStreaming: true,
+			pendingImages: [image],
+			pendingImageLinks: ["local://draft.png"],
+		});
+		prompt.mockImplementationOnce(async () => {
+			throw new Error("queue rejected");
+		});
+
+		const controller = new InputController(ctx);
+		editor.setText("[Image #1] look at this");
+		await controller.handleFollowUp();
+
+		expect(showError).toHaveBeenCalledWith("queue rejected");
+		expect(editor.getText()).toBe("[Image #1] look at this");
+		expect(ctx.editor.pendingImages).toEqual([image]);
+		expect(ctx.editor.pendingImageLinks).toEqual(["local://draft.png"]);
+		expect(ctx.editor.imageLinks).toEqual(["local://draft.png"]);
+	});
+
+	it("restores image-only follow-ups when idle dispatch rejects", async () => {
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+		const { ctx, editor, prompt, showError } = createContext({
+			isStreaming: false,
+			pendingImages: [image],
+		});
+		prompt.mockImplementationOnce(async () => {
+			throw new Error("model not configured");
+		});
+
+		const controller = new InputController(ctx);
+		editor.setText("[Image #1]");
+		await controller.handleFollowUp();
+
+		expect(showError).toHaveBeenCalledWith("model not configured");
+		expect(editor.getText()).toBe("[Image #1]");
+		expect(ctx.editor.pendingImages).toEqual([image]);
+		expect(ctx.editor.pendingImageLinks).toEqual([undefined]);
+		expect(ctx.editor.imageLinks).toEqual([undefined]);
+	});
+
+	it("forwards follow-up mode attachments before the command clears the draft", async () => {
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+		const { ctx, editor, handleGoalModeCommand } = createContext({
+			isStreaming: false,
+			pendingImages: [image],
+			pendingImageLinks: ["local://draft.png"],
+		});
+
+		const controller = new InputController(ctx);
+		editor.setText("/goal set Ship the release [Image #1]");
+		await controller.handleFollowUp();
+
+		expect(handleGoalModeCommand).toHaveBeenCalledWith("set Ship the release [Image #1]", {
+			images: [image],
+			imageLinks: ["local://draft.png"],
+		});
+		expect(ctx.editor.pendingImages).toEqual([]);
+		expect(ctx.editor.pendingImageLinks).toEqual([]);
+	});
+
+	it("restores a failed Ctrl+Enter mode command submission alongside a newer draft, reporting the error exactly once", async () => {
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "aW1hZ2U=" };
+		const { ctx, editor, handleGoalModeCommand, showError } = createContext({
+			isStreaming: false,
+			pendingImages: [image],
+			pendingImageLinks: ["local://draft.png"],
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		handleGoalModeCommand.mockImplementationOnce(async () => {
+			entered.resolve();
+			await release.promise;
+			throw new Error("goal setup failed");
+		});
+
+		const controller = new InputController(ctx);
+		editor.setText("/goal set Ship the release [Image #1]");
+		const submitting = controller.handleFollowUp();
+		await entered.promise;
+		// Typed after the draft detached for dispatch but before the mode
+		// command settles; a failed submission must merge with this, not
+		// replace or discard it.
+		editor.setText("later draft");
+		release.resolve();
+		await submitting;
+
+		expect(handleGoalModeCommand).toHaveBeenCalledTimes(1);
+		expect(showError).toHaveBeenCalledTimes(1);
+		expect(showError).toHaveBeenCalledWith("goal setup failed");
+		expect(editor.getText()).toBe("/goal set Ship the release [Image #1]\n\nlater draft");
+		expect(ctx.editor.pendingImages).toEqual([image]);
+		expect(ctx.editor.pendingImageLinks).toEqual(["local://draft.png"]);
+		expect(ctx.editor.imageLinks).toEqual(["local://draft.png"]);
 	});
 });

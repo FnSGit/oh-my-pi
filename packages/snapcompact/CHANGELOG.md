@@ -2,6 +2,273 @@
 
 ## [Unreleased]
 
+## [18.20.0] - 2026-11-12
+
+### Added
+
+- `resolveShapeAndScan()` returns the auto-picked shape together with its `scanRenderability()` verdict, reusing the scan auto resolution already runs; exported `ShapeScan` and `RenderabilityScan` types ([#15689](https://github.com/can1357/oh-my-pi/issues/15689), [#18867](https://github.com/can1357/oh-my-pi/pull/18867) by [@wolfiesch](https://github.com/wolfiesch))
+
+### Changed
+
+- `compact()` splits its synchronous work into two `compaction.snapcompact` loop phases (building the archive source, then planning the layout) with an event-loop turn between them, shortening the longest main-thread block on long histories ([#15689](https://github.com/can1357/oh-my-pi/issues/15689), [#18867](https://github.com/can1357/oh-my-pi/pull/18867) by [@wolfiesch](https://github.com/wolfiesch))
+
+## [18.17.0] - 2026-11-06
+
+### Fixed
+
+- `compact()` now keeps image content from pre-16.1.0 archived histories in the dropped-history summary.
+
+## [18.16.0] - 2026-11-02
+
+### Added
+
+- Added `archiveIncludesThinking()`, whether a compaction may replay reasoning from its summary's legend or its archive's text, and `viewSummary()`, which keeps a summary the template did not write in its own words, followed by the template's guide to the view's text ([#17745](https://github.com/can1357/oh-my-pi/pull/17745) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed `viewWithoutFrames` and `viewWithoutThinking` keeping an archive's reasoning for a reader without it when the summary (say, one an extension wrote) declares no `¶think:` scope, and replacing such a summary with the template's ([#17745](https://github.com/can1357/oh-my-pi/pull/17745) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.15.0] - 2026-11-01
+
+### Added
+
+- Added `viewWithoutFrames`: what a reader without image input reads for an archive, its kept text in place of its frames ([#17510](https://github.com/can1357/oh-my-pi/pull/17510) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
+## [18.12.4] - 2026-10-20
+
+### Fixed
+
+- Fixed snapcompact archive frames for Factory Droid models ignoring Factory's inline-image budget: they are now sized to half of it, like other budgeted hosts ([#16288](https://github.com/can1357/oh-my-pi/pull/16288) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.10.4] - 2026-10-13
+
+### Added
+
+- Added `viewWithoutThinking()`, `textWithoutThinking()`, `readerIncludesThinking()` and an optional `Archive.withoutThinking` variant, so an archive rendered with reasoning can be read by a model that must not see it; without a stored variant the view keeps only reasoning-free text and no frames ([#15436](https://github.com/can1357/oh-my-pi/pull/15436) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed re-rendering an archive without reasoning keeping every paragraph after the first of a multi-paragraph `¶think:` section ([#15436](https://github.com/can1357/oh-my-pi/pull/15436) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.10.3] - 2026-10-12
+
+### Breaking Changes
+
+- `providerImageBudget(provider)` and `providerFrameBudget(provider)` became `providerImageBudget(model)` and `providerFrameBudget(model)`, and `maxFramesForDataBudget(shape)` became `maxFramesForDataBudget(shape, budget)` with a required byte budget ([#15434](https://github.com/can1357/oh-my-pi/pull/15434) by [@will-bogusz](https://github.com/will-bogusz))
+- Removed `PROVIDER_IMAGE_BUDGETS` and `FRAME_DATA_BYTES_BUDGET`: image counts come from the catalog's `image-count-budget` rules, and frame byte budgets from `frameDataBytesBudget(model)` (`DEFAULT_FRAME_DATA_BYTES_BUDGET` where the host has none) ([#15434](https://github.com/can1357/oh-my-pi/pull/15434) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Added
+
+- Added `plannedFrameTokens` and `Shape.frameTokensVerified`: archive sizing charges a frame its own price when the reader's `image-tokenization` rule is `verified`, and at least `FRAME_TOKEN_ESTIMATE` otherwise ([#15442](https://github.com/can1357/oh-my-pi/pull/15442) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed snapcompact frames for Claude and GPT on Cursor, including its `default` (Auto) route, being drawn at 1568–1932px, which Cursor shrank to 1024px before the model read them; frames now render at the host's catalog `image-max-edge` ([#15448](https://github.com/can1357/oh-my-pi/pull/15448) by [@will-bogusz](https://github.com/will-bogusz))
+
+## [18.6.3] - 2026-10-06
+
+### Breaking Changes
+
+- `maxFramesForDataBudget()` now takes the frame shape instead of a byte budget, so the default 1568px shapes get 26 frames instead of 17 ([#14277](https://github.com/can1357/oh-my-pi/pull/14277) by [@will-bogusz](https://github.com/will-bogusz)).
+
+### Added
+
+- Added `frameBilling`, `frameTokens` and `frameBillingKey`, which price a rendered frame at what the model reading it is billed ([#14291](https://github.com/can1357/oh-my-pi/pull/14291) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed snapcompact frame token estimates following the gateway instead of the model reading the frames, which mispriced Claude behind OpenRouter or Vertex and Claude 4.6 and older ([#14286](https://github.com/can1357/oh-my-pi/pull/14286) by [@will-bogusz](https://github.com/will-bogusz)).
+
+## [18.6.2] - 2026-10-04
+
+### Fixed
+
+- Fixed short snapcompact frames being rejected by vision backends that require image dimensions above 32px ([#14355](https://github.com/can1357/oh-my-pi/issues/14355)).
+
+## [18.2.9] - 2026-09-22
+
+### Fixed
+
+- Fixed summaries incorrectly advertising a `¶think:` scope when thinking content is excluded from the archive.
+
+## [18.2.1] - 2026-09-15
+
+### Changed
+
+- `historyBlocks()` now resolves persisted frame payloads lazily, keeps the newest frames within a byte budget, and drops unresolved blob references instead of sending them to providers ([#10227](https://github.com/can1357/oh-my-pi/pull/10227) by [@lemonleks](https://github.com/lemonleks)).
+
+## [18.1.18] - 2026-09-11
+
+### Fixed
+
+- A snapcompact pass now also strips a superseded Anthropic server-compaction payload (`preserveData.anthropicCompaction`) alongside the OpenAI replacement history, so a stale native summary can never replay ahead of the archived frames.
+
+## [18.1.0] - 2026-09-01
+
+### Added
+
+- Added a declarative compatibility rules system for consistent model identification, capabilities, policies, and provider-specific behavior across model classes, families, and revisions.
+- Added the compat-compiler CLI for managing model identity and capability rules through KDL configuration files.
+
+### Changed
+
+- Standardized model revision handling and compatibility resolution across model discovery and runtime behavior.
+
+## [17.4.1] - 2026-08-21
+
+### Added
+
+- Restored `providerFrameBudget()` to allow callers to size archives according to the maximum frame budget the provider will send.
+
+### Fixed
+
+- Fixed an issue where character-based truncation could split inline base64 data URLs into corrupted payloads that were rejected by OpenAI-compatible providers. Data URLs are now replaced atomically with placeholders before truncation, and previously affected archives are healed during re-compaction.
+
+## [17.3.8] - 2026-08-19
+
+### Fixed
+
+- Fixed image-based compaction confusing digit `0` with letter `O` and corrupting compacted identifiers (e.g. Slack IDs): the default frame fonts (X.org `8x13`, `6x12`, `5x8`) drew zero as a bare oval indistinguishable from `O`. Zero now carries a disambiguating interior slash (`8x13`) or bar (`6x12`/`5x8`); unscii-8 already shipped a slashed zero ([#8713](https://github.com/can1357/oh-my-pi/issues/8713)).
+
+## [17.2.15] - 2026-08-12
+
+### Fixed
+
+- Fixed Anthropic model ID parsing to be case-insensitive and extended the high-resolution 1932px frame tier to Claude Opus 5 and later, preventing sessions from falling back to lower-resolution 1568px frames and preserving full history per compaction.
+
+## [17.1.5] - 2026-07-27
+
+### Fixed
+
+- Fixed snapcompact resume guides reporting only the HQ grid width for mixed-width foveated archives ([#6712](https://github.com/can1357/oh-my-pi/issues/6712)).
+
+## [17.1.0] - 2026-07-24
+
+### Added
+
+- Added an `includeThinking` serialization option (defaulting to `true`) to allow excluding assistant reasoning (`¶think:` sections) from archived transcripts.
+
+## [16.5.0] - 2026-07-13
+
+### Changed
+
+- Updated archived transcript rendering to use a more compact format with `¶user:`, `¶think:`, `¶ai:`, and `¶call:` scopes, omitting repeated adjacent scope headers and appending tool-call intents as comments.
+
+## [16.3.7] - 2026-07-05
+
+### Fixed
+
+- Fixed `resolveShapeForText(..., "auto")` to correctly select the `silver16-bw` shape for CJK-heavy transcript text while preserving explicit shape overrides.
+
+## [16.2.8] - 2026-06-30
+
+### Fixed
+
+- Fixed large snapcompact archives being reconstructed into unbounded per-request image payloads by adding a frame base64 byte budget and omitting over-budget archive frames from prompt blocks. ([#3792](https://github.com/can1357/oh-my-pi/issues/3792))
+
+## [16.2.7] - 2026-06-30
+
+### Added
+
+- Added the `silver16-bw` shape backed by an embedded Silver TrueType font to support CJK and other non-Latin text.
+- Added `resolveShapeForText` to support font-aware shape resolution.
+
+### Changed
+
+- Improved non-ASCII text normalization by folding semantic emojis to ASCII labels (e.g., `[OK]`, `[WARN]`), dropping decorative emojis, and folding box-drawing symbols to ASCII skeletons.
+- Enhanced missing glyph rendering to use the embedded Silver TrueType fallback per-character, including support for East Asian wide characters across two grid cells.
+- Updated text wrapping, pagination, and provider shape geometries to support wide character footprints and updated X.org 8x13 font metrics.
+
+## [16.1.23] - 2026-06-26
+
+### Added
+
+- Added `archiveSourceText(archive)` to extract a persisted frame archive's source text as plain text for LLM summarization. ([#3561](https://github.com/can1357/oh-my-pi/pull/3561) by [@serverinspector](https://github.com/serverinspector))
+- Added `stripPreservedArchive(preserveData)` to drop the persisted frame-archive slot (`PRESERVE_KEY`) and collapse to `undefined` when no other state remains — shared by the agent and coding-agent compaction paths instead of duplicating the strip rule.
+
+## [16.1.13] - 2026-06-22
+
+### Fixed
+
+- Fixed the Umans provider image budget to match its 10-image request cap.
+
+## [16.1.8] - 2026-06-20
+
+### Breaking Changes
+
+- Changed core rendering functions `render` and `renderMany` to be asynchronous
+
+## [16.1.0] - 2026-06-19
+
+### Added
+
+- Added `historyBlocks(archive)` to reconstruct ordered history blocks from archive data
+
+### Changed
+
+- Refactored compaction to be text-sourced, re-rendering from unified `Archive.text` source
+- Implemented foveated archive layout (HQ edges, dense LQ middle) for optimized context usage
+- Raised `MAX_FRAMES_DEFAULT` to 80 and consolidated `PROVIDER_IMAGE_BUDGETS`
+- Updated OpenRouter to use standard 90-image budget
+- Updated prompt instructions to clearly distinguish between plain-text and image history regions
+- `Options.maxFrames` is now an upper limit clamped to `MAX_FRAMES_DEFAULT`, not a per-call default
+- Rewrote the resume summary prompt into a structured reading guide (turn headings, grid/two-column layout, ink notes) and render file operations inline as a `FILES` section instead of a spliced `<files>` tag
+
+### Fixed
+
+- Fixed context budget undercounting by raising `FRAME_TOKEN_ESTIMATE` to 5024
+- Improved file list formatting in compaction summaries
+
+## [16.0.11] - 2026-06-19
+
+### Changed
+
+- Refined elision markers for file operations and truncated text for better display consistency
+- Updated summary text for consistent descriptions of archived tool output
+- Folded a much wider range of Unicode to ASCII in `normalize()` before native rendering: added a per-character Unicode NFKD decomposition fallback (fullwidth forms, super/subscripts, ligatures, circled and math-styled alphanumerics, Roman numerals, vulgar fractions) and expanded the `CHAR_FOLD` punctuation table (more quotes/primes, hyphens, the fraction slash, dot leaders, bullets, and arrows) so undrawable glyphs land on close ASCII equivalents instead of `?`
+
+## [16.0.8] - 2026-06-18
+
+### Added
+
+- Added `<out>` block wrapping for tool results to improve document structure
+- Rendered thinking process as italicized blocks above assistant text
+- Displayed tool call intents as `//` comments in tool call headers
+- Changed conversation role markers to standard Markdown headings
+
+### Changed
+
+- Merged tool results into their corresponding tool call blocks
+- Preserved prose formatting around tool calls to maintain conversation flow
+- Hidden `_i` argument from tool call output when an intent is provided
+- Optimized assistant turn output to group thinking and text blocks efficiently
+
+### Fixed
+
+- Fixed improper splitting of assistant messages around useless tool calls
+
+## [16.0.1] - 2026-06-15
+
+### Added
+
+- Added `openai-codex` to first-party provider image budgets so ChatGPT Plus/Pro Codex sessions use the same 200-image request cap as OpenAI API sessions instead of the unknown-provider floor.
+
+## [15.13.1] - 2026-06-15
+
+### Added
+
+- Added two spacing-tuned frame variants to `SHAPE_VARIANTS`: `8on22-bw` (8x13 glyphs on a 22px pitch — extra line spacing) and `11on16-bw` (8x13 glyphs on an 11px advance — extra letter spacing). Both pin the indexed `stretch: false` path, so the native renderer draws natural-size glyphs on the padded cell box (the Rust path already advances by `cellWidth` and the new variants validate horizontal padding)
+
+### Changed
+
+- **Changed the per-provider default shapes to the spacing-tuned cells.** The previous shapes were tuned on the SQuAD *prose* eval, where dense cells won; a new tool-result legibility benchmark (`research/toolbench.py` — real `search`/`read`/`find` output with structure-sensitive QA) showed the prose-era density erases the line numbers and indentation that code/search output depends on. Anthropic moves from `6x12-dim` to `11on16-bw` (opus-4.8 f1 .806 vs .755 for plain `8on16-bw` and .351 for `6x12-dim`, which fell below the OCR ~16px/char floor and abstained); OpenAI and Google move to `8on22-bw` (gemini-3.5-flash f1 .934 vs .807 for `8on16-bw` and .287 for `doc-8on16-sent-dim`; same leading win on gpt-5.5/gpt-5.4-mini). Kimi and GLM keep their measured `8on16-bw`. The bigger cells pack fewer chars per frame, so inline frame-swapping now breaks even at a larger tool-result size
+
 ## [15.12.1] - 2026-06-12
 
 ### Changed

@@ -1,11 +1,10 @@
 /**
  * Contract: a guest prompt that arrives while the host agent is streaming is
- * steered AND becomes visible as a queued message — the host registers the
- * pending-display twin (so `queuedMessageCount` covers it, feeding the web
- * composer's "queued ×N" badge and the TUI pending bar) and tags the custom
- * message so the entry is dequeued when the agent consumes it.
+ * steered AND becomes visible as a queued message. The host sends the guest text
+ * as `queueChipText` on the queued custom message; the session derives
+ * `queuedMessageCount` from the agent-core queue for host and guest UI state.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import {
@@ -16,7 +15,9 @@ import {
 	unpackEnvelope,
 } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { installTestCollabHome, uninstallTestCollabHome } from "./helpers/in-memory-relay";
 
 interface RelayData {
 	role: "host" | "guest";
@@ -76,23 +77,22 @@ function startTestRelay(): { url: string; stop(): void } {
 }
 
 interface CapturedPrompt {
-	details?: { from?: string; __pendingDisplayTag?: string };
+	details?: { from?: string };
+	options?: { streamingBehavior?: "steer"; queueChipText?: string };
 }
 
 interface StreamingHostHarness {
 	ctx: InteractiveModeContext;
 	prompts: CapturedPrompt[];
-	enqueued: { text: string; mode: string; tag: string }[];
 	nextPrompt(): Promise<CapturedPrompt>;
 }
 
 /** Context double for a host whose agent is mid-turn (isStreaming === true). */
 function makeStreamingHostContext(): StreamingHostHarness {
 	const prompts: CapturedPrompt[] = [];
-	const enqueued: { text: string; mode: string; tag: string }[] = [];
 	const promptWaiters: ((prompt: CapturedPrompt) => void)[] = [];
 	const ctx = {
-		settings: { get: () => "" },
+		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionId: () => "sess-1",
 			getCwd: () => "/tmp",
@@ -105,20 +105,16 @@ function makeStreamingHostContext(): StreamingHostHarness {
 		session: {
 			isStreaming: true,
 			get queuedMessageCount(): number {
-				return enqueued.length;
+				return prompts.filter(prompt => prompt.options?.queueChipText).length;
 			},
+			isAborting: false,
 			sessionName: "test",
 			model: undefined,
 			thinkingLevel: undefined,
 			subscribe: () => () => {},
 			emitNotice: () => {},
-			enqueueCustomMessageDisplay: (text: string, mode: string) => {
-				const tag = `tag-${enqueued.length + 1}`;
-				enqueued.push({ text, mode, tag });
-				return tag;
-			},
-			promptCustomMessage: (message: CapturedPrompt) => {
-				const captured: CapturedPrompt = { details: message.details };
+			promptCustomMessage: (message: CapturedPrompt, options?: CapturedPrompt["options"]) => {
+				const captured: CapturedPrompt = { details: message.details, options };
 				prompts.push(captured);
 				for (const waiter of promptWaiters.splice(0)) waiter(captured);
 				return Promise.resolve();
@@ -140,7 +136,7 @@ function makeStreamingHostContext(): StreamingHostHarness {
 		promptWaiters.push(resolve);
 		return promise;
 	};
-	return { ctx, prompts, enqueued, nextPrompt };
+	return { ctx, prompts, nextPrompt };
 }
 
 interface TestGuest {
@@ -157,6 +153,10 @@ async function joinAsGuest(link: string, name: string): Promise<TestGuest> {
 	const queue: CollabFrame[] = [];
 	const waiters: ((frame: CollabFrame) => void)[] = [];
 	socket.onFrame = frame => {
+		// The host follows every welcome with a `snapshot-chunk` train carrying
+		// the transcript. This harness ships zero entries, so the chunks are
+		// pure noise around the welcome/prompt-reply assertions.
+		if (frame.t === "snapshot-chunk") return;
 		const waiter = waiters.shift();
 		if (waiter) waiter(frame);
 		else queue.push(frame);
@@ -175,8 +175,13 @@ async function joinAsGuest(link: string, name: string): Promise<TestGuest> {
 
 const cleanups: (() => void | Promise<void>)[] = [];
 
+beforeEach(() => {
+	installTestCollabHome();
+});
+
 afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	uninstallTestCollabHome();
 });
 
 describe("collab mid-turn guest prompts", () => {
@@ -197,10 +202,8 @@ describe("collab mid-turn guest prompts", () => {
 		guest.socket.send({ t: "prompt", text: "steer the host" });
 		const prompt = await prompted;
 
-		// Display twin registered before dispatch, tag forwarded in details so
-		// the session dequeues the entry when the agent consumes the message.
-		expect(harness.enqueued).toEqual([{ text: "steer the host", mode: "steer", tag: "tag-1" }]);
-		expect(prompt.details).toEqual({ from: "writer", __pendingDisplayTag: "tag-1" });
+		expect(prompt.details).toEqual({ from: "writer" });
+		expect(prompt.options).toEqual({ streamingBehavior: "steer", queueChipText: "steer the host" });
 
 		// The queued steer must reach guests through state.queuedMessageCount —
 		// that field drives the web composer's "queued ×N" badge.

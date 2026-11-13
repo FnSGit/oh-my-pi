@@ -1,12 +1,17 @@
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Usage } from "@oh-my-pi/pi-ai";
-import { $env } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
-import type { AgentSessionEvent } from "../session/agent-session";
-import type { NestedRepoPatch } from "./worktree";
+import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
+export {
+	TASK_SUBAGENT_PROGRESS_CHANNEL,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+export type {
+	SubagentProgressPayload,
+	SubagentLifecyclePayload,
+} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { type BaseType, type FluentType, type } from "@oh-my-pi/omptype";
+import { $env, isRecord } from "@oh-my-pi/pi-utils";
 
-/** Source of an agent definition */
-export type AgentSource = "bundled" | "user" | "project";
+import type { AgentSessionEvent } from "../session/agent-session";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {
@@ -29,158 +34,292 @@ export const MAX_OUTPUT_LINES = parseNumber($env.PI_TASK_MAX_OUTPUT_LINES, 5000)
 /** EventBus channel for raw subagent events */
 export const TASK_SUBAGENT_EVENT_CHANNEL = "task:subagent:event";
 
-/** EventBus channel for aggregated subagent progress */
-export const TASK_SUBAGENT_PROGRESS_CHANNEL = "task:subagent:progress";
-
-/** EventBus channel for subagent lifecycle (start/end) */
-export const TASK_SUBAGENT_LIFECYCLE_CHANNEL = "task:subagent:lifecycle";
-
-/** Payload emitted on TASK_SUBAGENT_PROGRESS_CHANNEL */
-export interface SubagentProgressPayload {
-	index: number;
-	agent: string;
-	agentSource: AgentSource;
-	task: string;
-	parentToolCallId?: string;
-	assignment?: string;
-	progress: AgentProgress;
-	sessionFile?: string;
-	/** See {@link SubagentLifecyclePayload.detached}. */
-	detached?: boolean;
-}
-
 /** Payload emitted on TASK_SUBAGENT_EVENT_CHANNEL */
 export interface SubagentEventPayload {
 	id: string;
 	event: AgentSessionEvent;
 }
 
-/** Payload emitted on TASK_SUBAGENT_LIFECYCLE_CHANNEL */
-export interface SubagentLifecyclePayload {
-	id: string;
-	agent: string;
-	agentSource: AgentSource;
-	description?: string;
-	status: "started" | "completed" | "failed" | "aborted";
-	sessionFile?: string;
-	parentToolCallId?: string;
-	index: number;
-	/**
-	 * Spawn runs as a detached background job: the parent turn keeps working
-	 * while this agent runs. Sync task spawns (parent blocked on the call) and
-	 * eval `agent()` bridge spawns (rendered inside their eval cell) leave this
-	 * unset — surfaces like the subagent HUD only list detached spawns.
-	 */
-	detached?: boolean;
-}
+// Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
+const outputSchemaInputSchema = type("object | boolean | string | null");
+// Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
+const effortRule = '"lo" | "med" | "hi"' as const;
+
+// Per-spawn fields the schema declares only conditionally: `sourceSession`
+// while seance is advertised, `model` while seance is advertised or per-call
+// model is enabled for task calls. Typed against SeanceTaskSchemaFields so a
+// field added there fails to compile until it is listed here too; a missed key
+// would be dropped on batch items.
+const GATED_ITEM_KEY_SET = { sourceSession: true, model: true } as const satisfies Record<SeanceItemKey, true>;
+const GATED_ITEM_KEYS = Object.keys(GATED_ITEM_KEY_SET);
 
 /**
- * One unit of work. The single-spawn schema is `{ agent, ...taskItemSchema }`;
- * the batch schema (`task.batch`) is `{ agent, context, tasks: taskItemSchema[] }`.
- * When task isolation is enabled, `isolated` joins the item shape (per-item in
- * batch form, top-level in the flat form via the spread).
+ * Keep a batch item's gated keys through undeclared-key deletion: argument
+ * validation re-attaches only root keys, so without this an undeclared
+ * `tasks[].model` or `tasks[].sourceSession` is deleted before execute()
+ * instead of reaching the preflight refusal, leaving the child on its own
+ * model while the caller believes it pinned another. Other stale item keys are
+ * still deleted, and the wire schema is unchanged.
  */
-const taskItemShape = {
-	id: z.string().max(48).optional().describe("stable agent id; default generated"),
-	description: z.string().optional().describe("ui label, not seen by subagent"),
-	assignment: z.string().describe("the work; self-contained instructions"),
-};
-const isolatedShape = {
-	isolated: z.boolean().optional().describe("run in isolated env; returns patches"),
-};
-const agentShape = {
-	agent: z.string().describe("agent type to spawn"),
-};
-const contextShape = {
-	context: z.string().describe("shared background prepended to each assignment"),
-};
-
-export const taskItemSchema = z.object(taskItemShape);
-const taskItemSchemaIsolated = z.object({ ...taskItemShape, ...isolatedShape });
-
-/** Single task item. Fields are optional defensively: args stream in token by token. */
-export interface TaskItem {
-	/** Stable agent id; default = generated AdjectiveNoun. */
-	id?: string;
-	/** UI label, not seen by the subagent. */
-	description?: string;
-	/** The work; required by the schema. */
-	assignment?: string;
-	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
-	isolated?: boolean;
+function keepGatedItemKeys<T, I>(item: FluentType<T, I>): FluentType<unknown, I> {
+	return item.onUndeclaredKey("ignore").pipe((input: unknown): unknown => {
+		const out: unknown = item(input);
+		if (out instanceof type.errors || !isRecord(out) || !isRecord(input)) return out;
+		for (const key of GATED_ITEM_KEYS) {
+			if (Object.hasOwn(input, key) && !Object.hasOwn(out, key)) out[key] = input[key];
+		}
+		return out;
+	});
 }
 
-export const taskSchema = z.object({ ...agentShape, ...taskItemShape, ...isolatedShape });
-const taskSchemaNoIsolation = z.object({ ...agentShape, ...taskItemShape });
-const taskSchemaBatch = z.object({
-	...agentShape,
-	...contextShape,
-	tasks: z.array(taskItemSchemaIsolated).describe("tasks to spawn; one subagent per item"),
+export const taskItemSchema = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	solutionSpace: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"+": "delete",
 });
-const taskSchemaBatchNoIsolation = z.object({
-	...agentShape,
-	...contextShape,
-	tasks: z.array(taskItemSchema).describe("tasks to spawn; one subagent per item"),
+const taskItemSchemaIsolated = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	solutionSpace: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"isolated?": "boolean",
+	"+": "delete",
 });
+
+export const taskSchema = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	solutionSpace: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"isolated?": "boolean",
+	"+": "delete",
+});
+const taskSchemaNoIsolation = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	solutionSpace: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"+": "delete",
+});
+function guardBatchAgent(schema: BaseType): BaseType {
+	// Inspect the input before undeclared-key deletion can erase the requested agent.
+	return schema.in
+		.narrow((params, ctx) => {
+			if (params !== null && typeof params === "object" && Object.hasOwn(params, "agent")) {
+				return ctx.reject("a batch with `agent` specified in `tasks[].agent`, not at the top level");
+			}
+			return true;
+		})
+		.pipe(schema);
+}
+
+const taskSchemaBatch = guardBatchAgent(
+	type.raw({
+		context: "string",
+		tasks: keepGatedItemKeys(taskItemSchemaIsolated).array(),
+		"+": "delete",
+	}),
+);
+const taskSchemaBatchNoIsolation = guardBatchAgent(
+	type.raw({
+		context: "string",
+		tasks: keepGatedItemKeys(taskItemSchema).array(),
+		"+": "delete",
+	}),
+);
 const ALL_TASK_SCHEMAS = [taskSchema, taskSchemaNoIsolation, taskSchemaBatch, taskSchemaBatchNoIsolation] as const;
 
 type DynamicTaskSchema = (typeof ALL_TASK_SCHEMAS)[number];
 export type TaskSchema = typeof taskSchema;
 /** Active task tool parameter schema for the current isolation / batch flags */
-export type TaskToolSchemaInstance = DynamicTaskSchema;
+export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
 
-export function getTaskSchema(options: { isolationEnabled: boolean; batchEnabled: boolean }): DynamicTaskSchema {
-	if (options.batchEnabled) {
-		return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
+const TASK_AGENT_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+const taskSchemaCache = new Map<string, BaseType>();
+
+function taskAgentSchemaRule(defaultAgent: string): string {
+	const trimmed = defaultAgent.trim();
+	if (TASK_AGENT_NAME_PATTERN.test(trimmed)) {
+		return `string = '${trimmed}'`;
 	}
-	return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
+	return "string";
+}
+
+/** Task fields the seance schema adds or widens; `seanceTaskSchemaFields` in ./seance must match it exactly. */
+export type SeanceTaskSchemaFields = {
+	"sourceSession?"?: FluentType<string>;
+	"model?"?: FluentType<string | string[]>;
+};
+
+type SeanceItemKey = {
+	[K in keyof SeanceTaskSchemaFields]-?: K extends `${infer Name}?` ? Name : never;
+}[keyof SeanceTaskSchemaFields];
+
+function createTaskSchema(options: {
+	isolationEnabled: boolean;
+	batchEnabled: boolean;
+	defaultAgent: string;
+	effortEnabled: boolean;
+	evalToolsEnabled: boolean;
+	structured: boolean;
+	steps: boolean;
+	perCallModel: boolean;
+	seanceFields: SeanceTaskSchemaFields;
+}): BaseType {
+	const agent = taskAgentSchemaRule(options.defaultAgent);
+	const taskFields = options.steps ? { steps: "string[]" } : { task: "string" };
+	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
+	const schemaFields = options.structured
+		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
+		: {};
+	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
+	// `model` is declared only when the caller may send it: a per-call selector
+	// while `task.perCallModel` allows task calls, or seance's selector list. An
+	// undeclared `model` still reaches preflight (root keys survive lenient
+	// validation; batch items keep it via keepGatedItemKeys) and is refused there.
+	const gatedFields = { ...(options.perCallModel ? { "model?": "string" } : {}), ...options.seanceFields };
+	if (options.batchEnabled) {
+		if (options.isolationEnabled) {
+			const item = type.raw({
+				"name?": "string",
+				agent,
+				...taskFields,
+				solutionSpace: "string",
+				...effortField,
+				...schemaFields,
+				...toolsField,
+				...gatedFields,
+				"isolated?": "boolean",
+				"+": "delete",
+			});
+			return guardBatchAgent(
+				type.raw({
+					context: "string",
+					tasks: keepGatedItemKeys(item).array(),
+					"+": "delete",
+				}),
+			);
+		}
+		const item = type.raw({
+			"name?": "string",
+			agent,
+			...taskFields,
+			solutionSpace: "string",
+			...effortField,
+			...schemaFields,
+			...toolsField,
+			...gatedFields,
+			"+": "delete",
+		});
+		return guardBatchAgent(
+			type.raw({
+				context: "string",
+				tasks: keepGatedItemKeys(item).array(),
+				"+": "delete",
+			}),
+		);
+	}
+	if (options.isolationEnabled) {
+		return type.raw({
+			"name?": "string",
+			agent,
+			...taskFields,
+			solutionSpace: "string",
+			...effortField,
+			...schemaFields,
+			...toolsField,
+			...gatedFields,
+			"isolated?": "boolean",
+			"+": "delete",
+		});
+	}
+	return type.raw({
+		"name?": "string",
+		agent,
+		...taskFields,
+		solutionSpace: "string",
+		...effortField,
+		...schemaFields,
+		...toolsField,
+		...gatedFields,
+		"+": "delete",
+	});
+}
+
+/** Build the task wire schema for the current settings and spawn policy. */
+export function getTaskSchema(options: {
+	isolationEnabled: boolean;
+	batchEnabled: boolean;
+	effortEnabled?: boolean;
+	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
+	evalToolsEnabled?: boolean;
+	/** Advertise `outputSchema`/`schemaMode` (`task.structured`); default on. */
+	structured?: boolean;
+	/** Advertise `steps` instead of `task` (`task.steps`); default off. */
+	steps?: boolean;
+	defaultAgent?: string;
+	/** Advertise the per-call `model` field (`task.perCallModel` allows task calls); default off. */
+	perCallModel?: boolean;
+	/** Advertise historical source/model fields for the bundled seance agent. */
+	seanceFields?: SeanceTaskSchemaFields;
+}): TaskToolSchemaInstance {
+	const defaultAgent = options.defaultAgent ?? "task";
+	const effortEnabled = options.effortEnabled ?? false;
+	const evalToolsEnabled = options.evalToolsEnabled ?? true;
+	const structured = options.structured ?? true;
+	const steps = options.steps ?? false;
+	const perCallModel = options.perCallModel ?? false;
+	const seanceFields = options.seanceFields ?? {};
+	if (
+		defaultAgent === "task" &&
+		!effortEnabled &&
+		evalToolsEnabled &&
+		structured &&
+		!steps &&
+		!perCallModel &&
+		!options.seanceFields
+	) {
+		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
+		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
+	}
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${steps ? "steps" : "task"}:${perCallModel ? "model" : "nomodel"}:${options.seanceFields ? "seance" : "plain"}:${defaultAgent}`;
+	const cached = taskSchemaCache.get(key);
+	if (cached) return cached;
+	const schema = createTaskSchema({
+		...options,
+		steps,
+		effortEnabled,
+		evalToolsEnabled,
+		structured,
+		defaultAgent,
+		perCallModel,
+		seanceFields,
+	});
+	taskSchemaCache.set(key, schema);
+	return schema;
 }
 
 /**
- * Runtime params union over both wire shapes. The model sees exactly one shape
- * (`{ agent, context, tasks[] }` when `task.batch` is on, `{ agent, ...item }`
- * otherwise); runtime stays permissive so internal callers and stale
- * transcripts using the flat form keep working under either setting.
+ * Whether an agent at `taskDepth` may still spawn children — i.e. it currently
+ * holds the `task` tool. Mirrors the task-tool availability gate;
+ * `maxRecursionDepth < 0` disables the cap entirely.
  */
-export interface TaskParams {
-	/** Agent type; required. */
-	agent?: string;
-	/** Stable agent id (flat form); default = generated AdjectiveNoun. */
-	id?: string;
-	/** UI label (flat form), not seen by the subagent. */
-	description?: string;
-	/** The work (flat form). */
-	assignment?: string;
-	/** Batch form (`task.batch`): one subagent per item. */
-	tasks?: TaskItem[];
-	/** Batch form: shared background prepended to every assignment; required by the batch schema. */
-	context?: string;
-	/** Run in an isolated worktree (flat form; per-item in batch form). */
-	isolated?: boolean;
-}
-
-/** A code review finding reported by the reviewer agent */
-export interface ReviewFinding {
-	title: string;
-	body: string;
-	priority: number;
-	confidence: number;
-	file_path: string;
-	line_start: number;
-	line_end: number;
-}
-
-/** Review summary submitted by the reviewer agent */
-export interface ReviewSummary {
-	overall_correctness: "correct" | "incorrect";
-	explanation: string;
-	confidence: number;
-}
-
-/** Structured review data extracted from reviewer agent */
-export interface ReviewData {
-	findings: ReviewFinding[];
-	summary?: ReviewSummary;
+export function canSpawnAtDepth(maxRecursionDepth: number, taskDepth: number): boolean {
+	return maxRecursionDepth < 0 || taskDepth < maxRecursionDepth;
 }
 
 /** Agent definition (bundled or discovered) */
@@ -191,155 +330,18 @@ export interface AgentDefinition {
 	tools?: string[];
 	spawns?: string[] | "*";
 	model?: string[];
-	thinkingLevel?: ThinkingLevel;
+	thinkingLevel?: ConfiguredThinkingLevel;
 	output?: unknown;
 	blocking?: boolean;
+	/** `true` = task spawns keep the `yield` tool and this agent's `output` schema even when `task.structured` is off. */
+	structured?: boolean;
 	autoloadSkills?: string[];
 	/** When `false`, the agent's `read` tool returns verbatim file content instead of structural summaries. */
 	readSummarize?: boolean;
+	/** Prewalk hand-off for the spawned session: `true` = switch to the default prewalk target at the first edit/write, string = custom target model pattern. */
+	prewalk?: boolean | string;
+	/** Advisor for spawned sessions of this agent: `true` = advise with the default advisor-role model, string = advise with that model pattern (optional `:level` suffix). Absent/`false` = no advisor. */
+	advisor?: boolean | string;
 	source: AgentSource;
 	filePath?: string;
-}
-
-/** Progress tracking for a single agent */
-export interface AgentProgress {
-	index: number;
-	id: string;
-	agent: string;
-	agentSource: AgentSource;
-	status: "pending" | "running" | "completed" | "failed" | "aborted";
-	task: string;
-	assignment?: string;
-	description?: string;
-	lastIntent?: string;
-	currentTool?: string;
-	currentToolArgs?: string;
-	currentToolStartMs?: number;
-	recentTools: Array<{ tool: string; args: string; endMs: number }>;
-	recentOutput: string[];
-	toolCount: number;
-	/** Count of assistant requests (assistant message_end events) across the run. Drives the soft request budget guard. */
-	requests: number;
-	/** Cumulative input + output + cacheWrite tokens across all turns. Excludes cacheRead (re-reads cached context every turn, making cumulative sum misleading). */
-	tokens: number;
-	/**
-	 * Current per-turn context size: latest assistant message's `usage.totalTokens`.
-	 * This is the number to compare against `contextWindow` — what compaction
-	 * decides on, what the user typically reads as "how full is the context".
-	 * Distinct from `tokens`, which is a lifetime billing-volume counter.
-	 */
-	contextTokens?: number;
-	/** Model's context window in tokens, when known. Lets the UI render `<curr>/<window>` gauges. */
-	contextWindow?: number;
-	/** Cumulative billing cost in USD, accumulated incrementally from message_end events. */
-	cost: number;
-	durationMs: number;
-	modelOverride?: string | string[];
-	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Undefined when the model could not be resolved. */
-	resolvedModel?: string;
-	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
-	extractedToolData?: Record<string, unknown[]>;
-	/**
-	 * Auto-retry state when the subagent is sleeping between provider retries
-	 * (e.g. 429 rate-limit with retry-after). Cleared when the retry resolves
-	 * or fails. Surfacing this to the parent prevents the task tool from
-	 * looking indefinitely "in progress" when a child is actually blocked on
-	 * provider quota.
-	 */
-	retryState?: {
-		attempt: number;
-		maxAttempts: number;
-		delayMs: number;
-		errorMessage: string;
-		startedAtMs: number;
-	};
-	/**
-	 * Terminal retry failure surfaced once the subagent gave up retrying
-	 * (e.g. retry-after exceeded the cap, or all attempts exhausted). Carries
-	 * the final error so the parent UI can render "blocked: rate-limited"
-	 * instead of waiting for a status that never arrives.
-	 */
-	retryFailure?: {
-		attempt: number;
-		errorMessage: string;
-	};
-	/**
-	 * Snapshot of the most recent `task` tool call's in-flight `TaskToolDetails`,
-	 * captured from `tool_execution_update`. Lets the parent UI surface live
-	 * nested-subagent progress while this agent is still inside its own `task`
-	 * call. Cleared when the call ends — finalized data lives in
-	 * `extractedToolData.task` after that.
-	 */
-	inflightTaskDetails?: TaskToolDetails;
-}
-
-/** Result from a single agent execution */
-export interface SingleResult {
-	index: number;
-	id: string;
-	agent: string;
-	agentSource: AgentSource;
-	task: string;
-	assignment?: string;
-	description?: string;
-	lastIntent?: string;
-	exitCode: number;
-	output: string;
-	stderr: string;
-	truncated: boolean;
-	durationMs: number;
-	/** Cumulative input + output + cacheWrite tokens across all turns. Excludes cacheRead (re-reads cached context every turn, making cumulative sum misleading). */
-	tokens: number;
-	/** Count of assistant requests (assistant message_end events) across the run. */
-	requests: number;
-	/** Latest per-turn context size at task completion. See `AgentProgress.contextTokens`. */
-	contextTokens?: number;
-	/** Model's context window in tokens, when known. */
-	contextWindow?: number;
-	modelOverride?: string | string[];
-	/** Resolved model display string in the form `<provider>/<id>`, optionally suffixed with `:<thinkingLevel>` when the level was set explicitly. Omitted from tool-result JSON when undefined to keep wire payloads small. */
-	resolvedModel?: string;
-	error?: string;
-	aborted?: boolean;
-	abortReason?: string;
-	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
-	usage?: Usage;
-	/** Output path for the task result */
-	outputPath?: string;
-	/** Patch path for isolated worktree output */
-	patchPath?: string;
-	/** Branch name for isolated branch-mode output */
-	branchName?: string;
-	/** Nested repo patches to apply after parent merge */
-	nestedPatches?: NestedRepoPatch[];
-	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
-	extractedToolData?: Record<string, unknown[]>;
-	/**
-	 * Terminal retry failure, when the subagent exited because the auto-retry
-	 * loop gave up (retry-after exceeded the cap, or all attempts exhausted).
-	 * Lets the parent task tool surface a "blocked: rate-limited" outcome
-	 * instead of a generic failure.
-	 */
-	retryFailure?: {
-		attempt: number;
-		errorMessage: string;
-	};
-	/** Output metadata for agent:// URL integration */
-	outputMeta?: { lineCount: number; charCount: number };
-}
-
-/** Tool details for TUI rendering */
-export interface TaskToolDetails {
-	projectAgentsDir: string | null;
-	results: SingleResult[];
-	totalDurationMs: number;
-	/** Aggregated usage across all subagents. */
-	usage?: Usage;
-	outputPaths?: string[];
-	progress?: AgentProgress[];
-	async?: {
-		state: "running" | "completed" | "failed";
-		jobId: string;
-		type: "task";
-	};
 }

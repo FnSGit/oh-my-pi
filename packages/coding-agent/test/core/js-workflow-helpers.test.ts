@@ -89,8 +89,13 @@ describe("executeJs workflow helpers", () => {
 				output: 777,
 				cacheRead: 0,
 				cacheWrite: 0,
+				totalTokens: 787,
+				orchestrationInput: 0,
+				orchestrationOutput: 0,
+				orchestrationCacheRead: 0,
 				premiumRequests: 0,
 				cost: 0,
+				subagentCost: 0,
 			}),
 		});
 		const result = await executeJs(

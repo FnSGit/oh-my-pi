@@ -9,12 +9,14 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import {
 	RedisSessionStorage,
 	type RedisSessionStorageClient,
 } from "@oh-my-pi/pi-coding-agent/session/redis-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 
 interface FakeRedis extends RedisSessionStorageClient {
 	strings: Map<string, string>;
@@ -37,6 +39,41 @@ function createFakeRedis(): FakeRedis {
 	return {
 		strings,
 		hashes,
+		async send(command, args) {
+			if (command !== "EVAL") throw new Error(`Unsupported Redis command: ${command}`);
+			const script = args[0] ?? "";
+			const keyCount = Number(args[1] ?? "0");
+			const keys = args.slice(2, 2 + keyCount);
+			const argv = args.slice(2 + keyCount);
+			if (script.includes("OMP_WRITE_FULL")) {
+				const [fileKey, metaKey, titleKey] = keys;
+				const [content, filePath, mtimeMs, hasTitle, title, expectedSize] = argv;
+				const current = strings.get(fileKey);
+				const actualSize = current === undefined ? -1 : Buffer.byteLength(current, "utf8");
+				if (expectedSize !== "" && actualSize !== Number(expectedSize)) return [0, actualSize];
+				strings.set(fileKey, content);
+				getHash(metaKey).set(filePath, mtimeMs);
+				if (hasTitle === "1") getHash(titleKey).set(filePath, title);
+				else getHash(titleKey).delete(filePath);
+				return [1, Buffer.byteLength(content, "utf8")];
+			}
+			if (script.includes("OMP_APPEND")) {
+				const [fileKey, metaKey] = keys;
+				const [line, filePath, mtimeMs] = argv;
+				const next = (strings.get(fileKey) ?? "") + line;
+				strings.set(fileKey, next);
+				getHash(metaKey).set(filePath, mtimeMs);
+				return Buffer.byteLength(next, "utf-8");
+			}
+			if (script.includes("OMP_UPDATE_TITLE")) {
+				const [metaKey, titleKey] = keys;
+				const [filePath, mtimeMs, title] = argv;
+				getHash(metaKey).set(filePath, mtimeMs);
+				getHash(titleKey).set(filePath, title);
+				return 1;
+			}
+			throw new Error("Unsupported Redis script");
+		},
 		async get(key) {
 			return strings.has(key) ? (strings.get(key) as string) : null;
 		},
@@ -119,11 +156,15 @@ function fakeUsage(input: number, output: number): Usage {
 	};
 }
 
+// `path.resolve` makes the virtual dirs absolute on every platform: on Windows
+// `/sessions/x` is drive-relative, and `SessionManager` resolves it when reopening.
+const sessionRoot = path.resolve("/sessions");
+
 describe("SessionManager + RedisSessionStorage", () => {
 	it("persists appended assistant messages into Redis and reloads them via open()", async () => {
 		const redis = createFakeRedis();
 		const storage = await RedisSessionStorage.create({ client: redis });
-		const sessionDir = "/sessions/proj";
+		const sessionDir = path.join(sessionRoot, "proj");
 
 		const manager = SessionManager.create("/cwd", sessionDir, storage);
 		manager.appendMessage({
@@ -149,12 +190,14 @@ describe("SessionManager + RedisSessionStorage", () => {
 		await storage.drain();
 		await manager.close();
 
-		// Redis now contains the JSONL — header + one message entry.
+		// Redis now contains the JSONL — title slot + header + one message entry.
 		const stored = redis.strings.get(`omp:sessions:file:${sessionFilePath}`);
 		expect(stored).toBeDefined();
 		const lines = (stored as string).trim().split("\n");
-		expect(lines.length).toBeGreaterThanOrEqual(2);
-		const header = JSON.parse(lines[0]);
+		expect(lines.length).toBeGreaterThanOrEqual(3);
+		const slot = JSON.parse(lines[0]);
+		expect(slot.type).toBe("title");
+		const header = JSON.parse(lines[1]);
 		expect(header.type).toBe("session");
 		const msg = JSON.parse(lines[lines.length - 1]);
 		expect(msg.type).toBe("message");
@@ -172,7 +215,7 @@ describe("SessionManager + RedisSessionStorage", () => {
 	it("SessionManager.list returns Redis-backed sessions for the cwd", async () => {
 		const redis = createFakeRedis();
 		const storage = await RedisSessionStorage.create({ client: redis });
-		const sessionDir = "/sessions/list-proj";
+		const sessionDir = path.join(sessionRoot, "list-proj");
 
 		const a = SessionManager.create("/cwd", sessionDir, storage);
 		a.appendMessage({
@@ -213,5 +256,82 @@ describe("SessionManager + RedisSessionStorage", () => {
 		const sessionFiles = sessions.map(s => s.path).sort();
 		expect(sessionFiles).toContain(aFile as string);
 		expect(sessionFiles).toContain(bFile as string);
+	});
+
+	it("rejects a stale rewrite after another Redis storage appends", async () => {
+		const redis = createFakeRedis();
+		const firstStorage = await RedisSessionStorage.create({ client: redis });
+		const sharedDir = path.join(sessionRoot, "shared");
+		const first = SessionManager.create("/cwd", sharedDir, firstStorage);
+		await first.ensureOnDisk();
+		const sessionFile = first.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		const secondStorage = await RedisSessionStorage.create({ client: redis });
+		const second = await SessionManager.open(sessionFile, sharedDir, secondStorage);
+		second.appendMessage({ role: "user", content: "durable Redis peer turn", timestamp: Date.now() });
+		await second.close();
+
+		await expect(first.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
+		expect(redis.strings.get(`omp:sessions:file:${sessionFile}`)).toContain("durable Redis peer turn");
+	});
+
+	it("does not count a session as resumable while its Redis removal is in flight", async () => {
+		// remove() deletes the file key before the metadata HDEL; an exit-time resume hint read
+		// while the HDEL is stalled would advertise a session whose content is already gone.
+		const redis = createFakeRedis();
+		const hdelStarted = Promise.withResolvers<void>();
+		const allowHdel = Promise.withResolvers<void>();
+		const hdel = redis.hdel.bind(redis);
+		redis.hdel = async (key, ...fields) => {
+			hdelStarted.resolve();
+			await allowHdel.promise;
+			return hdel(key, ...fields);
+		};
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const manager = SessionManager.create("/cwd", path.join(sessionRoot, "removing"), storage);
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		expect(manager.isSessionConfirmedOnDisk()).toBe(true);
+
+		const removal = manager.dropSession(sessionFile);
+		await hdelStarted.promise;
+		expect(redis.strings.has(`omp:sessions:file:${sessionFile}`)).toBe(false);
+		expect(manager.isSessionConfirmedOnDisk()).toBe(false);
+
+		allowHdel.resolve();
+		await removal;
+		expect(manager.isSessionConfirmedOnDisk()).toBe(false);
+	});
+
+	it("keeps a session unconfirmed after a Redis removal fails past its file delete", async () => {
+		// remove() deletes the file key, then the metadata HDEL rejects: the rollback restores the
+		// index entry, but the content is gone, so an exit-time resume hint must not offer it.
+		const redis = createFakeRedis();
+		const storage = await RedisSessionStorage.create({ client: redis });
+		const manager = SessionManager.create("/cwd", path.join(sessionRoot, "failed-removal"), storage);
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		redis.hdel = async () => {
+			throw new Error("connection lost");
+		};
+
+		await expect(manager.dropSession(sessionFile)).rejects.toThrow("connection lost");
+		expect(redis.strings.has(`omp:sessions:file:${sessionFile}`)).toBe(false);
+		expect(storage.existsSync(sessionFile)).toBe(true);
+		expect(manager.isSessionConfirmedOnDisk()).toBe(false);
+
+		// An append extends whatever the backend holds, which no longer includes the header.
+		const writer = storage.openWriter(sessionFile);
+		await writer.append("{}\n");
+		await writer.close();
+		expect(manager.isSessionConfirmedOnDisk()).toBe(false);
+
+		// A later full write replaces the content, so the backend confirms the path again.
+		storage.writeTextSync(sessionFile, "rewritten\n");
+		await storage.drain();
+		expect(manager.isSessionConfirmedOnDisk()).toBe(true);
 	});
 });

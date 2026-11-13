@@ -1,10 +1,18 @@
 import { Database } from "bun:sqlite";
+import * as os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { cfgDevAutoqa } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import * as reportIssue from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import {
+	__awaitAutoQaRecordPipelineForTests,
+	__resetAutoQaConsentForTests,
 	__resetAutoQaFlushStateForTests,
+	dispatchReportIssueDevice,
 	flushGrievances,
 	isAutoQaEnabled,
+	reportIssueDeviceUsage,
 } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { mockFetch } from "../helpers/fetch-mock";
@@ -18,10 +26,20 @@ function openTempDb(): Database {
 			version TEXT NOT NULL,
 			tool TEXT NOT NULL,
 			report TEXT NOT NULL,
-			pushed INTEGER NOT NULL DEFAULT 0
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			pushed INTEGER NOT NULL DEFAULT 0,
+			push_error TEXT
 		);
 	`);
 	return db;
+}
+
+/** Rows the collector permanently refused — parked, never retried. */
+function selectRejected(db: Database): Array<{ id: number; push_error: string }> {
+	return db.prepare("SELECT id, push_error FROM grievances WHERE pushed = -1 ORDER BY id ASC").all() as Array<{
+		id: number;
+		push_error: string;
+	}>;
 }
 
 function insertGrievance(db: Database, tool: string, report: string): number {
@@ -55,7 +73,7 @@ function pushSettings(overrides: Record<string, unknown> = {}): Settings {
 		"dev.autoqa": true,
 		// Consent is the push opt-in; `granted` is what `resolvePushConfig`
 		// gates on (or `PI_AUTO_QA_PUSH=1` for headless overrides).
-		"dev.autoqa.consent": "granted",
+		"dev.autoqaConsent": "granted",
 		"dev.autoqaPush.endpoint": "https://qa.example.com/grievances",
 		...overrides,
 	});
@@ -71,6 +89,12 @@ function restoreAutoQaEnv(): void {
 	Bun.env.PI_AUTO_QA = originalPiAutoQa;
 }
 
+/** Pin the home directory and login name the redaction reads. */
+function stubIdentity(home: string, username: string): void {
+	vi.spyOn(os, "homedir").mockReturnValue(home);
+	vi.spyOn(os, "userInfo").mockReturnValue({ username, uid: 501, gid: 20, shell: "/bin/zsh", homedir: home });
+}
+
 describe("flushGrievances", () => {
 	let db: Database;
 
@@ -78,7 +102,6 @@ describe("flushGrievances", () => {
 		__resetAutoQaFlushStateForTests();
 		originalPiAutoQa = Bun.env.PI_AUTO_QA;
 		delete Bun.env.PI_AUTO_QA;
-		vi.spyOn(piUtils, "getInstallId").mockReturnValue("11111111-2222-3333-4444-555555555555");
 		db = openTempDb();
 	});
 
@@ -92,21 +115,41 @@ describe("flushGrievances", () => {
 	it("lets PI_AUTO_QA=false disable auto QA when the setting is enabled", () => {
 		Bun.env.PI_AUTO_QA = "0";
 
-		expect(isAutoQaEnabled(Settings.isolated({ "dev.autoqa": true }))).toBe(false);
+		const settings = Settings.isolated();
+		cfgDevAutoqa.set(settings, true);
+		expect(isAutoQaEnabled(settings)).toBe(false);
 	});
 
 	it("lets PI_AUTO_QA=true enable auto QA when the setting is disabled", () => {
 		Bun.env.PI_AUTO_QA = "1";
 
-		expect(isAutoQaEnabled(Settings.isolated({ "dev.autoqa": false }))).toBe(true);
+		const settings = Settings.isolated();
+		cfgDevAutoqa.set(settings, false);
+		expect(isAutoQaEnabled(settings)).toBe(true);
+	});
+
+	it("enables auto QA by default with consent still unset", () => {
+		expect(isAutoQaEnabled(Settings.isolated())).toBe(true);
+	});
+
+	it("vetoes default-on auto QA once the user denied consent", () => {
+		expect(isAutoQaEnabled(Settings.isolated({ "dev.autoqaConsent": "denied" }))).toBe(false);
+	});
+
+	it("keeps explicitly enabled auto QA on despite denied consent", () => {
+		expect(isAutoQaEnabled(Settings.isolated({ "dev.autoqa": true, "dev.autoqaConsent": "denied" }))).toBe(true);
+	});
+
+	it("stays off when explicitly disabled", () => {
+		expect(isAutoQaEnabled(Settings.isolated({ "dev.autoqa": false }))).toBe(false);
 	});
 
 	it("skips network when consent is missing and leaves rows intact", async () => {
-		insertGrievance(db, "find", "weird ordering");
+		insertGrievance(db, "glob", "weird ordering");
 		const fetchSpy = vi.fn(async () => new Response("unexpected", { status: 200 }));
 
 		// `denied` is the user-facing kill switch for push.
-		const result = await flushGrievances(db, pushSettings({ "dev.autoqa.consent": "denied" }), {
+		const result = await flushGrievances(db, pushSettings({ "dev.autoqaConsent": "denied" }), {
 			fetch: mockFetch(fetchSpy),
 		});
 
@@ -116,7 +159,7 @@ describe("flushGrievances", () => {
 	});
 
 	it("skips network when endpoint is missing", async () => {
-		insertGrievance(db, "find", "weird ordering");
+		insertGrievance(db, "glob", "weird ordering");
 		const fetchSpy = vi.fn(async () => new Response("unexpected", { status: 200 }));
 
 		const result = await flushGrievances(db, pushSettings({ "dev.autoqaPush.endpoint": "" }), {
@@ -138,7 +181,8 @@ describe("flushGrievances", () => {
 	});
 
 	it("posts pending rows with bearer header and marks them pushed=1 on 200", async () => {
-		insertGrievance(db, "find", "weird ordering");
+		vi.spyOn(piUtils, "getInstallId").mockReturnValue("11111111-2222-3333-4444-555555555555");
+		insertGrievance(db, "glob", "weird ordering");
 		insertGrievance(db, "read", "selector ignored");
 
 		let capturedInput: string | URL | Request | undefined;
@@ -170,7 +214,7 @@ describe("flushGrievances", () => {
 		expect(typeof body.arch).toBe("string");
 		expect(body.installId).toBe("11111111-2222-3333-4444-555555555555");
 		expect(body.entries).toEqual([
-			{ id: 1, model: "test-model", version: "test-version", tool: "find", report: "weird ordering" },
+			{ id: 1, model: "test-model", version: "test-version", tool: "glob", report: "weird ordering" },
 			{ id: 2, model: "test-model", version: "test-version", tool: "read", report: "selector ignored" },
 		]);
 
@@ -182,7 +226,7 @@ describe("flushGrievances", () => {
 	});
 
 	it("omits the Authorization header when no token is configured", async () => {
-		insertGrievance(db, "find", "no token here");
+		insertGrievance(db, "glob", "no token here");
 		let capturedInit: RequestInit | undefined;
 		const fetchSpy = vi.fn(async (_input: string | URL | Request, init: RequestInit | undefined) => {
 			capturedInit = init;
@@ -198,20 +242,99 @@ describe("flushGrievances", () => {
 		expect(selectPushedIds(db)).toEqual([1]);
 	});
 
-	it("leaves rows unpushed on 5xx and reports failure", async () => {
-		insertGrievance(db, "find", "boom");
+	it("leaves rows unpushed on 5xx and surfaces the server error", async () => {
+		insertGrievance(db, "glob", "boom");
 		const fetchSpy = vi.fn(async () => new Response("nope", { status: 500 }));
 
 		const result = await flushGrievances(db, pushSettings(), { fetch: mockFetch(fetchSpy) });
 
-		expect(result).toEqual({ pushed: 0, ok: false });
+		expect(result).toEqual({ pushed: 0, ok: false, error: "HTTP 500: nope" });
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 		expect(selectUnpushedIds(db)).toEqual([1]);
 		expect(selectPushedIds(db)).toEqual([]);
 	});
 
+	it("keeps rows queued on 401 instead of parking them as rejected", async () => {
+		// An auth failure says nothing about the payload — parking rows here
+		// would silently discard grievances over a misconfigured token.
+		insertGrievance(db, "glob", "unauthorized");
+		const fetchSpy = vi.fn(async () => new Response("bad token", { status: 401 }));
+
+		const result = await flushGrievances(db, pushSettings(), { fetch: mockFetch(fetchSpy) });
+
+		expect(result).toEqual({ pushed: 0, ok: false, error: "HTTP 401: bad token" });
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(selectUnpushedIds(db)).toEqual([1]);
+		expect(selectRejected(db)).toEqual([]);
+	});
+
+	it("clamps an over-long tool name at send time and keeps the full line in the report", async () => {
+		// Recorded by an older build that stored a whole sentence as the tool
+		// name; the collector rejects the batch above 128 UTF-8 bytes.
+		const prose =
+			"eval içindeki tool.glob exact ve var olmayan yolu çağırınca beklenmedik şekilde RuntimeError fırlatıyor, sessizce boş dönmüyor";
+		insertGrievance(db, prose, "glob threw instead of returning empty");
+
+		interface SentEntry {
+			tool: string;
+			report: string;
+		}
+		let entries: SentEntry[] = [];
+		const fetchSpy = vi.fn(async (_input: string | URL | Request, init: RequestInit | undefined) => {
+			const payload: { entries: SentEntry[] } = JSON.parse(String(init?.body));
+			entries = payload.entries;
+			const oversized = entries.some(e => Buffer.byteLength(e.tool, "utf8") > 128);
+			return new Response(oversized ? "tool exceeds 128 bytes" : "", { status: oversized ? 400 : 200 });
+		});
+
+		const result = await flushGrievances(db, pushSettings(), { fetch: mockFetch(fetchSpy) });
+
+		expect(result).toEqual({ pushed: 1, ok: true });
+		expect(Buffer.byteLength(entries[0]?.tool ?? "", "utf8")).toBeLessThanOrEqual(128);
+		expect(prose.startsWith(entries[0]?.tool ?? "")).toBe(true);
+		// Truncation happens on a code-point boundary, never mid-character.
+		expect(entries[0]?.tool ?? "").not.toContain("\ufffd");
+		// The clamped prefix isn't the report — the full original line is.
+		expect(entries[0]?.report).toBe(`${prose}\nglob threw instead of returning empty`);
+		expect(selectPushedIds(db)).toEqual([1]);
+	});
+
+	it("parks a permanently rejected row and drains the rest of the backlog", async () => {
+		// Reproduces #13091: the oldest row is refused, so before the fix every
+		// later flush re-sent the same first batch and nothing ever shipped.
+		for (let i = 0; i < 6; i++) insertGrievance(db, i === 0 ? "poison" : "read", `report-${i}`);
+
+		const fetchSpy = vi.fn(async (_input: string | URL | Request, init: RequestInit | undefined) => {
+			const payload: { entries: Array<{ tool: string }> } = JSON.parse(String(init?.body));
+			const bad = payload.entries.findIndex(e => e.tool === "poison");
+			return bad >= 0
+				? new Response(`{"error":"entries[${bad}].tool rejected"}`, { status: 400 })
+				: new Response("", { status: 200 });
+		});
+
+		const settings = pushSettings();
+		const result = await flushGrievances(db, settings, { fetch: mockFetch(fetchSpy) });
+
+		expect(result).toEqual({
+			pushed: 5,
+			ok: true,
+			rejected: 1,
+			error: 'HTTP 400: {"error":"entries[0].tool rejected"}',
+		});
+		expect(selectPushedIds(db)).toEqual([2, 3, 4, 5, 6]);
+		expect(selectRejected(db)).toEqual([{ id: 1, push_error: 'HTTP 400: {"error":"entries[0].tool rejected"}' }]);
+		expect(selectUnpushedIds(db)).toEqual([]);
+
+		// A later session finds nothing to send — the parked row is not retried.
+		__resetAutoQaFlushStateForTests();
+		fetchSpy.mockClear();
+		const second = await flushGrievances(db, settings, { fetch: mockFetch(fetchSpy) });
+		expect(second).toEqual({ pushed: 0, ok: true });
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
 	it("drains mid-flight inserts in a follow-up batch within the same loop", async () => {
-		insertGrievance(db, "find", "first");
+		insertGrievance(db, "glob", "first");
 
 		const fetchEntered = Promise.withResolvers<void>();
 		const releaseFirstFetch = Promise.withResolvers<Response>();
@@ -245,7 +368,7 @@ describe("flushGrievances", () => {
 	});
 
 	it("collapses concurrent callers onto a single in-flight push", async () => {
-		insertGrievance(db, "find", "single-flight");
+		insertGrievance(db, "glob", "single-flight");
 
 		const releaseFetch = Promise.withResolvers<Response>();
 		const fetchSpy = vi.fn(() => releaseFetch.promise);
@@ -265,14 +388,14 @@ describe("flushGrievances", () => {
 	});
 
 	it("skips the next push within the failure cooldown window", async () => {
-		insertGrievance(db, "find", "first");
+		insertGrievance(db, "glob", "first");
 		const fetchSpy = vi.fn(async () => new Response("nope", { status: 500 }));
 
 		const settings = pushSettings();
 		const firstResult = await flushGrievances(db, settings, { fetch: mockFetch(fetchSpy) });
 		const secondResult = await flushGrievances(db, settings, { fetch: mockFetch(fetchSpy) });
 
-		expect(firstResult).toEqual({ pushed: 0, ok: false });
+		expect(firstResult).toEqual({ pushed: 0, ok: false, error: "HTTP 500: nope" });
 		expect(secondResult).toEqual({ pushed: 0, ok: false, skipped: true });
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 		expect(selectUnpushedIds(db)).toEqual([1]);
@@ -284,7 +407,7 @@ describe("flushGrievances", () => {
 		// partial final one), exercising both the LIMIT semantics and the
 		// "remainder smaller than batch" tail.
 		const total = 127;
-		for (let i = 0; i < total; i++) insertGrievance(db, "find", `report-${i}`);
+		for (let i = 0; i < total; i++) insertGrievance(db, "glob", `report-${i}`);
 
 		const seenBatchSizes: number[] = [];
 		const fetchSpy = vi.fn(async (_input: string | URL | Request, init: RequestInit | undefined) => {
@@ -309,7 +432,7 @@ describe("flushGrievances", () => {
 		// rows stay flagged unpushed.
 		const firstBatch = 50;
 		const secondBatch = 10;
-		for (let i = 0; i < firstBatch + secondBatch; i++) insertGrievance(db, "find", `r-${i}`);
+		for (let i = 0; i < firstBatch + secondBatch; i++) insertGrievance(db, "glob", `r-${i}`);
 
 		let call = 0;
 		const fetchSpy = vi.fn(() => {
@@ -319,9 +442,237 @@ describe("flushGrievances", () => {
 
 		const result = await flushGrievances(db, pushSettings(), { fetch: mockFetch(fetchSpy) });
 
-		expect(result).toEqual({ pushed: firstBatch, ok: false });
+		expect(result).toEqual({ pushed: firstBatch, ok: false, error: "HTTP 500" });
 		expect(fetchSpy).toHaveBeenCalledTimes(2);
 		expect(selectPushedIds(db).length).toBe(firstBatch);
 		expect(selectUnpushedIds(db).length).toBe(secondBatch);
+	});
+
+	it("redacts the home directory from rows recorded before record-time redaction", async () => {
+		stubIdentity("/Users/jdoe", "jdoe");
+		insertGrievance(db, "read /Users/jdoe/notes.md", "selector dropped /Users/jdoe/notes.md:4");
+
+		let sentBody: unknown;
+		const fetchSpy = vi.fn(async (_input: string | URL | Request, init: RequestInit | undefined) => {
+			sentBody = JSON.parse(String(init?.body));
+			return new Response("", { status: 200 });
+		});
+
+		const result = await flushGrievances(db, pushSettings(), { fetch: mockFetch(fetchSpy) });
+
+		expect(result).toEqual({ pushed: 1, ok: true });
+		expect(sentBody).toMatchObject({
+			entries: [{ tool: "read ~/notes.md", report: "selector dropped ~/notes.md:4" }],
+		});
+	});
+});
+
+describe("dispatchReportIssueDevice", () => {
+	beforeEach(() => {
+		// Fixture words (`read`, `glob`, …) must not depend on the host's login name.
+		stubIdentity("/home/omp-test-user", "omp-test-user");
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		__resetAutoQaConsentForTests();
+	});
+
+	/** Drain the fire-and-forget consent → insert → flush pipeline. */
+	async function settlePipeline(): Promise<void> {
+		await __awaitAutoQaRecordPipelineForTests();
+	}
+
+	/** Auto QA on, consent already granted, push disabled (empty endpoint). */
+	function consentedSettings(): Settings {
+		return Settings.isolated({
+			"dev.autoqa": true,
+			"dev.autoqaConsent": "granted",
+			"dev.autoqaPush.endpoint": "",
+		});
+	}
+
+	it("records a grievance from `<tool>: <report>` text", async () => {
+		Bun.env.PI_AUTO_QA = "1";
+		const db = openTempDb();
+		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
+		try {
+			const session = { settings: consentedSettings() } as ToolSession;
+			const { result, xdev } = await dispatchReportIssueDevice(
+				session,
+				"read: selector parse dropped trailing line",
+			);
+			const first = result.content[0];
+			expect(first?.type).toBe("text");
+			if (first?.type === "text") expect(first.text).toBe("Noted, thanks!");
+			expect(xdev.tool).toBe("report_issue");
+			await settlePipeline();
+			expect(selectIds(db)).toHaveLength(1);
+			const row = db.prepare("SELECT tool, report FROM grievances").get() as { tool: string; report: string };
+			expect(row).toEqual({ tool: "read", report: "selector parse dropped trailing line" });
+		} finally {
+			openSpy.mockRestore();
+			db.close();
+		}
+	});
+
+	it("accepts the two-line fallback body format", async () => {
+		Bun.env.PI_AUTO_QA = "1";
+		const db = openTempDb();
+		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
+		try {
+			const session = { settings: consentedSettings() } as ToolSession;
+			await dispatchReportIssueDevice(session, "grep\nreported matches include a deleted file");
+			await settlePipeline();
+			const row = db.prepare("SELECT tool, report FROM grievances").get() as { tool: string; report: string };
+			expect(row).toEqual({ tool: "grep", report: "reported matches include a deleted file" });
+		} finally {
+			openSpy.mockRestore();
+			db.close();
+		}
+	});
+
+	it.each([
+		[
+			"xd://tui: start fails because kitty-vt-wasm is missing",
+			"xd://tui",
+			"start fails because kitty-vt-wasm is missing",
+		],
+		["write xd://tui: start fails before executing bun", "write xd://tui", "start fails before executing bun"],
+		[
+			'write conflict://*: per-id content "2:\ttext" was read as a hashline prefix',
+			"write conflict://*",
+			'per-id content "2:\ttext" was read as a hashline prefix',
+		],
+	])("keeps the URI in the tool name of %p", async (text, tool, report) => {
+		Bun.env.PI_AUTO_QA = "1";
+		const db = openTempDb();
+		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
+		try {
+			const session = { settings: consentedSettings() } as ToolSession;
+			await dispatchReportIssueDevice(session, text);
+			await settlePipeline();
+			const row = db.prepare("SELECT tool, report FROM grievances").get() as { tool: string; report: string };
+			expect(row).toEqual({ tool, report });
+		} finally {
+			openSpy.mockRestore();
+			db.close();
+		}
+	});
+
+	it.each([
+		"read agent://ReviewLifecycleLever returned an empty response",
+		"browser.open({name:'jio-terms',url:'https://www.jio.com/'}) navigated the attached relay tab",
+	])("rejects %p, which has no `: ` separator, instead of splitting inside it", async text => {
+		Bun.env.PI_AUTO_QA = "1";
+		const session = { settings: Settings.isolated({ "dev.autoqa": true }) } as ToolSession;
+		await expect(dispatchReportIssueDevice(session, text)).rejects.toThrow("Invalid report format");
+	});
+
+	it("clamps a prose first line so the stored tool stays within the collector limit", async () => {
+		Bun.env.PI_AUTO_QA = "1";
+		const db = openTempDb();
+		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
+		try {
+			const prose =
+				"eval içindeki tool.glob exact ve var olmayan yolu çağırınca beklenmedik şekilde RuntimeError fırlatıyor, sessizce boş dönmüyor";
+			const session = { settings: consentedSettings() } as ToolSession;
+			await dispatchReportIssueDevice(session, `${prose}\nglob threw instead of returning empty`);
+			await settlePipeline();
+			const row = db.prepare("SELECT tool, report FROM grievances").get() as { tool: string; report: string };
+			expect(Buffer.byteLength(row.tool, "utf8")).toBeLessThanOrEqual(128);
+			expect(prose.startsWith(row.tool)).toBe(true);
+			// The sentence is preserved in the report, not dropped on the floor.
+			expect(row.report).toBe(`${prose}\nglob threw instead of returning empty`);
+		} finally {
+			openSpy.mockRestore();
+			db.close();
+		}
+	});
+
+	/** Record `bash: <report>` as user `will` and return the stored report text. */
+	async function recordAsWill(report: string): Promise<string> {
+		Bun.env.PI_AUTO_QA = "1";
+		stubIdentity("/Users/will", "will");
+		const db = openTempDb();
+		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
+		try {
+			const session = { settings: consentedSettings() } as ToolSession;
+			await dispatchReportIssueDevice(session, `bash: ${report}`);
+			await settlePipeline();
+			const row = db.prepare("SELECT report FROM grievances").get() as { report: string };
+			return row.report;
+		} finally {
+			openSpy.mockRestore();
+			db.close();
+		}
+	}
+
+	it.each([
+		[
+			"launchctl print gui/501/com.will.agent failed in /Users/will/code (not /Users/willa)",
+			"launchctl print gui/501/com.<user>.agent failed in ~/code (not /Users/willa)",
+		],
+		["see /Users/will. Then ssh will@build-host", "see ~. Then ssh <user>@build-host"],
+		[
+			"transcript -Users-will-codebases-app/x.jsonl and /c/Users/will/AppData",
+			"transcript -Users-<user>-codebases-app/x.jsonl and /c/Users/<user>/AppData",
+		],
+	])("redacts the user's identity from %p", async (report, expected) => {
+		expect(await recordAsWill(report)).toBe(expected);
+	});
+
+	it("leaves the login name alone where it is a word or an unrelated path segment", async () => {
+		const report = "Ask will. It will-do: will/max under ./will_modules/x and /srv/will/test";
+		expect(await recordAsWill(report)).toBe(report);
+	});
+
+	it("redacts a Windows home written in another case", async () => {
+		Bun.env.PI_AUTO_QA = "1";
+		stubIdentity("C:\\Users\\Will", "Will");
+		const db = openTempDb();
+		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
+		try {
+			const session = { settings: consentedSettings() } as ToolSession;
+			await dispatchReportIssueDevice(
+				session,
+				"read: c:\\users\\will\\secret.txt and C:/USERS/WILL/x and -users-will-proj",
+			);
+			await settlePipeline();
+			const row = db.prepare("SELECT report FROM grievances").get() as { report: string };
+			expect(row.report).toBe("~\\secret.txt and ~/x and -users-<user>-proj");
+		} finally {
+			openSpy.mockRestore();
+			db.close();
+		}
+	});
+
+	it("writes nothing while consent is unresolved", async () => {
+		Bun.env.PI_AUTO_QA = "1";
+		const originalPush = Bun.env.PI_AUTO_QA_PUSH;
+		delete Bun.env.PI_AUTO_QA_PUSH;
+		const db = openTempDb();
+		const openSpy = vi.spyOn(reportIssue, "openAutoQaDb").mockReturnValue(db);
+		try {
+			// Consent unset and no UI handler registered → resolves to false.
+			const session = { settings: Settings.isolated({ "dev.autoqa": true }) } as ToolSession;
+			const { result } = await dispatchReportIssueDevice(session, "read: selector parse dropped trailing line");
+			const first = result.content[0];
+			if (first?.type === "text") expect(first.text).toBe("Noted, thanks!");
+			await settlePipeline();
+			expect(selectIds(db)).toHaveLength(0);
+		} finally {
+			if (originalPush === undefined) delete Bun.env.PI_AUTO_QA_PUSH;
+			else Bun.env.PI_AUTO_QA_PUSH = originalPush;
+			openSpy.mockRestore();
+			db.close();
+		}
+	});
+
+	it("rejects malformed body text with a usage hint", async () => {
+		const session = { settings: Settings.isolated({ "dev.autoqa": true }) } as ToolSession;
+		await expect(dispatchReportIssueDevice(session, "just a vague sentence")).rejects.toThrow(
+			reportIssueDeviceUsage(),
+		);
 	});
 });

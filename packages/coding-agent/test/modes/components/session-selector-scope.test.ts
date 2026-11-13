@@ -1,13 +1,13 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { SessionSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/session-selector";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 
-beforeAll(() => {
-	initTheme();
+beforeAll(async () => {
+	await initTheme();
 });
 
-function createSession(id: string, title: string, cwd: string): SessionInfo {
+function createSession(id: string, title: string, cwd: string, parentSessionPath?: string): SessionInfo {
 	return {
 		path: `${cwd}/${id}.jsonl`,
 		id,
@@ -19,6 +19,7 @@ function createSession(id: string, title: string, cwd: string): SessionInfo {
 		size: 0,
 		firstMessage: `${title} first message`,
 		allMessagesText: `${title} first message`,
+		...(parentSessionPath ? { parentSessionPath } : {}),
 	};
 }
 
@@ -40,7 +41,7 @@ describe("SessionSelectorComponent scope toggle", () => {
 			{
 				loadAllSessions: async () => {
 					loads++;
-					return global;
+					return { sessions: global };
 				},
 			},
 		);
@@ -69,6 +70,34 @@ describe("SessionSelectorComponent scope toggle", () => {
 		expect(loads).toBe(1);
 	});
 
+	it("shows directories in folder scope only when the list spans worktrees, across a Tab round-trip", () => {
+		const single = new SessionSelectorComponent(
+			[createSession("a", "Alpha", "/work/repo"), createSession("b", "Beta", "/work/repo")],
+			() => {},
+			() => {},
+			() => {},
+		);
+		expect(single.render(120).join("\n")).not.toContain("/work/repo");
+
+		const folder = [createSession("main", "Main", "/work/repo"), createSession("wt", "Moved", "/work/repo-wt")];
+		const selector = new SessionSelectorComponent(
+			folder,
+			() => {},
+			() => {},
+			() => {},
+			// Preloaded, so both Tab toggles apply synchronously.
+			{ allSessions: { sessions: folder } },
+		);
+		expect(selector.render(120).join("\n")).toContain("/work/repo-wt");
+
+		selector.handleInput(TAB);
+		expect(selector.render(120).join("\n")).toContain("(all projects)");
+		selector.handleInput(TAB);
+		const rendered = selector.render(120).join("\n");
+		expect(rendered).toContain("(current folder)");
+		expect(rendered).toContain("/work/repo-wt");
+	});
+
 	it("returns the full selected session, including its cwd", async () => {
 		const folder = [createSession("local", "Local", "/work/current")];
 		const remote = createSession("remote", "Remote", "/work/other-project");
@@ -78,7 +107,7 @@ describe("SessionSelectorComponent scope toggle", () => {
 			session => selected.push(session),
 			() => {},
 			() => {},
-			{ loadAllSessions: async () => [remote] },
+			{ loadAllSessions: async () => ({ sessions: [remote] }) },
 		);
 
 		selector.handleInput(TAB);
@@ -90,18 +119,45 @@ describe("SessionSelectorComponent scope toggle", () => {
 		expect(selected[0]?.cwd).toBe("/work/other-project");
 	});
 
-	it("opens directly in all-projects scope when started there with a preloaded list", () => {
+	it("starts in current-folder scope even when the cwd is empty and a global list is preloaded (#3099)", () => {
 		const global = [createSession("remote", "Remote", "/work/other-project")];
+		// `startInAllScope` was the toggle behind #3099 (an empty folder auto-opened
+		// the picker in all-projects scope). The fix removes the option, so force it
+		// via a cast to prove the component now ignores it and stays folder-scoped —
+		// without this, the test would pass against the buggy code too.
+		const opts = { allSessions: { sessions: global }, loadAllSessions: async () => ({ sessions: global }) };
+		(opts as { startInAllScope?: boolean }).startInAllScope = true;
 		const selector = new SessionSelectorComponent(
 			[],
 			() => {},
 			() => {},
 			() => {},
-			{ allSessions: global, startInAllScope: true, loadAllSessions: async () => global },
+			opts,
 		);
 
 		const rendered = selector.render(120).join("\n");
-		expect(rendered).toContain("(all projects)");
-		expect(rendered).toContain("other-project");
+		// Header stays scoped to the cwd so the user is never silently shown
+		// other projects' sessions just because the current folder is empty.
+		expect(rendered).toContain("(current folder)");
+		expect(rendered).not.toContain("(all projects)");
+		expect(rendered).not.toContain("other-project");
+		expect(rendered).toContain("No sessions in current folder");
+	});
+
+	it("marks forked child sessions in the rendered list", () => {
+		const parent = createSession("root", "Incident", "/work/current");
+		const child = createSession("child", "Incident", "/work/current", parent.path);
+		const selector = new SessionSelectorComponent(
+			[parent, child],
+			() => {},
+			() => {},
+			() => {},
+		);
+
+		const rendered = selector.render(120).join("\n");
+		const forkLines = rendered.split("\n").filter(line => line.includes("fork"));
+
+		expect(forkLines).toHaveLength(1);
+		expect(forkLines[0]).toContain("fork");
 	});
 });

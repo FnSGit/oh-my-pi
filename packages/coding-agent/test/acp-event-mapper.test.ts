@@ -2,19 +2,30 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import path from "node:path";
-import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
-import { zSessionNotification } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
+import { type } from "@oh-my-pi/omptype";
+import type { AgentSideConnection, SessionNotification } from "@oh-my-pi/pi-utils/acp";
+
+const arkSessionNotification = type({
+	sessionId: "string",
+	update: {
+		sessionUpdate:
+			"'agent_thought_chunk' | 'agent_message_chunk' | 'tool_call' | 'tool_call_update' | 'plan' | 'plan_update' | 'available_commands_update' | 'current_mode_update' | 'config_option_update' | 'session_info_update' | 'usage_update'",
+	},
+});
+
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import {
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
+	mapToolKind,
 	normalizeReplayToolArguments,
 } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-event-mapper";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { expectAcpStructure, expectAcpStructureRejects } from "./helpers/acp-schema";
+import { expectAcpStructure } from "./helpers/acp-schema";
 
 function makeAssistantMessage(text: string) {
 	return {
@@ -43,7 +54,7 @@ function getChunkMessageId(event: { update: object }): string | undefined {
 
 function expectAcpNotifications(updates: SessionNotification[]): void {
 	for (const update of updates) {
-		expectAcpStructure(zSessionNotification, update);
+		expectAcpStructure(arkSessionNotification, update);
 	}
 }
 
@@ -68,7 +79,7 @@ class ReplayTestSession {
 	customCommands: [] = [];
 	skills: [] = [];
 	extensionRunner = undefined;
-	settings = { get: (_key: string) => false };
+	settings = Settings.isolated();
 
 	constructor(cwd: string, sessionDir?: string) {
 		this.sessionManager = SessionManager.create(cwd, sessionDir);
@@ -88,6 +99,12 @@ class ReplayTestSession {
 	}
 
 	setClientBridge(_bridge: unknown): void {}
+
+	setMcpServerInstructionsSource(_source: unknown): void {}
+
+	registerSessionChangeCallback(_callback: () => void): () => void {
+		return () => {};
+	}
 
 	subscribe(_listener: (event: AgentSessionEvent) => void): () => void {
 		return () => {};
@@ -189,25 +206,74 @@ describe("ACP event mapper", () => {
 		expect(doneUpdates).toEqual([]);
 	});
 
-	it("preserves command text when a new command tool is started", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
+	it("keeps write agent:// messages off the ACP session stream", () => {
+		const args = { path: "agent://Scout", content: "Private coordination" };
+		const events: AgentSessionEvent[] = [
+			{ type: "tool_execution_start", toolCallId: "tc-agent-message", toolName: "write", args },
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-agent-message",
+				toolName: "write",
+				args,
+				partialResult: { content: [{ type: "text", text: "delivering" }] },
+			},
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-agent-message",
+				toolName: "write",
+				isError: false,
+				result: { content: [{ type: "text", text: "Delivered to Scout." }] },
+			},
+		] satisfies AgentSessionEvent[];
+		const updates = events.flatMap(event =>
+			mapAgentSessionEventToAcpSessionUpdates(event, "session-1", { getToolArgs: () => args }),
+		);
+		expect(updates).toEqual([]);
+	});
+
+	it("maps proc:// controls as execution and reads as resources, never editor file locations", () => {
+		expect(mapToolKind("write", { path: "proc://web/mode", content: "persist" })).toBe("execute");
+		expect(mapToolKind("write", { path: "proc://build-42/kill" })).toBe("execute");
+		expect(mapToolKind("read", { path: "proc://web" })).toBe("read");
+		for (const [toolName, args] of [
+			["write", { path: "proc://web/mode", content: "persist" }],
+			["read", { path: "proc://web" }],
+		] as const) {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{ type: "tool_execution_start", toolCallId: `tc-${toolName}-proc`, toolName, args } as AgentSessionEvent,
+				"session-1",
+				{ cwd: "/tmp" },
+			);
+			expect(updates).toHaveLength(1);
+			expect(updates[0]?.update).toMatchObject({ kind: toolName === "write" ? "execute" : "read" });
+			expect(updates[0]?.update).not.toHaveProperty("locations");
+		}
+	});
+
+	it("keeps background job-wait results visible over ACP", () => {
+		const events = [
 			{
 				type: "tool_execution_start",
-				toolCallId: "tc-command-start",
-				toolName: "bash",
-				args: { command: "npm run check" },
-			} as AgentSessionEvent,
-			"session-1",
+				toolCallId: "tc-job-wait",
+				toolName: "wait",
+				args: {},
+			},
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-job-wait",
+				toolName: "wait",
+				isError: false,
+				result: { content: [{ type: "text", text: "job output" }] },
+			},
+		] satisfies AgentSessionEvent[];
+
+		const updates = events.flatMap(event =>
+			mapAgentSessionEventToAcpSessionUpdates(event, "session-1", {
+				getToolArgs: () => ({}),
+			}),
 		);
 
-		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
-		};
-		expect(update.sessionUpdate).toBe("tool_call");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
+		expect(updates.map(update => update.update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
 	});
 
 	it("uses command text for a new command tool even when intent is generic", () => {
@@ -238,7 +304,7 @@ describe("ACP event mapper", () => {
 				type: "tool_execution_start",
 				toolCallId: "tc-eval-start",
 				toolName: "eval",
-				args: { cells: [{ language: "js", title: "sum", code: "return 1 + 1;" }] },
+				args: { language: "js", title: "sum", code: "return 1 + 1;" },
 				intent: "sum",
 			} as AgentSessionEvent,
 			"session-1",
@@ -258,7 +324,7 @@ describe("ACP event mapper", () => {
 		expect(update.title).toBe("[js] sum\nreturn 1 + 1;");
 		expect(update.kind).toBe("execute");
 		expect(update.status).toBe("pending");
-		expect(update.rawInput).toEqual({ cells: [{ language: "js", title: "sum", code: "return 1 + 1;" }] });
+		expect(update.rawInput).toEqual({ language: "js", title: "sum", code: "return 1 + 1;" });
 		expect(update.content).toContainEqual({
 			type: "content",
 			content: { type: "text", text: "[js] sum\nreturn 1 + 1;" },
@@ -296,7 +362,7 @@ describe("ACP event mapper", () => {
 				type: "tool_execution_start",
 				toolCallId: "tc-eval-long-source",
 				toolName: "eval",
-				args: { cells: [{ language: "js", code: source }] },
+				args: { language: "js", code: source },
 			} as AgentSessionEvent,
 			"session-1",
 		);
@@ -383,6 +449,77 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "single.ts" }]);
 	});
 
+	it("resolves live image blob refs for ACP content without expanding rawOutput", () => {
+		const blobRef = "blob:sha256:77467fcfe2bbdc034e0eabb4778c9d7de521c0d7c3e0d0a62566468e4d7da3a5";
+		const resolvedImageData = "resolved-webp-base64";
+		const events: AgentSessionEvent[] = [
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-image-update",
+				toolName: "generate_image",
+				args: {},
+				partialResult: {
+					content: [{ type: "image", data: blobRef, mimeType: "image/webp" }],
+					details: { images: [{ data: blobRef, mimeType: "image/webp" }] },
+				},
+			} as AgentSessionEvent,
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-image-end",
+				toolName: "generate_image",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "Generated image saved." }],
+					details: { images: [{ data: blobRef, mimeType: "image/webp" }] },
+				},
+			} as AgentSessionEvent,
+		];
+
+		for (const event of events) {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(event, "session-1", {
+				resolveImageData: data => (data === blobRef ? resolvedImageData : data),
+			});
+			const update = updates[0]!.update as {
+				content?: Array<{
+					type: string;
+					content?: { type: string; data?: string; mimeType?: string; text?: string };
+				}>;
+				rawOutput?: unknown;
+			};
+			const images = update.content?.filter(item => item.type === "content" && item.content?.type === "image") ?? [];
+
+			expect(images).toEqual([
+				{ type: "content", content: { type: "image", data: resolvedImageData, mimeType: "image/webp" } },
+			]);
+			expect(JSON.stringify(update.content)).not.toContain("blob:sha256:");
+			expect(JSON.stringify(update.rawOutput)).toContain(blobRef);
+		}
+	});
+
+	it("settles a backgrounded call with its job's final frame and keeps running frames in progress", () => {
+		const status = (state: string) => {
+			const [notification] = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_update",
+					toolCallId: "tc-bg",
+					toolName: "bash",
+					args: { command: "hyperfine bench" },
+					partialResult: {
+						content: [{ type: "text", text: "Benchmark 1" }],
+						details: { async: { state, jobId: "bg_2", type: "bash" } },
+					},
+				} as AgentSessionEvent,
+				"session-1",
+			);
+			return (notification!.update as { status?: string }).status;
+		};
+
+		expect(status("running")).toBe("in_progress");
+		expect(status("completed")).toBe("completed");
+		expect(status("failed")).toBe("failed");
+		expect(status("cancelled")).toBe("failed");
+	});
+
 	it("emits locations on tool_execution_update from args", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
@@ -454,6 +591,43 @@ describe("ACP event mapper", () => {
 			type: "content",
 			content: { type: "text", text: '{"content":[],"details":{"terminalId":"term-1"}}' },
 		});
+	});
+
+	it("does not serialize a wait progress envelope into content text", () => {
+		const partialResult = {
+			content: [{ type: "text", text: "" }],
+			details: {
+				op: "wait",
+				jobs: [
+					{ id: "bash_1", state: "running" },
+					{ id: "bash_2", state: "running" },
+				],
+			},
+		};
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_update",
+				toolCallId: "tc-wait",
+				toolName: "wait",
+				args: { i: "waiting for jobs" },
+				partialResult,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			sessionUpdate: string;
+			content?: unknown;
+			rawOutput?: unknown;
+		};
+		expect(update.sessionUpdate).toBe("tool_call_update");
+		// The job details already ride the frame as structured rawOutput.
+		expect(update.rawOutput).toEqual(partialResult);
+		// An empty-text envelope must not be dumped as a JSON blob display row.
+		expect(update.content).toBeUndefined();
+		expect(JSON.stringify(update.content ?? [])).not.toContain('"op":"wait"');
 	});
 
 	it("keeps terminal content alongside readable text", () => {
@@ -795,7 +969,7 @@ describe("ACP event mapper", () => {
 			status: "completed",
 		});
 
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
+		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
 		expect(update).toMatchObject({
 			sessionUpdate: "tool_call",
 			toolCallId: "toolu_replay_1",
@@ -808,26 +982,32 @@ describe("ACP event mapper", () => {
 	});
 
 	it("builds replayed read tool-call locations against the replay cwd", () => {
-		const replayArgs = normalizeReplayToolArguments(JSON.stringify({ path: "src/foo.ts" }));
-		const update = buildToolCallStartUpdate({
-			toolCallId: "toolu_replay_read",
-			toolName: "read",
-			args: replayArgs.args,
-			cwd: path.resolve("/repo"),
-			status: "completed",
-		});
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-replay-read-"));
+		fs.writeFileSync(path.join(dir, "foo.ts"), "data\n");
+		try {
+			const replayArgs = normalizeReplayToolArguments(JSON.stringify({ path: "foo.ts" }));
+			const update = buildToolCallStartUpdate({
+				toolCallId: "toolu_replay_read",
+				toolName: "read",
+				args: replayArgs.args,
+				cwd: dir,
+				status: "completed",
+			});
 
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
-		expect(update).toMatchObject({
-			sessionUpdate: "tool_call",
-			toolCallId: "toolu_replay_read",
-			title: "read: src/foo.ts",
-			kind: "read",
-			status: "completed",
-			rawInput: { path: "src/foo.ts" },
-			locations: [{ path: path.resolve("/repo", "src/foo.ts") }],
-		});
-		expect("content" in update).toBe(false);
+			expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
+			expect(update).toMatchObject({
+				sessionUpdate: "tool_call",
+				toolCallId: "toolu_replay_read",
+				title: "read: foo.ts",
+				kind: "read",
+				status: "completed",
+				rawInput: { path: "foo.ts" },
+				locations: [{ path: path.join(dir, "foo.ts") }],
+			});
+			expect("content" in update).toBe(false);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("keeps malformed replay arguments as raw input without command content", () => {
@@ -839,7 +1019,7 @@ describe("ACP event mapper", () => {
 			status: "completed",
 		});
 
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
+		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
 		expect(update).toMatchObject({
 			sessionUpdate: "tool_call",
 			toolCallId: "toolu_replay_bad",
@@ -849,6 +1029,22 @@ describe("ACP event mapper", () => {
 			rawInput: "{not json",
 		});
 		expect("content" in update).toBe(false);
+	});
+
+	it("names the tool so clients can label kind-other calls such as task", () => {
+		const update = buildToolCallStartUpdate({
+			toolCallId: "toolu_task",
+			toolName: "task",
+			args: { tasks: [] },
+			intent: "Waiting for agents",
+		});
+
+		expect(update).toMatchObject({
+			sessionUpdate: "tool_call",
+			name: "task",
+			title: "Waiting for agents",
+			kind: "other",
+		});
 	});
 
 	it("keeps object replay arguments unchanged and builds command content", () => {
@@ -862,7 +1058,7 @@ describe("ACP event mapper", () => {
 		});
 
 		expect(replayArgs.args).toBe(rawArgs);
-		expectAcpStructure(zSessionNotification, { sessionId: "session-1", update });
+		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
 		expect(update).toMatchObject({
 			title: "$ bun test",
 			status: "completed",
@@ -895,27 +1091,147 @@ describe("ACP event mapper", () => {
 		expect(update.title).toBe("read: README.md");
 		expect(update.kind).toBe("read");
 		expect(update.rawInput).toEqual({ path: "README.md" });
-		expect(update.locations).toEqual([{ path: "README.md" }]);
+		expect("locations" in update).toBe(false);
 		expect("content" in update).toBe(false);
 	});
 	it("resolves tool_execution_start locations against mapper cwd", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-read-cwd-"));
+		fs.writeFileSync(path.join(dir, "file.ts"), "data\n");
+		try {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_start",
+					toolCallId: "toolu_read_cwd",
+					toolName: "read",
+					args: { path: "file.ts" },
+				} as AgentSessionEvent,
+				"session-1",
+				{ cwd: dir },
+			);
+
+			expect(updates).toHaveLength(1);
+			expectAcpNotifications(updates);
+			const update = updates[0]!.update as {
+				sessionUpdate: string;
+				locations?: { path: string }[];
+				content?: unknown;
+			};
+			expect(update.sessionUpdate).toBe("tool_call");
+			expect(update.locations).toEqual([{ path: path.join(dir, "file.ts") }]);
+			expect("content" in update).toBe(false);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("strips read selectors from the ACP location while preserving rawInput", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-read-selector-"));
+		fs.writeFileSync(path.join(dir, "file.ts"), "data\n");
+		const cases = ["file.ts:1-20", "file.ts:raw", "file.ts:1-20:raw", "file.ts:raw:1-20", "file.ts:5-16,960-973"];
+		try {
+			for (const readPath of cases) {
+				const updates = mapAgentSessionEventToAcpSessionUpdates(
+					{
+						type: "tool_execution_start",
+						toolCallId: `toolu_read_sel_${readPath}`,
+						toolName: "read",
+						args: { path: readPath },
+					} as AgentSessionEvent,
+					"session-1",
+					{ cwd: dir },
+				);
+				expectAcpNotifications(updates);
+				const update = updates[0]!.update as { locations?: { path: string }[]; rawInput?: unknown };
+				expect(update.locations).toEqual([{ path: path.join(dir, "file.ts") }]);
+				expect(update.rawInput).toEqual({ path: readPath });
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("omits read locations that are not single existing files", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-read-non-file-"));
+		fs.mkdirSync(path.join(dir, "docs"));
+		fs.writeFileSync(path.join(dir, "file.ts"), "data\n");
+		fs.writeFileSync(path.join(dir, "archive.rar"), "data\n");
+		const cases = ["src/**/*.ts", "file.ts:1-20; docs", "docs", "archive.rar:inner/SKILL.md"];
+		try {
+			for (const readPath of cases) {
+				const updates = mapAgentSessionEventToAcpSessionUpdates(
+					{
+						type: "tool_execution_start",
+						toolCallId: `toolu_read_non_file_${readPath}`,
+						toolName: "read",
+						args: { path: readPath },
+					} as AgentSessionEvent,
+					"session-1",
+					{ cwd: dir },
+				);
+				expectAcpNotifications(updates);
+				expect("locations" in updates[0]!.update).toBe(false);
+			}
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("publishes the resolved file location when a read completes", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-read-result-"));
+		const file = path.join(dir, "file.ts");
+		fs.writeFileSync(file, "data\n");
+		try {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: "toolu_read_result",
+					toolName: "read",
+					isError: false,
+					result: { content: [{ type: "text", text: "data" }], details: { resolvedPath: file } },
+				} as AgentSessionEvent,
+				"session-1",
+				{ cwd: dir },
+			);
+			expectAcpNotifications(updates);
+			const update = updates[0]!.update as { locations?: { path: string }[] };
+			expect(update.locations).toEqual([{ path: file }]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps a real file literally named like a selector as the read location", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-read-literal-"));
+		const literalName = "report:1-20";
+		fs.writeFileSync(path.join(dir, literalName), "data\n");
+		try {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_start",
+					toolCallId: "toolu_read_literal",
+					toolName: "read",
+					args: { path: literalName },
+				} as AgentSessionEvent,
+				"session-1",
+				{ cwd: dir },
+			);
+			expectAcpNotifications(updates);
+			const update = updates[0]!.update as { locations?: { path: string }[] };
+			expect(update.locations).toEqual([{ path: path.join(dir, literalName) }]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("does not strip selector-looking suffixes from non-read tool paths", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
-				toolCallId: "toolu_read_cwd",
-				toolName: "read",
-				args: { path: "src/file.ts" },
+				toolCallId: "tc-write-colon",
+				toolName: "write",
+				args: { path: "src/report:1-20", content: "x" },
 			} as AgentSessionEvent,
 			"session-1",
 			{ cwd: "/repo" },
 		);
-
-		expect(updates).toHaveLength(1);
 		expectAcpNotifications(updates);
-		const update = updates[0]!.update as { sessionUpdate: string; locations?: { path: string }[]; content?: unknown };
-		expect(update.sessionUpdate).toBe("tool_call");
-		expect(update.locations).toEqual([{ path: path.resolve("/repo", "src/file.ts") }]);
-		expect("content" in update).toBe(false);
+		const update = updates[0]!.update as { locations?: { path: string }[] };
+		expect(update.locations).toEqual([{ path: path.resolve("/repo", "src/report:1-20") }]);
 	});
 	it("emits distinct locations for move-style path arguments", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
@@ -935,22 +1251,42 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "src/current.ts" }, { path: "src/old.ts" }, { path: "src/new.ts" }]);
 	});
 
-	it("rejects mutated ACP notification discriminators", () => {
-		const [notification] = mapAgentSessionEventToAcpSessionUpdates(
-			{
-				type: "tool_execution_start",
-				toolCallId: "tc-schema",
-				toolName: "read",
-				args: { path: "package.json" },
-			} as AgentSessionEvent,
-			"session-1",
-		);
-
-		expectAcpStructure(zSessionNotification, notification);
-		expectAcpStructureRejects(zSessionNotification, {
-			...notification,
-			update: { ...notification!.update, sessionUpdate: "tool_call_updates" },
+	it("maps xd:// device writes to an execute call with no fabricated file location", () => {
+		const update = buildToolCallStartUpdate({
+			toolCallId: "toolu_xd_write",
+			toolName: "write",
+			args: { path: "xd://github", content: '{"op":"repo_view"}' },
+			cwd: path.resolve("/repo"),
 		});
-		expectAcpStructureRejects(zSessionNotification, { ...notification, sessionId: 42 });
+
+		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
+		expect(update).toMatchObject({
+			sessionUpdate: "tool_call",
+			title: "xd://github",
+			kind: "execute",
+		});
+		expect("locations" in update).toBe(false);
+	});
+
+	it("keeps xd:// discovery reads as read kind and plain file writes as edit", () => {
+		const discovery = buildToolCallStartUpdate({
+			toolCallId: "toolu_xd_read",
+			toolName: "read",
+			args: { path: "xd://lsp" },
+		});
+		expect(discovery).toMatchObject({ title: "xd://lsp", kind: "read" });
+		expect("locations" in discovery).toBe(false);
+
+		const fileWrite = buildToolCallStartUpdate({
+			toolCallId: "toolu_file_write",
+			toolName: "write",
+			args: { path: "src/foo.ts", content: "x" },
+			cwd: path.resolve("/repo"),
+		});
+		expect(fileWrite).toMatchObject({
+			title: "write: src/foo.ts",
+			kind: "edit",
+			locations: [{ path: path.resolve("/repo", "src/foo.ts") }],
+		});
 	});
 });

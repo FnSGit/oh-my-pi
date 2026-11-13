@@ -1,10 +1,12 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
-import { HookEditorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/hook-editor";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
+import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
+import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
-import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
+import { CURSOR_MARKER, isFocusable, setKeybindings, type TUI } from "@oh-my-pi/pi-tui";
 
 beforeAll(async () => {
 	const theme = await getThemeByName("dark");
@@ -67,14 +69,17 @@ function createControllerContext() {
 		stop: vi.fn(),
 		terminal: { columns: 120 },
 	} as unknown as TestContext["ui"] & {
-		setFocus: ReturnType<typeof vi.fn>;
-		requestRender: ReturnType<typeof vi.fn>;
+		setFocus: Mock<any>;
+		requestRender: Mock<any>;
 	};
 	const ctx = {
 		editor,
 		editorContainer,
 		ui,
 		hookEditor: undefined,
+		closeLinkBrowser: () => {},
+		rerenderInLinkBrowser: () => {},
+		rebuildTranscriptScrollback: () => {},
 	} as unknown as TestContext;
 
 	return { ctx, editor, editorContainer, ui };
@@ -99,18 +104,6 @@ describe("HookEditorComponent default (hook) mode", () => {
 
 		expect(onSubmit).toHaveBeenCalledTimes(1);
 		expect(onSubmit).toHaveBeenCalledWith("ab\ncd");
-		expect(onCancel).not.toHaveBeenCalled();
-	});
-
-	it("submits the current text on Ctrl+Enter", () => {
-		const onSubmit = vi.fn();
-		const onCancel = vi.fn();
-		const component = new HookEditorComponent(createTui(), "Prompt", "line 1\nline 2", onSubmit, onCancel);
-
-		component.handleInput("\x1b[13;5u");
-
-		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("line 1\nline 2");
 		expect(onCancel).not.toHaveBeenCalled();
 	});
 
@@ -141,6 +134,26 @@ describe("HookEditorComponent default (hook) mode", () => {
 		expect(onSubmit).toHaveBeenCalledWith("draft");
 		expect(onCancel).not.toHaveBeenCalled();
 	});
+	it("keeps Ctrl+Q working after Enter inserts a newline (Windows Terminal)", () => {
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel);
+
+		component.handleInput("a");
+		component.handleInput("b");
+		// Windows Terminal sends bare `\r` for both Enter and Ctrl+Enter; the
+		// hook editor must treat `\r` as a newline and reserve Ctrl+Q for submit.
+		component.handleInput("\r");
+		component.handleInput("c");
+		component.handleInput("d");
+		expect(onSubmit).not.toHaveBeenCalled();
+
+		component.handleInput("\x11");
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("ab\ncd");
+		expect(onCancel).not.toHaveBeenCalled();
+	});
 
 	it("expands large paste markers when submitting on Ctrl+Enter", () => {
 		const onSubmit = vi.fn();
@@ -159,6 +172,19 @@ describe("HookEditorComponent default (hook) mode", () => {
 		expect(onCancel).not.toHaveBeenCalled();
 	});
 
+	it("treats Enter bundled after a bracketed paste as a newline in hook mode", () => {
+		const onSubmit = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, vi.fn());
+
+		component.handleInput("\x1b[200~first\nsecond\x1b[201~\r");
+		expect(onSubmit).not.toHaveBeenCalled();
+		component.handleInput("last");
+		component.handleInput("\x11");
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("first\nsecond\nlast");
+	});
+
 	it("cancels on Escape", () => {
 		const onSubmit = vi.fn();
 		const onCancel = vi.fn();
@@ -172,20 +198,192 @@ describe("HookEditorComponent default (hook) mode", () => {
 });
 
 describe("HookEditorComponent prompt-style mode", () => {
-	it("submits on plain Enter", () => {
+	it("cuts a long question to the terminal title but gives native hosts all of it", () => {
+		const question = `${"Which of these directions should the effort meter take? ".repeat(12)}FINAL-WORDS`;
+		const component = new HookEditorComponent(createTui(), "Custom answer", undefined, vi.fn(), vi.fn(), {
+			promptStyle: true,
+			question,
+		});
+
+		const terminal = renderText(component);
+		expect(terminal).toContain("Custom answer: Which of these");
+		expect(terminal).toContain("…");
+		expect(terminal).not.toContain("FINAL-WORDS");
+
+		const cx: DescribeContext = {
+			cols: 100,
+			reduceMotion: false,
+			dark: true,
+			supports: () => true,
+			feature: () => true,
+		};
+		const root = component.describe(cx);
+		const head = root.c?.[0];
+		const parts = typeof head === "object" && head !== null && "k" in head ? head.c : undefined;
+		expect(parts?.[0]).toMatchObject({ k: "text", p: { spans: [{ t: "Custom answer" }] } });
+		expect(parts?.[1]).toMatchObject({ k: "md", p: { text: question, role: "omp.ask.question" } });
+	});
+
+	it("runs the native action bar's Submit, Cancel and Open in editor like their keys", async () => {
 		const onSubmit = vi.fn();
+		const submitted = new HookEditorComponent(createTui(), "Prompt", "draft", onSubmit, vi.fn(), {
+			promptStyle: true,
+		});
+		submitted.handleNativeEvent({ type: "action", key: "actions/submit", act: "submit", mods: [] });
+		expect(onSubmit).toHaveBeenCalledWith("draft");
+
 		const onCancel = vi.fn();
-		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
+		const cancelled = new HookEditorComponent(createTui(), "Prompt", "draft", vi.fn(), onCancel);
+		cancelled.handleNativeEvent({ type: "action", key: "actions/cancel", act: "cancel", mods: [] });
+		expect(onCancel).toHaveBeenCalledTimes(1);
+
+		const tui = createTui();
+		// The external edit ends by restarting the TUI and requesting a render; await that.
+		const rendered = Promise.withResolvers<void>();
+		(tui.requestRender as Mock<TUI["requestRender"]>).mockImplementation(() => rendered.resolve());
+		const externalEditor = vi.fn(async (text: string) => `${text} edited`);
+		const onExternalSubmit = vi.fn();
+		const external = new HookEditorComponent(tui, "Prompt", "draft", onExternalSubmit, vi.fn(), { externalEditor });
+		external.handleNativeEvent({ type: "action", key: "actions/external", act: "external", mods: [] });
+		await rendered.promise;
+		expect(externalEditor).toHaveBeenCalledWith("draft");
+		external.handleNativeEvent({ type: "action", key: "actions/submit", act: "submit", mods: [] });
+		expect(onExternalSubmit).toHaveBeenCalledWith("draft edited");
+	});
+
+	it("refuses image attachments unless the prompt opted in and is still open", () => {
+		const image: ImageContent = { type: "image", data: "image", mimeType: "image/png" };
+		const plain = new HookEditorComponent(createTui(), "Prompt", undefined, vi.fn(), vi.fn(), { promptStyle: true });
+		const disposed = new HookEditorComponent(createTui(), "Prompt", undefined, vi.fn(), vi.fn(), {
+			promptStyle: true,
+			acceptImages: true,
+		});
+		disposed.dispose();
+
+		expect(plain.attachImage(image)).toBeUndefined();
+		expect(disposed.acceptsImages).toBe(false);
+		expect(disposed.attachImage(image)).toBeUndefined();
+	});
+
+	it("numbers images in text order on submit when they attached out of order", () => {
+		// Concurrent path loads: the second-pasted file finished first and took #1.
+		const later: ImageContent = { type: "image", data: "later", mimeType: "image/png" };
+		const earlier: ImageContent = { type: "image", data: "earlier", mimeType: "image/png" };
+		const onSubmit = vi.fn();
+		const component = new HookEditorComponent(
+			createTui(),
+			"Prompt",
+			"[Image #2] then [Image #1]",
+			onSubmit,
+			vi.fn(),
+			{
+				promptStyle: true,
+				acceptImages: true,
+				images: [later, earlier],
+			},
+		);
+
+		component.handleInput("\r");
+
+		expect(onSubmit).toHaveBeenCalledWith("[Image #1] then [Image #2]", [earlier, later]);
+	});
+
+	it("drops images whose markers were deleted and renumbers the rest on submit", () => {
+		const first: ImageContent = { type: "image", data: "first", mimeType: "image/png" };
+		const second: ImageContent = { type: "image", data: "second", mimeType: "image/jpeg" };
+		const onSubmit = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", "[Image #2]", onSubmit, vi.fn(), {
+			promptStyle: true,
+			acceptImages: true,
+			images: [first, second],
+		});
+
+		component.handleInput("\r");
+
+		expect(onSubmit).toHaveBeenCalledWith("[Image #1]", [second]);
+	});
+
+	it("hands an empty bracketed paste to the host's clipboard image read and submits once the marker lands", () => {
+		// Windows Terminal owns Ctrl+V and pastes an image-only clipboard as an empty paste.
+		const image: ImageContent = { type: "image", data: "image", mimeType: "image/png" };
+		const onSubmit = vi.fn();
+		let finishPaste: ((text: string | undefined) => boolean) | undefined;
+		const component: HookEditorComponent = new HookEditorComponent(createTui(), "Prompt", "see ", onSubmit, vi.fn(), {
+			promptStyle: true,
+			acceptImages: true,
+			// Like InputController.handleImagePaste: reserve delivery before the first await.
+			onPasteImage: () => {
+				finishPaste = component.beginPaste();
+				return Promise.resolve(true);
+			},
+		});
+
+		component.handleInput("\x1b[200~\x1b[201~\r");
+		expect(onSubmit).not.toHaveBeenCalled();
+		finishPaste?.(component.attachImage(image));
+
+		expect(onSubmit).toHaveBeenCalledWith("see [Image #1]", [image]);
+	});
+
+	it("labels attached images with their size and deletes the marker as a unit", () => {
+		const image: ImageContent = { type: "image", data: "image", mimeType: "image/png" };
+		const onSubmit = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", "see ", onSubmit, vi.fn(), {
+			promptStyle: true,
+			acceptImages: true,
+		});
+		const marker = component.attachImage(image, { width: 640, height: 240 });
+		expect(marker).toBe("[Image #1, 640x240]");
+		component.pasteText(marker ?? "");
+
+		// One backspace removes the whole marker, so its image is dropped on submit.
+		component.handleInput("\x7f");
+		component.handleInput("\r");
+
+		expect(onSubmit).toHaveBeenCalledWith("see ");
+	});
+
+	it("keeps empty and image-path pastes as text in a prompt that did not opt into images", () => {
+		const onPasteImage = vi.fn();
+		const otherPathHandler = vi.fn();
+		const onSubmit = vi.fn();
+		const plain = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, vi.fn(), {
+			promptStyle: true,
+			onPasteImage,
+			onPasteImagePath: otherPathHandler,
+		});
+		plain.handleInput("\x1b[200~\x1b[201~\x1b[200~/tmp/shot.png\x1b[201~\r");
+		expect(onPasteImage).not.toHaveBeenCalled();
+		expect(otherPathHandler).not.toHaveBeenCalled();
+		expect(onSubmit).toHaveBeenCalledWith("/tmp/shot.png");
+	});
+
+	it("submits the complete pasted answer once when paste and Enter arrive together", () => {
+		const onSubmit = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, vi.fn(), {
+			promptStyle: true,
+		});
+		const pasted = largePasteText();
+
+		component.handleInput(`\x1b[200~${pasted}\x1b[201~\r`);
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith(pasted);
+	});
+
+	it("submits only after a fragmented paste closes with a bundled Enter", () => {
+		const onSubmit = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, vi.fn(), {
 			promptStyle: true,
 		});
 
-		component.handleInput("a");
-		component.handleInput("b");
-		component.handleInput("\r");
+		component.handleInput("\x1b[200~first\n");
+		component.handleInput("second\x1b[20");
+		expect(onSubmit).not.toHaveBeenCalled();
+		component.handleInput("1~\r");
 
 		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("ab");
-		expect(onCancel).not.toHaveBeenCalled();
+		expect(onSubmit).toHaveBeenCalledWith("first\nsecond");
 	});
 
 	it("submits on alternate Enter encodings recognized by the key matcher", () => {
@@ -280,7 +478,7 @@ describe("HookEditorComponent prompt-style mode", () => {
 		expect(onSubmit).toHaveBeenCalledWith("a\nb");
 	});
 
-	it("treats Ctrl+Enter as newline in prompt-style mode", () => {
+	it("submits on the Ctrl+Enter chord in prompt-style mode (#3353)", () => {
 		const onSubmit = vi.fn();
 		const onCancel = vi.fn();
 		const component = new HookEditorComponent(createTui(), "Prompt", undefined, onSubmit, onCancel, {
@@ -288,31 +486,71 @@ describe("HookEditorComponent prompt-style mode", () => {
 		});
 
 		component.handleInput("x");
+		component.handleInput("y");
 		component.handleInput("\x1b[13;5u");
 
-		expect(onSubmit).not.toHaveBeenCalled();
-
-		component.handleInput("y");
-		component.handleInput("\r");
-
 		expect(onSubmit).toHaveBeenCalledTimes(1);
-		expect(onSubmit).toHaveBeenCalledWith("x\ny");
+		expect(onSubmit).toHaveBeenCalledWith("xy");
+		expect(onCancel).not.toHaveBeenCalled();
 	});
 
-	it("renders prompt-style editor with legacy ask chrome", () => {
+	it("submits on Ctrl+Q in prompt-style mode (Windows Terminal fallback, #3353)", () => {
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", "draft", onSubmit, onCancel, {
+			promptStyle: true,
+		});
+
+		// Windows Terminal swallows Ctrl+Enter, so app.message.followUp also binds
+		// Ctrl+Q (#1903). The ask tool's prompt-style editor missed this chord
+		// before #3353 — users hit Ctrl+Enter expecting submit, got nothing.
+		component.handleInput("\x11");
+
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit).toHaveBeenCalledWith("draft");
+		expect(onCancel).not.toHaveBeenCalled();
+	});
+
+	it("hands the draft and its images to onCancel on Escape (#18211)", () => {
+		const image: ImageContent = { type: "image", data: "image", mimeType: "image/png" };
+		const onSubmit = vi.fn();
+		const onCancel = vi.fn();
+		const component = new HookEditorComponent(createTui(), "Prompt", "see [Image #1]", onSubmit, onCancel, {
+			promptStyle: true,
+			acceptImages: true,
+			images: [image],
+		});
+
+		component.handleInput(" ");
+		component.handleInput("x");
+		component.handleInput("\x1b");
+
+		expect(onCancel).toHaveBeenCalledWith("see [Image #1] x", [image]);
+		expect(onSubmit).not.toHaveBeenCalled();
+	});
+
+	it("renders prompt-style editor with rounded overlay chrome", () => {
 		const component = new HookEditorComponent(createTui(), "Prompt", undefined, vi.fn(), vi.fn(), {
 			promptStyle: true,
 		});
 
-		const rendered = renderText(component);
 		const lines = renderLines(component);
 
-		expect(lines[0]).toMatch(/^─+$/);
-		expect(lines.at(-1)).toMatch(/^─+$/);
-		expect(lines[4]?.startsWith("> ")).toBe(true);
-		expect(rendered).toContain(" enter submit  esc cancel");
-		expect(rendered).not.toContain("shift+enter newline");
-		expect(rendered).toContain("ctrl+g external editor");
+		expect(lines[0]).toMatch(/^╭─ Prompt .*╮$/);
+		expect(lines.at(-1)).toMatch(/^╰.*╯$/);
+		expect(lines.some(line => line.includes("> "))).toBe(true);
+	});
+
+	it("anchors the hardware cursor while entering an Other response", () => {
+		const component = new HookEditorComponent(createTui(), "Prompt", undefined, vi.fn(), vi.fn(), {
+			promptStyle: true,
+		});
+		if (!isFocusable(component)) throw new Error("Hook editor must forward focus to its inner editor");
+
+		component.focused = true;
+		component.setUseTerminalCursor?.(true);
+
+		expect(component.render(120).some(line => line.includes(CURSOR_MARKER))).toBe(true);
 	});
 
 	it("keeps the prompt gutter visible after typing in prompt-style mode", () => {
@@ -325,8 +563,9 @@ describe("HookEditorComponent prompt-style mode", () => {
 		}
 
 		const lines = renderLines(component);
-		expect(lines[4]?.startsWith("> hello")).toBe(true);
-		expect(lines[4]?.startsWith("hello")).toBe(false);
+
+		expect(lines.some(line => line.includes("> hello"))).toBe(true);
+		expect(lines.some(line => line.includes("hello") && !line.includes(">"))).toBe(false);
 	});
 
 	it("aligns wrapped prompt-style continuation rows under the text column", () => {
@@ -335,9 +574,11 @@ describe("HookEditorComponent prompt-style mode", () => {
 		});
 
 		const lines = renderLines(component, 12);
-		expect(lines[4]).toBe("> abcdefghij");
-		expect(lines[5]?.startsWith("  klm")).toBe(true);
-		expect(lines[5]?.startsWith(">")).toBe(false);
+
+		expect(lines.some(line => line.includes("> abcdef"))).toBe(true);
+		const continuation = lines.find(line => line.includes("ghijkl"));
+		expect(continuation).toBeDefined();
+		expect(continuation).not.toContain(">");
 	});
 
 	it("cancels on Escape", () => {
@@ -369,6 +610,21 @@ describe("HookEditorComponent prompt-style mode", () => {
 
 		expect(onCancel).toHaveBeenCalledTimes(1);
 		expect(onSubmit).not.toHaveBeenCalled();
+	});
+
+	it("renders the title in the border, detail lines, hint, and prompt gutter", () => {
+		const title = "◆ Other (type your own)\nEnter your response:";
+		const component = new HookEditorComponent(createTui(), title, "不太清楚，", vi.fn(), vi.fn(), {
+			promptStyle: true,
+		});
+		const lines = renderLines(component);
+
+		// First title line insets into the top border row.
+		expect(lines[0]).toContain("Other (type your own)");
+		// Remaining title lines, gutter, and hint are body rows.
+		const content = component.renderContent(80).map(line => Bun.stripANSI(line));
+		expect(content.some(line => line.startsWith("Enter your response:"))).toBe(true);
+		expect(content.some(line => line.startsWith("> "))).toBe(true);
 	});
 });
 
@@ -503,6 +759,22 @@ describe("ExtensionUiController dialog serialization", () => {
 		abortA.abort();
 		await Bun.sleep(0);
 		expect(await promiseA).toBeUndefined();
+		expect(ctx.hookSelector).toBeUndefined();
+		expect(editorContainer.children).toEqual([editor]);
+	});
+	it("dismisses a confirmation and restores the editor when its signal aborts", async () => {
+		const { ctx, editor, editorContainer } = createControllerContext();
+		const controller = new ExtensionUiController(ctx);
+		const abortController = new AbortController();
+
+		const result = controller.showHookConfirm("High-risk command", "Allow this command?", {
+			signal: abortController.signal,
+		});
+		expect(ctx.hookSelector).toBeDefined();
+
+		abortController.abort();
+
+		expect(await result).toBe(false);
 		expect(ctx.hookSelector).toBeUndefined();
 		expect(editorContainer.children).toEqual([editor]);
 	});

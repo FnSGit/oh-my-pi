@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
+import { cosineSimilarityPairs } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
 import * as embeddings from "./embeddings";
 import { cosineSimilarity } from "./vector-math";
@@ -108,9 +108,10 @@ export function initSchema(db: Database): void {
 function hashEmbedding(text: string): Vector {
 	const out = new Float32Array(EMBEDDING_DIM);
 	const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+	const digest = new Uint8Array(20);
 	for (const word of words) {
-		const digest = createHash("sha1").update(word).digest();
-		const slot = digest.readUInt16BE(0) % EMBEDDING_DIM;
+		Bun.SHA1.hash(word, digest);
+		const slot = ((digest[0] << 8) | digest[1]) % EMBEDDING_DIM;
 		out[slot] = (out[slot] ?? 0) + 1;
 	}
 	return out;
@@ -166,17 +167,23 @@ export async function clusterBySimilarity(items: readonly ShmrItem[], threshold:
 	if (items.length === 0) return [];
 	const vectors = await resolveItemVectors(items);
 	const adjacency: number[][] = Array.from({ length: items.length }, () => []);
-	for (let i = 0; i < items.length; i++) {
-		const leftEmbedding = vectors[i];
-		if (leftEmbedding === undefined) continue;
-		for (let j = i + 1; j < items.length; j++) {
-			const rightEmbedding = vectors[j];
-			if (rightEmbedding === undefined) continue;
-			if (cosineSimilarity(leftEmbedding, rightEmbedding) >= threshold) {
-				adjacency[i]?.push(j);
-				adjacency[j]?.push(i);
-			}
-		}
+	// Native batch kernel: one N-API crossing evaluates all O(n^2) pairs.
+	// Vectors are zero-padded to a shared dim, matching the TS `?? 0`
+	// missing-element semantics of cosineSimilarity.
+	let dim = 0;
+	for (const vector of vectors) if (vector.length > dim) dim = vector.length;
+	const flat = new Float64Array(vectors.length * dim);
+	for (let i = 0; i < vectors.length; i++) {
+		const vector = vectors[i];
+		if (vector === undefined) continue;
+		for (let col = 0; col < vector.length; col++) flat[i * dim + col] = vector[col] ?? 0;
+	}
+	const pairs = cosineSimilarityPairs(flat, vectors.length, dim, threshold);
+	for (let p = 0; p < pairs.length; p += 2) {
+		const i = pairs[p] ?? 0;
+		const j = pairs[p + 1] ?? 0;
+		adjacency[i]?.push(j);
+		adjacency[j]?.push(i);
 	}
 	const visited = new Set<number>();
 	const clusters: ShmrItem[][] = [];
@@ -328,10 +335,10 @@ export function applyBeliefs(
 				confidence,
 				belief.target_fact_id,
 			]);
-		const beliefId = createHash("sha256")
-			.update(`${clusterId}:${belief.subject}:${belief.predicate}:${belief.object.slice(0, 50)}`)
-			.digest("hex")
-			.slice(0, 24);
+		const beliefId = Bun.SHA256.hash(
+			`${clusterId}:${belief.subject}:${belief.predicate}:${belief.object.slice(0, 50)}`,
+			"hex",
+		).slice(0, 24);
 		const provenance = JSON.stringify(
 			cluster.map(item => item.fact_id).filter((id): id is string => typeof id === "string"),
 		);

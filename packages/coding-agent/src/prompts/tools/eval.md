@@ -1,69 +1,91 @@
-Run code in a persistent kernel using a list of cells.
-
-<instruction>
-Cells run in array order. State persists per language — across cells, tool calls, and `task` subagents: variables either side defines are visible to the other. Stage helpers, datasets, or live clients once; subagents use them directly — no re-importing or serializing across the boundary.
-
-Cell fields:
-
-- `language` — {{#if py}}`"py"` for the IPython kernel{{/if}}{{#ifAll py js}}, {{/ifAll}}{{#if js}}`"js"` for the persistent JavaScript VM{{/if}}.
-- `code` — cell body, verbatim. Newlines and quotes JSON-encoded; no fences, no headers.
-- `title` (optional) — short transcript label (e.g. `"imports"`).
-- `timeout` (optional) — per-cell seconds (1-3600, default 30). Bounds the cell's own work only; the clock pauses while `agent()`/`parallel()`/`completion()` calls are in flight, so fanouts never need a raise. Raise only for heavy local compute or long non-agent tool calls.
-- `reset` (optional) — wipe this cell's language kernel first.{{#ifAll py js}} Per-language: a `py` reset never touches the JS VM.{{/ifAll}}
-
-Work incrementally: one logical step per cell (imports, define, test, use); pass multiple small cells per call; define small reusable functions for individual debugging. Workflow explanations go in the assistant message or `title`, never inside cell code.
-{{#if py}}Python runs in IPython with a live event loop: use top-level `await` directly; `asyncio.run(…)` raises "cannot be called from a running event loop".{{/if}}
-On failure, errors name the failing cell ("Cell 3 failed") — resubmit only the fixed cell (plus any remaining).
-</instruction>
+One cell per call; top-level state persists, including across compaction.{{#if spawns}} Subagents have separate kernels.{{/if}}
+{{#if spawns}}
+{{#if eagerDelegation}}
+For 2+ independent items, use a named `workpool()`; results auto-deliver.
+{{#if waitTool}}
+If blocked, leave `eval` and call `wait`.
+{{/if}}
+{{/if}}
+{{/if}}
+{{#if py}}
+Python: plain Python subprocess, not IPython (no `get_ipython()`, `obj?`, or %matplotlib).
+Magics like %pip, %load, %time and `!cmd` are rewritten to Python.
+Top-level `await` works; `asyncio.run(…)` fails.
+{{/if}}
+{{#if js}}JS: Bun (Bun.file, Bun.write, Bun.$); top-level `await`/`return` work.{{/if}}
+On error, retry only the failed step; earlier steps may have taken effect.
+Printing an image{{#if py}} or figure{{/if}} attaches it.
 
 <prelude>
-{{#ifAll py js}}Same helpers in both runtimes, same positional order. Python: helpers run synchronously; trailing options are keyword args. JavaScript: helpers are async and `await`able; trailing options are ONE trailing object literal, never positional (extra positional args throw).{{else}}{{#if py}}Helpers run synchronously. Trailing options are keyword arguments.{{/if}}{{#if js}}Helpers are async and `await`able. Trailing options are ONE trailing object literal, never positional (extra positional args throw).{{/if}}{{/ifAll}}
+{{#ifAll py js}}
+Python helpers take kwargs; JS helpers take the same parameters (camelCase) as positional args or ONE trailing options object.
+`await` marks async helpers; the rest are sync.
 ```
-display(value) → None
-    Render value in cell output, shows presentable values natively (figures, images, dataframes)
-print(value, ...) → None
-    Print to text output.
-read(path, offset?=1, limit?=None) → str
-    Read file as text; offset/limit are 1-indexed lines. Accepts `local://…`.
-write(path, content) → str
-    Write file (creates parents); returns resolved path. `local://…` persists across turns / subagents.
-append(path, content) → str
-    Append to file; returns resolved path. Accepts `local://…`.
-tree(path?=".", max_depth?=3, show_hidden?=False) → str
-    Directory tree.
-diff(a, b) → str
-    Unified diff of two files.
-env(key?=None, value?=None) → str | None | dict
-    No args → full env dict; one → value of `key`; two → set `key=value`, return value.
-output(*ids, format?="raw", query?=None, offset?=None, limit?=None) → str | dict | list[dict]
-    Read task/agent output by id; one id → text/dict, multiple → list.
-tool.<name>(args) → unknown
-    Invoke any session tool; `args` is its parameter object.
-completion(prompt, model?="default", system?=None, schema?=None) → str | dict
-    Oneshot stateless completion (no history, no tools). `model` tier: "smol" (fast) | "default" (session model) | "slow" (most capable). JSON-Schema `schema` forces structured output, returns parsed object.
-{{#if spawns}}agent(prompt, agent_type?="task", model?=None, label?=None, schema?=None) → str | dict
-    Run a subagent, return its final output. `agent_type`/`agentType` picks another discovered agent; `schema` as in completion(). Share background via `local://` files referenced in the prompt.
-{{#if js}}    JS: options are ONE trailing object — agent(prompt, { agentType, schema }).
-{{/if}}
-{{/if}}
-parallel(thunks) → list
-    Run thunks through a bounded pool (as wide as a `task` batch — don't pre-shrink), preserving input order. Barrier: returns when all finish; a throwing thunk propagates.
-pipeline(items, ...stages) → list
-    Map items through one-arg stages left-to-right, barrier between stages; stage 1 gets the item, later stages the previous result. Same pool width as parallel().
-log(message) → None
-    Progress line above the status tree.
-phase(title) → None
-    Start a phase grouping subsequent status lines.
-budget → per-turn token budget
-    {{#if py}}`budget.total` (ceiling or None), `budget.spent()`, `budget.remaining()` (math.inf when no ceiling), `budget.hard` (bool).{{/if}}{{#if js}}`await budget.total()` (ceiling or null), `await budget.spent()`, `await budget.remaining()` (Infinity when no ceiling), `await budget.hard()`.{{/if}} Ceiling comes from a `+Nk` directive (advisory) or `+Nk!`/Goal Mode (hard — `agent()` refuses to spawn past it); otherwise None/null, spend still tracked across the turn.
+print(value, ...)  log(message)  phase(title)  env(key?, value?)
+read(path, offset?, limit?)  write(path, content)  output(*ids, format?, query?, offset?, limit?); JS: await read(…)  await write(…)  await output(…)
+wait(handles, timeout?=None, raise_errors?=True); JS: await wait(…) — agent/completion barrier, ordered results; raise_errors=False retains failures
+await tool.<name>(args) — session tool; `args` is its parameter object
+sh(command, cwd?, timeout?); JS: await sh(…) or await sh`cmd ${arg}` — embedded bash engine, runs to completion (never backgrounded)
+  returns stdout+stderr; non-zero exit raises ShellError (.exit_code/.exitCode, .output)
+  JS interpolations are shell-quoted; starts in the session cwd unless cwd is given
 ```
+{{else}}
+`await` marks async helpers; the rest are sync.
+{{#if py}}
+Python (kwargs):
+```py
+print(value, ...)  log(message)  phase(title)  env(key?, value?)
+read(path, offset?, limit?)  write(path, content)  output(*ids, format?, query?, offset?, limit?)
+wait(handles, timeout?=None, raise_errors?=True) — agent/completion barrier, ordered results; `raise_errors=False` retains failures.
+await tool.<name>(args) — session tool; `args` is its parameter object
+sh(command, cwd?, timeout?) — embedded bash engine, runs to completion (never backgrounded)
+  returns stdout+stderr; non-zero exit raises ShellError (`.exit_code`, `.output`); starts in the session cwd unless `cwd` is given
+```
+{{/if}}
+{{#if js}}
+JS (positional args or ONE trailing options object):
+```js
+print(value, ...)  log(message)  phase(title)  env(key?, value?)
+await read(path, offset?, limit?)  await write(path, content)  await output(...ids, { format?, query?, offset?, limit? })
+await wait(handles, { timeout?, raiseErrors? }) — agent/completion barrier, ordered results; `raiseErrors: false` retains failures.
+await tool.<name>(args) — session tool; `args` is its parameter object
+await sh(command, { cwd?, timeout? })  await sh`cmd ${arg}` — embedded bash engine, runs to completion (never backgrounded)
+  resolves to stdout+stderr; non-zero exit throws ShellError (`.exitCode`, `.output`)
+  interpolations are shell-quoted; starts in the session cwd unless `cwd` is given
+```
+{{/if}}
+{{/ifAll}}
+{{#if toolNames}}Session tool names: {{#each toolNames}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}.{{/if}}
 </prelude>
 
-<example>
-{
-  "cells": [
-    { "language": "py", "title": "imports", "timeout": 10, "code": "import json\nfrom pathlib import Path" },
-    { "language": "py", "title": "load config", "code": "data = json.loads(read('package.json'))\ndisplay(data)" }
-  ]
-}
-</example>
+{{#if inlineTopics}}
+{{{inlineTopics}}}
+{{else}}
+<namespaces>
+More globals; `read` the linked docs before first use:
+- `judge`, `{{#if py}}judge_batch{{else}}judgeBatch{{/if}}`, `completion`: classification, bulk judgment, model calls → xd://eval/judge
+- `%load`{{#if py}}, `%pip`{{/if}}{{#if js}}, `%bun add`{{/if}}, `budget`{{#if evalTools}}, `@tool`/`tool(fn)`{{/if}}: setup, installs, utilities → xd://eval/helpers
+{{#if spawns}}
+- `agent`, `workpool`: background subagents, DAG waves → xd://eval/agents
+{{/if}}
+{{#each preludes}}
+- `{{name}}`: {{summary}} → xd://eval/{{name}}
+{{/each}}
+</namespaces>
+{{#each inlinePreludes}}
+
+<{{name}}>
+Global `{{name}}`, documented here in full (no `read` needed):
+{{{documentation}}}
+</{{name}}>
+{{/each}}
+{{/if}}
+
+<critical>
+NEVER repeat successful setup. Kernel-loss notice means reload setup.
+</critical>
+
+{{#if autoBackgroundEnabled}}
+Long cells may auto-background and deliver later; the kernel stays busy.
+`timeout: 0` disables the cell deadline, not the foreground wait.
+{{/if}}

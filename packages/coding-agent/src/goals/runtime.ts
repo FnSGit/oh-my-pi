@@ -1,8 +1,9 @@
-import { prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { escapeXmlText, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import goalBudgetLimitPrompt from "../prompts/goals/goal-budget-limit.md" with { type: "text" };
 import goalContinuationPrompt from "../prompts/goals/goal-continuation.md" with { type: "text" };
 import goalModeActivePrompt from "../prompts/goals/goal-mode-active.md" with { type: "text" };
-import type { Goal, GoalBudgetSteering, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "./state";
+import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
+import type { GoalBudgetSteering, GoalModeState, GoalRuntimeEvent, GoalTokenUsage } from "./state";
 
 export interface GoalRuntimeHost {
 	getState(): GoalModeState | undefined;
@@ -56,28 +57,6 @@ function remainingValue(goal: Goal): string {
 export function remainingTokens(goal: Goal | null | undefined): number | null {
 	if (!goal || goal.tokenBudget === undefined) return null;
 	return Math.max(0, goal.tokenBudget - goal.tokensUsed);
-}
-
-export function escapeXmlText(input: string): string {
-	let firstEscapable = -1;
-	for (let index = 0; index < input.length; index++) {
-		const char = input.charCodeAt(index);
-		if (char === 38 || char === 60 || char === 62) {
-			firstEscapable = index;
-			break;
-		}
-	}
-	if (firstEscapable === -1) return input;
-
-	let output = input.slice(0, firstEscapable);
-	for (let index = firstEscapable; index < input.length; index++) {
-		const char = input[index];
-		if (char === "&") output += "&amp;";
-		else if (char === "<") output += "&lt;";
-		else if (char === ">") output += "&gt;";
-		else output += char;
-	}
-	return output;
 }
 
 export function renderTrustedObjective(objective: string): string {
@@ -200,8 +179,8 @@ export class GoalRuntime {
 		}
 	}
 
-	#markActiveAccounting(goal: Goal): void {
-		if (this.#wallClock.activeGoalId !== goal.id) {
+	#markActiveAccounting(goal: Goal, resetWallClock = false): void {
+		if (resetWallClock || this.#wallClock.activeGoalId !== goal.id) {
 			this.#wallClock = { lastAccountedAt: this.#now(), activeGoalId: goal.id };
 		}
 		if (this.#turnSnapshot) {
@@ -215,6 +194,12 @@ export class GoalRuntime {
 		if (this.#turnSnapshot) {
 			this.#turnSnapshot.activeGoalId = undefined;
 		}
+	}
+
+	clearAccounting(): void {
+		this.#turnSnapshot = undefined;
+		this.#clearActiveAccounting();
+		this.#budgetReportedFor = undefined;
 	}
 
 	onTurnStart(turnId: string, baselineUsage: GoalTokenUsage): void {
@@ -239,12 +224,20 @@ export class GoalRuntime {
 		await this.flushUsage("suppressed");
 	}
 
-	async onAgentEnd(options?: { turnCompleted?: boolean; currentUsage?: GoalTokenUsage }): Promise<void> {
+	/**
+	 * `currentUsage` may be a thunk: it is read synchronously (before any await)
+	 * only when goal accounting is active, so idle sessions skip the usage walk.
+	 */
+	async onAgentEnd(options?: {
+		turnCompleted?: boolean;
+		currentUsage?: GoalTokenUsage | (() => GoalTokenUsage);
+	}): Promise<void> {
 		if (!this.#hasAccountingState()) {
 			this.#turnSnapshot = undefined;
 			return;
 		}
-		await this.flushUsage("suppressed", options?.currentUsage);
+		const currentUsage = options?.currentUsage;
+		await this.flushUsage("suppressed", typeof currentUsage === "function" ? currentUsage() : currentUsage);
 		this.#turnSnapshot = undefined;
 	}
 
@@ -257,7 +250,7 @@ export class GoalRuntime {
 			return;
 		}
 		await this.#withAccounting(async () => {
-			await this.#flushUsageLocked("suppressed");
+			await this.#flushUsageLocked("suppressed", undefined, options?.reason === "internal");
 			this.#turnSnapshot = undefined;
 			if (options?.reason !== "interrupted") return;
 			const cloned = this.#getStateClone();
@@ -271,9 +264,14 @@ export class GoalRuntime {
 		});
 	}
 
-	async onThreadResumed(): Promise<GoalModeState | undefined> {
+	async onThreadResumed(options?: { preserveActiveGoal?: boolean }): Promise<GoalModeState | undefined> {
 		const state = this.#getStateClone();
 		if (!state) return undefined;
+		if (options?.preserveActiveGoal && state.enabled && state.goal.status === "active") {
+			this.#markActiveAccounting(state.goal, true);
+			await this.#commitState(state, { emit: true });
+			return state;
+		}
 		if (state.goal.status === "active") {
 			state.enabled = false;
 			state.goal.status = "paused";
@@ -320,18 +318,22 @@ export class GoalRuntime {
 		});
 	}
 
+	/** `currentUsage` defaults to the host's live totals, read only once a token delta is needed. */
 	async #flushUsageLocked(
 		steering: GoalBudgetSteering,
-		currentUsage: GoalTokenUsage = this.#host.getCurrentUsage(),
+		currentUsage?: GoalTokenUsage,
+		persistWallClock = false,
 	): Promise<void> {
 		const state = this.#getStateClone();
 		if (!state?.enabled || !isAccountingStatus(state.goal)) return;
 		if (this.#turnSnapshot?.activeGoalId !== state.goal.id && this.#wallClock.activeGoalId !== state.goal.id) return;
 
-		const tokenDelta =
-			this.#turnSnapshot?.activeGoalId === state.goal.id
-				? goalTokenDelta(currentUsage, this.#turnSnapshot.baselineUsage)
-				: 0;
+		let usage: GoalTokenUsage | undefined;
+		let tokenDelta = 0;
+		if (this.#turnSnapshot?.activeGoalId === state.goal.id) {
+			usage = currentUsage ?? this.#host.getCurrentUsage();
+			tokenDelta = goalTokenDelta(usage, this.#turnSnapshot.baselineUsage);
+		}
 		const wallSeconds =
 			this.#wallClock.activeGoalId === state.goal.id
 				? Math.max(0, Math.floor((this.#now() - this.#wallClock.lastAccountedAt) / 1000))
@@ -349,14 +351,17 @@ export class GoalRuntime {
 			state.goal.status = "budget-limited";
 		}
 
-		if (this.#turnSnapshot?.activeGoalId === state.goal.id) {
-			this.#turnSnapshot.baselineUsage = { ...currentUsage };
+		if (usage && this.#turnSnapshot?.activeGoalId === state.goal.id) {
+			this.#turnSnapshot.baselineUsage = { ...usage };
 		}
 		if (this.#wallClock.activeGoalId === state.goal.id && wallSeconds > 0) {
 			this.#wallClock.lastAccountedAt += wallSeconds * 1000;
 		}
-
-		await this.#commitState(state, { persist: "goal" });
+		// Persisting wall-clock-only accounting on every tool event bloats /goal sessions with full
+		// objective snapshots. Keep normal tool flushes in memory/UI only, but make wall-clock
+		// usage durable before internal session switches because the active runtime is leaving.
+		const shouldPersistUsage = tokenDelta > 0 || flippedToBudgetLimited || (persistWallClock && wallSeconds > 0);
+		await this.#commitState(state, { persist: shouldPersistUsage ? "goal" : undefined });
 
 		if (state.goal.status !== "budget-limited") {
 			this.#budgetReportedFor = undefined;
@@ -366,10 +371,7 @@ export class GoalRuntime {
 		}
 	}
 
-	async flushUsage(
-		steering: GoalBudgetSteering,
-		currentUsage: GoalTokenUsage = this.#host.getCurrentUsage(),
-	): Promise<void> {
+	async flushUsage(steering: GoalBudgetSteering, currentUsage?: GoalTokenUsage): Promise<void> {
 		await this.#withAccounting(() => this.#flushUsageLocked(steering, currentUsage));
 	}
 

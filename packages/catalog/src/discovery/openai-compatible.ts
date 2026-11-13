@@ -1,8 +1,41 @@
-import { z } from "zod/v4";
-import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../provider-models/discovery-constants";
+import { type } from "@oh-my-pi/omptype";
 import type { Api, FetchImpl, ModelSpec, Provider } from "../types";
+import { discoveryFetch } from "../utils";
 
 const MODELS_PATH = "/models";
+
+/**
+ * Default hard deadline applied to an OpenAI-compatible `/models` probe when
+ * the caller supplies neither an `AbortSignal` nor an explicit `timeoutMs`.
+ *
+ * Built-in provider model managers (openrouter, xAI, DeepSeek, …) call
+ * {@link fetchOpenAICompatibleModels} with no timeout, so without this bound a
+ * stalled endpoint left the request pending forever and blocked startup's
+ * awaited `resolveModelDiscoveryFallback` discovery pass indefinitely
+ * (issue #8315). 10s matches the coding-agent's remote-discovery budget.
+ */
+export const DEFAULT_OPENAI_COMPATIBLE_DISCOVERY_TIMEOUT_MS = 10_000;
+
+/**
+ * Uses a cancellable timer rather than the native abort-timeout helper so
+ * successful fast discovery requests do not leave armed timeout signals for
+ * concurrent GC to trip over later.
+ */
+export async function withOpenAICompatibleDiscoveryTimeout<T>(
+	timeoutMs: number,
+	run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")),
+		timeoutMs,
+	);
+	try {
+		return await run(controller.signal);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 /**
  * Minimal OpenAI-style model entry shape consumed by discovery.
@@ -33,28 +66,23 @@ export interface OpenAICompatibleModelsEnvelope {
 	[key: string]: unknown;
 }
 
-const openAICompatibleModelRecordSchema = z
-	.object({
-		id: z.string().min(1),
-		name: z.string().optional().nullable(),
-		object: z.unknown().optional(),
-		owned_by: z.unknown().optional(),
-	})
-	.loose();
+const openAICompatibleModelRecordSchema = type({
+	id: "string >= 1",
+	"name?": "string | null",
+	"object?": "unknown",
+	"owned_by?": "unknown",
+});
 
-const openAICompatibleModelsEnvelopeSchema = z
-	.object({
-		data: z.unknown().optional(),
-		models: z.unknown().optional(),
-		result: z.unknown().optional(),
-		items: z.unknown().optional(),
-	})
-	.loose();
+const openAICompatibleModelsEnvelopeSchema = type({
+	"data?": "unknown",
+	"models?": "unknown",
+	"result?": "unknown",
+	"items?": "unknown",
+});
 
-const openAICompatibleModelsPayloadSchema = z.union([z.array(z.unknown()), openAICompatibleModelsEnvelopeSchema]);
+const openAICompatibleModelsPayloadSchema = type("unknown[]").or(openAICompatibleModelsEnvelopeSchema);
 
-type ParsedOpenAICompatibleModelRecord = z.infer<typeof openAICompatibleModelRecordSchema>;
-
+type ParsedOpenAICompatibleModelRecord = typeof openAICompatibleModelRecordSchema.infer;
 /**
  * Context passed to custom OpenAI-compatible model mappers.
  */
@@ -78,8 +106,16 @@ export interface FetchOpenAICompatibleModelsOptions<TApi extends Api> {
 	apiKey?: string;
 	/** Additional request headers. */
 	headers?: Record<string, string>;
-	/** Optional AbortSignal for request cancellation. */
+	/** Query parameters appended to the `/models` probe (e.g. OpenRouter's `output_modalities` roster filter). */
+	query?: Record<string, string>;
+	/** Optional AbortSignal for request cancellation; caller owns its lifecycle. */
 	signal?: AbortSignal;
+	/**
+	 * Optional cancellable request timeout used when `signal` is omitted.
+	 * Defaults to {@link DEFAULT_OPENAI_COMPATIBLE_DISCOVERY_TIMEOUT_MS} so a
+	 * stalled endpoint can never hang discovery indefinitely.
+	 */
+	timeoutMs?: number;
 	/** Optional fetch implementation override for testing/custom runtimes. */
 	fetch?: FetchImpl;
 	/**
@@ -120,26 +156,38 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 		requestHeaders.Authorization = `Bearer ${options.apiKey}`;
 	}
 
-	const fetchImpl = options.fetch ?? globalThis.fetch;
-	let response: Response;
-	try {
-		response = await fetchImpl(`${baseUrl}${MODELS_PATH}`, {
-			method: "GET",
-			headers: requestHeaders,
-			signal: options.signal,
-		});
-	} catch {
-		return null;
-	}
+	const fetchImpl = discoveryFetch(options.fetch);
+	const query = options.query ? `?${new URLSearchParams(options.query)}` : "";
+	const fetchPayload = async (signal?: AbortSignal): Promise<unknown | null> => {
+		let response: Response;
+		try {
+			response = await fetchImpl(`${baseUrl}${MODELS_PATH}${query}`, {
+				method: "GET",
+				headers: requestHeaders,
+				signal,
+			});
+		} catch {
+			return null;
+		}
 
-	if (!response.ok) {
-		return null;
-	}
+		if (!response.ok) {
+			return null;
+		}
 
-	let payload: unknown;
-	try {
-		payload = await response.json();
-	} catch {
+		try {
+			return await response.json();
+		} catch {
+			return null;
+		}
+	};
+	const payload =
+		options.signal !== undefined
+			? await fetchPayload(options.signal)
+			: await withOpenAICompatibleDiscoveryTimeout(
+					options.timeoutMs ?? DEFAULT_OPENAI_COMPATIBLE_DISCOVERY_TIMEOUT_MS,
+					fetchPayload,
+				);
+	if (payload === null) {
 		return null;
 	}
 
@@ -165,8 +213,8 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: UNK_CONTEXT_WINDOW,
-			maxTokens: UNK_MAX_TOKENS,
+			contextWindow: null,
+			maxTokens: null,
 		};
 
 		// `mapModel` returning null skips the entry (documented contract); only a
@@ -197,22 +245,17 @@ function extractModelEntries(payload: unknown): ParsedOpenAICompatibleModelRecor
 }
 
 function extractModelEntriesFromNode(node: unknown): ParsedOpenAICompatibleModelRecord[] | null {
-	const parsedPayload = openAICompatibleModelsPayloadSchema.safeParse(node);
-	if (!parsedPayload.success) {
+	const parsedPayload = openAICompatibleModelsPayloadSchema(node);
+	if (parsedPayload instanceof type.errors) {
 		return null;
 	}
-	if (Array.isArray(parsedPayload.data)) {
-		const parsedEntries = parsedPayload.data
-			.map(entry => openAICompatibleModelRecordSchema.safeParse(entry))
-			.flatMap(entry => (entry.success ? [entry.data] : []));
+	if (Array.isArray(parsedPayload)) {
+		const parsedEntries = parsedPayload
+			.map(entry => openAICompatibleModelRecordSchema(entry))
+			.flatMap(entry => (entry instanceof type.errors ? [] : [entry]));
 		return parsedEntries;
 	}
-	for (const candidate of [
-		parsedPayload.data.data,
-		parsedPayload.data.models,
-		parsedPayload.data.result,
-		parsedPayload.data.items,
-	]) {
+	for (const candidate of [parsedPayload.data, parsedPayload.models, parsedPayload.result, parsedPayload.items]) {
 		if (candidate === undefined) {
 			continue;
 		}

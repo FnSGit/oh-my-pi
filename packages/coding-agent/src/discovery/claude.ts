@@ -7,7 +7,9 @@
 import * as path from "node:path";
 import { hasFsCode, tryParseJson } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
-import { type ContextFile, contextFileCapability } from "../capability/context-file";
+import { isUserSourceEnabled } from "../capability";
+import type { ContextFile } from "../capability/context-file";
+import { contextFileCapability } from "../capability/context-file";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { readFile } from "../capability/fs";
 import { type ClaudeHookEvent, type ClaudeHooksConfig, type Hook, hookCapability } from "../capability/hook";
@@ -19,6 +21,7 @@ import { type SlashCommand, slashCommandCapability } from "../capability/slash-c
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
+import { resolveClaudePaths } from "../config/claude-paths";
 import { settings } from "../config/settings";
 import {
 	buildRuleFromMarkdown,
@@ -30,6 +33,13 @@ import {
 	loadFilesFromDir,
 	scanSkillsFromDir,
 } from "./helpers";
+import type { Setting } from "../config/registry";
+
+import {
+	cfgCommandsEnableClaudeProject,
+	cfgCommandsEnableClaudeUser,
+	cfgSkillsEnableClaudeUser,
+} from "../extensibility/settings";
 
 const PROVIDER_ID = "claude";
 const DISPLAY_NAME = "Claude Code";
@@ -37,10 +47,27 @@ const PRIORITY = 80;
 const CONFIG_DIR = ".claude";
 
 /**
- * Get user-level .claude path.
+ * Read a legacy per-capability `~/.claude` toggle. Defaults to off (opt-in);
+ * also off when settings are not initialized (discovery unit tests).
  */
-function getUserClaude(ctx: LoadContext): string {
-	return path.join(ctx.home, CONFIG_DIR);
+function readClaudeUserToggle(toggle: Setting<boolean>): boolean {
+	try {
+		return toggle.get(settings) === true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Get the active user-level Claude Code directory, or null when `~/.claude`
+ * is not opted in. `capabilityToggle` is a legacy per-capability opt-in
+ * (`skills.enableClaudeUser`, `commands.enableClaudeUser`) that admits just
+ * that capability's directory.
+ */
+function getUserClaude(ctx: LoadContext, capabilityToggle = false): string | null {
+	if (!capabilityToggle && !isUserSourceEnabled("claude", ctx)) return null;
+	const { configDir } = resolveClaudePaths(ctx.home);
+	return configDir;
 }
 
 /**
@@ -63,16 +90,16 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	const warnings: string[] = [];
 
 	const userBase = getUserClaude(ctx);
-	const userClaudeJson = path.join(ctx.home, ".claude.json");
-	const userMcpJson = path.join(userBase, "mcp.json");
+	const userClaudeJson = userBase ? resolveClaudePaths(ctx.home).configFile : null;
+	const userMcpJson = userBase ? path.join(userBase, "mcp.json") : null;
 
 	const projectBase = path.join(ctx.cwd, CONFIG_DIR);
 	const projectMcpJson = path.join(projectBase, ".mcp.json");
 	const projectMcpJsonAlt = path.join(projectBase, "mcp.json");
 
 	const userPaths = [
-		{ path: userClaudeJson, level: "user" as const },
-		{ path: userMcpJson, level: "user" as const },
+		...(userClaudeJson ? [{ path: userClaudeJson, level: "user" as const }] : []),
+		...(userMcpJson ? [{ path: userMcpJson, level: "user" as const }] : []),
 	];
 	const projectPaths = [
 		{ path: projectMcpJson, level: "project" as const },
@@ -92,6 +119,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 			const serverConfig = config as Record<string, unknown>;
 			return {
 				name,
+				enabled: typeof serverConfig.enabled === "boolean" ? serverConfig.enabled : undefined,
 				timeout: typeof serverConfig.timeout === "number" ? serverConfig.timeout : undefined,
 				command: serverConfig.command as string | undefined,
 				args: serverConfig.args as string[] | undefined,
@@ -104,17 +132,19 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		});
 	};
 
-	for (let i = 0; i < userPaths.length; i++) {
-		const servers = parseMcpServers(contents[i], userPaths[i].path, userPaths[i].level);
+	// Load project entries before user entries so a project `enabled: false`
+	// claims its dedupe key before a same-named user server can survive (#7654).
+	const projectOffset = userPaths.length;
+	for (let i = 0; i < projectPaths.length; i++) {
+		const servers = parseMcpServers(contents[projectOffset + i], projectPaths[i].path, projectPaths[i].level);
 		if (servers.length > 0) {
 			items.push(...servers);
 			break;
 		}
 	}
 
-	const projectOffset = userPaths.length;
-	for (let i = 0; i < projectPaths.length; i++) {
-		const servers = parseMcpServers(contents[projectOffset + i], projectPaths[i].path, projectPaths[i].level);
+	for (let i = 0; i < userPaths.length; i++) {
+		const servers = parseMcpServers(contents[i], userPaths[i].path, userPaths[i].level);
 		if (servers.length > 0) {
 			items.push(...servers);
 			break;
@@ -133,10 +163,10 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const warnings: string[] = [];
 
 	const userBase = getUserClaude(ctx);
-	const userClaudeMd = path.join(userBase, "CLAUDE.md");
+	const userClaudeMd = userBase ? path.join(userBase, "CLAUDE.md") : null;
 
-	const userContent = await readFile(userClaudeMd);
-	if (userContent !== null) {
+	const userContent = userClaudeMd ? await readFile(userClaudeMd) : null;
+	if (userContent !== null && userClaudeMd) {
 		items.push({
 			path: userClaudeMd,
 			content: userContent,
@@ -167,29 +197,35 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 // =============================================================================
 
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const userSkillsDir = path.join(getUserClaude(ctx), "skills");
+	const userBase = getUserClaude(ctx, readClaudeUserToggle(cfgSkillsEnableClaudeUser));
+	const userSkillsDir = userBase ? path.join(userBase, "skills") : null;
 
-	// Walk up from cwd finding .claude/skills/ in ancestors
+	// Walk up from cwd finding .claude/skills/ in ancestors. Skip $HOME:
+	// that path is already scanned as the Claude user source below, and scanning
+	// it again as project would bypass enableClaudeUser when project skills stay enabled.
 	const projectScans: Promise<LoadResult<Skill>>[] = [];
 	let current = ctx.cwd;
 	while (true) {
-		projectScans.push(
-			scanSkillsFromDir(ctx, {
-				dir: path.join(current, CONFIG_DIR, "skills"),
-				providerId: PROVIDER_ID,
-				level: "project",
-			}),
-		);
+		if (current !== ctx.home) {
+			projectScans.push(
+				scanSkillsFromDir(ctx, {
+					dir: path.join(current, CONFIG_DIR, "skills"),
+					providerId: PROVIDER_ID,
+					level: "project",
+				}),
+			);
+		}
 		if (current === (ctx.repoRoot ?? ctx.home)) break;
 		const parent = path.dirname(current);
 		if (parent === current) break; // filesystem root
 		current = parent;
 	}
 
-	const [userResult, ...projectResults] = await Promise.allSettled([
-		scanSkillsFromDir(ctx, { dir: userSkillsDir, providerId: PROVIDER_ID, level: "user" }),
-		...projectScans,
-	]);
+	const userScanPromise = userSkillsDir
+		? scanSkillsFromDir(ctx, { dir: userSkillsDir, providerId: PROVIDER_ID, level: "user" })
+		: Promise.resolve({ items: [] as Skill[], warnings: [] as string[] });
+
+	const [userResult, ...projectResults] = await Promise.allSettled([userScanPromise, ...projectScans]);
 
 	const items: Skill[] = [];
 	const warnings: string[] = [];
@@ -197,7 +233,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	if (userResult.status === "fulfilled") {
 		items.push(...userResult.value.items);
 		warnings.push(...(userResult.value.warnings ?? []));
-	} else if (!isMissingDirectoryError(userResult.reason)) {
+	} else if (userSkillsDir && !isMissingDirectoryError(userResult.reason)) {
 		warnings.push(`Failed to scan Claude user skills in ${userSkillsDir}: ${String(userResult.reason)}`);
 	}
 
@@ -222,12 +258,11 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 	const warnings: string[] = [];
 
 	const userBase = getUserClaude(ctx);
-	const userExtensionsDir = path.join(userBase, "extensions");
 	const projectExtensionsDir = path.join(ctx.cwd, CONFIG_DIR, "extensions");
 
 	const dirsToDiscover: { dir: string; level: "user" | "project" }[] = [
-		{ dir: userExtensionsDir, level: "user" },
-		{ dir: projectExtensionsDir, level: "project" },
+		...(userBase ? [{ dir: path.join(userBase, "extensions"), level: "user" as const }] : []),
+		{ dir: projectExtensionsDir, level: "project" as const },
 	];
 
 	const pathsByLevel = await Promise.all(
@@ -256,18 +291,14 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 // =============================================================================
 
 /**
- * Read the Claude command-loading toggles from settings.
- * Falls back to true (current behavior) when settings are not initialized,
- * e.g. inside discovery unit tests that run without Settings.init().
+ * Read the project command-loading toggle. Falls back to true when settings
+ * are not initialized, e.g. inside discovery unit tests without Settings.init().
  */
-function readClaudeCommandToggles(): { enableUser: boolean; enableProject: boolean } {
+function readClaudeProjectCommandsToggle(): boolean {
 	try {
-		return {
-			enableUser: settings.get("commands.enableClaudeUser") ?? true,
-			enableProject: settings.get("commands.enableClaudeProject") ?? true,
-		};
+		return cfgCommandsEnableClaudeProject.get(settings);
 	} catch {
-		return { enableUser: true, enableProject: true };
+		return true;
 	}
 }
 
@@ -297,10 +328,10 @@ function addClaudeCommandNamespaceAliases(commands: SlashCommand[], commandsDir:
 async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashCommand>> {
 	const items: SlashCommand[] = [];
 	const warnings: string[] = [];
-	const { enableUser, enableProject } = readClaudeCommandToggles();
+	const enableProject = readClaudeProjectCommandsToggle();
 
-	if (enableUser) {
-		const userBase = getUserClaude(ctx);
+	const userBase = getUserClaude(ctx, readClaudeUserToggle(cfgCommandsEnableClaudeUser));
+	if (userBase) {
 		const userCommandsDir = path.join(userBase, "commands");
 
 		const userResult = await loadFilesFromDir<SlashCommand>(ctx, userCommandsDir, PROVIDER_ID, "user", {
@@ -410,7 +441,6 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 	const warnings: string[] = [];
 
 	const userBase = getUserClaude(ctx);
-	const userHooksDir = path.join(userBase, "hooks");
 	const projectBase = getProjectClaude(ctx);
 	const projectHooksDir = path.join(projectBase, "hooks");
 
@@ -418,8 +448,11 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 
 	// --- Load file-based hooks from .claude/hooks/{pre,post}/ ---
 	const loadTasks: { dir: string; hookType: "pre" | "post"; level: "user" | "project" }[] = [];
-	for (const hookType of hookTypes) {
-		loadTasks.push({ dir: path.join(userHooksDir, hookType), hookType, level: "user" });
+	if (userBase) {
+		const userHooksDir = path.join(userBase, "hooks");
+		for (const hookType of hookTypes) {
+			loadTasks.push({ dir: path.join(userHooksDir, hookType), hookType, level: "user" });
+		}
 	}
 	for (const hookType of hookTypes) {
 		loadTasks.push({ dir: path.join(projectHooksDir, hookType), hookType, level: "project" });
@@ -450,7 +483,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 
 	// --- Load command-based hooks from .claude/settings.json ---
 	const settingsPaths: { filePath: string; level: "user" | "project" }[] = [
-		{ filePath: path.join(userBase, "settings.json"), level: "user" },
+		...(userBase ? [{ filePath: path.join(userBase, "settings.json"), level: "user" as const }] : []),
 		{ filePath: path.join(projectBase, "settings.json"), level: "project" },
 	];
 
@@ -482,30 +515,34 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 	const warnings: string[] = [];
 
 	const userBase = getUserClaude(ctx);
-	const userToolsDir = path.join(userBase, "tools");
+	if (userBase) {
+		const userToolsDir = path.join(userBase, "tools");
 
-	const userResult = await loadFilesFromDir<CustomTool>(ctx, userToolsDir, PROVIDER_ID, "user", {
-		transform: (name, _content, path, source) => {
-			const toolName = name.replace(/\.(ts|js|sh|bash|py)$/, "");
-			return {
-				name: toolName,
-				path,
-				description: `${toolName} custom tool`,
-				level: "user",
-				_source: source,
-			};
-		},
-	});
+		const userResult = await loadFilesFromDir<CustomTool>(ctx, userToolsDir, PROVIDER_ID, "user", {
+			extensions: ["ts", "js"],
+			transform: (name, _content, path, source) => {
+				const toolName = name.replace(/\.(ts|js)$/, "");
+				return {
+					name: toolName,
+					path,
+					description: `${toolName} custom tool`,
+					level: "user",
+					_source: source,
+				};
+			},
+		});
 
-	items.push(...userResult.items);
-	if (userResult.warnings) warnings.push(...userResult.warnings);
+		items.push(...userResult.items);
+		if (userResult.warnings) warnings.push(...userResult.warnings);
+	}
 
 	const projectBase = getProjectClaude(ctx);
 	const projectToolsDir = path.join(projectBase, "tools");
 
 	const projectResult = await loadFilesFromDir<CustomTool>(ctx, projectToolsDir, PROVIDER_ID, "project", {
+		extensions: ["ts", "js"],
 		transform: (name, _content, path, source) => {
-			const toolName = name.replace(/\.(ts|js|sh|bash|py)$/, "");
+			const toolName = name.replace(/\.(ts|js)$/, "");
 			return {
 				name: toolName,
 				path,
@@ -530,17 +567,42 @@ async function loadSystemPrompts(ctx: LoadContext): Promise<LoadResult<SystemPro
 	const items: SystemPrompt[] = [];
 	const warnings: string[] = [];
 
-	const userBase = getUserClaude(ctx);
-	const userSystemMd = path.join(userBase, "SYSTEM.md");
+	const projectBase = getProjectClaude(ctx);
+	for (const [file, kind] of [
+		["SYSTEM_TEMPLATE.md", "template"],
+		["SYSTEM.md", "text"],
+	] as const) {
+		const projectPath = path.join(projectBase, file);
+		const content = await readFile(projectPath);
+		if (content) {
+			items.push({
+				path: projectPath,
+				content,
+				kind,
+				level: "project",
+				_source: createSourceMeta(PROVIDER_ID, projectPath, "project"),
+			});
+		}
+	}
 
-	const content = await readFile(userSystemMd);
-	if (content !== null) {
-		items.push({
-			path: userSystemMd,
-			content,
-			level: "user",
-			_source: createSourceMeta(PROVIDER_ID, userSystemMd, "user"),
-		});
+	const userBase = getUserClaude(ctx);
+	if (userBase) {
+		for (const [file, kind] of [
+			["SYSTEM_TEMPLATE.md", "template"],
+			["SYSTEM.md", "text"],
+		] as const) {
+			const userPath = path.join(userBase, file);
+			const content = await readFile(userPath);
+			if (content !== null) {
+				items.push({
+					path: userPath,
+					content,
+					kind,
+					level: "user",
+					_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
+				});
+			}
+		}
 	}
 
 	return { items, warnings };
@@ -555,20 +617,22 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	const warnings: string[] = [];
 
 	const userBase = getUserClaude(ctx);
-	const userSettingsJson = path.join(userBase, "settings.json");
+	if (userBase) {
+		const userSettingsJson = path.join(userBase, "settings.json");
 
-	const userContent = await readFile(userSettingsJson);
-	if (userContent) {
-		const data = tryParseJson<Record<string, unknown>>(userContent);
-		if (data) {
-			items.push({
-				path: userSettingsJson,
-				data,
-				level: "user",
-				_source: createSourceMeta(PROVIDER_ID, userSettingsJson, "user"),
-			});
-		} else {
-			warnings.push(`Failed to parse JSON in ${userSettingsJson}`);
+		const userContent = await readFile(userSettingsJson);
+		if (userContent) {
+			const data = tryParseJson<Record<string, unknown>>(userContent);
+			if (data) {
+				items.push({
+					path: userSettingsJson,
+					data,
+					level: "user",
+					_source: createSourceMeta(PROVIDER_ID, userSettingsJson, "user"),
+				});
+			} else {
+				warnings.push(`Failed to parse JSON in ${userSettingsJson}`);
+			}
 		}
 	}
 
@@ -599,16 +663,18 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const items: Rule[] = [];
 	const warnings: string[] = [];
-
-	const userRulesDir = path.join(getUserClaude(ctx), "rules");
+	const userBase = getUserClaude(ctx);
+	const userRulesDir = userBase ? path.join(userBase, "rules") : null;
 	const projectRulesDir = path.join(getProjectClaude(ctx), "rules");
 
 	const [userResult, projectResult] = await Promise.all([
-		loadFilesFromDir<Rule>(ctx, userRulesDir, PROVIDER_ID, "user", {
-			extensions: ["mdc", "md"],
-			transform: (name, content, filePath, source) =>
-				buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(mdc|md)$/ }),
-		}),
+		userRulesDir
+			? loadFilesFromDir<Rule>(ctx, userRulesDir, PROVIDER_ID, "user", {
+					extensions: ["mdc", "md"],
+					transform: (name, content, filePath, source) =>
+						buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(mdc|md)$/ }),
+				})
+			: Promise.resolve({ items: [] as Rule[], warnings: [] as string[] }),
 		loadFilesFromDir<Rule>(ctx, projectRulesDir, PROVIDER_ID, "project", {
 			extensions: ["mdc", "md"],
 			transform: (name, content, filePath, source) =>

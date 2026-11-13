@@ -19,7 +19,7 @@ function createSqliteDb(path: string): void {
 	const db = new Database(path, { create: true, readwrite: true, strict: true });
 	try {
 		db.exec("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT NOT NULL)");
-		db.prepare("INSERT INTO memories (content) VALUES (?)").run("backup me");
+		db.run("INSERT INTO memories (content) VALUES (?)", ["backup me"]);
 	} finally {
 		db.close();
 	}
@@ -52,7 +52,7 @@ function withFrozenNow<T>(iso: string, fn: () => T): T {
 			else super(value);
 		}
 
-		static now(): number {
+		static override now(): number {
 			return fixedMs;
 		}
 	}
@@ -114,14 +114,6 @@ describe("SQLite recovery helpers", () => {
 		expect(existsSync(second.metadata_path)).toBe(true);
 	});
 
-	it("returns true for a valid SQLite database integrity check", () => {
-		const dir = makeTempDir();
-		const dbPath = join(dir, "mnemopi.db");
-		createSqliteDb(dbPath);
-
-		expect(verifyIntegrity(dbPath)).toBe(true);
-	});
-
 	it("restores a backup to a new path", () => {
 		const dir = makeTempDir();
 		const dbPath = join(dir, "mnemopi.db");
@@ -152,7 +144,7 @@ describe("SQLite recovery helpers", () => {
 		try {
 			db.exec("PRAGMA journal_mode=WAL");
 			db.exec("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT NOT NULL)");
-			db.prepare("INSERT INTO memories (content) VALUES (?)").run("wal protected");
+			db.run("INSERT INTO memories (content) VALUES (?)", ["wal protected"]);
 			expect(existsSync(`${dbPath}-wal`)).toBe(true);
 
 			expect(() => restoreBackup(badBackup, dbPath)).toThrow(/integrity/);

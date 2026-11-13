@@ -1,11 +1,71 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $which, APP_NAME, getToolsDir, logger, ptree, TempDir } from "@oh-my-pi/pi-utils";
+import { $env, $which, fetchWithRetry, getToolsDir, logger, ptree, TempDir, USER_AGENT } from "@oh-my-pi/pi-utils";
+import { extractArchive } from "@oh-my-pi/pi-utils/ar";
+import { type DownloadTracker, trackDownload, withDownload } from "../downloads/activity";
 
 const TOOLS_DIR = getToolsDir();
 const TOOL_DOWNLOAD_TIMEOUT_MS = 120_000;
 const TOOL_METADATA_TIMEOUT_MS = 5000;
+
+type BodyReadResult = Bun.ReadableStreamDefaultReadResult<Uint8Array>;
+type BodyReader = {
+	read(): Promise<BodyReadResult>;
+	cancel(reason?: unknown): Promise<void>;
+};
+
+function isAbortLikeError(error: unknown): boolean {
+	return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
+
+function abortReason(signal: AbortSignal): unknown {
+	return signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+}
+
+async function readBodyChunk(reader: BodyReader, signal: AbortSignal | undefined): Promise<BodyReadResult> {
+	if (!signal) return await reader.read();
+	if (signal.aborted) throw abortReason(signal);
+
+	const abort = Promise.withResolvers<BodyReadResult>();
+	const onAbort = () => abort.reject(abortReason(signal));
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		return await Promise.race([reader.read(), abort.promise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
+}
+
+async function writeResponseBody(
+	dest: string,
+	body: NonNullable<Response["body"]>,
+	signal: AbortSignal | undefined,
+	onChunk: ((bytes: number) => void) | undefined,
+): Promise<void> {
+	const reader = body.getReader();
+	const sink = Bun.file(dest).writer();
+	let completed = false;
+
+	try {
+		while (true) {
+			const { done, value } = await readBodyChunk(reader, signal);
+			if (done) break;
+			if (value) {
+				await sink.write(value);
+				onChunk?.(value.byteLength);
+			}
+		}
+		await sink.end();
+		completed = true;
+	} finally {
+		if (!completed) {
+			await reader.cancel().catch(() => {});
+			await Promise.resolve(sink.end()).catch(() => {});
+			await fs.promises.rm(dest, { force: true }).catch(() => {});
+		}
+	}
+}
 
 interface ToolConfig {
 	name: string;
@@ -113,11 +173,17 @@ export function getToolPath(tool: ToolName): string | null {
 }
 
 // Fetch latest release version from GitHub
-async function getLatestVersion(repo: string, signal?: AbortSignal): Promise<string> {
+export async function getLatestVersion(repo: string, signal?: AbortSignal): Promise<string> {
+	// Use GITHUB_TOKEN if available
+	const token = $env.GITHUB_TOKEN || $env.GH_TOKEN;
+	const headers: Record<string, string> = { "User-Agent": USER_AGENT };
+	if (token) {
+		headers.Authorization = `Bearer ${token}`;
+	}
 	let response: Response;
 	try {
 		response = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
-			headers: { "User-Agent": `${APP_NAME}-coding-agent` },
+			headers,
 			signal: ptree.combineSignals(signal, TOOL_METADATA_TIMEOUT_MS),
 		});
 	} catch (err) {
@@ -135,29 +201,57 @@ async function getLatestVersion(repo: string, signal?: AbortSignal): Promise<str
 	return data.tag_name.replace(/^v/, "");
 }
 
-// Download a file from URL
-async function downloadFile(url: string, dest: string, signal?: AbortSignal): Promise<void> {
+/** Options for {@link downloadFile}. */
+export interface DownloadFileOptions {
+	signal?: AbortSignal;
+	/** Bound on the whole transfer (default 2 minutes; raise it for large model weights). */
+	timeoutMs?: number;
+	/** Bytes written so far and the `Content-Length` total (undefined when the server omits it). */
+	onProgress?: (loaded: number, total: number | undefined) => void;
+}
+
+/**
+ * Download a tool asset without handing the streaming Response to Bun.write.
+ * Transient failures (5xx, 408, 429, network errors) are retried within `timeoutMs`.
+ */
+export async function downloadFile(url: string, dest: string, options: DownloadFileOptions = {}): Promise<void> {
+	const { signal, timeoutMs = TOOL_DOWNLOAD_TIMEOUT_MS, onProgress } = options;
+	const downloadSignal = ptree.combineSignals(signal, timeoutMs);
 	let response: Response;
 	try {
-		response = await fetch(url, {
-			signal: ptree.combineSignals(signal, TOOL_DOWNLOAD_TIMEOUT_MS),
-		});
+		response = await fetchWithRetry(url, { signal: downloadSignal, maxAttempts: 4, maxDelayMs: 8_000 });
+		if (!response.ok) {
+			throw new Error(`Failed to download: ${response.status}`);
+		} else if (!response.body) {
+			throw new Error("No response body");
+		}
+		const length = Number(response.headers.get("content-length"));
+		const total = Number.isFinite(length) && length > 0 ? length : undefined;
+		let loaded = 0;
+		await writeResponseBody(
+			dest,
+			response.body,
+			downloadSignal,
+			onProgress &&
+				(bytes => {
+					loaded += bytes;
+					onProgress(loaded, total);
+				}),
+		);
 	} catch (err) {
-		if (err instanceof Error && err.name === "AbortError") {
+		if (isAbortLikeError(err) || downloadSignal?.aborted) {
 			throw new Error(`Download timed out: ${url}`);
 		}
 		throw err;
 	}
-	if (!response.ok) {
-		throw new Error(`Failed to download: ${response.status}`);
-	} else if (!response.body) {
-		throw new Error("No response body");
-	}
-	await Bun.write(dest, response);
 }
 
 // Download and install a tool
-async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<string> {
+async function downloadTool(
+	tool: ToolName,
+	signal: AbortSignal | undefined,
+	tracker: DownloadTracker,
+): Promise<string> {
 	const config = TOOLS[tool];
 	if (!config) throw new Error(`Unknown tool: ${tool}`);
 
@@ -181,8 +275,9 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 	const binaryPath = path.join(TOOLS_DIR, config.binaryName + binaryExt);
 
 	// Handle direct binary downloads (no archive extraction needed)
+	const onProgress = (loaded: number, total: number | undefined): void => tracker.update({ loaded, total });
 	if (config.isDirectBinary) {
-		await downloadFile(downloadUrl, binaryPath, signal);
+		await downloadFile(downloadUrl, binaryPath, { signal, onProgress });
 		if (plat !== "win32") {
 			await fs.promises.chmod(binaryPath, 0o755);
 		}
@@ -191,7 +286,8 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 
 	// Download archive
 	const archivePath = path.join(TOOLS_DIR, assetName);
-	await downloadFile(downloadUrl, archivePath, signal);
+	await downloadFile(downloadUrl, archivePath, { signal, onProgress });
+	tracker.update({ detail: "extracting" });
 
 	// Extract
 	const tmp = await TempDir.create("@omp-tools-extract-");
@@ -202,17 +298,7 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 		}
 
 		try {
-			const archive = new Bun.Archive(await Bun.file(archivePath).arrayBuffer());
-			const files = await archive.files();
-			const extractRoot = path.resolve(tmp.path());
-
-			for (const [filePath, file] of files) {
-				const outputPath = path.resolve(extractRoot, filePath);
-				if (!outputPath.startsWith(extractRoot + path.sep)) {
-					throw new Error(`Archive entry escapes extraction dir: ${filePath}`);
-				}
-				await Bun.write(outputPath, file);
-			}
+			await extractArchive(archivePath, tmp.path());
 		} catch (err) {
 			throw new Error(`Failed to extract ${assetName}: ${err instanceof Error ? err.message : String(err)}`);
 		}
@@ -248,6 +334,7 @@ async function downloadTool(tool: ToolName, signal?: AbortSignal): Promise<strin
 
 // Install a Python package via uv (preferred) or pip
 async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<boolean> {
+	if (signal?.aborted) return false;
 	try {
 		// Try uv first (faster, better isolation)
 		const uv = $which("uv");
@@ -259,6 +346,7 @@ async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<
 				stderr: "full",
 			});
 			if (result.exitCode === 0) return true;
+			if (signal?.aborted) return false;
 		}
 
 		// Fall back to pip
@@ -302,6 +390,7 @@ export async function ensureTool(tool: ToolName, silentOrOptions?: EnsureToolOpt
 	if (existingPath) {
 		return existingPath;
 	}
+	if (signal?.aborted) return undefined;
 
 	// On Android/Termux, Linux binaries don't work due to Bionic libc incompatibility.
 	// Users must install via pkg.
@@ -320,17 +409,24 @@ export async function ensureTool(tool: ToolName, silentOrOptions?: EnsureToolOpt
 			logger.debug(`${pythonConfig.name} not found. Installing via uv/pip...`);
 		}
 		notify?.(`Installing ${pythonConfig.name}…`);
+		const tracker = trackDownload(pythonConfig.name, { detail: "installing" });
 		const success = await installPythonPackage(pythonConfig.package, signal);
+		if (signal?.aborted) {
+			tracker.done();
+			return undefined;
+		}
 		if (success) {
 			// Re-check for the command after installation
 			const path = $which(pythonConfig.binaryName);
 			if (path) {
+				tracker.done();
 				if (!silent) {
 					logger.debug(`${pythonConfig.name} installed successfully`);
 				}
 				return path;
 			}
 		}
+		tracker.fail(new Error(`could not install ${pythonConfig.package} with uv or pip`));
 		if (!silent) {
 			logger.warn(`Failed to install ${pythonConfig.name}`);
 		}
@@ -347,7 +443,7 @@ export async function ensureTool(tool: ToolName, silentOrOptions?: EnsureToolOpt
 	notify?.(`Downloading ${config.name}…`);
 
 	try {
-		const path = await downloadTool(tool, signal);
+		const path = await withDownload(config.name, tracker => downloadTool(tool, signal, tracker));
 		if (!silent) {
 			logger.debug(`${config.name} installed to ${path}`);
 		}

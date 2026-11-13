@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import {
-	ENTITY_EXTRACTION_STOP_WORDS,
 	extractEntitiesRegex,
 	findSimilarEntities,
 	levenshteinDistance,
+	REGEX_EXTRACTION_MAX_INPUT_CHARS,
 	similarity,
 } from "@oh-my-pi/pi-mnemopi/core/entities";
 
@@ -47,15 +47,15 @@ describe("entity utilities", () => {
 		expect(extractEntitiesRegex("I visited New York with Abdias yesterday.")).toEqual(["Abdias", "New York"]);
 	});
 
+	it("skips regex extraction for oversized raw transcripts", () => {
+		const text = "Project Alpha progress ".repeat(Math.ceil((REGEX_EXTRACTION_MAX_INPUT_CHARS + 1) / 23));
+
+		expect(extractEntitiesRegex(text)).toEqual([]);
+	});
+
 	it("finds similar entities above threshold sorted by score", () => {
 		const result = findSimilarEntities("Abdias", ["Maya", "Abdias Moya", "Abdias J.", "Zebra"], 0.7);
 		expect(result.map(([name]) => name)).toEqual(["Abdias J.", "Abdias Moya"]);
 		expect(findSimilarEntities("Zebra", ["Abdias", "Maya"], 0.8)).toEqual([]);
-	});
-
-	it("exports the stop-word set used by extraction", () => {
-		expect(ENTITY_EXTRACTION_STOP_WORDS.has("the")).toBe(true);
-		expect(ENTITY_EXTRACTION_STOP_WORDS.has("and")).toBe(true);
-		expect(ENTITY_EXTRACTION_STOP_WORDS.has("for")).toBe(true);
 	});
 });

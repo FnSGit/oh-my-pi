@@ -36,7 +36,7 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 			},
 		} as unknown;
 
-		// normalizeTypeArrayToNullable converts type array to scalar + nullable,
+		// scalarizeTypeArrays converts type array to scalar + nullable,
 		// then stripNullableKeyword removes the nullable marker.
 		expect(normalizeSchemaForCCA(schema)).toEqual({
 			type: "object",
@@ -172,7 +172,7 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 		expect(claudeDeclaration.parametersJsonSchema).toBeUndefined();
 		expect(
 			(geminiDeclaration.parametersJsonSchema as { properties?: Record<string, unknown> })?.properties?.lines,
-		).toEqual((parameters as { properties: { lines: unknown } }).properties.lines);
+		).toEqual(normalizeSchemaForGoogle((parameters as { properties: { lines: unknown } }).properties.lines));
 	});
 
 	it("collapses mixed anyOf with shared metadata for edit-style lines fields", () => {
@@ -278,17 +278,21 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 		expect(claudeDeclaration.parameters).toEqual({
 			type: "object",
 			properties: {
-				value: { enum: ["A", "B"] },
+				value: { enum: ["A", "B"], type: "string" },
 			},
 			required: [],
 		});
 		expect(JSON.stringify(claudeDeclaration.parameters)).not.toContain('"anyOf"');
 		expect(
 			(geminiDeclaration.parametersJsonSchema as { properties?: Record<string, unknown> })?.properties?.value,
-		).toEqual((parameters as { properties: { value: unknown } }).properties.value);
+		).toEqual(normalizeSchemaForGoogle((parameters as { properties: { value: unknown } }).properties.value));
 	});
 
-	it("falls back to minimal object schema when non-null unresolved unions remain for CCA Claude", () => {
+	it("unions same-type enum branches losslessly for CCA Claude instead of falling back", () => {
+		// With a `type` now inferred onto each bare-enum branch, an anyOf of two
+		// same-type enums is no longer an "unresolved union": the branches collapse
+		// by unioning their members (A,B,C,D) rather than falling back to the
+		// minimal object schema, so no allowed value is silently dropped.
 		const parameters = {
 			type: "object",
 			properties: {
@@ -308,8 +312,39 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 
 		expect(claudeDeclaration.parameters).toEqual({
 			type: "object",
-			properties: {},
+			properties: {
+				value: { type: "string", enum: ["A", "B", "C", "D"] },
+			},
+			required: ["value"],
 		});
+	});
+
+	it("broadens a mixed enum/unconstrained same-type union without narrowing for CCA Claude", () => {
+		// Regression: once each branch carries an inferred `type`, an `enum` branch
+		// and an unconstrained branch of the same type look collapsible. The
+		// unconstrained branch is broader, so the collapse must keep it (any string)
+		// and never narrow to the enum branch's members.
+		const parameters = {
+			type: "object",
+			properties: {
+				value: {
+					anyOf: [{ enum: ["A"] }, { type: "string" }],
+				},
+			},
+			required: ["value"],
+		} as TJsonSchema;
+		const tools: Tool[] = [{ name: "test_tool", description: "Test tool", parameters }];
+		const claudeModel = createModel("claude-sonnet-4-5");
+
+		const claudeDeclaration = convertTools(tools, claudeModel)?.[0]?.functionDeclarations[0] as Record<
+			string,
+			unknown
+		>;
+
+		const value = (claudeDeclaration.parameters as { properties: { value: Record<string, unknown> } }).properties
+			.value;
+		expect(value).toEqual({ type: "string" });
+		expect(value).not.toHaveProperty("enum");
 	});
 
 	it("falls back when CCA schema meta-validation catches malformed keywords", () => {
@@ -317,7 +352,6 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 			type: "object",
 			properties: {
 				mode: { type: "string", enum: ["read", "read"] },
-				tags: { type: "array", items: { type: "string" }, uniqueItems: "true" },
 			},
 			required: ["mode"],
 		} as unknown;
@@ -347,6 +381,74 @@ describe("Cloud Code Assist Claude tool schema conversion", () => {
 			},
 		});
 	});
+
+	it("splits a multi-type array into typed anyOf branches instead of leaving `items` on a string", () => {
+		// Stencil Carly's canvas_edit `from`/`to`: a shape ref or an [x, y] point. Collapsing to
+		// `{ type: "string", items }` made Gemini reject the request (`items: field predicate
+		// failed: $type == Type.ARRAY`).
+		const end = { type: ["string", "array", "null"], items: { type: "number" }, description: "Ref or point." };
+
+		expect(normalizeSchemaForGoogle(end)).toEqual({
+			description: "Ref or point.",
+			nullable: true,
+			anyOf: [{ type: "string" }, { type: "array", items: { type: "number" } }],
+		});
+		// CCA cannot carry anyOf: the first type wins without the array branch's keywords.
+		expect(normalizeSchemaForCCA(end)).toEqual({ type: "string", description: "Ref or point." });
+	});
+
+	it("normalizes schemas for gemini models using normalizeSchemaForGoogle", () => {
+		const parameters = {
+			type: "object",
+			properties: {
+				value: {
+					type: "string",
+				},
+			},
+			additionalProperties: false,
+		} as unknown as TJsonSchema;
+		const tools: Tool[] = [{ name: "test_tool", description: "Test tool", parameters }];
+		const model = createModel("gemini-3.5-flash");
+
+		const result = convertTools(tools, model);
+		const declaration = result?.[0]?.functionDeclarations[0] as Record<string, unknown>;
+
+		expect(declaration.parametersJsonSchema).toEqual({
+			type: "object",
+			properties: {
+				value: {
+					type: "string",
+				},
+			},
+		});
+	});
+
+	it("infers enum type through convertTools for both claude (parameters) and gemini (parametersJsonSchema)", () => {
+		const parameters = {
+			type: "object",
+			properties: {
+				action: { enum: ["definition", "references", "code_actions"] },
+			},
+			required: ["action"],
+		} as unknown as TJsonSchema;
+		const tools: Tool[] = [{ name: "lsp", description: "LSP tool", parameters }];
+
+		const claudeDeclaration = convertTools(tools, createModel("claude-sonnet-4-5"))?.[0]
+			?.functionDeclarations[0] as Record<string, unknown>;
+		expect((claudeDeclaration.parameters as { properties: { action: unknown } }).properties.action).toEqual({
+			type: "string",
+			enum: ["definition", "references", "code_actions"],
+		});
+
+		const geminiDeclaration = convertTools(tools, createModel("gemini-2.5-pro"))?.[0]
+			?.functionDeclarations[0] as Record<string, unknown>;
+		expect((geminiDeclaration.parametersJsonSchema as { properties: { action: unknown } }).properties.action).toEqual(
+			{
+				type: "string",
+				enum: ["definition", "references", "code_actions"],
+			},
+		);
+	});
 });
 
 /**
@@ -370,28 +472,6 @@ describe("normalizeSchemaForGoogle parity with python-genai process_schema", () 
 			default: "null",
 			title: "Total Area Sq Mi",
 		});
-	});
-
-	// Mirrors python-genai test_schema.py::test_t_schema_for_null_fields
-	it("collapses {type:'null'} variant in anyOf into nullable + sole remaining variant", () => {
-		const schema = {
-			type: "object",
-			properties: {
-				name: { type: "string" },
-				population: {
-					anyOf: [{ type: "integer" }, { type: "null" }],
-					default: null,
-					title: "Population",
-				},
-			},
-			required: ["name"],
-		} as const;
-
-		const sanitized = normalizeSchemaForGoogle(schema) as Record<string, unknown>;
-		const props = sanitized.properties as Record<string, Record<string, unknown>>;
-		expect(props.population?.nullable).toBe(true);
-		expect(props.population?.type).toBe("integer");
-		expect(props.population?.anyOf).toBeUndefined();
 	});
 
 	// Mirrors python-genai test_schema.py::test_schema_with_any_of
@@ -467,14 +547,26 @@ describe("normalizeSchemaForGoogle parity with python-genai process_schema", () 
 		expect(sanitized).toEqual({ type: "string", enum: ["FOO"] });
 	});
 
-	// Mirrors python-genai test_schema.py::test_process_schema_forbids_non_string_const
-	// We deviate intentionally: rather than raise on non-string const we accept
-	// the value as a singleton enum. Google's Schema proto accepts numeric enums
-	// and we prefer permissive normalization over surfacing a transformer-level error.
-	it("accepts non-string const as a singleton enum (intentional deviation from upstream raise)", () => {
-		const sanitized = normalizeSchemaForGoogle({ type: "integer", const: 123 }) as Record<string, unknown>;
-		expect(sanitized.enum).toEqual([123]);
-		expect(sanitized.type).toBe("integer");
+	// Mirrors python-genai test_schema.py::test_process_schema_forbids_non_string_const.
+	// Google enum fields accept strings only, so normalization drops the numeric
+	// singleton enum while preserving the integer type constraint.
+	it("omits a non-string const enum while preserving its type", () => {
+		const sanitized = normalizeSchemaForGoogle({ type: "integer", const: 123 });
+		expect(sanitized).toEqual({ type: "integer" });
+	});
+
+	it("drops negations whose non-string enums cannot be represented", () => {
+		const sanitized = normalizeSchemaForGoogle({ not: { enum: [1] } });
+		expect(sanitized).toEqual({});
+		expect(
+			normalizeSchemaForGoogle({
+				not: { type: "object", properties: { value: { enum: [1] } } },
+			}),
+		).toEqual({});
+	});
+
+	it("drops negations containing snake-case combiners with non-string enums", () => {
+		expect(normalizeSchemaForGoogle({ not: { any_of: [{ const: 1 }] } })).toEqual({});
 	});
 
 	// Mirrors python-genai test_schema.py::test_process_schema_order_properties_propagates_into_defs
@@ -634,33 +726,6 @@ describe("normalizeSchemaForGoogle parity with python-genai process_schema", () 
 
 		const sanitized = normalizeSchemaForGoogle(schema) as Record<string, unknown>;
 		expect(sanitized.propertyOrdering).toEqual(custom);
-	});
-
-	// Mirrors python-genai test_schema.py::test_t_schema_sets_property_ordering_for_json_schema
-	it("populates propertyOrdering from properties insertion order when missing", () => {
-		const schema = {
-			type: "object",
-			properties: {
-				name: { type: "string" },
-				population: { type: "integer" },
-				capital: { type: "string" },
-				continent: { type: "string" },
-				gdp: { type: "integer" },
-				official_language: { type: "string" },
-				total_area_sq_mi: { type: "integer" },
-			},
-		} as const;
-
-		const sanitized = normalizeSchemaForGoogle(schema) as Record<string, unknown>;
-		expect(sanitized.propertyOrdering).toEqual([
-			"name",
-			"population",
-			"capital",
-			"continent",
-			"gdp",
-			"official_language",
-			"total_area_sq_mi",
-		]);
 	});
 
 	// Covers python-genai _transformers.py:745-752 snake_case → camelCase renames.

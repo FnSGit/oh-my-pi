@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { extractPrintableText, matchesKey, parseKey, setKittyProtocolActive } from "@oh-my-pi/pi-tui/keys";
+import {
+	extractPrintableText,
+	isWindowsTerminalSession,
+	matchesKey,
+	matchesRawBackspace,
+	parseKey,
+	setKittyProtocolActive,
+} from "@oh-my-pi/pi-tui/keys";
+import { TERMINAL_MULTIPLEXER_ENV_KEYS } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 
 describe("matchesKey", () => {
 	it("matches ctrl+letter sequences", () => {
@@ -49,6 +57,17 @@ describe("matchesKey", () => {
 		expect(matchesKey(dvorakCtrlSlash, "ctrl+[")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+
+	it("matches non-Latin shortcuts by their base-layout key", () => {
+		setKittyProtocolActive(true);
+		try {
+			expect(matchesKey("\x1b[1089::99;5u", "ctrl+c")).toBe(true);
+			expect(matchesKey("\x1b[1079::112;5u", "ctrl+p")).toBe(true);
+			expect(matchesKey("\x1b[1057::99;6u", "ctrl+shift+c")).toBe(true);
+		} finally {
+			setKittyProtocolActive(false);
+		}
+	});
 	it("ignores Kitty release events while still matching repeats", () => {
 		setKittyProtocolActive(true);
 		expect(matchesKey("\x1b[127u", "backspace")).toBe(true);
@@ -57,10 +76,23 @@ describe("matchesKey", () => {
 		setKittyProtocolActive(false);
 	});
 
-	it("keeps NumLock keypad digits as text instead of navigation keys", () => {
+	it("keeps keypad digits as text with or without NumLock modifier", () => {
 		setKittyProtocolActive(true);
-		expect(matchesKey("\x1b[57400;129u", "1")).toBe(true);
-		expect(matchesKey("\x1b[57400;129u", "end")).toBe(false);
+		for (const data of ["\x1b[57400u", "\x1b[57400;129u"]) {
+			expect(matchesKey(data, "1")).toBe(true);
+			expect(matchesKey(data, "end")).toBe(false);
+		}
+		expect(matchesKey("\x1b[57404u", "5")).toBe(true);
+		expect(matchesKey("\x1b[57404u", "clear")).toBe(false);
+		setKittyProtocolActive(false);
+	});
+
+	it("defers CSI-u/modifyOtherKeys named keys to native normalization", () => {
+		// Regression: the keypad text fast path must not short-circuit canonical
+		// named keys that decode to a printable codepoint (space, shifted letters).
+		setKittyProtocolActive(true);
+		expect(matchesKey("\x1b[32u", "space")).toBe(true);
+		expect(matchesKey("\x1b[97:65;2u", "shift+a")).toBe(true);
 		setKittyProtocolActive(false);
 	});
 
@@ -124,9 +156,21 @@ describe("parseKey", () => {
 		setKittyProtocolActive(false);
 	});
 
-	it("parses NumLock keypad digits as digits", () => {
+	it("parses keypad digits as digits with or without NumLock modifier", () => {
 		setKittyProtocolActive(true);
+		expect(parseKey("\x1b[57400u")).toBe("1");
 		expect(parseKey("\x1b[57400;129u")).toBe("1");
+		expect(parseKey("\x1b[57404u")).toBe("5");
+		setKittyProtocolActive(false);
+	});
+
+	it("normalizes CSI-u/modifyOtherKeys named keys instead of returning raw printables", () => {
+		// Regression: space/backspace encoded via CSI-u or modifyOtherKeys must
+		// resolve to their canonical identifiers, not literal " "/DEL bytes.
+		setKittyProtocolActive(true);
+		expect(parseKey("\x1b[32u")).toBe("space");
+		expect(parseKey("\x1b[27;1;32~")).toBe("space");
+		expect(parseKey("\x1b[27;1;127~")).toBe("backspace");
 		setKittyProtocolActive(false);
 	});
 
@@ -152,9 +196,120 @@ describe("parseKey", () => {
 	});
 });
 
+describe("Raw 0x08 backspace disambiguation", () => {
+	const envKeys = [
+		"WT_SESSION",
+		"SSH_CONNECTION",
+		"SSH_CLIENT",
+		"SSH_TTY",
+		"PI_TUI_RAW_BACKSPACE_IS_CTRL",
+		...TERMINAL_MULTIPLEXER_ENV_KEYS,
+	];
+	function withEnv(overrides: Record<string, string>, run: () => void): void {
+		const saved: Record<string, string | undefined> = {};
+		for (const key of envKeys) {
+			saved[key] = process.env[key];
+			delete process.env[key];
+		}
+		Object.assign(process.env, overrides);
+		try {
+			run();
+		} finally {
+			for (const key of envKeys) {
+				const value = saved[key];
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+
+	it("maps raw 0x08 to ctrl+backspace only in a genuine Windows Terminal session", () => {
+		// Windows Terminal sends 0x08 for Ctrl+Backspace; the native parser reports
+		// plain `backspace` because it cannot see the environment.
+		withEnv({ WT_SESSION: "1" }, () => {
+			expect(isWindowsTerminalSession()).toBe(true);
+			expect(matchesRawBackspace("\x08", 4)).toBe(true);
+			expect(matchesRawBackspace("\x08", 0)).toBe(false);
+			expect(parseKey("\x08")).toBe("ctrl+backspace");
+			expect(matchesKey("\x08", "ctrl+backspace")).toBe(true);
+			expect(matchesKey("\x08", "backspace")).toBe(false);
+		});
+		// Outside Windows Terminal 0x08 stays plain backspace.
+		withEnv({}, () => {
+			expect(isWindowsTerminalSession()).toBe(false);
+			expect(matchesRawBackspace("\x08", 0)).toBe(true);
+			expect(matchesRawBackspace("\x08", 4)).toBe(false);
+			expect(parseKey("\x08")).toBe("backspace");
+			expect(matchesKey("\x08", "backspace")).toBe(true);
+			expect(matchesKey("\x08", "ctrl+backspace")).toBe(false);
+		});
+	});
+
+	it("does not apply the heuristic when WT_SESSION is forwarded over SSH", () => {
+		withEnv({ WT_SESSION: "1", SSH_CONNECTION: "1.2.3.4 5 6.7.8.9 22" }, () => {
+			expect(isWindowsTerminalSession()).toBe(false);
+			expect(parseKey("\x08")).toBe("backspace");
+		});
+	});
+
+	it("does not apply the heuristic inside a multiplexer that inherited WT_SESSION", () => {
+		// tmux/screen/Zellij inherit WT_SESSION from the launching shell but emit
+		// raw 0x08 for plain Backspace themselves, so the automatic heuristic
+		// must stay off there (#6784 review).
+		const multiplexers: Array<Record<string, string>> = [
+			{ WT_SESSION: "1", TMUX: "/tmp/tmux-1000/default,1,0" },
+			{ WT_SESSION: "1", STY: "1234.pts-0" },
+			{ WT_SESSION: "1", ZELLIJ: "0" },
+			{ WT_SESSION: "1", TERM: "tmux-256color" },
+			{ WT_SESSION: "1", TERM: "screen-256color" },
+		];
+		for (const env of multiplexers) {
+			withEnv(env, () => {
+				expect(matchesRawBackspace("\x08", 0)).toBe(true);
+				expect(matchesRawBackspace("\x08", 4)).toBe(false);
+				expect(parseKey("\x08")).toBe("backspace");
+			});
+		}
+		// The explicit opt-in still wins inside a multiplexer.
+		withEnv({ WT_SESSION: "1", TMUX: "/tmp/tmux-1000/default,1,0", PI_TUI_RAW_BACKSPACE_IS_CTRL: "1" }, () => {
+			expect(matchesRawBackspace("\x08", 4)).toBe(true);
+			expect(matchesRawBackspace("\x08", 0)).toBe(false);
+			expect(parseKey("\x08")).toBe("ctrl+backspace");
+		});
+	});
+
+	it("supports an explicit opt-in when remote/container sessions lose terminal identity", () => {
+		withEnv(
+			{
+				PI_TUI_RAW_BACKSPACE_IS_CTRL: "1",
+				SSH_CONNECTION: "1.2.3.4 5 6.7.8.9 22",
+			},
+			() => {
+				expect(isWindowsTerminalSession()).toBe(false);
+				expect(matchesRawBackspace("\x08", 4)).toBe(true);
+				expect(matchesRawBackspace("\x08", 0)).toBe(false);
+				expect(parseKey("\x08")).toBe("ctrl+backspace");
+				expect(matchesKey("\x08", "ctrl+backspace")).toBe(true);
+			},
+		);
+	});
+
+	it("leaves 0x7f as plain backspace regardless of Windows Terminal or opt-in", () => {
+		withEnv({ WT_SESSION: "1", PI_TUI_RAW_BACKSPACE_IS_CTRL: "1" }, () => {
+			expect(matchesRawBackspace("\x7f", 0)).toBe(true);
+			expect(matchesRawBackspace("\x7f", 4)).toBe(false);
+			expect(parseKey("\x7f")).toBe("backspace");
+			expect(matchesKey("\x7f", "backspace")).toBe(true);
+			expect(matchesKey("\x7f", "ctrl+backspace")).toBe(false);
+		});
+	});
+});
+
 describe("extractPrintableText", () => {
-	it("extracts NumLock keypad digits from Kitty CSI-u sequences", () => {
+	it("extracts keypad digits from Kitty CSI-u sequences", () => {
+		expect(extractPrintableText("\x1b[57407u")).toBe("8");
 		expect(extractPrintableText("\x1b[57407;129u")).toBe("8");
+		expect(extractPrintableText("\x1b[57404u")).toBe("5");
 	});
 
 	it("extracts keypad operators from Kitty CSI-u sequences", () => {
@@ -164,6 +319,10 @@ describe("extractPrintableText", () => {
 
 	it("does not treat modified NumLock keypad navigation keys as text", () => {
 		expect(extractPrintableText("\x1b[57400;133u")).toBeUndefined();
+	});
+
+	it("does not extract DEL from modifyOtherKeys sequences as text", () => {
+		expect(extractPrintableText("\x1b[27;1;127~")).toBeUndefined();
 	});
 
 	it("ignores unsupported modifiers on Kitty CSI-u text", () => {

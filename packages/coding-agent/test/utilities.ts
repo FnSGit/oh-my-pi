@@ -8,6 +8,8 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -27,6 +29,10 @@ export interface TestSessionOptions {
 	systemPrompt?: string | string[];
 	/** Custom settings overrides */
 	settingsOverrides?: Record<string, unknown>;
+	/** Extension runner to wire into the session (e.g. to stub `session_before_tree`/etc. hooks) */
+	extensionRunner?: ExtensionRunner;
+	/** Secret obfuscator to wire into the session (e.g. to test deobfuscation of persisted tool arguments) */
+	obfuscator?: SecretObfuscator;
 }
 
 /**
@@ -75,6 +81,8 @@ export function assistantMsg(text: string) {
  */
 export async function createTestSession(options: TestSessionOptions = {}): Promise<TestSessionContext> {
 	const tempDir = path.join(os.tmpdir(), `omp-test-${Snowflake.next()}`);
+	// Interactive editor input must not contact the developer's global text-predict daemon.
+	const settingsOverrides = { "spelling.autocomplete": "off", ...options.settingsOverrides };
 	fs.mkdirSync(tempDir, { recursive: true });
 
 	const toolSession: ToolSession = {
@@ -82,7 +90,7 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		settings: Settings.isolated(options.settingsOverrides),
+		settings: Settings.isolated(settingsOverrides),
 	};
 	const tools = await createTools(toolSession);
 
@@ -98,8 +106,10 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		},
 	});
 
-	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir, tempDir);
-	const settings = Settings.isolated(options.settingsOverrides);
+	const sessionManager = options.inMemory
+		? SessionManager.inMemory()
+		: SessionManager.create(tempDir, SessionManager.getDefaultSessionDir(tempDir, path.join(tempDir, "agent")));
+	const settings = Settings.isolated(settingsOverrides);
 
 	const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
@@ -108,6 +118,8 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		sessionManager,
 		settings,
 		modelRegistry,
+		extensionRunner: options.extensionRunner,
+		obfuscator: options.obfuscator,
 	});
 
 	// Must subscribe to enable session persistence

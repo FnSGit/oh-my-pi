@@ -7,16 +7,25 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentSideConnection, InitializeRequest } from "@agentclientprotocol/sdk";
-import { zInitializeResponse } from "@agentclientprotocol/sdk/dist/schema/zod.gen.js";
+import { type } from "@oh-my-pi/omptype";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import { ACP_TERMINAL_AUTH_FLAG, prepareAcpTerminalAuthArgs } from "@oh-my-pi/pi-coding-agent/modes/acp/terminal-auth";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getConfigRootDir, setAgentDir, VERSION } from "@oh-my-pi/pi-utils";
+import type { AgentSideConnection, InitializeRequest } from "@oh-my-pi/pi-utils/acp";
 import { expectAcpStructure } from "./helpers/acp-schema";
+
+const arkInitializeResponse = type({
+	protocolVersion: "number",
+	"_meta?": type({ "[string]": "unknown" }).or("null"),
+	"agentCapabilities?": type({ "[string]": "unknown" }),
+	"agentInfo?": type({ "[string]": "unknown" }).or("null"),
+	"authMethods?": type({ "[string]": "unknown" }).array(),
+});
 
 const TEST_MODELS: Model[] = [
 	buildModel({
@@ -45,7 +54,7 @@ class FakeAgentSession {
 	queuedMessageCount = 0;
 	systemPrompt = "system";
 	disposed = false;
-	settings = { get: (_path: string) => false };
+	settings = Settings.isolated();
 
 	constructor(cwd: string) {
 		this.sessionManager = SessionManager.create(cwd);
@@ -105,6 +114,10 @@ class FakeAgentSession {
 	}
 	setActiveToolsByName(): void {}
 	setClientBridge(): void {}
+	setMcpServerInstructionsSource(): void {}
+	registerSessionChangeCallback(): () => void {
+		return () => {};
+	}
 	getPlanModeState(): undefined {
 		return undefined;
 	}
@@ -150,7 +163,10 @@ async function createAgent(): Promise<AcpAgent> {
 	} as unknown as AgentSideConnection;
 
 	const initialSession = new FakeAgentSession(cwd);
-	const factory = async (next: string): Promise<AgentSession> => new FakeAgentSession(next) as unknown as AgentSession;
+	const factory = async (next: string) => ({
+		session: new FakeAgentSession(next) as unknown as AgentSession,
+		setToolUIContext: () => {},
+	});
 	return new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
 }
 
@@ -166,7 +182,7 @@ describe("ACP initialize conformance", () => {
 	it("only advertises the agent-managed auth method when the client lacks terminal capability", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());
-		expectAcpStructure(zInitializeResponse, response);
+		expectAcpStructure(arkInitializeResponse, response);
 		expect(response.authMethods).toHaveLength(1);
 		const [agentMethod] = response.authMethods!;
 		// AuthMethodAgent omits the `type` discriminator per ACP spec — the absence is the signal.
@@ -185,7 +201,7 @@ describe("ACP initialize conformance", () => {
 		const response = await agent.initialize(
 			buildInitializeRequest({ clientCapabilities: { auth: { terminal: true } } }),
 		);
-		expectAcpStructure(zInitializeResponse, response);
+		expectAcpStructure(arkInitializeResponse, response);
 		expect(response.authMethods).toHaveLength(2);
 		const [first, second] = response.authMethods!;
 		expect((first as { type?: string }).type).toBeUndefined();
@@ -220,8 +236,7 @@ describe("ACP initialize conformance", () => {
 		const pkg = (await Bun.file(pkgPath).json()) as { version: string };
 		expect(response.agentInfo).toEqual(
 			expect.objectContaining({
-				name: "oh-my-pi",
-				title: "Oh My Pi",
+				title: "omp",
 				version: VERSION,
 			}),
 		);
@@ -231,7 +246,7 @@ describe("ACP initialize conformance", () => {
 	it("preserves the agentCapabilities contract clients depend on", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());
-		expectAcpStructure(zInitializeResponse, response);
+		expectAcpStructure(arkInitializeResponse, response);
 		expect(response.agentCapabilities).toEqual(
 			expect.objectContaining({
 				loadSession: true,
@@ -245,5 +260,15 @@ describe("ACP initialize conformance", () => {
 				}),
 			}),
 		);
+	});
+
+	it("advertises the steering extension via top-level _meta", async () => {
+		const agent = await createAgent();
+		const response = await agent.initialize(buildInitializeRequest());
+		expectAcpStructure(arkInitializeResponse, response);
+		// Top-level `_meta` (sibling of `agentCapabilities`) is the
+		// claude-agent-acp / codex-acp advertisement that gates clients'
+		// `_session/steering` calls (agent-shell, spec proposal `session/inject`).
+		expect(response._meta).toEqual({ steering: { supported: true } });
 	});
 });

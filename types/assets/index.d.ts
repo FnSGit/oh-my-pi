@@ -13,7 +13,33 @@ declare module "*.py" {
 	export default content;
 }
 
+declare module "*.rb" {
+	const content: string;
+	export default content;
+}
+
+declare module "*.jl" {
+	const content: string;
+	export default content;
+}
+
 declare module "*.lark" {
+	const content: string;
+	export default content;
+}
+
+declare module "*.sh" {
+	const content: string;
+	export default content;
+}
+
+declare module "*.applescript" {
+	const content: string;
+	export default content;
+}
+
+// Package license files imported as text by `omp --license` (coding-agent src/cli/license.ts).
+declare module "*/LICENSE" {
 	const content: string;
 	export default content;
 }
@@ -41,11 +67,9 @@ declare module "*.generated.js" {
 	export default content;
 }
 
-// turndown-plugin-gfm has no published types
-declare module "turndown-plugin-gfm" {
-	import type TurndownService from "turndown";
-	export const gfm: TurndownService.Plugin;
-	export const tables: TurndownService.Plugin;
-	export const strikethrough: TurndownService.Plugin;
-	export const taskListItems: TurndownService.Plugin;
+// axe-core's minified browser build, imported as text by the browser a11y audit
+// (coding-agent src/tools/browser/a11y/audit.ts) and evaluated inside the page.
+declare module "axe-core/axe.min.js" {
+	const content: string;
+	export default content;
 }

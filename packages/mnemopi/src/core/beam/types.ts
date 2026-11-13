@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { QueryCache } from "../query-cache";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
@@ -41,6 +42,13 @@ export interface BeamCaches {
 	polyphonicEngine?: unknown;
 	extractionClient?: unknown;
 	extractionBuffer: unknown[];
+	/** Enhanced-recall result cache; installed lazily while `enhancedRecall` is enabled. */
+	queryCache?: QueryCache<RecallResult>;
+	/**
+	 * SQLite write token (`data_version` + `total_changes()`) the cached entries were
+	 * computed against; any other write to the database drops the cache.
+	 */
+	queryCacheToken?: string;
 	[key: string]: unknown;
 }
 
@@ -53,6 +61,12 @@ export interface BeamConfig {
 	importanceWeight: number;
 	useCloud: boolean;
 	localLlmEnabled: boolean;
+	maxEpisodeChars: number;
+	proactiveLinking?: boolean;
+	/** Per-instance polyphonic recall gate; `undefined` defers to the process-wide default. */
+	polyphonicRecall?: boolean;
+	/** Per-instance enhanced recall (query cache) gate; `undefined` defers to the process-wide default. */
+	enhancedRecall?: boolean;
 }
 
 export interface BeamMemoryOptions {
@@ -62,6 +76,11 @@ export interface BeamMemoryOptions {
 	authorType?: string | null;
 	channelId?: string | null;
 	useCloud?: boolean;
+	proactiveLinking?: boolean;
+	/** Route `recallEnhanced` through polyphonic recall. `MNEMOPI_POLYPHONIC_RECALL` wins when set. */
+	polyphonicRecall?: boolean;
+	/** Cache `recallEnhanced` results per query and options. `MNEMOPI_ENHANCED_RECALL` wins when set. */
+	enhancedRecall?: boolean;
 	eventEmitter?: (event: BeamEvent) => void;
 	pluginManager?: BeamPluginManager | null;
 	annotations?: AnnotationStoreLike | null;
@@ -117,6 +136,20 @@ export interface RememberOptions {
 	metadata?: Metadata | null;
 	extract?: boolean;
 	extractEntities?: boolean;
+	/**
+	 * Override the text passed to fact and graph extraction. When unset
+	 * (default) extraction runs over the stored `content`. Use this when the
+	 * stored memory is a multi-author transcript but only a subset (e.g. the
+	 * user-authored turns) should drive deterministic fact extraction — see
+	 * coding-agent issue #3372 where assistant prose was being mis-attributed
+	 * as user `Instruction:` memories.
+	 */
+	extractText?: string;
+	/**
+	 * Override the text passed to embeddings and FTS indexing. Stored `content`
+	 * remains unchanged; when unset, embeddings and FTS use `content`.
+	 */
+	embedText?: string;
 	veracity?: Veracity;
 	memoryType?: string;
 	scope?: MemoryScope;
@@ -155,9 +188,19 @@ export interface RecallOptions {
 	useIntent?: boolean;
 	useMmr?: boolean;
 	mmrLambda?: number;
+	/**
+	 * Maximum characters of `content` returned per {@link RecallResult}. When the
+	 * stored content exceeds this, the preview is clipped and the trailing
+	 * character is replaced with `…` so callers can see it was truncated. The
+	 * full row is always reachable via {@link BeamMemoryState.get}. `0` or a
+	 * negative value disables clipping. Defaults to
+	 * {@link RECALL_CONTENT_PREVIEW_CHARS} (500).
+	 */
+	contentPreviewChars?: number;
 }
 
 export interface RecallEnhancedOptions extends RecallOptions {
+	/** Set `false` to bypass the enhanced-recall result cache for this call. */
 	useCache?: boolean;
 	includeFacts?: boolean;
 }
@@ -221,6 +264,15 @@ export type RecallResult = RecallRowFields & {
 	[key: string]: unknown;
 	id: string;
 	content: string;
+	/**
+	 * True when {@link content} is a clipped preview of the stored row. The
+	 * clip is capped at {@link RecallOptions.contentPreviewChars} (default 500)
+	 * and the last character is replaced with `…`. Fetch the full row via
+	 * `memory://<id>` (mnemopi backend) or the `Mnemopi.get(id)` API.
+	 */
+	truncated?: boolean;
+	/** Original character count of `content` before {@link truncated} clipping. */
+	full_length?: number;
 	score?: number;
 	distance?: number;
 	rank?: number;
@@ -237,6 +289,31 @@ export type RecallResult = RecallRowFields & {
 	voice_scores?: RecallVoiceScores;
 	metadata?: Metadata;
 };
+
+/**
+ * One row of the compact memory index the coding agent injects into its
+ * system prompt. Index reads are intentionally lighter than recall: no
+ * embeddings, no scoring, just the most important live rows of a bank.
+ */
+export interface MemoryIndexEntry {
+	id: string;
+	content: string;
+	source: string | null;
+	timestamp: string | null;
+	importance: number;
+	memory_type: string | null;
+	veracity: string | null;
+	store: "working" | "episodic";
+	tier: number | null;
+}
+
+export interface MemoryIndexOptions {
+	limit?: number;
+	includeWorking?: boolean;
+	includeEpisodic?: boolean;
+	memoryType?: string | null;
+	minImportance?: number;
+}
 
 export interface BeamStats {
 	count: number;

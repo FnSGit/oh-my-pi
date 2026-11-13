@@ -1,43 +1,57 @@
-import { z } from "zod/v4";
+import { type } from "@oh-my-pi/omptype";
 import { getBundledModels } from "../models";
 import { toModelSpec } from "../provider-models/bundled-references";
-import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "../provider-models/discovery-constants";
 import type { FetchImpl, Model, ModelSpec } from "../types";
+import { discoveryFetch } from "../utils";
 
 const GOOGLE_GENERATIVE_AI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 25;
 
-const geminiModelListItemSchema = z.object({
-	name: z.string().optional().catch(undefined),
-	displayName: z.string().optional().catch(undefined),
-	supportedGenerationMethods: z.array(z.string()).optional(),
-	inputTokenLimit: z.number().finite().optional().catch(undefined),
-	outputTokenLimit: z.number().finite().optional().catch(undefined),
+// Hoisted: constructing type("string")/type("number") per property per row
+// builds a fresh schema (~2 closures + 13 slots) on a discovery hot path.
+const stringSchema = type("string");
+const numberSchema = type("number");
+
+const resilientString = type("unknown").pipe(val => {
+	if (val === undefined) return undefined;
+	const out = stringSchema(val);
+	return out instanceof type.errors ? undefined : out;
 });
 
-const geminiModelListResponseSchema = z.object({
-	models: z
-		.array(z.unknown())
-		.optional()
-		.transform(items => {
-			if (!items) {
-				return [];
-			}
-			const parsedItems: GeminiModelListItem[] = [];
-			for (const item of items) {
-				const parsed = geminiModelListItemSchema.safeParse(item);
-				if (parsed.success) {
-					parsedItems.push(parsed.data);
-				}
-			}
-			return parsedItems;
-		}),
-	nextPageToken: z.string().optional().catch(undefined),
+const resilientNumber = type("unknown").pipe(val => {
+	if (val === undefined) return undefined;
+	const out = numberSchema(val);
+	return out instanceof type.errors ? undefined : out;
 });
 
-type GeminiModelListItem = z.infer<typeof geminiModelListItemSchema>;
+const geminiModelListItemSchema = type({
+	"name?": resilientString,
+	"displayName?": resilientString,
+	"supportedGenerationMethods?": "string[]",
+	"inputTokenLimit?": resilientNumber,
+	"outputTokenLimit?": resilientNumber,
+});
 
+type GeminiModelListItem = typeof geminiModelListItemSchema.infer;
+
+const modelsSchema = type("unknown[]")
+	.pipe(items => {
+		const parsedItems: GeminiModelListItem[] = [];
+		for (const item of items) {
+			const parsed = geminiModelListItemSchema(item);
+			if (!(parsed instanceof type.errors)) {
+				parsedItems.push(parsed);
+			}
+		}
+		return parsedItems;
+	})
+	.default(() => []);
+
+const geminiModelListResponseSchema = type({
+	models: modelsSchema,
+	"nextPageToken?": resilientString,
+});
 /**
  * Configuration for Google Generative AI model discovery.
  */
@@ -69,7 +83,7 @@ export async function fetchGeminiModels(
 		return null;
 	}
 
-	const fetchImpl = options.fetch ?? fetch;
+	const fetchImpl = discoveryFetch(options.fetch);
 	const baseUrl = normalizeBaseUrl(options.baseUrl);
 	const pageSize = normalizePositiveInt(options.pageSize, DEFAULT_PAGE_SIZE);
 	const maxPages = normalizePositiveInt(options.maxPages, DEFAULT_MAX_PAGES);
@@ -104,19 +118,19 @@ export async function fetchGeminiModels(
 			return null;
 		}
 
-		const parsed = geminiModelListResponseSchema.safeParse(payload);
-		if (!parsed.success) {
+		const parsed = geminiModelListResponseSchema(payload);
+		if (parsed instanceof type.errors) {
 			return null;
 		}
 
-		for (const item of parsed.data.models) {
+		for (const item of parsed.models) {
 			const model = normalizeModel(item, baseUrl, bundledById);
 			if (model) {
 				modelsById.set(model.id, model);
 			}
 		}
 
-		const token = normalizePageToken(parsed.data.nextPageToken);
+		const token = normalizePageToken(parsed.nextPageToken);
 		if (!token) {
 			break;
 		}
@@ -148,7 +162,9 @@ function normalizeBaseUrl(baseUrl?: string): string {
 	return value.replace(/\/+$/, "");
 }
 
-function normalizePositiveInt(value: number | undefined, fallback: number): number {
+function normalizePositiveInt(value: number | undefined, fallback: number): number;
+function normalizePositiveInt(value: number | undefined, fallback: number | null): number | null;
+function normalizePositiveInt(value: number | undefined, fallback: number | null): number | null {
 	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
 		return fallback;
 	}
@@ -178,8 +194,8 @@ function normalizeModel(
 	}
 
 	const reference = bundledById.get(id);
-	const contextWindow = normalizePositiveInt(item.inputTokenLimit, reference?.contextWindow ?? UNK_CONTEXT_WINDOW);
-	const maxTokens = normalizePositiveInt(item.outputTokenLimit, reference?.maxTokens ?? UNK_MAX_TOKENS);
+	const contextWindow = normalizePositiveInt(item.inputTokenLimit, reference?.contextWindow ?? null);
+	const maxTokens = normalizePositiveInt(item.outputTokenLimit, reference?.maxTokens ?? null);
 	const name = normalizeModelName(item.displayName, reference?.name ?? id);
 
 	if (reference) {
@@ -242,6 +258,8 @@ function inferReasoningFromGeminiId(id: string): boolean {
 
 function inferInputFromGeminiId(id: string): ("text" | "image")[] {
 	const normalized = id.toLowerCase();
+	// residue: modality inference for discovery rows without metadata — the
+	// id shape is the only signal; no request policy hangs off this.
 	if (normalized.includes("vision") || normalized.includes("image") || normalized.includes("gemini")) {
 		return ["text", "image"];
 	}

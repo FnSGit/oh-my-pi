@@ -1,10 +1,4 @@
-<user_interjection>
-The user sent this message while you were working on the current task. It takes
-priority and supersedes your earlier plan wherever they conflict. Stop work that no
-longer matches their intent, re-read the request below, and adjust what you are doing
-now.
-
-<message>
+<system-notice>
+User interjection during work: priority; supersedes conflicting prior instructions. Re-read; ensure current work reflects user intent.
+</system-notice>
 {{message}}
-</message>
-</user_interjection>

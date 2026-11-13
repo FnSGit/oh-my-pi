@@ -3,13 +3,23 @@ import type * as fsNode from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { type ApiKey, completeSimple, Effort, type Model } from "@oh-my-pi/pi-ai";
+import { type ApiKey, completeSimple, Effort, type Model, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
-import { getAgentDbPath, getMemoriesDir, logger, parseJsonlLenient, prompt } from "@oh-my-pi/pi-utils";
+import {
+	getAgentDbPath,
+	getMemoriesDir,
+	isEnoent,
+	logger,
+	parseJsonlLenient,
+	peekFile,
+	prompt,
+} from "@oh-my-pi/pi-utils";
 
 import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import { redactMemorySecrets as redactSecrets } from "../memory-backend/redact";
+import type { MemoryBackendSaveInput, MemoryBackendSaveResult } from "../memory-backend/types";
 import consolidationTemplate from "../prompts/memories/consolidation.md" with { type: "text" };
 import consolidationSystemTemplate from "../prompts/memories/consolidation_system.md" with { type: "text" };
 import readPathTemplate from "../prompts/memories/read-path.md" with { type: "text" };
@@ -30,12 +40,32 @@ import {
 	markStage1Failed,
 	markStage1SucceededNoOutput,
 	markStage1SucceededWithOutput,
+	normalizeScopeCwd,
 	openMemoryDb,
 	type Stage1Claim,
 	type Stage1OutputRow,
 	tryClaimGlobalPhase2Job,
 	upsertThreads,
 } from "./storage";
+
+import {
+	cfgMemoriesFallbackTokenLimit,
+	cfgMemoriesMaxRawMemoriesForGlobal,
+	cfgMemoriesMaxRolloutAgeDays,
+	cfgMemoriesMaxRolloutsPerStartup,
+	cfgMemoriesMinRolloutIdleHours,
+	cfgMemoriesPhase1InputTokenLimit,
+	cfgMemoriesPhase2HeartbeatSeconds,
+	cfgMemoriesPhase2LeaseSeconds,
+	cfgMemoriesPhase2RetryDelaySeconds,
+	cfgMemoriesRolloutPayloadPercent,
+	cfgMemoriesStage1Concurrency,
+	cfgMemoriesStage1LeaseSeconds,
+	cfgMemoriesStage1RetryDelaySeconds,
+	cfgMemoriesSummaryInjectionTokenLimit,
+	cfgMemoriesThreadScanLimit,
+} from "./settings";
+import { cfgMemoryBackend } from "../memory-backend/settings";
 
 interface MemoryRuntimeConfig {
 	enabled: boolean;
@@ -55,25 +85,6 @@ interface MemoryRuntimeConfig {
 	fallbackTokenLimit: number;
 	summaryInjectionTokenLimit: number;
 }
-
-const DEFAULTS: MemoryRuntimeConfig = {
-	enabled: false,
-	maxRolloutsPerStartup: 64,
-	maxRolloutAgeDays: 30,
-	minRolloutIdleHours: 12,
-	threadScanLimit: 300,
-	maxRawMemoriesForGlobal: 200,
-	stage1Concurrency: 8,
-	stage1LeaseSeconds: 120,
-	stage1RetryDelaySeconds: 120,
-	phase2LeaseSeconds: 180,
-	phase2RetryDelaySeconds: 180,
-	phase2HeartbeatSeconds: 30,
-	rolloutPayloadPercent: 0.7,
-	phase1InputTokenLimit: 4_000,
-	fallbackTokenLimit: 16_000,
-	summaryInjectionTokenLimit: 5_000,
-};
 
 interface Stage1Stats {
 	claimed: number;
@@ -141,47 +152,177 @@ export function startMemoryStartupTask(options: {
 		return;
 	}
 
-	void runMemoryStartup({ session, settings, modelRegistry, agentDir, config: cfg }).catch(error => {
-		logger.warn("Memory startup failed", { error: String(error) });
+	const signal = session.beginLocalMemoryStartup?.() ?? new AbortController().signal;
+	void runMemoryStartup({ session, settings, modelRegistry, agentDir, config: cfg, signal })
+		.catch(error => {
+			if (!signal.aborted) logger.warn("Memory startup failed", { error: String(error) });
+		})
+		.finally(() => session.endLocalMemoryStartup?.(signal));
+}
+
+interface MemoryInstructionSession {
+	sessionManager: Pick<AgentSession["sessionManager"], "getSessionFile">;
+	agent?: { state: { messages: readonly unknown[] } };
+}
+
+interface MemoryToolDeveloperInstructionsSnapshot {
+	summary: string;
+	learned: string;
+}
+
+// The first user message means a request was built from the current prompt,
+// and any signed thinking it returns is bound to that prompt.
+function memoryConversationStarted(session: MemoryInstructionSession): boolean {
+	return (session.agent?.state.messages.length ?? 0) > 0;
+}
+
+interface CachedMemoryToolDeveloperInstructions {
+	sessionFile: string | undefined;
+	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined;
+	value: string | undefined;
+}
+
+const memoryToolDeveloperInstructionsBySession = new WeakMap<
+	MemoryInstructionSession,
+	CachedMemoryToolDeveloperInstructions
+>();
+const memoryToolDeveloperInstructionsByRoot = new Map<string, MemoryToolDeveloperInstructionsSnapshot | undefined>();
+
+function getMemoryInstructionSessionFile(session: MemoryInstructionSession): string | undefined {
+	return session.sessionManager.getSessionFile() ?? undefined;
+}
+
+async function readMemoryToolDeveloperInstructionsSnapshot(
+	memoryRoot: string,
+	settings: Settings,
+): Promise<MemoryToolDeveloperInstructionsSnapshot | undefined> {
+	const cfg = loadMemoryConfig(settings);
+	if (!cfg.enabled) return undefined;
+
+	let summary = "";
+	try {
+		summary = (await Bun.file(path.join(memoryRoot, "memory_summary.md")).text()).trim();
+	} catch {
+		// Missing or unreadable summary — injection is best-effort; fall through
+		// so any captured lessons still surface on their own.
+	}
+	const learned = await readLearnedLessons(memoryRoot);
+	return { summary, learned };
+}
+
+function renderMemoryToolDeveloperInstructionsSnapshot(
+	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined,
+	settings: Settings,
+): string | undefined {
+	if (!snapshot) return undefined;
+	const cfg = loadMemoryConfig(settings);
+	if (!cfg.enabled) return undefined;
+	if (!snapshot.summary && !snapshot.learned) return undefined;
+
+	const summaryOut = snapshot.summary
+		? truncateByApproxTokens(snapshot.summary, cfg.summaryInjectionTokenLimit).trim()
+		: "";
+	// Lessons share ONE injection budget with the summary so the combined block
+	// stays within `summaryInjectionTokenLimit` (~4 chars/token, matching
+	// truncateByApproxTokens). With no summary, lessons get the whole budget.
+	// Clamp to 0: truncateByApproxTokens appends a marker, so a truncated summary
+	// can exceed `limit * 4` chars and drive the remainder negative — when the
+	// summary already fills the budget, lessons are simply dropped.
+	const learnedBudget = Math.max(0, cfg.summaryInjectionTokenLimit - Math.ceil(summaryOut.length / 4));
+	const learnedOut =
+		snapshot.learned && learnedBudget > 0 ? truncateByApproxTokens(snapshot.learned, learnedBudget).trim() : "";
+	if (!summaryOut && !learnedOut) return undefined;
+
+	return prompt.render(readPathTemplate, {
+		memory_summary: summaryOut,
+		learned: learnedOut,
 	});
+}
+
+function cacheMemoryToolDeveloperInstructions(
+	session: MemoryInstructionSession,
+	sessionFile: string | undefined,
+	snapshot: MemoryToolDeveloperInstructionsSnapshot | undefined,
+	settings: Settings,
+): string | undefined {
+	const value = renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
+	memoryToolDeveloperInstructionsBySession.set(session, { sessionFile, snapshot, value });
+	return value;
+}
+
+/**
+ * Drop the per-session memory instruction snapshot after explicit memory state
+ * changes that must affect the active conversation immediately, such as
+ * `/memory clear`.
+ */
+export function clearMemoryToolDeveloperInstructionsCache(session: MemoryInstructionSession | undefined): void {
+	if (session) memoryToolDeveloperInstructionsBySession.delete(session);
+}
+
+/**
+ * Refresh the active session's consolidated-memory snapshot after startup maintenance.
+ *
+ * Startup may finish after the first prompt build and write `memory_summary.md`.
+ * The session adopts that summary only while it holds no messages: once a
+ * request went out, signed thinking is bound to the prompt it carried, so the
+ * new summary waits for the next session, whose cache key (session file) differs.
+ * It must not reread `learned.md`, because a `learn` call racing with startup
+ * belongs to the next session's memory prompt, not the active prompt-cache prefix.
+ */
+export async function refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
+	session: MemoryInstructionSession,
+	agentDir: string,
+	cwd: string,
+	settings: Settings,
+): Promise<void> {
+	if (memoryConversationStarted(session)) return;
+	const sessionFile = getMemoryInstructionSessionFile(session);
+	const cached = memoryToolDeveloperInstructionsBySession.get(session);
+	const root = getMemoryRoot(agentDir, cwd);
+	const current = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
+	if (memoryConversationStarted(session)) return;
+	const baseline = memoryToolDeveloperInstructionsByRoot.get(root);
+	const cachedLearned = cached && cached.sessionFile === sessionFile ? cached.snapshot?.learned : undefined;
+	const learned = cachedLearned ?? baseline?.learned ?? "";
+	const snapshot = current ? { summary: current.summary, learned } : undefined;
+	cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
 }
 
 /**
  * Build memory usage instructions for prompt injection.
+ *
+ * `cwd` is the session's project directory, the same scope consolidation and
+ * `learn` write to; never `settings.getCwd()`, which an embedding host may pin
+ * to one directory for sessions spanning several projects.
  */
 export async function buildMemoryToolDeveloperInstructions(
 	agentDir: string,
+	cwd: string,
 	settings: Settings,
+	session?: MemoryInstructionSession,
 ): Promise<string | undefined> {
-	const cfg = loadMemoryConfig(settings);
-	if (!cfg.enabled) return undefined;
-	const memoryRoot = getMemoryRoot(agentDir, settings.getCwd());
-	const summaryPath = path.join(memoryRoot, "memory_summary.md");
-
-	let text: string;
-	try {
-		text = await Bun.file(summaryPath).text();
-	} catch {
-		return undefined;
+	const root = getMemoryRoot(agentDir, cwd);
+	if (!session) {
+		const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
+		memoryToolDeveloperInstructionsByRoot.set(root, snapshot);
+		return renderMemoryToolDeveloperInstructionsSnapshot(snapshot, settings);
 	}
 
-	const summary = text.trim();
-	if (!summary) return undefined;
-	const truncated = truncateByApproxTokens(summary, cfg.summaryInjectionTokenLimit);
-	if (!truncated.trim()) return undefined;
+	const sessionFile = getMemoryInstructionSessionFile(session);
+	const cached = memoryToolDeveloperInstructionsBySession.get(session);
+	if (cached && cached.sessionFile === sessionFile) return cached.value;
 
-	return prompt.render(readPathTemplate, {
-		memory_summary: truncated,
-	});
+	const snapshot = await readMemoryToolDeveloperInstructionsSnapshot(root, settings);
+	return cacheMemoryToolDeveloperInstructions(session, sessionFile, snapshot, settings);
 }
 
 /**
- * Clear all persisted memory state and generated artifacts.
+ * Clear the persisted memory state and generated artifacts of one project.
  */
 export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	try {
-		clearMemoryDataInDb(db);
+		clearMemoryDataInDb(db, cwd);
 	} finally {
 		closeMemoryDb(db);
 	}
@@ -200,25 +341,38 @@ export function enqueueMemoryConsolidation(agentDir: string, cwd: string, source
 	}
 }
 
-async function runMemoryStartup(options: {
+interface MemoryStartupOptions {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	agentDir: string;
 	config: MemoryRuntimeConfig;
-}): Promise<void> {
+	signal: AbortSignal;
+}
+
+function isMemoryStartupActive(options: MemoryStartupOptions): boolean {
+	return !options.signal.aborted && !options.session.isDisposed && cfgMemoryBackend.get(options.settings) === "local";
+}
+
+async function runMemoryStartup(options: MemoryStartupOptions): Promise<void> {
+	if (!isMemoryStartupActive(options)) return;
 	await runPhase1(options);
+	if (!isMemoryStartupActive(options)) return;
 	await runPhase2(options);
+	if (!isMemoryStartupActive(options)) return;
+	await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(
+		options.session,
+		options.agentDir,
+		options.session.sessionManager.getCwd(),
+		options.settings,
+	);
+	if (!isMemoryStartupActive(options)) return;
+	if (memoryConversationStarted(options.session)) return;
 	await options.session.refreshBaseSystemPrompt?.();
 }
 
-async function runPhase1(options: {
-	session: AgentSession;
-	settings: Settings;
-	modelRegistry: ModelRegistry;
-	agentDir: string;
-	config: MemoryRuntimeConfig;
-}): Promise<void> {
+async function runPhase1(options: MemoryStartupOptions): Promise<void> {
+	if (!isMemoryStartupActive(options)) return;
 	const { session, modelRegistry, agentDir, config } = options;
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	const nowSec = unixNow();
@@ -228,6 +382,7 @@ async function runPhase1(options: {
 
 	try {
 		const threads = await collectThreads(session, currentThreadId);
+		if (!isMemoryStartupActive(options)) return;
 		upsertThreads(db, threads);
 
 		const phase1Model = await resolveMemoryModel({
@@ -248,6 +403,7 @@ async function runPhase1(options: {
 			return;
 		}
 
+		if (!isMemoryStartupActive(options)) return;
 		const claims = claimStage1Jobs(db, {
 			nowSec,
 			threadScanLimit: config.threadScanLimit,
@@ -271,14 +427,17 @@ async function runPhase1(options: {
 		};
 
 		await runWithConcurrency(claims, config.stage1Concurrency, async claim => {
+			if (!isMemoryStartupActive(options)) return;
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
 				apiKey: modelRegistry.resolver(phase1Model, session.sessionId),
+				sessionId: session.sessionId,
 				modelMaxTokens: computeModelTokenBudget(phase1Model, config),
 				config,
 				metadata: session.agent?.metadataForProvider(phase1Model.provider),
 			});
+			if (!isMemoryStartupActive(options)) return;
 
 			if (result.kind === "failed") {
 				logger.error("Memory phase1 stage1 job failed", {
@@ -344,13 +503,8 @@ async function runPhase1(options: {
 	}
 }
 
-async function runPhase2(options: {
-	session: AgentSession;
-	settings: Settings;
-	modelRegistry: ModelRegistry;
-	agentDir: string;
-	config: MemoryRuntimeConfig;
-}): Promise<void> {
+async function runPhase2(options: MemoryStartupOptions): Promise<void> {
+	if (!isMemoryStartupActive(options)) return;
 	const { session, modelRegistry, agentDir, config } = options;
 	const cwd = session.sessionManager.getCwd();
 	const db = openMemoryDb(getAgentDbPath(agentDir));
@@ -372,8 +526,10 @@ async function runPhase2(options: {
 		const newWatermark = computeCompletionWatermark(claim.inputWatermark, outputs);
 
 		await syncPhase2Artifacts(memoryRoot, outputs);
+		if (!isMemoryStartupActive(options)) return;
 		if (outputs.length === 0) {
 			await cleanupConsolidatedArtifacts(memoryRoot);
+			if (!isMemoryStartupActive(options)) return;
 			const marked = markGlobalPhase2Succeeded(db, {
 				ownershipToken: claim.ownershipToken,
 				newWatermark,
@@ -386,6 +542,7 @@ async function runPhase2(options: {
 			return;
 		}
 
+		if (!isMemoryStartupActive(options)) return;
 		const phase2Model = await resolveMemoryModel({
 			modelRegistry,
 			session,
@@ -413,8 +570,13 @@ async function runPhase2(options: {
 			return;
 		}
 
+		if (!isMemoryStartupActive(options)) return;
 		let heartbeatLostOwnership = false;
 		const heartbeat = setInterval(() => {
+			if (!isMemoryStartupActive(options)) {
+				clearInterval(heartbeat);
+				return;
+			}
 			const ok = heartbeatGlobalJob(db, {
 				ownershipToken: claim.ownershipToken,
 				leaseSeconds: config.phase2LeaseSeconds,
@@ -428,13 +590,17 @@ async function runPhase2(options: {
 		}, config.phase2HeartbeatSeconds * 1000);
 
 		try {
+			if (!isMemoryStartupActive(options)) return;
 			const consolidated = await runConsolidationModel({
 				memoryRoot,
 				model: phase2Model,
 				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
+				sessionId: session.sessionId,
 				metadata: session.agent?.metadataForProvider(phase2Model.provider),
 			});
+			if (!isMemoryStartupActive(options)) return;
 			await applyConsolidation(memoryRoot, consolidated);
+			if (!isMemoryStartupActive(options)) return;
 			if (heartbeatLostOwnership) {
 				throw new Error("Phase2 lease ownership lost before completion");
 			}
@@ -448,6 +614,7 @@ async function runPhase2(options: {
 				throw new Error("Phase2 could not mark success: ownership lost");
 			}
 		} catch (error) {
+			if (!isMemoryStartupActive(options)) return;
 			markPhase2FailureWithFallback(db, {
 				claim,
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
@@ -502,7 +669,8 @@ function markPhase2FailureWithFallback(
 	}
 }
 
-async function collectThreads(session: AgentSession, currentThreadId?: string): Promise<MemoryThread[]> {
+/** @internal Exported for unit-testing. */
+export async function collectThreads(session: AgentSession, currentThreadId?: string): Promise<MemoryThread[]> {
 	const sessionDir = session.sessionManager.getSessionDir();
 	const files = await fs.readdir(sessionDir);
 	const threads: MemoryThread[] = [];
@@ -518,13 +686,38 @@ async function collectThreads(session: AgentSession, currentThreadId?: string): 
 		let cwd = "";
 		let id = name.slice(0, -6);
 		try {
-			const fileText = await Bun.file(fullPath).text();
-			const firstLine = fileText.split("\n", 1)[0] ?? "";
-			const parsed = parseJsonlLenient(firstLine);
-			const header = Array.isArray(parsed) && parsed.length > 0 ? (parsed[0] as Record<string, unknown>) : undefined;
-			if (header && header.type === "session") {
-				if (typeof header.cwd === "string") cwd = header.cwd;
-				if (typeof header.id === "string") id = header.id;
+			// Bounded head read: session files can grow to hundreds of MBs, but the
+			// session header line always lives at line 1 (or line 2 after a title
+			// slot). Reading a small head slice avoids full-file read and line-split
+			// allocations on startup for every past session. If the candidate line
+			// falls on the slice boundary, fall back to a full read.
+			const HEAD_CAP = 64 * 1024;
+			let isLarge = stat.size > HEAD_CAP;
+			let fileText = isLarge
+				? await peekFile(fullPath, HEAD_CAP, bytes => new TextDecoder().decode(bytes))
+				: await Bun.file(fullPath).text();
+			let lines = fileText.split(/\r?\n/);
+			let sawTitleSlot = false;
+			for (let i = 0; i < lines.length; i++) {
+				// If the slice was cut before this line terminated, fall back to full read
+				if (isLarge && i === lines.length - 1) {
+					fileText = await Bun.file(fullPath).text();
+					lines = fileText.split(/\r?\n/);
+					isLarge = false;
+				}
+				const line = lines[i].trim();
+				if (!line) continue;
+				const parsed = parseJsonlLenient<Record<string, unknown>>(line);
+				const header = Array.isArray(parsed) && parsed.length > 0 ? parsed[0] : undefined;
+				if (!sawTitleSlot && header?.type === "title") {
+					sawTitleSlot = true;
+					continue;
+				}
+				if (header?.type === "session") {
+					if (typeof header.cwd === "string") cwd = header.cwd;
+					if (typeof header.id === "string") id = header.id;
+				}
+				break;
 			}
 		} catch {
 			// ignore malformed session files
@@ -549,7 +742,7 @@ function shouldPersistResponseItemForMemories(message: AgentMessage): boolean {
 	}
 	if (role !== "toolResult") return false;
 	const toolName = (message as { toolName?: string }).toolName;
-	if (toolName === "bash" || toolName === "eval" || toolName === "read" || toolName === "search") {
+	if (toolName === "bash" || toolName === "eval" || toolName === "read" || toolName === "grep") {
 		const text = extractMessageText(message);
 		return text.length > 0 && text.length <= 32_000;
 	}
@@ -567,17 +760,114 @@ function extractPersistableMessages(payload: string): AgentMessage[] {
 		const maybeMessage = entry.message;
 		if (!maybeMessage || typeof maybeMessage !== "object") continue;
 		const message = maybeMessage as AgentMessage;
-		if (shouldPersistResponseItemForMemories(message)) {
+		if (!shouldPersistResponseItemForMemories(message)) continue;
+		if (message.role !== "assistant") {
 			messages.push(message);
+			continue;
 		}
+		const content = message.content.some(block => block.type === "thinking" || block.type === "redactedThinking")
+			? message.content.filter(block => block.type !== "thinking" && block.type !== "redactedThinking")
+			: message.content;
+		messages.push(
+			content === message.content && !message.providerPayload
+				? message
+				: { ...message, content, providerPayload: undefined },
+		);
 	}
 	return messages;
+}
+
+/** Byte window used when streaming rollout head/tail for stage-1 input. */
+const STAGE1_ROLLOUT_WINDOW_BYTES = 1024 * 1024;
+
+/** Persistable messages from the start of the rollout, in file order, read window by window. */
+async function* persistableMessagesFromFront(file: Bun.BunFile, size: number): AsyncGenerator<AgentMessage> {
+	const decoder = new TextDecoder();
+	let carry: Uint8Array | undefined;
+	let offset = 0;
+	while (offset < size) {
+		const end = Math.min(size, offset + STAGE1_ROLLOUT_WINDOW_BYTES);
+		const window = await file.slice(offset, end).bytes();
+		offset = end;
+		const bytes = carry ? Buffer.concat([carry, window]) : window;
+		const cut = offset >= size ? bytes.length : bytes.lastIndexOf(0x0a) + 1;
+		carry = cut < bytes.length ? bytes.subarray(cut) : undefined;
+		if (cut > 0) yield* extractPersistableMessages(decoder.decode(bytes.subarray(0, cut)));
+	}
+}
+
+/** Persistable messages from the end of the rollout, in reverse file order, read window by window. */
+async function* persistableMessagesFromBack(file: Bun.BunFile, size: number): AsyncGenerator<AgentMessage> {
+	const decoder = new TextDecoder();
+	let carry: Uint8Array | undefined;
+	let end = size;
+	while (end > 0) {
+		const start = Math.max(0, end - STAGE1_ROLLOUT_WINDOW_BYTES);
+		const window = await file.slice(start, end).bytes();
+		end = start;
+		const bytes = carry ? Buffer.concat([window, carry]) : window;
+		// Bytes before the first newline belong to a line that starts in an earlier window.
+		const cut = start === 0 ? 0 : bytes.indexOf(0x0a) + 1;
+		if (start > 0 && cut === 0) {
+			carry = bytes;
+			continue;
+		}
+		carry = cut > 0 ? bytes.subarray(0, cut) : undefined;
+		const messages = extractPersistableMessages(decoder.decode(bytes.subarray(cut)));
+		for (let i = messages.length - 1; i >= 0; i--) yield messages[i];
+	}
+}
+
+/**
+ * Build the stage-1 `response_items_json` payload for a rollout file.
+ *
+ * Equivalent to `truncateByApproxTokens(JSON.stringify(persistableMessages), tokenLimit)`, but
+ * streams the rollout in byte windows and serializes messages from the front and back only until
+ * the head/tail budgets fill. Peak memory is bounded by the window size plus the largest single
+ * JSONL record (a record spanning windows is carried until its newline), not by rollout size.
+ */
+export async function buildStage1RolloutItems(rolloutPath: string, tokenLimit: number): Promise<string> {
+	const file = Bun.file(rolloutPath);
+	// stat() throws for a missing rollout, matching the previous Bun.file().text() failure.
+	const { size } = await file.stat();
+	if (tokenLimit <= 0) return "";
+	const maxChars = tokenLimit * 4;
+	const headChars = Math.floor(maxChars * 0.6);
+	const tailChars = maxChars - headChars;
+
+	let head = "[";
+	let truncated = false;
+	for await (const message of persistableMessagesFromFront(file, size)) {
+		head += head.length === 1 ? JSON.stringify(message) : `,${JSON.stringify(message)}`;
+		if (head.length > maxChars) {
+			truncated = true;
+			break;
+		}
+	}
+	if (!truncated) {
+		const full = `${head}]`;
+		if (full.length <= maxChars) return full;
+	}
+
+	let tail = "]";
+	let exhausted = true;
+	for await (const message of persistableMessagesFromBack(file, size)) {
+		tail = `,${JSON.stringify(message)}${tail}`;
+		if (tail.length >= tailChars) {
+			exhausted = false;
+			break;
+		}
+	}
+	// Every message consumed: the leading separator is really the array opener.
+	if (exhausted) tail = `[${tail.slice(1)}`;
+	return `${head.slice(0, headChars)}\n\n...[truncated]...\n\n${tail.slice(-tailChars)}`;
 }
 
 async function runStage1Job(options: {
 	claim: Stage1Claim;
 	model: Model;
 	apiKey: ApiKey;
+	sessionId: string;
 	modelMaxTokens: number;
 	config: MemoryRuntimeConfig;
 	metadata?: Record<string, unknown>;
@@ -592,31 +882,36 @@ async function runStage1Job(options: {
 > {
 	const { claim, model, apiKey, modelMaxTokens, config } = options;
 	try {
-		const rolloutRaw = await Bun.file(claim.rolloutPath).text();
-		const persisted = extractPersistableMessages(rolloutRaw);
-		const serializedItems = JSON.stringify(persisted);
 		const budgetTokens = Math.min(
 			config.phase1InputTokenLimit,
 			Math.floor(modelMaxTokens * config.rolloutPayloadPercent),
 		);
-		const truncatedItems = truncateByApproxTokens(serializedItems, budgetTokens);
+		const truncatedItems = await buildStage1RolloutItems(claim.rolloutPath, budgetTokens);
 		const inputPrompt = prompt.render(stageOneInputTemplate, {
 			thread_id: claim.threadId,
 			response_items_json: truncatedItems,
 		});
 
-		const response = await completeSimple(
-			model,
-			{
-				systemPrompt: [stageOneSystemTemplate],
-				messages: [{ role: "user", content: [{ type: "text", text: inputPrompt }], timestamp: Date.now() }],
-			},
-			{
-				apiKey,
-				metadata: options.metadata,
-				maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
-				reasoning: clampThinkingLevelForModel(model, Effort.Low),
-			},
+		const response = await retryTransientCompletion(
+			() =>
+				completeSimple(
+					model,
+					{
+						systemPrompt: [stageOneSystemTemplate],
+						messages: [{ role: "user", content: [{ type: "text", text: inputPrompt }], timestamp: Date.now() }],
+					},
+					{
+						apiKey,
+						sessionId: options.sessionId,
+						metadata: options.metadata,
+						maxTokens: Math.max(1024, Math.min(4096, Math.floor(modelMaxTokens * 0.2))),
+						reasoning: clampThinkingLevelForModel(model, Effort.Low),
+						// OpenAI chat-completions owns its transient retries in the HTTP
+						// transport; never restart that budget at the provider/oneshot layers.
+						maxHttpAttempts: model.api === "openai-completions" ? 3 : undefined,
+					},
+				),
+			{ provider: model.provider, maxAttempts: model.api === "openai-completions" ? 1 : undefined },
 		);
 
 		if (response.stopReason === "error") {
@@ -722,6 +1017,7 @@ async function runConsolidationModel(options: {
 	memoryRoot: string;
 	model: Model;
 	apiKey: ApiKey;
+	sessionId: string;
 	metadata?: Record<string, unknown>;
 }): Promise<{
 	memoryMd: string;
@@ -742,18 +1038,24 @@ async function runConsolidationModel(options: {
 		rollout_summaries: truncateByApproxTokens(rolloutSummaries, 12_000),
 	});
 
-	const response = await completeSimple(
-		model,
-		{
-			systemPrompt: [consolidationSystemTemplate],
-			messages: [{ role: "user", content: [{ type: "text", text: input }], timestamp: Date.now() }],
-		},
-		{
-			apiKey,
-			metadata: options.metadata,
-			maxTokens: 8192,
-			reasoning: clampThinkingLevelForModel(model, Effort.Medium),
-		},
+	const response = await retryTransientCompletion(
+		() =>
+			completeSimple(
+				model,
+				{
+					systemPrompt: [consolidationSystemTemplate],
+					messages: [{ role: "user", content: [{ type: "text", text: input }], timestamp: Date.now() }],
+				},
+				{
+					apiKey,
+					sessionId: options.sessionId,
+					metadata: options.metadata,
+					maxTokens: 8192,
+					reasoning: clampThinkingLevelForModel(model, Effort.Medium),
+					maxHttpAttempts: model.api === "openai-completions" ? 3 : undefined,
+				},
+			),
+		{ provider: model.provider, maxAttempts: model.api === "openai-completions" ? 1 : undefined },
 	);
 	if (response.stopReason === "error") {
 		throw new Error(response.errorMessage || "phase2 model error");
@@ -976,19 +1278,6 @@ function hasExactKeys(value: Record<string, unknown>, expectedKeys: string[], al
 	return true;
 }
 
-function redactSecrets(input: string): string {
-	let out = input;
-	const patterns = [
-		/(?:sk|pk|rk|tok|key|secret|token|password)[-_A-Za-z0-9]{12,}/g,
-		/[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g,
-		/(?:AKIA|ASIA)[A-Z0-9]{16}/g,
-	];
-	for (const pattern of patterns) {
-		out = out.replace(pattern, "[REDACTED]");
-	}
-	return out;
-}
-
 function sanitizeSkillName(name: string): string {
 	return name
 		.toLowerCase()
@@ -1071,7 +1360,9 @@ function truncateByApproxTokens(text: string, tokenLimit: number): string {
 
 function computeModelTokenBudget(model: Model, config: MemoryRuntimeConfig): number {
 	const maxTokens =
-		Number.isFinite(model.contextWindow) && model.contextWindow > 0 ? model.contextWindow : config.fallbackTokenLimit;
+		model.contextWindow !== null && Number.isFinite(model.contextWindow) && model.contextWindow > 0
+			? model.contextWindow
+			: config.fallbackTokenLimit;
 	return Math.max(2048, Math.floor(maxTokens));
 }
 
@@ -1086,7 +1377,6 @@ async function resolveMemoryModel(options: {
 		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
 			settings: session.settings,
 			matchPreferences: getModelMatchPreferences(session.settings),
-			modelRegistry,
 		});
 		if (resolved.model) return resolved.model;
 	}
@@ -1095,28 +1385,165 @@ async function resolveMemoryModel(options: {
 
 function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {
 	return {
-		enabled: settings.get("memory.backend") === "local" || settings.get("memories.enabled") === true,
-		maxRolloutsPerStartup: settings.get("memories.maxRolloutsPerStartup") ?? DEFAULTS.maxRolloutsPerStartup,
-		maxRolloutAgeDays: settings.get("memories.maxRolloutAgeDays") ?? DEFAULTS.maxRolloutAgeDays,
-		minRolloutIdleHours: settings.get("memories.minRolloutIdleHours") ?? DEFAULTS.minRolloutIdleHours,
-		threadScanLimit: settings.get("memories.threadScanLimit") ?? DEFAULTS.threadScanLimit,
-		maxRawMemoriesForGlobal: settings.get("memories.maxRawMemoriesForGlobal") ?? DEFAULTS.maxRawMemoriesForGlobal,
-		stage1Concurrency: settings.get("memories.stage1Concurrency") ?? DEFAULTS.stage1Concurrency,
-		stage1LeaseSeconds: settings.get("memories.stage1LeaseSeconds") ?? DEFAULTS.stage1LeaseSeconds,
-		stage1RetryDelaySeconds: settings.get("memories.stage1RetryDelaySeconds") ?? DEFAULTS.stage1RetryDelaySeconds,
-		phase2LeaseSeconds: settings.get("memories.phase2LeaseSeconds") ?? DEFAULTS.phase2LeaseSeconds,
-		phase2RetryDelaySeconds: settings.get("memories.phase2RetryDelaySeconds") ?? DEFAULTS.phase2RetryDelaySeconds,
-		phase2HeartbeatSeconds: settings.get("memories.phase2HeartbeatSeconds") ?? DEFAULTS.phase2HeartbeatSeconds,
-		rolloutPayloadPercent: settings.get("memories.rolloutPayloadPercent") ?? DEFAULTS.rolloutPayloadPercent,
-		phase1InputTokenLimit: settings.get("memories.phase1InputTokenLimit") ?? DEFAULTS.phase1InputTokenLimit,
-		fallbackTokenLimit: settings.get("memories.fallbackTokenLimit") ?? DEFAULTS.fallbackTokenLimit,
-		summaryInjectionTokenLimit:
-			settings.get("memories.summaryInjectionTokenLimit") ?? DEFAULTS.summaryInjectionTokenLimit,
+		enabled: cfgMemoryBackend.get(settings) === "local",
+		maxRolloutsPerStartup: cfgMemoriesMaxRolloutsPerStartup.get(settings),
+		maxRolloutAgeDays: cfgMemoriesMaxRolloutAgeDays.get(settings),
+		minRolloutIdleHours: cfgMemoriesMinRolloutIdleHours.get(settings),
+		threadScanLimit: cfgMemoriesThreadScanLimit.get(settings),
+		maxRawMemoriesForGlobal: cfgMemoriesMaxRawMemoriesForGlobal.get(settings),
+		stage1Concurrency: cfgMemoriesStage1Concurrency.get(settings),
+		stage1LeaseSeconds: cfgMemoriesStage1LeaseSeconds.get(settings),
+		stage1RetryDelaySeconds: cfgMemoriesStage1RetryDelaySeconds.get(settings),
+		phase2LeaseSeconds: cfgMemoriesPhase2LeaseSeconds.get(settings),
+		phase2RetryDelaySeconds: cfgMemoriesPhase2RetryDelaySeconds.get(settings),
+		phase2HeartbeatSeconds: cfgMemoriesPhase2HeartbeatSeconds.get(settings),
+		rolloutPayloadPercent: cfgMemoriesRolloutPayloadPercent.get(settings),
+		phase1InputTokenLimit: cfgMemoriesPhase1InputTokenLimit.get(settings),
+		fallbackTokenLimit: cfgMemoriesFallbackTokenLimit.get(settings),
+		summaryInjectionTokenLimit: cfgMemoriesSummaryInjectionTokenLimit.get(settings),
 	};
 }
 
 export function getMemoryRoot(agentDir: string, cwd: string): string {
-	return path.join(getMemoriesDir(agentDir), encodeProjectPath(cwd));
+	return path.join(getMemoriesDir(agentDir), encodeProjectPath(normalizeScopeCwd(cwd)));
+}
+
+/**
+ * Filename of the captured-lessons file under a project's memory root.
+ *
+ * Written by the `learn` tool via {@link saveLearnedLesson} and read back by
+ * {@link buildMemoryToolDeveloperInstructions}. Deliberately distinct from the
+ * consolidation artifacts (`MEMORY.md`, `memory_summary.md`, `skills/`) so a
+ * consolidation pass never clobbers manually captured lessons.
+ */
+const LEARNED_LESSONS_FILE = "learned.md";
+/** Newest-first cap on retained lessons, bounding file growth by entry count. */
+const MAX_LEARNED_LESSONS = 100;
+/** Per-field char caps so a single huge capture can't bloat learned.md. */
+const MAX_LEARNED_CONTENT_CHARS = 2000;
+const MAX_LEARNED_CONTEXT_CHARS = 400;
+
+/**
+ * Strip prompt-injection vectors from a single line of lesson text: control/
+ * format chars, angle brackets (`</skills>`), backticks, and `~~~` fences, then
+ * collapse whitespace. Applied on BOTH write and read (the block renders
+ * unescaped into the system prompt), mirroring managed-skill descriptions.
+ */
+function neutralizeInjection(text: string): string {
+	return text
+		.replace(/[\p{Cc}\p{Cf}]/gu, " ")
+		.replace(/[<>`]/g, "")
+		.replace(/~{2,}/g, "~")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/** Slice to `maxChars`, dropping a trailing unpaired high surrogate. */
+function boundChars(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	const sliced = text.slice(0, maxChars);
+	return /[\uD800-\uDBFF]$/.test(sliced) ? sliced.slice(0, -1) : sliced;
+}
+
+/**
+ * Normalize one lesson field for storage: neutralize injection delimiters
+ * FIRST, then redact secrets (so delimiter stripping can't reassemble a token
+ * the redactor would have caught), then bound the length.
+ */
+function normalizeLearnedText(text: string, maxChars: number): string {
+	return boundChars(redactSecrets(neutralizeInjection(text)).trim(), maxChars);
+}
+
+/** Per-path write chains serializing `learned.md` read-modify-write. */
+const learnedWriteChains = new Map<string, Promise<unknown>>();
+
+/**
+ * Append one lesson to the project's `learned.md` (newest-first, deduped,
+ * capped, secret-redacted, injection-neutralized). The file backs the `learn`
+ * tool when `memory.backend` is `local`.
+ */
+export async function saveLearnedLesson(
+	agentDir: string,
+	cwd: string,
+	input: MemoryBackendSaveInput,
+): Promise<MemoryBackendSaveResult> {
+	const content = normalizeLearnedText(input.content, MAX_LEARNED_CONTENT_CHARS);
+	if (!content) {
+		return { backend: "local", stored: 0, message: "Empty lesson; nothing stored." };
+	}
+	const context = input.context ? normalizeLearnedText(input.context, MAX_LEARNED_CONTEXT_CHARS) : "";
+	const line = context ? `- ${content} _(context: ${context})_` : `- ${content}`;
+	const filePath = path.join(getMemoryRoot(agentDir, cwd), LEARNED_LESSONS_FILE);
+
+	// Serialize the read-modify-write per file: parallel `learn` calls (sibling
+	// subagents, or two shared tool calls in one turn) share the project memory
+	// root, so an unguarded RMW would let the last writer drop the other's lesson.
+	const run = (learnedWriteChains.get(filePath) ?? Promise.resolve()).then(() => appendLearnedLine(filePath, line));
+	const guarded = run.catch(() => {});
+	learnedWriteChains.set(filePath, guarded);
+	try {
+		await run;
+	} finally {
+		// Drop the entry once this write is the chain tail, so the map does not
+		// retain one promise per distinct memory root for the process lifetime.
+		if (learnedWriteChains.get(filePath) === guarded) learnedWriteChains.delete(filePath);
+	}
+	return { backend: "local", stored: 1, message: `Lesson saved to ${LEARNED_LESSONS_FILE}.` };
+}
+
+async function appendLearnedLine(filePath: string, line: string): Promise<void> {
+	let existing = "";
+	try {
+		existing = await Bun.file(filePath).text();
+	} catch (err) {
+		if (!isEnoent(err)) throw err;
+	}
+	// Treat the file as an ordered line list so headings, prose, and blank
+	// lines keep their positions relative to the bullets they scope. Managed
+	// operations touch only bullet lines: dedupe removes an existing copy of
+	// the incoming lesson in place, the new lesson enters at the head of the
+	// first bullet run (newest-first, matching the read path and cap docs),
+	// and the cap drops the oldest (bottom-most) bullets. Hand-edited content
+	// outside the list region survives every write byte-for-byte.
+	const lines = existing.split("\n");
+	// A well-formed file ends with "\n"; drop the terminal split artifact so
+	// repeated saves stay idempotent instead of growing a blank line each time.
+	if (lines.at(-1) === "") lines.pop();
+	const isLesson = (l: string) => l.trimStart().startsWith("- ");
+	const out = lines.filter(l => !(isLesson(l) && l.trim() === line));
+	const firstBullet = out.findIndex(isLesson);
+	if (firstBullet === -1) out.push(line);
+	else out.splice(firstBullet, 0, line);
+	let lessonCount = 0;
+	for (const l of out) if (isLesson(l)) lessonCount++;
+	for (let i = out.length - 1; i >= 0 && lessonCount > MAX_LEARNED_LESSONS; i--) {
+		if (isLesson(out[i])) {
+			out.splice(i, 1);
+			lessonCount--;
+		}
+	}
+	await Bun.write(filePath, `${out.join("\n")}\n`);
+}
+
+/**
+ * Read `learned.md`, neutralizing each line on read too — a hand-edited or
+ * pre-existing file bypasses write-time normalization and the block renders
+ * unescaped into the system prompt. Returns "" when absent/unreadable.
+ */
+async function readLearnedLessons(memoryRoot: string): Promise<string> {
+	let raw = "";
+	try {
+		raw = (await Bun.file(path.join(memoryRoot, LEARNED_LESSONS_FILE)).text()).trim();
+	} catch {
+		return "";
+	}
+	if (!raw) return "";
+	// Neutralize delimiters THEN redact per line — mirrors the write path so a
+	// hand-edited line cannot reassemble a token after delimiter stripping.
+	return raw
+		.split("\n")
+		.map(line => redactSecrets(neutralizeInjection(line)))
+		.join("\n");
 }
 
 function encodeProjectPath(cwd: string): string {
@@ -1133,6 +1560,7 @@ async function runWithConcurrency<T>(
 	worker: (item: T) => Promise<void>,
 ): Promise<void> {
 	const queue = [...items];
+	// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
 	const workers = new Array(Math.max(1, concurrency)).fill(0).map(async () => {
 		while (queue.length > 0) {
 			const item = queue.shift();

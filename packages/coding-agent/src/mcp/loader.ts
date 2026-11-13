@@ -5,9 +5,10 @@
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
-import { AgentStorage } from "../session/agent-storage";
+import { AgentStorage, type AgentStorageApi } from "../session/agent-storage";
 import type { AuthStorage } from "../session/auth-storage";
 import { type MCPLoadResult, MCPManager } from "./manager";
+import type { McpConnectionStatusEvent } from "./startup-events";
 import { MCPToolCache } from "./tool-cache";
 
 /** Result from loading MCP tools */
@@ -26,21 +27,23 @@ export interface MCPToolsLoadResult {
 
 /** Options for loading MCP tools */
 export interface MCPToolsLoadOptions {
-	/** Called when starting to connect to servers */
-	onConnecting?: (serverNames: string[]) => void;
+	/** Called when MCP server connection state changes. */
+	onStatus?: (event: McpConnectionStatusEvent) => void;
+	/** Initial non-blocking discovery window in milliseconds (environment override wins). */
+	startupTimeoutMs?: number;
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
 	filterExa?: boolean;
-	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
+	/** Whether to filter out browser MCP servers when the built-in browser capability is enabled (default: false) */
 	filterBrowser?: boolean;
 	/** SQLite storage for MCP tool cache (null disables cache) */
-	cacheStorage?: AgentStorage | null;
+	cacheStorage?: AgentStorageApi | null;
 	/** Auth storage used to resolve OAuth credentials before initial MCP connect */
 	authStorage?: AuthStorage;
 }
 
-async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
+async function resolveToolCache(storage: AgentStorageApi | null | undefined): Promise<MCPToolCache | null> {
 	if (storage === null) return null;
 	try {
 		const resolved = storage ?? (await AgentStorage.open());
@@ -68,7 +71,8 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 	let result: MCPLoadResult;
 	try {
 		result = await manager.discoverAndConnect({
-			onConnecting: options?.onConnecting,
+			onStatus: options?.onStatus,
+			startupTimeoutMs: options?.startupTimeoutMs,
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,

@@ -1,9 +1,11 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import type { AuthGatewayClient } from "./clients";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
 	CacheRetention,
 	Context,
+	OpenAIResponseInclude,
 	ServiceTier,
 	TokenTaskBudget,
 } from "../types";
@@ -22,7 +24,7 @@ import type {
 /** Default bind. Loopback-only — front with reverse proxy for remote access. */
 export const DEFAULT_AUTH_GATEWAY_BIND = "127.0.0.1:4000";
 
-export type AuthGatewayToolChoice = "auto" | "none" | "required" | { name: string };
+export type AuthGatewayToolChoice = "auto" | "none" | "required" | { name: string } | { type: "computer" };
 
 export interface AuthGatewayParsedRequestOptions {
 	// ── Sampling ──────────────────────────────────────────────────────────
@@ -51,12 +53,18 @@ export interface AuthGatewayParsedRequestOptions {
 	toolChoice?: AuthGatewayToolChoice;
 	/** OpenAI `parallel_tool_calls`. */
 	parallelToolCalls?: boolean;
-
+	/** OpenAI Responses fields requested in the response payload. */
+	include?: OpenAIResponseInclude[];
 	// ── Reasoning ─────────────────────────────────────────────────────────
 	/** Effort-level reasoning request (OpenAI Responses / Chat `reasoning_effort`). */
 	reasoning?: Effort;
 	/** Force-disable reasoning (Anthropic `thinking: { type: "disabled" }`). */
 	disableReasoning?: boolean;
+	/**
+	 * Preserve an explicit wire-level reasoning-off request through providers
+	 * that distinguish it from the generic disable hint.
+	 */
+	forceReasoningOff?: boolean;
 	/**
 	 * Explicit Anthropic `thinking.budget_tokens`. Mirrors Rust's
 	 * `resolve_thinking_budget`: pins onto whichever effort the client
@@ -70,6 +78,8 @@ export interface AuthGatewayParsedRequestOptions {
 	hideThinkingSummary?: boolean;
 	/** Anthropic `output_config.task_budget` advisory loop budget. */
 	taskBudget?: TokenTaskBudget;
+	/** Anthropic preserved-thinking behavior for a changed conversation prefix. */
+	anthropicPrefixMismatchBehavior?: "drop_block" | "error";
 
 	// ── Service / routing ─────────────────────────────────────────────────
 	/** OpenAI service tier (auto|default|flex|scale|priority). */
@@ -90,6 +100,8 @@ export interface AuthGatewayParsedRequestOptions {
 	 * free-form bag. The gateway forwards as-is.
 	 */
 	metadata?: Record<string, unknown>;
+	/** Anthropic User Profile attribution from the inbound request header. */
+	userProfileId?: string;
 	/**
 	 * Captured allow-listed passthrough headers (anthropic-beta,
 	 * anthropic-version, openai-organization, openai-project, openai-beta,
@@ -110,6 +122,13 @@ export interface AuthGatewayParsedRequest {
 	options: AuthGatewayParsedRequestOptions;
 }
 
+export interface AuthGatewayStreamControl {
+	/** Gateway request signal. Encoders stop producing frames when it aborts. */
+	signal?: AbortSignal;
+	/** Called when the HTTP response body is cancelled by the client. */
+	onCancel?: (reason?: unknown) => void;
+}
+
 export interface AuthGatewayFormatModule {
 	parseRequest(body: unknown, headers?: Headers): AuthGatewayParsedRequest;
 	encodeResponse(message: AssistantMessage, requestedModelId: string): Record<string, unknown>;
@@ -117,6 +136,7 @@ export interface AuthGatewayFormatModule {
 		events: AssistantMessageEventStream,
 		requestedModelId: string,
 		options?: AuthGatewayParsedRequestOptions,
+		control?: AuthGatewayStreamControl,
 	): ReadableStream<Uint8Array>;
 	/**
 	 * Emit a protocol-specific error envelope. OpenAI returns
@@ -129,8 +149,16 @@ export interface AuthGatewayFormatModule {
 export interface AuthGatewayServerOptions {
 	/** Listen address. Default `127.0.0.1:4000`. */
 	bind?: string;
-	/** Accept any of these bearer tokens. Empty allows unauthenticated calls. */
+	/** Accept any of these bearer tokens. Empty allows unauthenticated calls unless `clients` is set. */
 	bearerTokens: string[];
+	/**
+	 * Scoped clients, each admitted by its own bearer and limited to its models
+	 * and accounts (see `clients.ts`). Any table, even an empty one, requires a
+	 * bearer on every request. Throws at startup when invalid.
+	 */
+	clients?: readonly AuthGatewayClient[];
+	/** Honor forwarded peer headers only when the connecting proxy is trusted. Default false. */
+	trustProxyHeaders?: boolean;
 	/** Version surfaced on `/healthz`. */
 	version?: string;
 }
@@ -140,4 +168,11 @@ export interface AuthGatewayServerHandle {
 	port: number;
 	hostname: string;
 	close(): Promise<void>;
+	/**
+	 * Replace the scoped clients. A removed or changed token is refused from
+	 * the next request on; a request already in flight keeps the models and
+	 * accounts it was admitted with, retries included, until it finishes.
+	 * Throws, changing nothing, when the table is invalid. Turns bearer auth on.
+	 */
+	setClients(clients: readonly AuthGatewayClient[]): void;
 }

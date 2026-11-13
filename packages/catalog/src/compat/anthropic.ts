@@ -1,17 +1,12 @@
 /**
- * Anthropic-messages compat builder — the anthropic-side analogue of
- * `./openai`. Runs exactly once per model (from `buildModel`); detect-time
- * defaults come from provider ids, strict host checks, and model-id
- * classification, with explicit spec overrides assigned on top.
+ * Anthropic endpoint-shape predicates: which URLs are the official first-party
+ * API, and which non-official hosts enforce Anthropic's thinking-signature
+ * protocol on replay. Compat resolution (`./resolve`) and runtime routing in
+ * pi-ai both consume these; URL matching is the one detection surface that
+ * stays in code.
  */
-import { modelMatchesHost } from "../hosts";
-import {
-	hasOpus47ApiRestrictions,
-	isAnthropicFableOrMythosModel,
-	supportsMidConversationSystemMessages,
-} from "../identity/family";
-import type { ModelSpec, ResolvedAnthropicCompat } from "../types";
-import { applyCompatOverrides } from "./apply";
+import { $env, logger } from "@oh-my-pi/pi-utils";
+import { hostMatchesUrl, isBedrockRouteUrl } from "../hosts";
 
 const OFFICIAL_ANTHROPIC_URL = "https://api.anthropic.com";
 
@@ -28,40 +23,93 @@ export function isOfficialAnthropicApiUrl(baseUrl?: string): boolean {
 	return lower === OFFICIAL_ANTHROPIC_URL || lower.startsWith(`${OFFICIAL_ANTHROPIC_URL}/`);
 }
 
-/** Build the resolved anthropic-messages compat record for a model spec. */
-export function buildAnthropicCompat(spec: ModelSpec<"anthropic-messages">): ResolvedAnthropicCompat {
-	const baseUrl = spec.baseUrl;
-	const official = isOfficialAnthropicApiUrl(baseUrl);
-	// Z.AI's Anthropic-compatible proxy lives at `api.z.ai/api/anthropic`.
-	const isZai = modelMatchesHost(spec, "zai");
-	const compat: ResolvedAnthropicCompat = {
-		officialEndpoint: official,
-		disableStrictTools: false,
-		disableAdaptiveThinking: false,
-		supportsEagerToolInputStreaming: true,
-		// Long cache retention is only sent to the official API by default;
-		// proxies opt in explicitly via `compat.supportsLongCacheRetention: true`.
-		supportsLongCacheRetention: official,
-		// First-party Claude API only. Bedrock/Vertex/Foundry and other
-		// Anthropic-compatible gateways reject mid-conversation system roles, so
-		// detection requires the canonical api.anthropic.com host plus a
-		// supported model id.
-		supportsMidConversationSystem: official && supportsMidConversationSystemMessages(spec.id),
-		supportsForcedToolChoice: !isAnthropicFableOrMythosModel(spec.id),
-		// Opus 4.7+ and Fable/Mythos reject temperature/top_p/top_k with a 400.
-		supportsSamplingParams: !hasOpus47ApiRestrictions(spec.id),
-		// Z.AI workaround (issue #814): its proxy deserializes tool_result blocks
-		// into a class that reads `.id`.
-		requiresToolResultId: isZai,
-		// Official Anthropic enforces signature-based thinking-chain integrity, so
-		// unsigned thinking blocks must stay text there. Anthropic-compatible
-		// reasoning endpoints commonly emit unsigned thinking blocks while still
-		// expecting them back as `type: "thinking"` on continuation; demoting them
-		// loses the reasoning chain and can destabilize the next tool-call
-		// arguments (#2005). Known non-signing hosts (Z.AI, DeepSeek) are also
-		// preserved for compatibility.
-		replayUnsignedThinking: isZai || modelMatchesHost(spec, "deepseekFamily") || (spec.reasoning && !official),
-	};
-	applyCompatOverrides(compat, spec.compat);
-	return compat;
+/** `anthropic-version` values this codebase knows how to speak. */
+export const ANTHROPIC_API_VERSIONS = ["2023-06-01", "2026-10-21"] as const;
+export type AnthropicApiVersion = (typeof ANTHROPIC_API_VERSIONS)[number];
+
+/** Version every non-official Anthropic-compatible endpoint receives. */
+export const LEGACY_ANTHROPIC_API_VERSION: AnthropicApiVersion = "2023-06-01";
+
+let warnedInvalidApiVersion: string | undefined;
+
+function isAnthropicApiVersion(value: string): value is AnthropicApiVersion {
+	return (ANTHROPIC_API_VERSIONS as readonly string[]).includes(value);
+}
+
+/**
+ * `anthropic-version` for a request to `baseUrl`. `PI_ANTHROPIC_API_VERSION`
+ * opts the official first-party API into a newer version; every other host
+ * (Copilot, Bedrock, Foundry, Cloudflare, third-party compatibles) stays on
+ * {@link LEGACY_ANTHROPIC_API_VERSION} because those deployments gate newer
+ * versions on their own schedule (Bedrock accepts 2026-10-21 only for 4.7+).
+ * Read per call so a flipped environment takes effect without a restart.
+ */
+export function resolveAnthropicApiVersion(baseUrl?: string): AnthropicApiVersion {
+	if (!isOfficialAnthropicApiUrl(baseUrl)) return LEGACY_ANTHROPIC_API_VERSION;
+	const configured = $env.PI_ANTHROPIC_API_VERSION?.trim();
+	if (!configured) return LEGACY_ANTHROPIC_API_VERSION;
+	if (isAnthropicApiVersion(configured)) return configured;
+	if (warnedInvalidApiVersion !== configured) {
+		warnedInvalidApiVersion = configured;
+		logger.warn("anthropic: unsupported PI_ANTHROPIC_API_VERSION; using legacy version", {
+			configured,
+			supported: ANTHROPIC_API_VERSIONS,
+			using: LEGACY_ANTHROPIC_API_VERSION,
+		});
+	}
+	return LEGACY_ANTHROPIC_API_VERSION;
+}
+
+/**
+ * Whether Messages requests on `version` may carry `temperature`, `top_p`,
+ * or `top_k`. API version 2026-10-21 rejects all three with a 400, even at
+ * their default values.
+ */
+export function anthropicApiVersionAcceptsSamplingParams(version: AnthropicApiVersion): boolean {
+	return version === "2023-06-01";
+}
+
+const CLOUDFLARE_ANTHROPIC_GATEWAY_URL_MARKER = /gateway\.ai\.cloudflare\.com\/.+\/anthropic(?:\/|$)/i;
+const VERTEX_ANTHROPIC_URL_MARKER = /aiplatform\.googleapis\.com\/.+\/publishers\/anthropic\//i;
+const BEDROCK_ANTHROPIC_URL_MARKER = /(?:^|\/\/|\.)bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com/i;
+const AZURE_ANTHROPIC_URL_MARKER = /(?:^|\/\/|\.)[a-z0-9-]+\.(?:inference|services)\.ai\.azure\.com/i;
+
+/**
+ * Amazon Bedrock's Anthropic Messages API: the `/anthropic` path on the
+ * bedrock-runtime or bedrock-mantle endpoint. It rejects the tool `strict`
+ * field and enforces Anthropic signatures on replay.
+ */
+export function isBedrockAnthropicRoute(baseUrl?: string): boolean {
+	return isBedrockRouteUrl(baseUrl, "anthropic");
+}
+
+/**
+ * Azure AI Inference / Foundry Anthropic route
+ * (`<resource>.inference.ai.azure.com`, `<resource>.services.ai.azure.com`).
+ * Fronts Claude behind Azure identity and enforces Anthropic signatures on
+ * replay; it also rejects the top-level `strict` tool field.
+ */
+export function isAzureAnthropicRoute(baseUrl?: string): boolean {
+	return baseUrl !== undefined && AZURE_ANTHROPIC_URL_MARKER.test(baseUrl);
+}
+
+/**
+ * Known non-official URLs that enforce Anthropic thinking signatures on replay
+ * (GitHub Copilot, ZenMux, Cloudflare AI Gateway `/anthropic`, Google Vertex
+ * `publishers/anthropic`, AWS Bedrock, Azure Foundry).
+ *
+ * Runtime routing calls this with the effective URL because a model's resolved
+ * compat can be stale after Foundry or a provider base-URL override reroutes it.
+ */
+export function isAnthropicSigningProxyUrl(baseUrl?: string): boolean {
+	return (
+		hostMatchesUrl(baseUrl, "githubCopilot") ||
+		hostMatchesUrl(baseUrl, "zenmux") ||
+		(baseUrl !== undefined &&
+			(CLOUDFLARE_ANTHROPIC_GATEWAY_URL_MARKER.test(baseUrl) ||
+				VERTEX_ANTHROPIC_URL_MARKER.test(baseUrl) ||
+				BEDROCK_ANTHROPIC_URL_MARKER.test(baseUrl))) ||
+		isBedrockAnthropicRoute(baseUrl) ||
+		isAzureAnthropicRoute(baseUrl)
+	);
 }

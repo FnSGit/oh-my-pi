@@ -1,4 +1,7 @@
-import type { AuthStorage, FetchImpl } from "@oh-my-pi/pi-ai";
+import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { ModelRegistry } from "../../../config/model-registry";
+import type { StructuredQuery } from "../query";
 import type { SearchProviderId, SearchResponse } from "../types";
 
 /**
@@ -13,6 +16,21 @@ import type { SearchProviderId, SearchResponse } from "../types";
  */
 export interface SearchParams {
 	query: string;
+	/**
+	 * Structured view of `query`, parsed once by the search pipeline:
+	 * Google-style directives (`site:`, `before:`/`after:`, `inurl:`,
+	 * `intitle:`, `filetype:`, quoted phrases, `OR` groups, `-exclusions`)
+	 * extracted into fields.
+	 *
+	 * Providers SHOULD map constraints onto native API parameters
+	 * (domain/date filters) or engine query syntax (`formatQuery`) where the
+	 * upstream supports them, and lean lenient otherwise: the pipeline
+	 * post-filters every response with `applyQueryConstraints`, which
+	 * relaxes any constraint that would eliminate all results — so a
+	 * best-effort search always beats an empty one. When absent (direct
+	 * provider calls), parse with `parseSearchQuery(params.query)`.
+	 */
+	parsedQuery?: StructuredQuery;
 	limit?: number;
 	/**
 	 * Temporal filter narrowing results to the specified time window.
@@ -30,6 +48,8 @@ export interface SearchParams {
 	recency?: "day" | "week" | "month" | "year";
 	systemPrompt: string;
 	signal?: AbortSignal;
+	/** Hard timeout for this provider's search transport, in milliseconds. */
+	timeoutMs?: number;
 	fetch?: FetchImpl;
 	maxOutputTokens?: number;
 	numSearchResults?: number;
@@ -45,12 +65,21 @@ export interface SearchParams {
 	 * the per-credential single-flight refresh.
 	 */
 	authStorage: AuthStorage;
+	/** Selected catalog model that chose this engine or grounding backend. */
+	model: Model<Api>;
+	/** Thinking selector resolved from the model-role candidate. */
+	thinkingLevel?: ConfiguredThinkingLevel;
+	/** Provider/model transport settings used by native search endpoints. */
+	modelRegistry: ModelRegistry;
+	/** Whether the selected model came from an explicit role-chain entry. */
+	explicit?: boolean;
 	/**
 	 * Optional session id used as the round-robin / sticky key when selecting
 	 * among multiple credentials for the same provider. Pass through from the
 	 * caller's agent session when available; otherwise omit.
 	 */
 	sessionId?: string;
+	antigravityEndpointMode?: "auto" | "production" | "sandbox";
 }
 
 /** Base class for web search providers. */
@@ -63,23 +92,23 @@ export abstract class SearchProvider {
 	 * service a request right now. Implementations consult the passed
 	 * {@link AuthStorage} — never a sibling store.
 	 *
-	 * Drives auto-chain admission: providers that return `false` are skipped
-	 * when {@link resolveProviderChain} walks the order. Explicit selection
-	 * uses {@link isExplicitlyAvailable} instead.
+	 * Drives role-chain admission: providers that return `false` are skipped.
+	 * Explicit selection uses {@link isExplicitlyAvailable} instead. The model
+	 * is supplied for providers whose authentication depends on its transport.
 	 */
-	abstract isAvailable(authStorage: AuthStorage): Promise<boolean> | boolean;
+	abstract isAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean;
 
 	/**
 	 * Returns `true` when this provider should run when the user explicitly
 	 * selects it, even if {@link isAvailable} would reject it for the auto
-	 * chain. Providers that ship an unauthenticated fallback (e.g. Exa's
-	 * public MCP) override this so explicit selection still routes through
-	 * the fallback rather than silently falling back to another provider.
+	 * chain. Providers with an unauthenticated fallback kept out of the auto
+	 * chain (e.g. Perplexity's anonymous ask endpoint) override this so explicit
+	 * selection still routes through it rather than failing.
 	 *
 	 * Defaults to mirroring {@link isAvailable}.
 	 */
-	isExplicitlyAvailable(authStorage: AuthStorage): Promise<boolean> | boolean {
-		return this.isAvailable(authStorage);
+	isExplicitlyAvailable(authStorage: AuthStorage, model?: Model<Api>): Promise<boolean> | boolean {
+		return this.isAvailable(authStorage, model);
 	}
 
 	/**

@@ -1,14 +1,13 @@
-import * as path from "node:path";
-import type { TodoPhase } from "../../tools/todo";
+import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import {
 	applyOpsToPhases,
 	getLatestTodoPhasesFromEntries,
 	markdownToPhases,
 	phasesToMarkdown,
-	USER_TODO_EDIT_CUSTOM_TYPE,
+	resolveTodoMarkdownPath,
 } from "../../tools/todo";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
-import { commandConsumed, parseSubcommand, usage } from "./parse";
+import { commandConsumed, errorMessage, parseSubcommand, usage } from "./parse";
 
 type TodoMutationVerb = "done" | "drop" | "rm";
 
@@ -96,8 +95,7 @@ function currentPhases(runtime: SlashCommandRuntime): TodoPhase[] {
 }
 
 function commitTodos(runtime: SlashCommandRuntime, phases: TodoPhase[]): void {
-	runtime.session.setTodoPhases(phases);
-	runtime.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+	runtime.session.commitTodoPhases(phases);
 }
 
 const TODO_HELP_TEXT = [
@@ -105,6 +103,8 @@ const TODO_HELP_TEXT = [
 	"  /todo                              Show current todos",
 	"  /todo edit                         (TUI only) open in $EDITOR",
 	"  /todo copy                         Print todos as Markdown",
+	"  /todo expand                       (TUI only) expand the sticky HUD",
+	"  /todo collapse                     (TUI only) collapse the sticky HUD",
 	"  /todo export [<path>]              Write todos to file (default: TODO.md)",
 	"  /todo import [<path>]              Replace todos from file (default: TODO.md)",
 	"  /todo append [<phase>] <task...>   Append a task",
@@ -127,19 +127,25 @@ async function handleTodoExportCommand(restArgs: string, runtime: SlashCommandRu
 		await runtime.output("No todos to export.");
 		return commandConsumed();
 	}
-	const target = restArgs ? path.resolve(runtime.cwd, restArgs) : path.resolve(runtime.cwd, "TODO.md");
-	await Bun.write(target, phasesToMarkdown(phases));
+	let target: string;
+	try {
+		target = resolveTodoMarkdownPath(restArgs, runtime.sessionManager.getCwd());
+		await Bun.write(target, phasesToMarkdown(phases));
+	} catch (err) {
+		return usage(`Failed to write todos: ${errorMessage(err)}`, runtime);
+	}
 	await runtime.output(`Wrote todos to ${target}`);
 	return commandConsumed();
 }
 
 async function handleTodoImportCommand(restArgs: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
-	const target = restArgs ? path.resolve(runtime.cwd, restArgs) : path.resolve(runtime.cwd, "TODO.md");
+	let target: string;
 	let content: string;
 	try {
+		target = resolveTodoMarkdownPath(restArgs, runtime.sessionManager.getCwd());
 		content = await Bun.file(target).text();
 	} catch (err) {
-		return usage(`Failed to read ${target}: ${err instanceof Error ? err.message : String(err)}`, runtime);
+		return usage(`Failed to read todos: ${errorMessage(err)}`, runtime);
 	}
 	const { phases, errors } = markdownToPhases(content);
 	if (errors.length > 0) return usage(`Could not parse ${target}:\n  ${errors.join("\n  ")}`, runtime);
@@ -269,6 +275,9 @@ export async function handleTodoAcp(
 				"/todo edit requires the TUI editor; use /todo export then /todo import for non-interactive edits.",
 				runtime,
 			);
+		case "expand":
+		case "collapse":
+			return usage(`/todo ${verb} controls the interactive HUD and is unavailable in this mode.`, runtime);
 		case "help":
 		case "?":
 			await runtime.output(TODO_HELP_TEXT);

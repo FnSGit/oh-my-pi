@@ -91,6 +91,12 @@ class WorkerPool:
 
     async def start(self) -> None:
         await self._reap_all_slots()
+        if self.settings.reclaim_workspace_caches:
+            # Crash leftovers: strip dependency caches from every workspace
+            # before the dispatcher can touch any of them again.
+            swept = await asyncio.to_thread(self.sandbox.reclaim_all_caches)
+            if swept:
+                log.info("workspace cache sweep", extra={"workspaces": swept})
         recovered = self.db.reset_stuck_running()
         if recovered:
             log.info("recovered stuck events", extra={"count": recovered})
@@ -301,8 +307,25 @@ class WorkerPool:
                 self.db.mark_event(row.delivery_id, "failed", error="cancelled by operator")
             else:
                 tb = traceback.format_exc(limit=20)
-                log.exception("event handler failed", extra={"delivery": row.delivery_id})
-                self.db.mark_event(row.delivery_id, "failed", error=f"{exc}\n{tb}")
+                err = f"{exc}\n{tb}"
+                max_retries = self.settings.event_max_retries
+                delay = self.settings.retry_delay_seconds(row.attempts)
+                if 0 < row.attempts <= max_retries and self.db.schedule_retry(
+                    row.delivery_id, delay_seconds=delay, error=err
+                ):
+                    log.warning(
+                        "event retry scheduled",
+                        extra={
+                            "delivery": row.delivery_id,
+                            "key": row.issue_key,
+                            "attempt": row.attempts,
+                            "max_retries": max_retries,
+                            "retry_in_seconds": round(delay, 1),
+                        },
+                    )
+                else:
+                    log.exception("event handler failed", extra={"delivery": row.delivery_id})
+                    self.db.mark_event(row.delivery_id, "failed", error=err)
         finally:
             self._cancelled.discard(row.delivery_id)
             self._shutdown_cancelled.discard(row.delivery_id)
@@ -312,8 +335,31 @@ class WorkerPool:
                     _reap_slot(slot_uid)
                 finally:
                     self._slot_pool.release(slot_uid)
+            await self._reclaim_event_caches(row)
             await self._release(row)
             clear_current_event(token)
+
+    async def _reclaim_event_caches(self, row: EventRow) -> None:
+        """Drop the workspace's dependency caches now that its event is over.
+
+        Runs before `_release` so the issue key is still in `_inflight`:
+        nothing can re-enter `ensure_workspace` for this issue mid-reclaim.
+        Skipped during shutdown (the row resumes right after restart and the
+        startup sweep covers it). Best-effort: a reclaim failure never fails
+        the event.
+        """
+        if not self.settings.reclaim_workspace_caches or self._shutting_down:
+            return
+        repo, sep, number = (row.issue_key or "").rpartition("#")
+        if not sep or not repo or not number.isdigit():
+            return
+        try:
+            reclaimed = await asyncio.to_thread(self.sandbox.reclaim_workspace_caches, repo=repo, number=int(number))
+        except OSError as exc:
+            log.warning("workspace cache reclaim failed", extra={"key": row.issue_key, "err": str(exc)})
+            return
+        if reclaimed:
+            log.info("workspace caches reclaimed", extra={"key": row.issue_key})
 
     async def _dispatch_and_mark(self, row: EventRow, *, slot_uid: int | None = None) -> None:
         await self._dispatch(row, slot_uid=slot_uid)
@@ -336,8 +382,20 @@ class WorkerPool:
                 "recovered": row.attempts >= 2,
             },
         )
-        if event == "issues" and action == "opened":
+        if event == "issues" and action in ("opened", "reopened"):
             await tasks.triage_issue(
+                settings=self.settings,
+                db=self.db,
+                github=self.github,
+                sandbox=self.sandbox,
+                git_transport=self.git_transport,
+                payload=row.payload,
+                delivery_id=row.delivery_id,
+                attempts=row.attempts,
+                slot_uid=slot_uid,
+            )
+        elif event == "workflow_run" and action == "completed":
+            await tasks.handle_release_ci(
                 settings=self.settings,
                 db=self.db,
                 github=self.github,
@@ -374,7 +432,7 @@ class WorkerPool:
                     attempts=row.attempts,
                     slot_uid=slot_uid,
                 )
-        elif event == "pull_request" and action in ("opened", "reopened", "ready_for_review"):
+        elif event == "pull_request" and action in ("opened", "reopened", "ready_for_review", "labeled"):
             await tasks.review_pr(
                 settings=self.settings,
                 db=self.db,

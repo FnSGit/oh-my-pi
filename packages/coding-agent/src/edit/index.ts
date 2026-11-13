@@ -1,571 +1,829 @@
-import { MismatchError as HashlineMismatchError } from "@oh-my-pi/hashline";
-import hashlineGrammar from "@oh-my-pi/hashline/grammar.lark" with { type: "text" };
-import hashlineDescription from "@oh-my-pi/hashline/prompt.md" with { type: "text" };
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { prompt } from "@oh-my-pi/pi-utils";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type {
+	AgentTool,
+	AgentToolArgStream,
+	AgentToolArgStreamInit,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolApprovalDecision,
+} from "@oh-my-pi/pi-agent-core";
+import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
 import {
-	createLspWritethrough,
-	type FileDiagnosticsResult,
-	type WritethroughCallback,
-	type WritethroughDeferredHandle,
-	writethroughNoop,
-} from "../lsp";
+	EditSession,
+	editDescription,
+	editGrammar,
+	editInspect,
+	type EditFileOutcome,
+	type EditInspection,
+	type EditPolicy,
+	type EditPreviewBatch,
+	type EditUrlResolution,
+	type EditWriteRequest,
+	type EditWriteResponse,
+} from "@oh-my-pi/pi-natives";
+import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { extractUriScheme, InternalUrlRouter, type ResolveContext, sessionResolveContext } from "../internal-urls";
+import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
+import { type FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
+import { notifyWorkspaceWatchedFiles } from "../lsp/client";
+import { FileChangeType } from "../lsp/types";
+import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
-import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
-import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
-import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
-import type { DeferredDiagnosticsEntry, ToolSession } from "../tools";
-import { truncateForPrompt } from "../tools/approval";
-import { isInternalUrlPath } from "../tools/path-utils";
-import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
-import { executeHashlineSingle, type HashlineParams, hashlineEditParamsSchema } from "./hashline";
-import { type ApplyPatchParams, applyPatchSchema, expandApplyPatchToEntries } from "./modes/apply-patch";
-import applyPatchGrammar from "./modes/apply-patch.lark" with { type: "text" };
-import { executePatchSingle, type PatchEditEntry, type PatchParams, patchEditSchema } from "./modes/patch";
-import { executeReplaceSingle, type ReplaceEditEntry, type ReplaceParams, replaceEditSchema } from "./modes/replace";
-import { type EditToolDetails, type EditToolPerFileResult, getLspBatchRequest, type LspBatchRequest } from "./renderer";
-import { EDIT_MODE_STRATEGIES } from "./streaming";
+import type { ToolSession } from "../tools";
+import { routeWriteThroughBridge } from "../tools/acp-bridge";
+import { approvalTargetKey } from "../tools/approval-targets";
+import { strictestApproval, truncateForPrompt } from "../tools/approval";
+import {
+	deleteFileWithFallback,
+	hasFileWriteFallback,
+	isPermissionDeniedError,
+	writeFileWithFallback,
+} from "../tools/file-write-fallback";
+import { outputMeta, resolveOutputMaxColumns } from "../tools/output-meta";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
+import { resolveEditMode } from "../utils/edit-mode";
+import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
+import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
+import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
+import { getLspBatchRequest } from "../lsp/batch";
+import { type EditToolDetails, type EditToolPerFileResult, type Operation } from "@oh-my-pi/pi-tui/tools/edit";
+import {
+	type ApplyPatchParams,
+	applyPatchSchema,
+	type HashlineParams,
+	hashlineEditParamsSchema,
+	type PatchParams,
+	patchEditSchema,
+	type ReplaceBatchParams,
+	type ReplaceParams,
+	replaceEditSchema,
+	type SloppyParams,
+	sloppyEditSchema,
+} from "./schemas";
+import { getEditStore } from "./store";
 
-export * from "@oh-my-pi/hashline";
-export { DEFAULT_EDIT_MODE, type EditMode, normalizeEditMode } from "../utils/edit-mode";
-export * from "./apply-patch";
-export * from "./diff";
-export * from "./file-snapshot-store";
-export * from "./hashline";
-export * from "./modes/apply-patch";
-export * from "./modes/patch";
-export * from "./modes/replace";
-export * from "./normalize";
-export * from "./renderer";
-export * from "./streaming";
+import {
+	cfgEditBlockAutoGenerated,
+	cfgEditEnforceSeenLines,
+	cfgEditFuzzyMatch,
+	cfgEditFuzzyThreshold,
+} from "./settings";
+import {
+	cfgLspDiagnosticsDeduplicate,
+	cfgLspDiagnosticsOnEdit,
+	cfgLspEnabled,
+	cfgLspFormatOnWrite,
+	cfgLspRequestTimeout,
+} from "../lsp/settings";
+
+export type {
+	EditRenderContext,
+	EditToolDetails,
+	EditToolPerFileResult,
+	Operation,
+	PerFileDiffPreview,
+} from "@oh-my-pi/pi-tui/tools/edit";
+export * from "./schemas";
+export * from "./store";
+export { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 
 type TInput =
 	| typeof replaceEditSchema
 	| typeof patchEditSchema
 	| typeof hashlineEditParamsSchema
-	| typeof applyPatchSchema;
+	| typeof applyPatchSchema
+	| typeof sloppyEditSchema;
 
-type EditParams = ReplaceParams | PatchParams | HashlineParams | ApplyPatchParams;
+type EditParams = ReplaceParams | ReplaceBatchParams | PatchParams | HashlineParams | ApplyPatchParams | SloppyParams;
 
-type EditModeDefinition = {
-	description: (session: ToolSession) => string;
-	parameters: TInput;
-	execute: (
-		tool: EditTool,
-		params: EditParams,
-		signal: AbortSignal | undefined,
-		batchRequest: LspBatchRequest | undefined,
-		onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-	) => Promise<AgentToolResult<EditToolDetails, TInput>>;
-};
+const PATCH_EXAMPLES = [
+	{
+		caption: "Create",
+		call: { path: "hello.txt", edits: [{ op: "create", diff: "Hello\n" }] },
+	},
+	{
+		caption: "Update",
+		call: {
+			path: "src/app.py",
+			edits: [{ op: "update", diff: "@@ def greet():\n def greet():\n-print('Hi')\n+print('Hello')\n" }],
+		},
+	},
+	{
+		caption: "Rename",
+		call: {
+			path: "src/app.py",
+			edits: [{ op: "update", rename: "src/main.py", diff: "@@\n …\n" }],
+		},
+	},
+	{
+		caption: "Delete",
+		call: { path: "obsolete.txt", edits: [{ op: "delete" }] },
+	},
+	{
+		caption: "Multiple entries",
+		note: "All entries in one call apply to the top-level `path`; use separate calls for different files.",
+	},
+] satisfies readonly ToolExample<PatchParams>[];
 
-function resolveConfiguredEditMode(rawEditMode: string): EditMode | undefined {
-	if (!rawEditMode || rawEditMode === "auto") {
-		return undefined;
-	}
+const APPLY_PATCH_EXAMPLES = [
+	{
+		caption: "Apply a combined patch file",
+		call: {
+			input: '*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print("Hi")\n+print("Hello, world!")\n*** Delete File: obsolete.txt\n*** End Patch\n',
+		},
+	},
+] satisfies readonly ToolExample<ApplyPatchParams>[];
 
-	const editMode = normalizeEditMode(rawEditMode);
-	if (!editMode) {
-		throw new Error(`Invalid PI_EDIT_VARIANT: ${rawEditMode}`);
-	}
-
-	return editMode;
-}
-
-function resolveAllowFuzzy(session: ToolSession, rawValue: string): boolean {
-	switch (rawValue) {
-		case "true":
-		case "1":
-			return true;
-		case "false":
-		case "0":
-			return false;
-		case "auto":
-			return session.settings.get("edit.fuzzyMatch");
+/**
+ * Compact tool description markdown for `mode`, when one exists. TS-side
+ * source (not the native addon) so PR CI — which tests against the latest
+ * *release* addons — exercises the same rendering production does.
+ */
+export function editDescriptionCompact(mode: EditMode): string | undefined {
+	switch (mode) {
+		case "hashline":
+			return hashlineCompactPrompt;
 		default:
-			throw new Error(`Invalid PI_EDIT_FUZZY: ${rawValue}`);
+			return undefined;
 	}
 }
 
-function resolveFuzzyThreshold(session: ToolSession, rawValue: string): number {
-	if (rawValue === "auto") {
-		return session.settings.get("edit.fuzzyThreshold");
-	}
-
-	const threshold = Number.parseFloat(rawValue);
-	if (Number.isNaN(threshold) || threshold < 0 || threshold > 1) {
-		throw new Error(`Invalid PI_EDIT_FUZZY_THRESHOLD: ${rawValue}`);
-	}
-
-	return threshold;
+/**
+ * Tool description for `mode`, at the density the model's catalog policy
+ * selects (`edit-prompt-variant`). Models without the compact variant — or
+ * modes that have none — keep the full prompt; both renderings preserve every
+ * operation and invariant.
+ */
+export function resolveEditToolDescription(
+	mode: EditMode,
+	model: Pick<Model, "editPromptVariant"> | undefined,
+): string {
+	const source =
+		model?.editPromptVariant === "compact"
+			? (editDescriptionCompact(mode) ?? editDescription(mode))
+			: editDescription(mode);
+	return prompt.render(source);
 }
 
+/** Builds the LSP writethrough from the current `lsp.*` settings; called per write so changes apply immediately. */
 function createEditWritethrough(session: ToolSession): WritethroughCallback {
-	const enableLsp = session.enableLsp ?? true;
-	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
-	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
-	const dedup = enableDiagnostics && session.settings.get("lsp.diagnosticsDeduplicate");
+	const enableLsp = (session.enableLsp ?? true) && cfgLspEnabled.get(session.settings);
+	const enableDiagnostics = enableLsp && cfgLspDiagnosticsOnEdit.get(session.settings);
+	const enableFormat = enableLsp && cfgLspFormatOnWrite.get(session.settings);
+	const deduplicate = enableDiagnostics && cfgLspDiagnosticsDeduplicate.get(session.settings);
 	return enableLsp
 		? createLspWritethrough(session.cwd, {
 				enableFormat,
 				enableDiagnostics,
-				transformDiagnostics: dedup
-					? (path, result) => getDiagnosticsLedger(session).reduce(path, result)
+				transformDiagnostics: deduplicate
+					? (filePath, result) => getDiagnosticsLedger(session).reduce(filePath, result)
 					: undefined,
+				requestTimeoutSec: cfgLspRequestTimeout.get(session.settings),
 			})
 		: writethroughNoop;
 }
 
-/** Run apply_patch file operations and aggregate their multi-file result. */
-async function executeApplyPatchPerFile(
-	fileEntries: {
-		path: string;
-		run: (batchRequest: LspBatchRequest | undefined) => Promise<AgentToolResult<EditToolDetails>>;
-	}[],
-	outerBatchRequest: LspBatchRequest | undefined,
-	onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-): Promise<AgentToolResult<EditToolDetails, TInput>> {
-	if (fileEntries.length === 1) {
-		// Single file — just run directly, no wrapping
-		return fileEntries[0].run(outerBatchRequest);
+function operationFromNative(op: string): Operation | undefined {
+	return op === "create" || op === "delete" || op === "update" ? op : undefined;
+}
+
+/**
+ * Narrowest per-line cap, in UTF-8 bytes, at which any tool may have cut a line it displayed: grep's
+ * fixed byte cap or read's `tools.outputMaxColumns` (UTF-16 units, which never exceed UTF-8 bytes).
+ */
+function displayMaxColumns(settings: ToolSession["settings"]): number {
+	const readMaxColumns = resolveOutputMaxColumns(settings);
+	return readMaxColumns > 0 ? Math.min(readMaxColumns, DEFAULT_MAX_COLUMN) : DEFAULT_MAX_COLUMN;
+}
+
+function parseDiagnostics(json: string | undefined): FileDiagnosticsResult | undefined {
+	if (!json) return undefined;
+	try {
+		return JSON.parse(json) as FileDiagnosticsResult;
+	} catch {
+		return undefined;
 	}
+}
 
-	const perFileResults: EditToolPerFileResult[] = [];
-	const contentTexts: string[] = [];
-
-	for (let i = 0; i < fileEntries.length; i++) {
-		const { path, run } = fileEntries[i];
-		const isLast = i === fileEntries.length - 1;
-		const batchRequest: LspBatchRequest | undefined = outerBatchRequest
-			? { id: outerBatchRequest.id, flush: isLast && outerBatchRequest.flush }
-			: undefined;
-
-		try {
-			const result = await run(batchRequest);
-			const details = result.details;
-			perFileResults.push({
-				path: details?.path ?? path,
-				diff: details?.diff ?? "",
-				firstChangedLine: details?.firstChangedLine,
-				diagnostics: details?.diagnostics,
-				op: details?.op,
-				move: details?.move,
-				meta: details?.meta,
-				oldText: details?.oldText,
-				newText: details?.newText,
-			});
-			const text = result.content?.find(c => c.type === "text")?.text ?? "";
-			if (text) contentTexts.push(text);
-		} catch (err) {
-			const errorText = err instanceof Error ? err.message : String(err);
-			const displayErrorText = err instanceof HashlineMismatchError ? err.displayMessage : undefined;
-			perFileResults.push({ path, diff: "", isError: true, errorText, displayErrorText });
-			contentTexts.push(`Error editing ${path}: ${errorText}`);
-		}
-
-		// Emit partial result after each file so UI shows progressive completion
-		if (!isLast && onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: contentTexts.join("\n") }],
-				details: {
-					diff: perFileResults
-						.map(r => r.diff)
-						.filter(Boolean)
-						.join("\n"),
-					firstChangedLine: perFileResults.find(r => r.firstChangedLine)?.firstChangedLine,
-					perFileResults: [...perFileResults],
-				},
-			});
-		}
+function mergeDiagnosticsWithWarnings(
+	diagnostics: FileDiagnosticsResult | undefined,
+	warnings: readonly string[],
+): FileDiagnosticsResult | undefined {
+	if (warnings.length === 0) return diagnostics;
+	const warningMessages = warnings.map(warning => `patch: ${warning}`);
+	if (!diagnostics) {
+		return {
+			server: "patch",
+			messages: warningMessages,
+			summary: `Patch warnings: ${warnings.length}`,
+			errored: false,
+		};
 	}
-
 	return {
-		content: [{ type: "text", text: contentTexts.join("\n") }],
-		details: {
-			diff: perFileResults
-				.map(r => r.diff)
-				.filter(Boolean)
-				.join("\n"),
-			firstChangedLine: perFileResults.find(r => r.firstChangedLine)?.firstChangedLine,
-			perFileResults,
-		},
+		...diagnostics,
+		messages: [...warningMessages, ...diagnostics.messages],
+		summary: `${diagnostics.summary}; Patch warnings: ${warnings.length}`,
 	};
 }
 
-async function executeSinglePathEntries(
-	path: string,
-	runs: ((batchRequest: LspBatchRequest | undefined) => Promise<AgentToolResult<EditToolDetails>>)[],
-	outerBatchRequest: LspBatchRequest | undefined,
-	onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-): Promise<AgentToolResult<EditToolDetails, TInput>> {
-	if (runs.length === 1) {
-		return runs[0](outerBatchRequest);
+function toPerFileResult(file: EditFileOutcome, mode: EditMode): EditToolPerFileResult {
+	let diagnostics = parseDiagnostics(file.diagnosticsJson);
+	if (mode === "patch" || mode === "apply_patch") {
+		diagnostics = mergeDiagnosticsWithWarnings(diagnostics, file.warnings);
 	}
-
-	const contentTexts: string[] = [];
-	const diffTexts: string[] = [];
-	let firstChangedLine: number | undefined;
-	let errorCount = 0;
-	let metadataPath: string | undefined;
-	let hasFirstOldText = false;
-	let firstOldText: string | undefined;
-	let hasLastNewText = false;
-	let lastNewText: string | undefined;
-
-	for (let i = 0; i < runs.length; i++) {
-		const isLast = i === runs.length - 1;
-		const batchRequest: LspBatchRequest | undefined = outerBatchRequest
-			? { id: outerBatchRequest.id, flush: isLast && outerBatchRequest.flush }
-			: undefined;
-
-		try {
-			const result = await runs[i](batchRequest);
-			const details = result.details;
-			if (details?.diff) diffTexts.push(details.diff);
-			firstChangedLine ??= details?.firstChangedLine;
-			if (details?.path) {
-				metadataPath ??= details.path;
-			}
-			if (details && "oldText" in details && !hasFirstOldText) {
-				firstOldText = details.oldText;
-				hasFirstOldText = true;
-			}
-			if (details && "newText" in details) {
-				lastNewText = details.newText;
-				hasLastNewText = true;
-			}
-			const text = result.content?.find(c => c.type === "text")?.text ?? "";
-			if (text) contentTexts.push(text);
-		} catch (err) {
-			const errorText = err instanceof Error ? err.message : String(err);
-			contentTexts.push(`Error editing ${path} (entry ${i + 1} of ${runs.length}): ${errorText}`);
-			if (i > 0) {
-				contentTexts.push(i === 1 ? `Entry 1 was already applied.` : `Entries 1-${i} were already applied.`);
-			}
-			if (i + 1 < runs.length) {
-				contentTexts.push(
-					(i + 2 === runs.length
-						? `Entry ${runs.length} was NOT applied`
-						: `Entries ${i + 2}-${runs.length} were NOT applied`) +
-						`; re-read the file and re-issue only the failed and unapplied entries.`,
-				);
-			}
-			errorCount++;
-			// Stop at the first failure: later entries were authored against
-			// line numbers/content that assumed this entry succeeded, and
-			// applying them after a failure compounds the damage.
-			break;
-		}
-
-		if (!isLast && onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: contentTexts.join("\n") }],
-				details: {
-					diff: diffTexts.join("\n"),
-					firstChangedLine,
-				},
-				...(errorCount > 0 ? { isError: true } : {}),
-			});
-		}
-	}
-
+	const resultPath = file.moveTo ?? file.path;
 	return {
-		content: [{ type: "text", text: contentTexts.join("\n") }],
-		details: {
-			diff: diffTexts.join("\n"),
-			firstChangedLine,
-			path: metadataPath ?? path,
-			...(hasFirstOldText ? { oldText: firstOldText } : {}),
-			...(hasLastNewText ? { newText: lastNewText } : {}),
-		},
-		// Any per-entry failure marks the aggregate result as an error so the
-		// renderer takes the error branch instead of falling through to the
-		// streaming-edit preview (which displays the *proposed* diff and looks
-		// indistinguishable from success).
-		...(errorCount > 0 ? { isError: true } : {}),
+		path: resultPath,
+		diff: file.diff,
+		firstChangedLine: file.firstChangedLine,
+		diagnostics,
+		op: operationFromNative(file.op),
+		move: file.moveTo,
+		sourcePath: file.moveTo ? file.path : undefined,
+		oldText: file.oldText,
+		newText: file.newText,
+		snapshotsPruned: file.snapshotsPruned || undefined,
+		meta: outputMeta()
+			.diagnostics(diagnostics?.summary ?? "", diagnostics?.messages ?? [])
+			.get(),
 	};
 }
 
-function extractApprovalPath(args: unknown): string {
-	const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
-	const input = typeof record.input === "string" ? record.input : undefined;
-	if (input) {
-		const hashlineMatch = /^\[([^#\r\n]+)(?:#[0-9a-fA-F]{4})?\]/m.exec(input);
-		if (hashlineMatch?.[1]) return hashlineMatch[1];
-
-		const applyPatchMatch = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/m.exec(input);
-		if (applyPatchMatch?.[1]) return applyPatchMatch[1].trim();
+function aggregateDetails(files: readonly EditFileOutcome[], mode: EditMode): EditToolDetails | undefined {
+	if (files.length === 0) return undefined;
+	const perFileResults = files.map(file => toPerFileResult(file, mode));
+	if (perFileResults.length === 1) {
+		const [file] = perFileResults;
+		return {
+			diff: file.diff,
+			firstChangedLine: file.firstChangedLine,
+			diagnostics: file.diagnostics,
+			op: file.op,
+			move: file.move,
+			sourcePath: file.sourcePath,
+			path: file.path,
+			oldText: file.oldText,
+			newText: file.newText,
+			snapshotsPruned: file.snapshotsPruned,
+			meta: file.meta,
+		};
 	}
+	return {
+		diff: perFileResults
+			.map(file => file.diff)
+			.filter(Boolean)
+			.join("\n"),
+		firstChangedLine: perFileResults.find(file => file.firstChangedLine !== undefined)?.firstChangedLine,
+		perFileResults: capPerFileSnapshots(perFileResults),
+	};
+}
 
-	const targetPath = record.path;
-	return typeof targetPath === "string" && targetPath.length > 0 ? targetPath : "(unknown)";
+/**
+ * Combined `oldText` + `newText` character budget shared across a multi-file
+ * result. The engine already prunes each file on its own; this keeps a
+ * many-small-files batch from accumulating unbounded snapshot bytes in the
+ * session JSONL (#3787). Early entries keep their diff visualization; later
+ * ones degrade to text-only.
+ */
+const MAX_EDIT_SNAPSHOT_TEXT_CHARS = 32_768;
+
+function capPerFileSnapshots(entries: EditToolPerFileResult[]): EditToolPerFileResult[] {
+	let remaining = MAX_EDIT_SNAPSHOT_TEXT_CHARS;
+	return entries.map(entry => {
+		const kept = (entry.oldText?.length ?? 0) + (entry.newText?.length ?? 0);
+		if (kept === 0) return entry;
+		if (kept <= remaining) {
+			remaining -= kept;
+			return entry;
+		}
+		const { oldText: _old, newText: _new, ...rest } = entry;
+		return { ...rest, snapshotsPruned: true };
+	});
+}
+
+async function mkdirAllowingFallback(directory: string): Promise<void> {
+	try {
+		await fs.mkdir(directory, { recursive: true });
+	} catch (error) {
+		if (!hasFileWriteFallback() || !isPermissionDeniedError(error)) throw error;
+	}
+}
+
+/**
+ * Permission bits a move carries to its destination, or undefined where they cannot be read:
+ * Windows has no POSIX mode, and a source the process may not stat is moved by the
+ * privileged fallback writer, which keeps the destination's own mode.
+ */
+async function movedFileMode(filePath: string): Promise<number | undefined> {
+	if (process.platform === "win32") return undefined;
+	try {
+		return (await fs.stat(filePath)).mode & 0o7777;
+	} catch (error) {
+		if (isPermissionDeniedError(error)) return undefined;
+		throw error;
+	}
+}
+
+/**
+ * Give a moved file its source's mode. The content is already at the destination, possibly
+ * written by a privileged fallback writer, so a destination that denies mode changes keeps
+ * its own mode instead of failing the move halfway with both files left behind.
+ */
+async function chmodMovedFile(filePath: string, mode: number): Promise<void> {
+	try {
+		await fs.chmod(filePath, mode);
+	} catch (error) {
+		if (!isPermissionDeniedError(error)) throw error;
+	}
+}
+
+/** Memoized native inspection, tagged onto the streamed args object it describes. */
+const kInspection = Symbol("edit.inspection");
+
+interface InspectedArgs {
+	[kInspection]?: { mode: EditMode; inspection: EditInspection };
+}
+
+/** A native edit session paired with the router context its URL targets resolve with. */
+interface OpenEditSession {
+	native: EditSession;
+	resolveContext: ResolveContext;
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+	// Zero-copy Buffer view: `equals` is a native memcmp.
+	return Buffer.from(left.buffer, left.byteOffset, left.byteLength).equals(right);
 }
 
 export class EditTool implements AgentTool<TInput> {
-	readonly approval = (args: unknown) => {
-		const targetPath = extractApprovalPath(args);
-		return targetPath !== "(unknown)" && isInternalUrlPath(targetPath) ? "read" : "write";
-	};
-	readonly formatApprovalDetails = (args: unknown): string[] => [
-		`File: ${truncateForPrompt(extractApprovalPath(args))}`,
-	];
 	readonly name = "edit";
 	readonly label = "Edit";
 	readonly loadMode = "essential";
 	readonly concurrency = "exclusive";
 	readonly strict = true;
 
-	readonly #allowFuzzy: boolean;
-	readonly #fuzzyThreshold: number;
-	readonly #writethrough: WritethroughCallback;
 	readonly #editMode?: EditMode;
-	readonly #dedupDiagnostics: boolean;
-	readonly #pendingDeferredFetches = new Map<string, AbortController>();
-	/** Fallback per-path mutation counter used only when the session does not expose
-	 *  a shared one. Prefer `session.bumpFileMutationVersion` so write (and any other
-	 *  tool) mutating the same file also invalidates pending late-diagnostics. */
-	readonly #editVersionByPath = new Map<string, number>();
+	readonly #deferredDiagnostics: DeferredDiagnostics;
+	readonly #sessions = new Map<string, OpenEditSession>();
+	readonly #streamedArgs = new Map<string, string>();
 
-	constructor(private readonly session: ToolSession) {
-		const {
-			PI_EDIT_FUZZY: editFuzzy = "auto",
-			PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto",
-			PI_EDIT_VARIANT: envEditVariant = "auto",
-		} = Bun.env;
-
-		this.#editMode = resolveConfiguredEditMode(envEditVariant);
-		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);
-		this.#fuzzyThreshold = resolveFuzzyThreshold(session, editFuzzyThreshold);
-		this.#dedupDiagnostics =
-			(session.enableLsp ?? true) &&
-			session.settings.get("lsp.diagnosticsOnEdit") &&
-			session.settings.get("lsp.diagnosticsDeduplicate");
-		this.#writethrough = createEditWritethrough(session);
+	constructor(
+		private readonly session: ToolSession,
+		mode?: EditMode,
+	) {
+		this.#editMode = mode;
+		this.#deferredDiagnostics = new DeferredDiagnostics(session);
 	}
 
 	get mode(): EditMode {
 		if (this.#editMode) return this.#editMode;
-		return resolveEditMode(this.session);
+		const mode = resolveEditMode(this.session);
+		// `edit.mode: none` unregisters this tool on the next built-in reconcile; until then keep a valid schema.
+		return mode === "none" ? "replace" : mode;
 	}
 
 	get description(): string {
-		return this.#getModeDefinition().description(this.session);
+		return resolveEditToolDescription(this.mode, this.session.getActiveModel?.());
 	}
 
 	get parameters(): TInput {
-		return this.#getModeDefinition().parameters;
+		switch (this.mode) {
+			case "replace":
+				return replaceEditSchema;
+			case "patch":
+				return patchEditSchema;
+			case "apply_patch":
+				return applyPatchSchema;
+			case "hashline":
+				return hashlineEditParamsSchema;
+			case "sloppy":
+				return sloppyEditSchema;
+		}
 	}
 
-	/**
-	 * When in `apply_patch` mode, expose the Codex Lark grammar so providers
-	 * that support OpenAI-style custom tools can emit a grammar-constrained
-	 * variant. Providers that don't support custom tools ignore this field
-	 * and fall back to emitting a JSON function tool from `parameters`.
-	 */
-	get customFormat(): { syntax: "lark"; definition: string } | undefined {
-		if (this.mode === "apply_patch") return { syntax: "lark", definition: applyPatchGrammar };
-		if (this.mode === "hashline") return { syntax: "lark", definition: hashlineGrammar };
+	get examples(): readonly ToolExample[] | undefined {
+		if (this.mode === "patch") return PATCH_EXAMPLES;
+		if (this.mode === "apply_patch") return APPLY_PATCH_EXAMPLES;
 		return undefined;
 	}
 
-	/**
-	 * Wire-level tool name used when the custom-tool variant is active. GPT-5+
-	 * is trained on the literal name `apply_patch`; internally this is just a
-	 * mode of the `edit` tool. The agent-loop dispatcher matches both the
-	 * internal `name` and `customWireName`, so returned calls route correctly.
-	 */
+	get customFormat(): { syntax: "lark"; definition: string } | undefined {
+		const definition = editGrammar(this.mode);
+		return definition === null ? undefined : { syntax: "lark", definition };
+	}
+
 	get customWireName(): string | undefined {
-		if (this.mode !== "apply_patch") return undefined;
-		return "apply_patch";
+		return this.mode === "apply_patch" ? "apply_patch" : undefined;
 	}
 
 	/**
-	 * Normalize streamed args into the source text this edit introduces, so
-	 * stream matchers (TTSR rules) run against real file content instead of the
-	 * mode-specific patch grammar.
+	 * Strictest write decision ({@link strictestApproval}) over every path the payload writes:
+	 * section targets plus move/rename destinations. "write" while no target is known.
 	 */
+	readonly approval = (args: unknown): ToolApprovalDecision => {
+		const { paths, fileOps } = this.#inspect(args);
+		const targets = [...paths];
+		for (const op of fileOps) if (op.kind === "move" && op.to !== undefined) targets.push(op.to);
+		if (targets.length === 0) return "write";
+		const router = InternalUrlRouter.instance();
+		return strictestApproval(targets.map(target => router.writeTier(target, undefined, this.session)));
+	};
+
+	readonly formatApprovalDetails = (args: unknown): string[] => {
+		const { paths, fileOps } = this.#inspect(args);
+		const lines = paths.map(target => `File: ${truncateForPrompt(target)}`);
+		for (const op of fileOps) {
+			if (op.kind === "move" && op.to !== undefined) {
+				lines.push(`Move: ${truncateForPrompt(op.path)} → ${truncateForPrompt(op.to)}`);
+			}
+		}
+		return lines.length === 0 ? ["File: (unknown)"] : lines;
+	};
+
+	/**
+	 * `always-ask-cached` keys: every file the payload writes — section targets
+	 * plus move/rename destinations, mirroring {@link approval}.
+	 */
+	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
+		const { paths, fileOps } = this.#inspect(args);
+		const targets = [...paths];
+		for (const op of fileOps) if (op.kind === "move" && op.to !== undefined) targets.push(op.to);
+		const keys: string[] = [];
+		for (const target of targets) {
+			const key = approvalTargetKey(this.session.cwd, target);
+			if (key !== undefined) keys.push(key);
+		}
+		return keys.length > 0 ? keys : undefined;
+	};
+
 	matcherDigest(args: unknown): string | undefined {
-		return EDIT_MODE_STRATEGIES[this.mode].matcherDigest(args);
+		const digest = this.#inspect(args)
+			.entries.map(entry => entry.digest)
+			.filter(Boolean)
+			.join("\n");
+		return digest || undefined;
+	}
+
+	matcherPaths(args: unknown): readonly string[] | undefined {
+		const inspection = this.#inspect(args);
+		const paths = inspection.entries.length > 0 ? inspection.entries.map(entry => entry.path) : inspection.paths;
+		return paths.length > 0 ? paths : undefined;
+	}
+
+	matcherEntries(args: unknown): readonly { path: string; digest: string }[] | undefined {
+		const entries = this.#inspect(args).entries;
+		return entries.length > 0 ? entries : undefined;
+	}
+
+	openArgStream(init: AgentToolArgStreamInit): AgentToolArgStream {
+		this.#sessions.get(init.toolCallId)?.native.close();
+		this.#streamedArgs.delete(init.toolCallId);
+		// A call that arrived through the custom-tool wire streams the payload
+		// verbatim; JSON function calls stream JSON text.
+		const rawInput = init.customWireName !== undefined;
+		const open = this.#openSession(rawInput, undefined, (error, batch) => {
+			if (error) {
+				logger.debug("Native edit preview failed", { error: error.message, toolCallId: init.toolCallId });
+				return;
+			}
+			init.emit(batch);
+		});
+		const editSession = open.native;
+		this.#sessions.delete(init.toolCallId);
+		this.#sessions.set(init.toolCallId, open);
+		while (this.#sessions.size > 32) {
+			const oldestId = this.#sessions.keys().next().value;
+			if (oldestId === undefined) break;
+			this.#sessions.get(oldestId)?.native.close();
+			this.#sessions.delete(oldestId);
+			this.#streamedArgs.delete(oldestId);
+		}
+		return {
+			push: delta => editSession.push(delta),
+			end: args => {
+				editSession.finish();
+				this.#streamedArgs.set(init.toolCallId, JSON.stringify(args));
+			},
+			cancel: () => {
+				editSession.close();
+				if (this.#sessions.get(init.toolCallId) === open) this.#sessions.delete(init.toolCallId);
+				this.#streamedArgs.delete(init.toolCallId);
+			},
+		};
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: EditParams,
 		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<EditToolDetails, TInput>,
+		_onUpdate?: AgentToolUpdateCallback<EditToolDetails, TInput>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
-		const modeDefinition = this.#getModeDefinition();
-		return modeDefinition.execute(this, params, signal, getLspBatchRequest(context?.toolCall), onUpdate);
-	}
-
-	#getModeDefinition(): EditModeDefinition {
-		return {
-			patch: {
-				description: () => prompt.render(patchDescription),
-				parameters: patchEditSchema,
-				execute: (
-					tool: EditTool,
-					params: EditParams,
-					signal: AbortSignal | undefined,
-					batchRequest: LspBatchRequest | undefined,
-					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-				) => {
-					const { edits, path } = params as PatchParams;
-					const runs = (edits as PatchEditEntry[]).map(
-						entry => (br: LspBatchRequest | undefined) =>
-							executePatchSingle({
-								session: tool.session,
-								path,
-								params: entry,
-								signal,
-								batchRequest: br,
-								allowFuzzy: tool.#allowFuzzy,
-								fuzzyThreshold: tool.#fuzzyThreshold,
-								writethrough: tool.#writethrough,
-								beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
-							}),
-					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate);
-				},
-			},
-			apply_patch: {
-				description: () => prompt.render(applyPatchDescription),
-				parameters: applyPatchSchema,
-				execute: (
-					tool: EditTool,
-					params: EditParams,
-					signal: AbortSignal | undefined,
-					batchRequest: LspBatchRequest | undefined,
-					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-				) => {
-					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
-					const perFile = entries.map(entry => {
-						const { path, ...patchParams } = entry;
-						return {
-							path,
-							run: (br: LspBatchRequest | undefined) =>
-								executePatchSingle({
-									session: tool.session,
-									path,
-									params: patchParams,
-									signal,
-									batchRequest: br,
-									allowFuzzy: tool.#allowFuzzy,
-									fuzzyThreshold: tool.#fuzzyThreshold,
-									writethrough: tool.#writethrough,
-									beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
-								}),
-						};
-					});
-					return executeApplyPatchPerFile(perFile, batchRequest, onUpdate);
-				},
-			},
-			hashline: {
-				description: () => prompt.render(hashlineDescription),
-				parameters: hashlineEditParamsSchema,
-				execute: (
-					tool: EditTool,
-					params: EditParams,
-					signal: AbortSignal | undefined,
-					batchRequest: LspBatchRequest | undefined,
-					_onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-				) => {
-					const { input } = params as HashlineParams;
-					return executeHashlineSingle({
-						session: tool.session,
-						input,
-						signal,
-						batchRequest,
-						writethrough: tool.#writethrough,
-						beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
-					});
-				},
-			},
-			replace: {
-				description: () => prompt.render(replaceDescription),
-				parameters: replaceEditSchema,
-				execute: (
-					tool: EditTool,
-					params: EditParams,
-					signal: AbortSignal | undefined,
-					batchRequest: LspBatchRequest | undefined,
-					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
-				) => {
-					const { edits, path } = params as ReplaceParams;
-					const runs = (edits as ReplaceEditEntry[]).map(
-						entry => (br: LspBatchRequest | undefined) =>
-							executeReplaceSingle({
-								session: tool.session,
-								path,
-								params: entry,
-								signal,
-								batchRequest: br,
-								allowFuzzy: tool.#allowFuzzy,
-								fuzzyThreshold: tool.#fuzzyThreshold,
-								writethrough: tool.#writethrough,
-								beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
-							}),
-					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate);
-				},
-			},
-		}[this.mode];
-	}
-
-	#beginDeferredDiagnosticsForPath(path: string): WritethroughDeferredHandle {
-		const existingDeferred = this.#pendingDeferredFetches.get(path);
-		if (existingDeferred) {
-			existingDeferred.abort();
-			this.#pendingDeferredFetches.delete(path);
+		let open = this.#sessions.get(toolCallId);
+		const argsJson = JSON.stringify(params);
+		if (open && this.#streamedArgs.get(toolCallId) !== argsJson) {
+			open.native.close();
+			this.#sessions.delete(toolCallId);
+			open = undefined;
+		}
+		this.#streamedArgs.delete(toolCallId);
+		if (open) {
+			// The streamed session was opened before any signal existed; URL targets
+			// resolved during apply honor this call's abort.
+			open.resolveContext.signal = signal;
+		} else {
+			// No deltas were streamed (non-streaming provider, inline recovery,
+			// Cursor batch frames), or a pre-execution hook revised the arguments:
+			// the parsed args are the whole effective payload.
+			open = this.#openSession(false, signal);
+			open.native.setArgsJson(argsJson);
+			open.native.finish();
+		}
+		const editSession = open.native;
+		const batch = getLspBatchRequest(context?.toolCall);
+		let outcome;
+		try {
+			outcome = await editSession.apply(
+				{ lspBatchId: batch?.id, lspFlush: batch?.flush ?? false },
+				(_error, request) => this.#write(request, signal),
+			);
+			if (outcome.isError && batch?.flush) {
+				await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+			}
+		} catch (error) {
+			if (batch?.flush) await flushLspWritethroughBatch(batch.id, this.session.cwd, signal);
+			throw error;
+		} finally {
+			editSession.close();
+			if (this.#sessions.get(toolCallId) === open) this.#sessions.delete(toolCallId);
+			this.#streamedArgs.delete(toolCallId);
 		}
 
-		const deferredController = new AbortController();
-		const editVersion = this.#bumpFileVersion(path);
+		if (outcome.isError) {
+			return {
+				content: [{ type: "text", text: outcome.text }],
+				details: { diff: "", errorKind: outcome.errorKind },
+				isError: true,
+			};
+		}
+
+		const details = aggregateDetails(outcome.files, this.mode);
+		const result: AgentToolResult<EditToolDetails, TInput> = {
+			content: [{ type: "text", text: outcome.text }],
+			...(details ? { details } : {}),
+		};
+		const record = createEditBlackboxRecorder(this.session, this.mode, params);
+		const notes: string[] = [];
+		for (const file of outcome.files) {
+			if (!file.parseRegressed || file.oldText === undefined || file.newText === undefined) continue;
+			const snapshot: AppliedEditSnapshot = {
+				path: file.moveTo ?? file.path,
+				prev: file.oldText,
+				next: file.newText,
+			};
+			try {
+				await record?.(snapshot);
+			} catch {
+				// Blackbox recording is diagnostic only.
+			}
+			const display = path.relative(this.session.cwd, snapshot.path) || snapshot.path;
+			let repaired: EditAutoRepairOutcome | undefined;
+			try {
+				repaired = await attemptEditAutoRepair({
+					session: this.session,
+					snapshot,
+					writethrough: createEditWritethrough(this.session),
+					signal,
+				});
+				if (repaired) getEditStore(this.session).invalidate(snapshot.path);
+			} catch (error) {
+				logger.warn("Edit auto-repair failed", {
+					path: snapshot.path,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			notes.push(
+				repaired
+					? `Note: ${display} stopped parsing after this edit; an automatic syntax repair (${repaired.model}) was applied on top:\n${repaired.diff}\nReview the repaired region; adjust it if the repair guessed wrong.`
+					: `Warning: ${display} no longer parses after this edit. The change was applied; re-read the edited region and fix the syntax, or revert if unintended.`,
+			);
+		}
+		if (notes.length > 0) result.content.push({ type: "text", text: notes.join("\n\n") });
+		return result;
+	}
+
+	/**
+	 * TTSR asks `matcherPaths` and `matcherEntries` (and approval asks again)
+	 * for the same streamed args object on every delta, and the native inspect
+	 * re-parses the whole payload each time; the result is tagged onto the args
+	 * so repeat lookups for one object pay once.
+	 */
+	#inspect(args: unknown): EditInspection {
+		const tagged = typeof args === "object" && args !== null ? (args as InspectedArgs) : undefined;
+		const cached = tagged?.[kInspection];
+		if (cached?.mode === this.mode) return cached.inspection;
+		let inspection: EditInspection;
+		try {
+			inspection = editInspect(this.mode, JSON.stringify(args ?? {}));
+		} catch {
+			inspection = { paths: [], entries: [], fileOps: [] };
+		}
+		if (tagged) tagged[kInspection] = { mode: this.mode, inspection };
+		return inspection;
+	}
+
+	/**
+	 * Open a native session whose internal-URL targets resolve through the router
+	 * with one {@link ResolveContext} built for the session's lifetime.
+	 */
+	#openSession(
+		rawInput: boolean,
+		signal?: AbortSignal,
+		onPreview?: (error: Error | null, batch: EditPreviewBatch) => void,
+	): OpenEditSession {
+		const resolveContext = sessionResolveContext(this.session, { signal });
+		const native = new EditSession(
+			getEditStore(this.session),
+			this.#policy(rawInput, resolveContext),
+			onPreview,
+			(_error, url) => this.#resolveUrl(url, resolveContext),
+		);
+		return { native, resolveContext };
+	}
+
+	#policy(rawInput: boolean, context: ResolveContext): EditPolicy {
+		const router = InternalUrlRouter.instance();
+		const specs = router.specs();
+		const urlAliasSchemes: string[] = [];
+		for (const [scheme, spec] of specs) if (spec.singleSlashAlias) urlAliasSchemes.push(scheme);
 		return {
-			onDeferredDiagnostics: (lateDiagnostics: FileDiagnosticsResult) => {
-				this.#pendingDeferredFetches.delete(path);
-				this.#injectLateDiagnostics(path, lateDiagnostics, editVersion);
-			},
-			signal: deferredController.signal,
-			finalize: (diagnostics: FileDiagnosticsResult | undefined) => {
-				if (!diagnostics) {
-					this.#pendingDeferredFetches.set(path, deferredController);
-				} else {
-					deferredController.abort();
-				}
-			},
+			cwd: this.session.cwd,
+			mode: this.mode,
+			allowFuzzy: cfgEditFuzzyMatch.get(this.session.settings),
+			fuzzyThreshold: cfgEditFuzzyThreshold.get(this.session.settings),
+			enforceSeenLines: cfgEditEnforceSeenLines.get(this.session.settings),
+			maxColumns: displayMaxColumns(this.session.settings),
+			blockAutoGenerated: cfgEditBlockAutoGenerated.get(this.session.settings),
+			planActive: this.session.getPlanModeState?.()?.enabled ?? false,
+			urlSchemes: [...specs.keys()],
+			urlAliasSchemes,
+			planWritableRoots: router.sandboxRoots(context),
+			homeDir: os.homedir(),
+			rawInput,
 		};
 	}
 
-	#injectLateDiagnostics(path: string, diagnostics: FileDiagnosticsResult, editVersion: number): void {
-		const effective = this.#dedupDiagnostics
-			? getDiagnosticsLedger(this.session).reduce(path, diagnostics)
-			: diagnostics;
-		if (this.#dedupDiagnostics && effective.messages.length === 0) return;
+	/**
+	 * Host answer for one internal-URL edit target: its backing file, or a model-facing refusal.
+	 * Only file-written mutable schemes ({@link InternalUrlRouter.fileWritable}) are editable;
+	 * handler-owned writes (agent:// messages, proc:// stdin, ...) never patch their backing file.
+	 * A line/partial selector is refused ({@link InternalUrlRouter.peelWriteSelector}): edits
+	 * address whole files.
+	 */
+	async #resolveUrl(url: string, context: ResolveContext): Promise<EditUrlResolution> {
+		const router = InternalUrlRouter.instance();
+		try {
+			const target = router.peelWriteSelector(url, "edit");
+			const scheme = extractUriScheme(target);
+			const spec = scheme === undefined ? undefined : router.spec(scheme);
+			if (!spec) return { error: `Unknown internal URL: ${url}`, planWritable: false };
+			if (!router.fileWritable(target)) {
+				const reason = spec.write?.via === "handler" ? "is written through `write`, not edited" : "is read-only";
+				return { error: `${url} ${reason}`, planWritable: false };
+			}
+			const located = await router.locate(target, context, { create: true });
+			return { path: located ?? undefined, planWritable: spec.write?.scope === "sandbox" };
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error), planWritable: false };
+		}
+	}
 
-		const entry: DeferredDiagnosticsEntry = {
-			path,
-			summary: effective.summary ?? "",
-			messages: effective.messages ?? [],
-			errored: effective.errored,
-			// Drop at flush time if a later edit to the same file superseded this fetch.
-			isStale: () => this.#fileVersion(path) !== editVersion,
+	async #write(request: EditWriteRequest, signal?: AbortSignal): Promise<EditWriteResponse> {
+		if (request.op === "delete") {
+			await deleteFileWithFallback(request.path, Bun.file(request.path));
+			if (this.session.enableLsp ?? true) {
+				await notifyWorkspaceWatchedFiles(
+					this.session.cwd,
+					[{ filePath: request.path, type: FileChangeType.Deleted }],
+					signal,
+				);
+			}
+			this.session.bumpFileMutationVersion?.(request.path);
+			const diagnostics =
+				request.flushLsp && request.lspBatchId
+					? await flushLspWritethroughBatch(request.lspBatchId, this.session.cwd, signal)
+					: undefined;
+			return {
+				written: "",
+				diagnosticsJson: diagnostics ? JSON.stringify(diagnostics) : undefined,
+			};
+		}
+
+		if (request.content === undefined) {
+			throw new ToolError(`Native edit ${request.op} request omitted content`, { path: request.path });
+		}
+
+		if (request.op === "move") {
+			if (!request.moveTo) {
+				throw new ToolError("Native edit move request omitted destination", { path: request.path });
+			}
+			const mode = await movedFileMode(request.path);
+			await mkdirAllowingFallback(path.dirname(request.moveTo));
+			await writeFileWithFallback(request.moveTo, request.content);
+			if (mode !== undefined) await chmodMovedFile(request.moveTo, mode);
+			await deleteFileWithFallback(request.path, Bun.file(request.path));
+			if (this.session.enableLsp ?? true) {
+				await notifyWorkspaceWatchedFiles(
+					this.session.cwd,
+					[
+						{ filePath: request.path, type: FileChangeType.Deleted },
+						{ filePath: request.moveTo, type: FileChangeType.Created },
+					],
+					signal,
+				);
+			}
+			this.session.bumpFileMutationVersion?.(request.path);
+			this.session.bumpFileMutationVersion?.(request.moveTo);
+			const diagnostics =
+				request.flushLsp && request.lspBatchId
+					? await flushLspWritethroughBatch(request.lspBatchId, this.session.cwd, signal)
+					: undefined;
+			return {
+				written: request.content,
+				diagnosticsJson: diagnostics ? JSON.stringify(diagnostics) : undefined,
+			};
+		}
+
+		const bridge = await routeWriteThroughBridge(
+			this.session,
+			request.displayPath,
+			request.path,
+			request.content,
+			signal,
+		);
+		if (bridge) return { written: bridge.text };
+
+		// The pre-image is the only way to tell "the write never landed" from
+		// "something else rewrote the file"; a stat cannot (coarse mtimes).
+		let preWriteBytes: Uint8Array | undefined;
+		if (request.op === "update") {
+			try {
+				preWriteBytes = await Bun.file(request.path).bytes();
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+		} else if (request.op === "create") {
+			await mkdirAllowingFallback(path.dirname(request.path));
+		}
+
+		// `begin()` claims this mutation's version; only bump when the writethrough
+		// never began a deferred fetch for the path (LSP off, unflushed batch).
+		let began = false;
+		const diagnostics = await createEditWritethrough(this.session)(
+			request.path,
+			request.content,
+			signal,
+			Bun.file(request.path),
+			request.lspBatchId ? { id: request.lspBatchId, flush: request.flushLsp } : undefined,
+			destination => {
+				if (destination !== request.path) return undefined;
+				began = true;
+				return this.#deferredDiagnostics.begin(request.path);
+			},
+		);
+
+		if (preWriteBytes !== undefined) {
+			// Fail when a content-changing write left disk at the pre-image. Compare
+			// post vs pre first (native memcmp, usually a length mismatch) so the
+			// requested content is only encoded when disk really is unchanged.
+			let postWriteBytes: Uint8Array | undefined;
+			try {
+				postWriteBytes = await Bun.file(request.path).bytes();
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			if (
+				postWriteBytes !== undefined &&
+				bytesEqual(postWriteBytes, preWriteBytes) &&
+				(Buffer.byteLength(request.content, "utf8") !== preWriteBytes.byteLength ||
+					!bytesEqual(Buffer.from(request.content, "utf8"), preWriteBytes))
+			) {
+				throw new ToolError(
+					`edit appeared successful but file content did not change on disk: ${request.displayPath}`,
+					{ path: request.path },
+				);
+			}
+		}
+
+		if (!began) this.session.bumpFileMutationVersion?.(request.path);
+		return {
+			written: diagnostics.finalContent,
+			diagnosticsJson: diagnostics.diagnostics ? JSON.stringify(diagnostics.diagnostics) : undefined,
 		};
-		this.session.queueDeferredDiagnostics?.(entry);
-	}
-
-	/** Bump the file's mutation counter (session-global when available). */
-	#bumpFileVersion(path: string): number {
-		if (this.session.bumpFileMutationVersion) return this.session.bumpFileMutationVersion(path);
-		const next = (this.#editVersionByPath.get(path) ?? 0) + 1;
-		this.#editVersionByPath.set(path, next);
-		return next;
-	}
-
-	/** Read the file's current mutation counter (session-global when available). */
-	#fileVersion(path: string): number {
-		if (this.session.getFileMutationVersion) return this.session.getFileMutationVersion(path);
-		return this.#editVersionByPath.get(path) ?? 0;
 	}
 }

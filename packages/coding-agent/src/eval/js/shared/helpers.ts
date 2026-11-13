@@ -1,19 +1,12 @@
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-
-import * as Diff from "diff";
-import { ToolError } from "../../../tools/tool-errors";
+import { isEnoent } from "@oh-my-pi/pi-utils/fs-error";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { JsStatusEvent } from "./types";
 
 export interface HelperOptions {
-	path?: string;
-	hidden?: boolean;
-	maxDepth?: number;
 	limit?: number;
 	offset?: number;
-	reverse?: boolean;
-	unique?: boolean;
-	count?: boolean;
 }
 
 /**
@@ -25,9 +18,9 @@ export interface HelperContext {
 	cwd(): string;
 	env: Map<string, string>;
 	/**
-	 * On-disk roots for internal-URL schemes the helpers accept (e.g.
-	 * `{ local: "/…/artifacts/local" }`). A path like `local://x.md` is rewritten
-	 * to `<root>/x.md` before any filesystem op; unknown schemes are rejected.
+	 * On-disk roots for internal-URL schemes the helpers accept, keyed by scheme
+	 * (see `buildEvalUrlRoots`). A path like `<scheme>://x.md` is rewritten to
+	 * `<root>/x.md` before any filesystem op; unknown schemes are rejected.
 	 */
 	localRoots(): Record<string, string>;
 	emitStatus(event: JsStatusEvent): void;
@@ -35,19 +28,16 @@ export interface HelperContext {
 
 /**
  * The set of functions exposed to user code via `globalThis.__omp_helpers__`. The JS
- * prelude reads from this bag and attaches short aliases (`read`, `write`, `tree`, ...)
+ * prelude reads from this bag and attaches short aliases (`read`, `write`, `env`, ...)
  * onto the global scope.
  */
 export interface HelperBundle {
-	read(rawPath: string, options?: HelperOptions): Promise<string>;
+	/** Resolves to `undefined` when `artifact://<id>` is not in this session's artifacts dir; the prelude then asks the read tool. */
+	read(rawPath: string, options?: HelperOptions): Promise<string | undefined>;
 	writeFile(rawPath: string, data: unknown): Promise<string>;
-	append(rawPath: string, content: string): Promise<string>;
-	sortText(text: string, options?: HelperOptions): string;
-	uniqText(text: string, options?: HelperOptions): string | Array<[number, string]>;
-	counter(items: string | string[], options?: HelperOptions): Array<[number, string]>;
-	diff(rawA: string, rawB: string): Promise<string>;
-	tree(searchPath?: string, options?: HelperOptions): Promise<string>;
 	env(key?: string, value?: string): string | Record<string, string> | undefined;
+	/** Whether `rawPath` is an internal URL whose scheme has an injected root (served by these helpers, not delegated to the read tool). */
+	hasRoot(rawPath: string): boolean;
 }
 
 const utf8Encoder = new TextEncoder();
@@ -55,7 +45,9 @@ const utf8Encoder = new TextEncoder();
 export function createHelpers(ctx: HelperContext): HelperBundle {
 	return {
 		read: async (rawPath, options = {}) => {
-			const { filePath, file, size } = await resolveRegularFile(ctx, rawPath);
+			const resolved = await resolveRegularFile(ctx, rawPath);
+			if (!resolved) return undefined;
+			const { filePath, file, size } = resolved;
 			let text = await file.text();
 			const offset = typeof options.offset === "number" ? options.offset : 1;
 			const limit = typeof options.limit === "number" ? options.limit : undefined;
@@ -81,105 +73,6 @@ export function createHelpers(ctx: HelperContext): HelperBundle {
 			ctx.emitStatus({ op: "write", path: filePath, bytes: getDataSize(data) });
 			return filePath;
 		},
-		append: async (rawPath, content) => {
-			const target = resolveHelperPath(ctx, rawPath, "write");
-			// O(1) append; read-all+rewrite both raced concurrent writers and went
-			// quadratic when called in a loop. Bun.write creates parent dirs, so
-			// keep that behavior for the append path too.
-			await fs.promises.mkdir(path.dirname(target), { recursive: true });
-			await fs.promises.appendFile(target, content, "utf-8");
-			ctx.emitStatus({
-				op: "append",
-				path: target,
-				chars: content.length,
-				bytes: utf8Encoder.encode(content).byteLength,
-			});
-			return target;
-		},
-		sortText: (text, options = {}) => {
-			const lines = String(text).split(/\r?\n/);
-			const deduped = options.unique ? Array.from(new Set(lines)) : lines;
-			const sorted = deduped.sort((a, b) => a.localeCompare(b));
-			if (options.reverse) sorted.reverse();
-			const result = sorted.join("\n");
-			ctx.emitStatus({
-				op: "sort",
-				lines: sorted.length,
-				reverse: options.reverse === true,
-				unique: options.unique === true,
-			});
-			return result;
-		},
-		uniqText: (text, options = {}) => {
-			const lines = String(text)
-				.split(/\r?\n/)
-				.filter(line => line.length > 0);
-			const groups: Array<[number, string]> = [];
-			for (const line of lines) {
-				const last = groups.at(-1);
-				if (last && last[1] === line) {
-					last[0] += 1;
-					continue;
-				}
-				groups.push([1, line]);
-			}
-			ctx.emitStatus({ op: "uniq", groups: groups.length, count_mode: options.count === true });
-			if (options.count) return groups;
-			return groups.map(([, line]) => line).join("\n");
-		},
-		counter: (items, options = {}) => {
-			const values = Array.isArray(items) ? items : String(items).split(/\r?\n/).filter(Boolean);
-			const counts = new Map<string, number>();
-			for (const item of values) counts.set(item, (counts.get(item) ?? 0) + 1);
-			const entries = Array.from(counts.entries())
-				.map(([item, count]) => [count, item] as [number, string])
-				.sort((a, b) => (options.reverse === false ? a[0] - b[0] : b[0] - a[0]) || a[1].localeCompare(b[1]));
-			const limited = entries.slice(0, options.limit ?? entries.length);
-			ctx.emitStatus({ op: "counter", unique: counts.size, total: values.length, top: limited.slice(0, 10) });
-			return limited;
-		},
-		diff: async (rawA, rawB) => {
-			const fileA = resolvePath(ctx, rawA);
-			const fileB = resolvePath(ctx, rawB);
-			const [a, b] = await Promise.all([Bun.file(fileA).text(), Bun.file(fileB).text()]);
-			const result = Diff.createTwoFilesPatch(fileA, fileB, a, b, "", "", { context: 3 });
-			ctx.emitStatus({
-				op: "diff",
-				file_a: fileA,
-				file_b: fileB,
-				identical: a === b,
-				preview: result.slice(0, 500),
-			});
-			return result;
-		},
-		tree: async (searchPath = ".", options = {}) => {
-			const root = resolvePath(ctx, searchPath);
-			const maxDepth = options.maxDepth ?? 3;
-			const showHidden = options.hidden ?? false;
-			const lines: string[] = [`${root}/`];
-			let entryCount = 0;
-			const walk = async (dir: string, prefix: string, depth: number): Promise<void> => {
-				if (depth > maxDepth) return;
-				const entries = (await fs.promises.readdir(dir, { withFileTypes: true }))
-					.filter(entry => showHidden || !entry.name.startsWith("."))
-					.sort((a, b) => a.name.localeCompare(b.name));
-				for (let index = 0; index < entries.length; index++) {
-					const entry = entries[index];
-					const isLast = index === entries.length - 1;
-					const connector = isLast ? "└── " : "├── ";
-					const suffix = entry.isDirectory() ? "/" : "";
-					lines.push(`${prefix}${connector}${entry.name}${suffix}`);
-					entryCount += 1;
-					if (entry.isDirectory()) {
-						await walk(path.join(dir, entry.name), `${prefix}${isLast ? "    " : "│   "}`, depth + 1);
-					}
-				}
-			};
-			await walk(root, "", 1);
-			const result = lines.join("\n");
-			ctx.emitStatus({ op: "tree", path: root, entries: entryCount, preview: result.slice(0, 1000) });
-			return result;
-		},
 		env: (key, value) => {
 			if (!key) {
 				const merged = Object.fromEntries(Object.entries(getMergedEnv(ctx)).sort(([a], [b]) => a.localeCompare(b)));
@@ -195,6 +88,14 @@ export function createHelpers(ctx: HelperContext): HelperBundle {
 			ctx.emitStatus({ op: "env", key, value: result, action: "get" });
 			return result;
 		},
+		hasRoot: rawPath => {
+			const match = INTERNAL_URL_RE.exec(rawPath);
+			if (match === null) return false;
+			const scheme = match[1].toLowerCase();
+			if (!Object.hasOwn(ctx.localRoots(), scheme)) return false;
+			// `artifact://<id>` reads its file here; selector forms (`artifact://3:raw:5-9`) stay with the read tool.
+			return scheme !== "artifact" || ARTIFACT_ID_RE.test(match[2]);
+		},
 	};
 }
 
@@ -208,6 +109,7 @@ function getMergedEnv(ctx: HelperContext): Record<string, string> {
 }
 
 const INTERNAL_URL_RE = /^([a-z][a-z0-9+.-]*):\/\/(.*)$/i;
+const ARTIFACT_ID_RE = /^\d+$/;
 
 function resolvePath(ctx: HelperContext, value: string): string {
 	if (path.isAbsolute(value)) return path.normalize(value);
@@ -216,8 +118,8 @@ function resolvePath(ctx: HelperContext, value: string): string {
 
 /**
  * Map a raw helper path to an absolute filesystem path. Plain paths resolve
- * against the cwd; an internal-URL whose scheme has an injected root (e.g.
- * `local://`) is rewritten under that root; any other `scheme://` is rejected
+ * against the cwd; an internal-URL whose scheme has an injected root is
+ * rewritten under that root; any other `scheme://` is rejected
  * so we never silently create a literal `scheme:/` directory.
  */
 function resolveHelperPath(ctx: HelperContext, rawPath: string, op: "read" | "write"): string {
@@ -225,14 +127,33 @@ function resolveHelperPath(ctx: HelperContext, rawPath: string, op: "read" | "wr
 	if (!match) return resolvePath(ctx, rawPath);
 	const scheme = match[1].toLowerCase();
 	const root = ctx.localRoots()[scheme];
-	if (!root) {
+	// Artifacts are immutable, and their root is a lookup dir rather than a path prefix.
+	if (!root || scheme === "artifact") {
 		throw new ToolError(`Protocol paths are not supported by ${op}(): ${rawPath}`);
 	}
 	return resolveUnderRoot(scheme, root, match[2], rawPath);
 }
 
+/**
+ * The file backing `artifact://<id>` in the artifacts dir `root` (`<id>.<tool>.log`), or `undefined` when absent.
+ * Mirrors `ArtifactManager.getPath`, which lives on the host (the worker cannot import it without loading the
+ * native addon), as `resolveUnderRoot` mirrors the local:// handler. A miss, including a dir still being seeded,
+ * falls back to the read tool, which resolves through the manager.
+ */
+async function resolveArtifactPath(root: string, id: string): Promise<string | undefined> {
+	let files: string[];
+	try {
+		files = await fs.readdir(root);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		return undefined;
+	}
+	const name = files.find(file => file.startsWith(`${id}.`));
+	return name === undefined ? undefined : path.join(root, name);
+}
+
 /** Resolve an internal-URL relative path under its root, mirroring the host
- *  local-protocol handler: decode, reject absolute/traversal, confine to root. */
+ *  protocol handler: decode, reject absolute/traversal, confine to root. */
 function resolveUnderRoot(scheme: string, root: string, rawRelative: string, rawPath: string): string {
 	let relative: string;
 	try {
@@ -259,8 +180,14 @@ function resolveUnderRoot(scheme: string, root: string, rawRelative: string, raw
 async function resolveRegularFile(
 	ctx: HelperContext,
 	rawPath: string,
-): Promise<{ filePath: string; file: Bun.BunFile; size: number }> {
-	const filePath = resolveHelperPath(ctx, rawPath, "read");
+): Promise<{ filePath: string; file: Bun.BunFile; size: number } | undefined> {
+	const match = INTERNAL_URL_RE.exec(rawPath);
+	const artifactRoot = match?.[1].toLowerCase() === "artifact" ? ctx.localRoots().artifact : undefined;
+	const filePath =
+		artifactRoot && match && ARTIFACT_ID_RE.test(match[2])
+			? await resolveArtifactPath(artifactRoot, match[2])
+			: resolveHelperPath(ctx, rawPath, "read");
+	if (filePath === undefined) return undefined;
 	const file = Bun.file(filePath);
 	const stat = await file.stat();
 	if (stat.isDirectory()) {

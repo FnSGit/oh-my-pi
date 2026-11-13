@@ -8,10 +8,14 @@ export type IssueState =
   | "new"
   | "reproducing"
   | "fixing"
+  | "reviewing"
   | "opened"
   | "merged"
   | "closed"
+  | "needs_info"
   | "abandoned";
+
+export type ReleaseState = "awaiting_ci" | "fixing" | "green" | "failed" | "superseded";
 
 export interface RuntimeInfo {
   bot_login: string;
@@ -37,10 +41,25 @@ export interface IssueRow {
   number: number;
   branch: string | null;
   pr_number: number | null;
-  state: IssueState | string;
+  state: IssueState;
   classification: string | null;
   updated_at: string;
   latest_event: LatestEvent | null;
+}
+
+export interface ReleaseRow {
+  key: string;
+  repo: string;
+  tag: string;
+  version: string;
+  state: ReleaseState;
+  current_sha: string;
+  last_failed_sha: string | null;
+  rounds: number;
+  last_error: string | null;
+  session_dir: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface RunningEvent {
@@ -65,6 +84,7 @@ export interface RecentEvent {
   attempts: number;
   received_at: string;
   last_error: string | null;
+  issue_state: IssueState | null;
 }
 
 export interface StatusResponse {
@@ -74,6 +94,7 @@ export interface StatusResponse {
   running_events: RunningEvent[];
   inflight: string[];
   issues: IssueRow[];
+  releases: ReleaseRow[];
   recent_events: RecentEvent[];
 }
 

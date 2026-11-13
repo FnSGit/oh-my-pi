@@ -1,10 +1,11 @@
-import { ToolError } from "../tools/tool-errors";
+import { InternalUrlRouter } from "../internal-urls/router";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
-/** Shape forwarded from the plan-mode resolve handler to InteractiveMode's
- *  approval popup. Populated by the standing handler that the resolve tool
- *  dispatches to when the agent submits `resolve { action: "apply" }`.
- *  `planFilePath` is the agent-chosen `local://<slug>-plan.md` artifact — it is
- *  never renamed on approval, so links to it stay valid for the session. */
+/** Shape forwarded from the plan-proposal handler to InteractiveMode's
+ *  approval popup. Populated by the `xd://propose` dispatch when the agent
+ *  submits a plan for approval. `planFilePath` is the agent-chosen
+ *  `local://<slug>-plan.md` artifact — it is never renamed on approval, so
+ *  links to it stay valid for the session. */
 export interface PlanApprovalDetails {
 	planFilePath: string;
 	title: string;
@@ -90,10 +91,10 @@ function firstLevelOneHeading(planContent: string): string {
 	return match?.[1]?.trim() ?? "";
 }
 
-/** Stem of a `local://name.md` (or bare `name.md`) URL — the filename without
+/** Stem of a `scheme://…/name.md` URL (or bare `name.md` path) — the filename without
  *  scheme or extension. Returns the empty string for inputs that have no stem. */
 function planFilenameStem(planFilePath: string): string {
-	const withoutScheme = planFilePath.replace(/^local:\/+/, "");
+	const withoutScheme = planFilePath.replace(/^[a-z][a-z0-9+.-]*:\/+/i, "");
 	const lastSegment = withoutScheme.split(/[\\/]/).pop() ?? "";
 	return lastSegment.replace(/\.md$/i, "");
 }
@@ -149,8 +150,9 @@ export interface ResolvedApprovedPlan {
 
 /** Locate the plan file the agent wrote and finalize its title — without
  *  renaming anything. Tries, in order: the slug derived from `extra.title`
- *  (`local://<slug>-plan.md`), the plan path from plan-mode state, then a scan
- *  of recent plan files. Throws a `ToolError` guiding the agent when none exist. */
+ *  (`local://<slug>-plan.md`), a state plan that the artifact scan can't see,
+ *  scanned plan files newest-to-oldest, then the state plan path as a final
+ *  fallback. Throws a `ToolError` guiding the agent when none exist. */
 export async function resolveApprovedPlan(input: ResolveApprovedPlanInput): Promise<ResolvedApprovedPlan> {
 	const ordered: string[] = [];
 	const consider = (url: string | undefined): void => {
@@ -159,19 +161,26 @@ export async function resolveApprovedPlan(input: ResolveApprovedPlanInput): Prom
 
 	const slug = planSlugFromSupplied(input.suppliedTitle);
 	consider(slug ? planFileUrlForSlug(slug) : undefined);
+
+	const listed = input.listPlanFiles ? await input.listPlanFiles() : [];
+	// A state plan the scan cannot surface (cwd-relative, or a local file whose
+	// name does not end in `plan.md`) has no mtime in `listed` to compete on, so
+	// it keeps precedence over scanned artifacts — otherwise a stale older draft
+	// could shadow the deliberately-set current plan. A state plan already inside
+	// the scan competes purely on the newest-first ordering below (issue #6569).
+	// Compare canonical `local://` spellings so a resumed `local:/…` state path
+	// still matches the scanner's `local://…` entry (InternalUrlRouter.normalize).
+	const router = InternalUrlRouter.instance();
+	const canonicalListed = new Set(listed.map(url => router.normalize(url)));
+	if (input.statePlanFilePath && !canonicalListed.has(router.normalize(input.statePlanFilePath))) {
+		consider(input.statePlanFilePath);
+	}
+	for (const url of listed) consider(url);
 	consider(input.statePlanFilePath);
 
 	for (const url of ordered) {
 		const content = await input.readPlan(url);
 		if (content !== null) return finalizeApprovedPlan(url, content, input.suppliedTitle);
-	}
-
-	if (input.listPlanFiles) {
-		for (const url of await input.listPlanFiles()) {
-			if (ordered.includes(url)) continue;
-			const content = await input.readPlan(url);
-			if (content !== null) return finalizeApprovedPlan(url, content, input.suppliedTitle);
-		}
 	}
 
 	const target = ordered[0] ?? input.statePlanFilePath;

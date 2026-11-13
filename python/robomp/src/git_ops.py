@@ -1,9 +1,10 @@
 """Low-level git primitives with ephemeral PAT injection.
 
-The PAT is supplied through `git --config-env=http.extraHeader=ENVVAR`. Git
-expands the env var inside the spawned process; the secret only appears in
-the spawned process's environment, never in argv visible to other UIDs via
-`/proc/<pid>/cmdline`. The env var is wiped from the parent after each call.
+The PAT is supplied through `git --config-env=http.<url>.extraHeader=ENVVAR`
+when a verified HTTPS remote is known, or the legacy global `http.extraHeader`
+path for older direct callers. Git expands the env var inside the spawned
+process; the secret never appears in argv visible to other UIDs via
+`/proc/<pid>/cmdline`.
 
 Used by:
 - `robomp.sandbox.LocalGitTransport` for in-process git operations when no
@@ -30,6 +31,83 @@ log = logging.getLogger(__name__)
 # Per-call env var name. `git --config-env` reads the header value from this
 # env entry inside the spawned process — never persisted into `.git/config`.
 AUTH_ENV_VAR = "ROBOMP_GIT_HTTP_AUTH"
+_TOKEN_ALLOWED_PROTOCOLS = "https"
+_TOKEN_SAFE_CONFIG = [
+    "protocol.allow=never",
+    "protocol.https.allow=always",
+    "protocol.http.allow=never",
+    "protocol.git.allow=never",
+    "protocol.ssh.allow=never",
+    "protocol.file.allow=never",
+    "protocol.ext.allow=never",
+    "credential.helper=",
+    "core.askPass=",
+    "core.hooksPath=/dev/null",
+    "http.proxy=",
+    "http.sslVerify=true",
+    "http.extraHeader=",
+]
+_GIT_SUBPROCESS_SCRUBBED_ENV_KEYS = (
+    AUTH_ENV_VAR,
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_WEBHOOK_SECRET",
+    "ROBOMP_REPLAY_TOKEN",
+    "ROBOMP_GH_PROXY_HMAC_KEY",
+)
+
+
+def _git_subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in _GIT_SUBPROCESS_SCRUBBED_ENV_KEYS:
+        env.pop(key, None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = ""
+    env["SSH_ASKPASS"] = ""
+    return env
+
+
+# git matches `http.<url>.*` / `credential.<url>.*` against the FULL request
+# URL, and the longest path-prefix wins — so a base-only override loses to an
+# agent-planted repo-local key like `http.<url>/info/refs.proxy=http://evil`,
+# which would route the token-bearing fetch through an attacker proxy and read
+# the injected Authorization header. Override every git smart-HTTP request path
+# the fetch/push can actually hit. The set is exhaustive: a repo-local key
+# longer than the real request path can't match it, and `GIT_CONFIG_SYSTEM`/
+# `GLOBAL` are already nulled, so repo-local `.git/config` is the only competing
+# source. We blank `proxy` and force `sslVerify=true` — no proxy plus verified
+# TLS leaves no interception point, so the PAT can't be captured — and blank
+# `credential.helper` (a forced 401 would otherwise run a repo-configured
+# `!cmd` helper with the PAT still in the environment). We deliberately do NOT
+# touch `sslCAInfo`/`sslCAPath`: blanking them makes libcurl fail with "error
+# setting certificate verify locations" before any TLS, breaking every real
+# github fetch; and with the proxy neutralized an attacker-set CA only yields a
+# self-inflicted fetch failure, never interception. `extraHeader` is blanked
+# only at the base — the real header is injected right after via `--config-env`,
+# and a path-scoped blank would strip it (auth failure).
+_GIT_SMART_HTTP_PATHS = ("", "/info", "/info/refs", "/git-upload-pack", "/git-receive-pack")
+
+
+def _token_url_safe_config(auth_url: str | None) -> list[str]:
+    if auth_url is None:
+        return []
+    items: list[str] = []
+    for suffix in _GIT_SMART_HTTP_PATHS:
+        scoped = f"{auth_url}{suffix}"
+        items += [
+            f"http.{scoped}.proxy=",
+            f"http.{scoped}.sslVerify=true",
+            f"credential.{scoped}.helper=",
+        ]
+    items.append(f"http.{auth_url}.extraHeader=")
+    return items
+
+
+def _http_extra_header_key(auth_url: str | None) -> str:
+    if auth_url is None:
+        return "http.extraHeader"
+    return f"http.{auth_url}.extraHeader"
+
 
 _CRED_URL = re.compile(r"(https?://)([^:/@\s]+):([^@/\s]+)@")
 _BAD_OBJECT_REF_RE = re.compile(
@@ -125,6 +203,7 @@ def _run_git(
     *,
     cwd: Path | None,
     token: str | None,
+    auth_url: str | None = None,
     extra_env: Mapping[str, str] | None = None,
     safe_directory: Path | None = None,
     user: int | None = None,
@@ -132,20 +211,22 @@ def _run_git(
     extra_groups: list[int] | tuple[int, ...] | None = None,
     umask: int | None = None,
     timeout: float | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run `git <args>` with optional PAT injection via `--config-env`.
+
+    When `auth_url` is supplied, the PAT header is scoped to that exact
+    HTTPS URL (`http.<url>.extraHeader`) and git is restricted to the HTTPS
+    transport. That keeps a token-bearing invocation from handing the header
+    to another host, following `url.*.insteadOf` to `ext::`/ssh/file helpers,
+    or running workspace hooks with the token in the environment.
 
     A returncode of 0 returns the populated `CompletedProcess`. Non-zero exit
     returns the same shape; callers either `_check` it or inspect manually
     (e.g. when probing for ref existence). Stdout/stderr are always
     credential-redacted before being returned.
-
-    On `timeout` expiry the child (and any descendants spawned by git's
-    helpers) is killed and `GitCommandError` is raised with a synthetic
-    returncode (124, matching coreutils `timeout`). `None` uses
-    `_DEFAULT_GIT_TIMEOUT_SECONDS`.
     """
-    env: dict[str, str] = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env = _git_subprocess_env()
     if user is not None and _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     if extra_env:
@@ -153,10 +234,17 @@ def _run_git(
     if safe_directory is not None:
         _append_safe_directory(env, safe_directory)
 
-    cmd: list[str] = ["git"]
+    cmd: list[str] = ["git", "-c", "protocol.ext.allow=never"]
     if token:
         env[AUTH_ENV_VAR] = _basic_auth_header(token)
-        cmd.extend(["--config-env", f"http.extraHeader={AUTH_ENV_VAR}"])
+        if auth_url is not None:
+            env["GIT_ALLOW_PROTOCOL"] = _TOKEN_ALLOWED_PROTOCOLS
+            env["GIT_CONFIG_NOSYSTEM"] = "1"
+            env["GIT_CONFIG_SYSTEM"] = os.devnull
+            env["GIT_CONFIG_GLOBAL"] = os.devnull
+            for item in [*_TOKEN_SAFE_CONFIG, *_token_url_safe_config(auth_url)]:
+                cmd.extend(["-c", item])
+        cmd.extend(["--config-env", f"{_http_extra_header_key(auth_url)}={AUTH_ENV_VAR}"])
     cmd.extend(args)
     log.debug("git", extra={"cmd": _redacted_cmd(cmd), "cwd": str(cwd) if cwd else None})
     effective_timeout = _DEFAULT_GIT_TIMEOUT_SECONDS if timeout is None else timeout
@@ -178,6 +266,7 @@ def _run_git(
             capture_output=True,
             text=True,
             timeout=effective_timeout,
+            input=input,
             **subprocess_kwargs,
         )
     except subprocess.TimeoutExpired as exc:
@@ -378,6 +467,24 @@ def _repair_fetch_prune_failure(repo_dir: Path, output: str) -> bool:
     return pruned_alternates or deleted_refs
 
 
+def _explicit_remote_env(remote_url: str | None, *, cwd: Path) -> dict[str, str] | None:
+    if remote_url is None:
+        return None
+    local_remote = _local_remote_safe_directory(remote_url, cwd=cwd)
+    if local_remote is None:
+        return None
+    env: dict[str, str] = {}
+    _append_safe_directory(env, local_remote)
+    return env
+
+
+def _branch_refspec(ref: str) -> str:
+    if ":" in ref or ref.startswith("refs/") and not ref.startswith("refs/heads/"):
+        return ref
+    branch = ref.removeprefix("refs/heads/")
+    return f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
+
+
 # ---------- Public primitives ----------
 
 
@@ -387,6 +494,7 @@ def clone(
     clone_url: str,
     default_branch: str,
     token: str | None,
+    auth_url: str | None = None,
     safe_directory: Path | None = None,
 ) -> None:
     """Fresh `git clone --filter=blob:none` into `target`."""
@@ -400,24 +508,47 @@ def clone(
         clone_url,
         str(target),
     ]
-    _check(_run_git(args, cwd=None, token=token, safe_directory=safe_directory), ["git", *args])
+    _check(_run_git(args, cwd=None, token=token, auth_url=auth_url, safe_directory=safe_directory), ["git", *args])
 
 
-def fetch_prune(repo_dir: Path, *, token: str | None, safe_directory: Path | None = None) -> None:
-    """`git fetch --prune origin` on the shared pool clone.
+def fetch_prune(
+    repo_dir: Path,
+    *,
+    token: str | None,
+    remote_url: str | None = None,
+    auth_url: str | None = None,
+    safe_directory: Path | None = None,
+) -> None:
+    """Refresh `refs/remotes/origin/*` on the shared pool clone.
 
-    Pool clones are long-lived. If a transient git object alternate leaks into
-    the pool and later disappears, `git fetch` can fail before it has a chance
-    to refresh from origin because a local ref points at an object that only
-    existed in that missing alternate. Repair that exact corruption in-place:
-    drop dead alternates, delete refs Git already reported as invalid, then
-    retry the fetch.
+    When `remote_url` is supplied the fetch bypasses on-disk `origin` and uses
+    an explicit branch refspec so checkout and push-lease logic still see
+    fresh `refs/remotes/origin/*`.
     """
-    args = ["fetch", "--prune", "origin"]
     _prune_missing_alternates(repo_dir)
     last_proc: subprocess.CompletedProcess[str] | None = None
+    extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
+    args = (
+        ["fetch", "--prune", "origin"]
+        if remote_url is None
+        else [
+            "fetch",
+            "--prune",
+            "--no-tags",
+            "--filter=blob:none",
+            remote_url,
+            "+refs/heads/*:refs/remotes/origin/*",
+        ]
+    )
     for _ in range(_FETCH_PRUNE_REPAIR_ATTEMPTS):
-        proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory)
+        proc = _run_git(
+            args,
+            cwd=repo_dir,
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+        )
         if proc.returncode == 0:
             return
         last_proc = proc
@@ -428,36 +559,132 @@ def fetch_prune(repo_dir: Path, *, token: str | None, safe_directory: Path | Non
     _check(last_proc, ["git", *args])
 
 
-def fetch_ref(repo_dir: Path, ref: str, *, token: str | None, safe_directory: Path | None = None) -> None:
-    """Fetch ``<ref>`` from origin AND materialize every reachable blob locally.
+def _backfill_tip_blobs(
+    repo_dir: Path,
+    rev: str,
+    remote: str,
+    *,
+    token: str | None,
+    auth_url: str | None,
+    extra_env: Mapping[str, str] | None,
+    safe_directory: Path | None,
+) -> subprocess.CompletedProcess[str] | None:
+    """Fetch the blobs of ``rev``'s tree that the blob:none pool lacks.
+
+    A checkout of ``rev`` then never needs a lazy promisor fetch, which in
+    proxy-transport deployments runs in the orchestrator without a PAT and
+    dies (oh-my-pi#1818). Only the tip tree is materialized, not ``rev``'s
+    history, so the transfer is the files changed since the pool last saw
+    them. Returns the fetch result, or ``None`` when nothing was missing.
+
+    Raises ``GitCommandError`` if ``rev`` cannot be walked locally.
+    """
+    listing = ["rev-list", "--objects", "--missing=print", "--no-object-names", "-n1", rev]
+    walked = _check(_run_git(listing, cwd=repo_dir, token=None, safe_directory=safe_directory), ["git", *listing])
+    missing = [line[1:] for line in walked.stdout.splitlines() if line.startswith("?")]
+    if not missing:
+        return None
+    # Same request git's own lazy fetch sends: explicit object ids (served
+    # regardless of the filter), no negotiation, no ref updates.
+    args = [
+        "-c",
+        "fetch.negotiationAlgorithm=noop",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--recurse-submodules=no",
+        "--filter=blob:none",
+        "--stdin",
+        remote,
+    ]
+    return _run_git(
+        args,
+        cwd=repo_dir,
+        token=token,
+        auth_url=auth_url,
+        extra_env=extra_env,
+        safe_directory=safe_directory,
+        input="\n".join(missing) + "\n",
+    )
+
+
+def fetch_ref(
+    repo_dir: Path,
+    ref: str,
+    *,
+    token: str | None,
+    remote_url: str | None = None,
+    auth_url: str | None = None,
+    safe_directory: Path | None = None,
+) -> None:
+    """Fetch ``<ref>`` from origin AND materialize the blobs of its tree.
 
     Callers invoke this immediately before a ``git worktree add`` / checkout
-    that needs the working-tree contents, so the blobs MUST be present after
+    that needs the working-tree contents, so those blobs MUST be present after
     this returns. ``<repo_dir>`` is typically a ``--filter=blob:none`` partial
-    clone: a plain ``git fetch origin <ref>`` would inherit
-    ``remote.origin.partialclonefilter`` from the pool, bringing the commit
-    and tree but no blobs, leaving the subsequent ``worktree add`` to trigger
-    a lazy promisor fetch — which in proxy-transport deployments has no PAT
-    in the orchestrator process and dies with::
+    clone, so the ref fetch itself brings commits and trees only;
+    :func:`_backfill_tip_blobs` then fetches exactly the missing blobs of the
+    tip. (An earlier ``--refetch --no-filter`` did the same job by re-downloading
+    and re-indexing the ref's entire history on every call.) The on-disk
+    partial-clone config is untouched, so ``fetch_prune`` stays cheap.
 
-        fatal: could not read Username for 'https://github.com'
-        fatal: could not fetch <sha> from promisor remote
-
-    (oh-my-pi#1818). ``--refetch`` forces a fresh negotiation that ignores
-    "we already have this commit", and ``--no-filter`` overrides the inherited
-    filter for this one invocation without touching the on-disk config — so
-    ``fetch_prune`` keeps its cheap blob-skipping semantics on the next pool
-    refresh. Best-effort: a non-zero exit is logged and swallowed because the
-    caller still attempts the checkout (and a stale-ref worktree add will
-    surface a more actionable error than this fetch ever could).
+    Best-effort: a failure is logged and swallowed because the caller still
+    attempts the checkout, and a stale-ref worktree add surfaces a more
+    actionable error than this fetch ever could.
     """
-    args = ["fetch", "--refetch", "--no-filter", "origin", ref]
-    proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory)
-    if proc.returncode != 0:
-        log.debug(
-            "fetch_ref non-fatal failure",
-            extra={"ref": ref, "stderr": proc.stderr},
-        )
+    remote = remote_url or "origin"
+    extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
+    args = ["fetch", "--no-tags", remote, _branch_refspec(ref) if remote_url else ref]
+    proc = _run_git(
+        args,
+        cwd=repo_dir,
+        token=token,
+        auth_url=auth_url,
+        extra_env=extra_env,
+        safe_directory=safe_directory,
+    )
+    if proc.returncode == 0:
+        try:
+            backfill = _backfill_tip_blobs(
+                repo_dir,
+                "FETCH_HEAD",
+                remote,
+                token=token,
+                auth_url=auth_url,
+                extra_env=extra_env,
+                safe_directory=safe_directory,
+            )
+        except GitCommandError as exc:
+            log.debug("fetch_ref blob backfill failed", extra={"ref": ref, "stderr": exc.stderr})
+            return
+        if backfill is None or backfill.returncode == 0:
+            return
+        proc = backfill
+    log.debug(
+        "fetch_ref non-fatal failure",
+        extra={"ref": ref, "stderr": proc.stderr},
+    )
+
+
+_UNSAFE_REF_BODY_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+def validate_fetch_ref(ref: str) -> str:
+    """Accept Git-valid branch names minus refspec/option-injectable characters."""
+    body = ref.removeprefix("refs/heads/")
+    if (
+        not body
+        or body.startswith(("-", "/"))
+        or body.endswith(("/", ".", ".lock"))
+        or "//" in body
+        or ".." in body
+        or "@{" in body
+        or body == "@"
+        or any(part.startswith(".") or part.endswith(".lock") for part in body.split("/"))
+        or _UNSAFE_REF_BODY_RE.search(body)
+    ):
+        raise ValueError("invalid ref")
+    return ref
 
 
 def fetch_pr_head(
@@ -465,20 +692,102 @@ def fetch_pr_head(
     pr_number: int,
     *,
     token: str | None,
+    remote_url: str | None = None,
+    auth_url: str | None = None,
     safe_directory: Path | None = None,
+    head_ref: str | None = None,
+    head_sha: str | None = None,
+    same_repo: bool = False,
 ) -> None:
-    """Fetch ``refs/pull/<n>/head`` into FETCH_HEAD with all reachable blobs.
+    """Fetch the PR head, falling back to a verified same-repo branch.
 
     Immediately followed by ``git worktree add --detach FETCH_HEAD`` for PR
-    review checkouts. See :func:`fetch_ref` for why ``--refetch --no-filter``
-    is required: without the blob backfill, the worktree-add triggers a
-    promisor lazy fetch that fails under proxy-transport deployments
-    (oh-my-pi#1818).
+    review checkouts, so the head's tree blobs are backfilled the same way as
+    :func:`fetch_ref`; without them the worktree-add triggers a promisor lazy
+    fetch that fails under proxy-transport deployments (oh-my-pi#1818).
+
+    Raises ``GitCommandError`` when fetching, SHA verification, or backfill fails.
     """
     if pr_number <= 0:
-        raise ValueError(f"invalid PR number: {pr_number!r}")
-    args = ["fetch", "--refetch", "--no-filter", "origin", f"pull/{pr_number}/head"]
-    _check(_run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory), ["git", *args])
+        raise ValueError(f"invalid pr_number={pr_number!r}")
+    remote = remote_url or "origin"
+    extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
+    ref = f"refs/pull/{pr_number}/head" if remote_url else f"pull/{pr_number}/head"
+    args = ["fetch", "--no-tags", remote, ref]
+    try:
+        _check(
+            _run_git(
+                args,
+                cwd=repo_dir,
+                token=token,
+                auth_url=auth_url,
+                extra_env=extra_env,
+                safe_directory=safe_directory,
+            ),
+            ["git", *args],
+        )
+    except GitCommandError as exc:
+        # The fallback fetches a branch named by the (webhook-supplied) PR
+        # payload, so it is only eligible when we can verify the result:
+        # same-repo PR, present head ref, present head SHA. Anything else
+        # keeps the original failure.
+        if (
+            "couldn't find remote ref" not in exc.stderr
+            or not same_repo
+            or not head_ref
+            or not head_sha
+        ):
+            raise
+        validate_fetch_ref(head_ref)
+        log.warning("PR head ref unavailable; fetching same-repo branch", extra={"pr": pr_number, "head_ref": head_ref})
+        args = ["fetch", "--no-tags", remote, "--", f"refs/heads/{head_ref}"]
+        try:
+            _check(
+                _run_git(
+                    args,
+                    cwd=repo_dir,
+                    token=token,
+                    auth_url=auth_url,
+                    extra_env=extra_env,
+                    safe_directory=safe_directory,
+                ),
+                ["git", *args],
+            )
+        except GitCommandError as fallback_exc:
+            raise GitCommandError(
+                fallback_exc.cmd,
+                fallback_exc.returncode,
+                fallback_exc.stdout,
+                f"{exc.stderr}\nBranch fallback failed: {fallback_exc.stderr}",
+            ) from fallback_exc
+        probe_args = ["rev-parse", "FETCH_HEAD"]
+        probe = _run_git(
+            probe_args,
+            cwd=repo_dir,
+            token=token,
+            auth_url=auth_url,
+            extra_env=extra_env,
+            safe_directory=safe_directory,
+        )
+        _check(probe, ["git", *probe_args])
+        if probe.stdout.strip() != head_sha:
+            raise GitCommandError(
+                ["git", *probe_args],
+                1,
+                probe.stdout,
+                f"PR head SHA mismatch: expected {head_sha}, fetched {probe.stdout.strip()}",
+            )
+    backfill = _backfill_tip_blobs(
+        repo_dir,
+        "FETCH_HEAD",
+        remote,
+        token=token,
+        auth_url=auth_url,
+        extra_env=extra_env,
+        safe_directory=safe_directory,
+    )
+    if backfill is not None:
+        _check(backfill, ["git", "fetch", "--stdin", remote])
 
 
 @dataclass(slots=True, frozen=True)
@@ -612,10 +921,12 @@ def push(
     branch: str,
     expected_head: str | None,
     token: str | None,
+    remote_url: str | None = None,
+    auth_url: str | None = None,
     slot_uid: int | None = None,
     safe_directory: Path | None = None,
 ) -> PushResult:
-    """`git push --force-with-lease=<ref>:<sha> --set-upstream origin <branch>` from `repo_dir`.
+    """Push `HEAD` with a lease, optionally to an explicit remote URL.
 
     The lease is pinned to whatever SHA the local `refs/remotes/origin/<branch>`
     currently records — i.e. what the workspace last fetched. The push only
@@ -661,20 +972,122 @@ def push(
         **slot_kwargs,
     )
     expected_remote = probe.stdout.strip() if probe.returncode == 0 else ""
-    push_extra_env: dict[str, str] | None = None
-    origin = _run_git(
-        ["remote", "get-url", "origin"], cwd=repo_dir, token=None, safe_directory=git_safe_directory, **slot_kwargs
-    )
-    if origin.returncode == 0:
-        local_remote = _local_remote_safe_directory(origin.stdout, cwd=repo_dir)
-        if local_remote is not None:
-            push_extra_env = {}
-            _append_safe_directory(push_extra_env, local_remote)
+    if remote_url is None:
+        push_extra_env: dict[str, str] | None = None
+        origin = _run_git(
+            ["remote", "get-url", "origin"], cwd=repo_dir, token=None, safe_directory=git_safe_directory, **slot_kwargs
+        )
+        if origin.returncode == 0:
+            local_remote = _local_remote_safe_directory(origin.stdout, cwd=repo_dir)
+            if local_remote is not None:
+                push_extra_env = {}
+                _append_safe_directory(push_extra_env, local_remote)
+        destination = "origin"
+        refspec = branch
+        set_upstream = True
+    else:
+        push_extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
+        destination = remote_url
+        refspec = f"HEAD:refs/heads/{branch}"
+        set_upstream = False
     lease = f"--force-with-lease=refs/heads/{branch}:{expected_remote}"
-    args = ["push", lease, "--set-upstream", "origin", branch]
+    args = ["push"]
+    if token:
+        args.append("--no-verify")
+    args.append(lease)
+    if set_upstream:
+        args.append("--set-upstream")
+    args.extend([destination, refspec])
     _check(
         _run_git(
-            args, cwd=repo_dir, token=token, extra_env=push_extra_env, safe_directory=git_safe_directory, **slot_kwargs
+            args,
+            cwd=repo_dir,
+            token=token,
+            auth_url=auth_url,
+            extra_env=push_extra_env,
+            safe_directory=git_safe_directory,
+            **slot_kwargs,
+        ),
+        ["git", *args],
+    )
+    if remote_url is not None:
+        update = _run_git(
+            ["update-ref", f"refs/remotes/origin/{branch}", head],
+            cwd=repo_dir,
+            token=None,
+            safe_directory=git_safe_directory,
+            **slot_kwargs,
+        )
+        if update.returncode != 0:
+            log.warning(
+                "failed to refresh remote-tracking ref after explicit-url push",
+                extra={"repo_dir": str(repo_dir), "branch": branch, "stderr": update.stderr[:500]},
+            )
+    return PushResult(head=head, branch=branch)
+
+
+def push_release(
+    repo_dir: Path,
+    *,
+    branch: str,
+    tag: str,
+    expected_head: str,
+    token: str | None,
+    remote_url: str | None = None,
+    auth_url: str | None = None,
+    slot_uid: int | None = None,
+    safe_directory: Path | None = None,
+) -> PushResult:
+    """Atomically push a release branch and force its tag to the same commit."""
+    slot_kwargs = _slot_subprocess_kwargs(slot_uid)
+    git_safe_directory = safe_directory
+    if git_safe_directory is None and slot_kwargs:
+        git_safe_directory = repo_dir
+    head = rev_parse_head(repo_dir, safe_directory=git_safe_directory, **slot_kwargs)
+    if head != expected_head:
+        raise HeadDriftError(
+            ["git", "push"],
+            128,
+            "",
+            f"HEAD changed since preflight ({expected_head[:12]} → {head[:12]}); aborting push.",
+        )
+    if remote_url is None:
+        push_extra_env: dict[str, str] | None = None
+        origin = _run_git(
+            ["remote", "get-url", "origin"],
+            cwd=repo_dir,
+            token=None,
+            safe_directory=git_safe_directory,
+            **slot_kwargs,
+        )
+        if origin.returncode == 0:
+            local_remote = _local_remote_safe_directory(origin.stdout, cwd=repo_dir)
+            if local_remote is not None:
+                push_extra_env = {}
+                _append_safe_directory(push_extra_env, local_remote)
+        destination = "origin"
+    else:
+        push_extra_env = _explicit_remote_env(remote_url, cwd=repo_dir)
+        destination = remote_url
+    args = ["push", "--atomic"]
+    if token:
+        args.append("--no-verify")
+    args.extend(
+        [
+            destination,
+            f"refs/heads/{branch}:refs/heads/{branch}",
+            f"+{expected_head}:refs/tags/{tag}",
+        ]
+    )
+    _check(
+        _run_git(
+            args,
+            cwd=repo_dir,
+            token=token,
+            auth_url=auth_url,
+            extra_env=push_extra_env,
+            safe_directory=git_safe_directory,
+            **slot_kwargs,
         ),
         ["git", *args],
     )
@@ -693,6 +1106,7 @@ __all__ = [
     "fetch_ref",
     "inspect_dirty_state",
     "push",
+    "push_release",
     "redact_credentials",
     "rev_parse_head",
 ]

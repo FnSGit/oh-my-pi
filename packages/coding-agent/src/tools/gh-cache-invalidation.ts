@@ -10,6 +10,9 @@
  * eliminates the much-worse "issue shows OPEN for up to softTtlSec after
  * `gh issue close`" failure mode reported by users.
  *
+ * Plain `git push` calls are handled after the command exits 0 instead, once
+ * their destination repository can be resolved (`invalidateGithubCacheForBashResult`).
+ *
  * Detector scope: ops that change visible issue/PR state — `close`,
  * `reopen`, `merge`, `delete`, `ready`, `lock`, `unlock`, `pin`, `unpin`,
  * `transfer`, plus the comment/review/edit ops that change the rendered
@@ -17,10 +20,16 @@
  * number, all auth_keys) because the upside of staleness elimination
  * dwarfs the cost of one cache miss.
  */
-import { invalidateAllForNumber, invalidateAllForRepo } from "./github-cache";
+import * as path from "node:path";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { logger } from "@oh-my-pi/pi-utils";
+import { parseGitUrl } from "../extensibility/plugins/git-url";
+import { formatRepoRef } from "./gh-common";
+import { invalidateAllForNumber, invalidateAllForRepo, invalidatePullRequestsForRepo } from "./github-cache";
+import { tokenizeShellSegments } from "./shell-tokenize";
 
-const PR_URL_PATTERN = /^https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)(?:[/?#].*)?$/i;
-const ISSUE_URL_PATTERN = /^https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/issues\/(\d+)(?:[/?#].*)?$/i;
+const PR_URL_PATTERN = /^https:\/\/([^/\s]+)\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)(?:[/?#].*)?$/i;
+const ISSUE_URL_PATTERN = /^https:\/\/([^/\s]+)\/([^/\s]+\/[^/\s]+)\/issues\/(\d+)(?:[/?#].*)?$/i;
 
 /** Subcommands that mutate the rendered issue/PR view in any meaningful way. */
 const MUTATING_ISSUE_SUBCMDS: Record<string, true> = {
@@ -142,10 +151,10 @@ function detectGhMutation(tokens: readonly string[]): { number?: number; repo?: 
 		}
 		const urlMatch = (subject === "pr" ? PR_URL_PATTERN : ISSUE_URL_PATTERN).exec(token);
 		if (urlMatch) {
-			const num = Number(urlMatch[2]);
+			const num = Number(urlMatch[3]);
 			if (Number.isSafeInteger(num) && num > 0) {
 				// URL carries its own repo and wins over a stray --repo flag.
-				return { number: num, repo: urlMatch[1] };
+				return { number: num, repo: formatRepoRef(urlMatch[1], urlMatch[2]) };
 			}
 		}
 	}
@@ -155,94 +164,13 @@ function detectGhMutation(tokens: readonly string[]): { number?: number; repo?: 
 }
 
 /**
- * Conservative tokenizer that splits a bash command into individual word
- * tokens. Handles single/double-quoted strings, backslash escapes, and
- * standard operators (`;`, `&&`, `||`, `|`, `&`, newlines) as token
- * boundaries that emit a sentinel `";"` so the caller treats the segments
- * as independent command sequences. We do not attempt full POSIX shell
- * parsing — heredocs, command substitution, and arithmetic expansion are
- * out of scope; the detector simply falls through when it cannot find a
- * clean `gh issue|pr <subcmd>` triple.
- */
-function tokenize(command: string): string[][] {
-	const segments: string[][] = [];
-	let current: string[] = [];
-	let buffer = "";
-	let inSingle = false;
-	let inDouble = false;
-	const pushBuffer = () => {
-		if (buffer.length > 0) {
-			current.push(buffer);
-			buffer = "";
-		}
-	};
-	const pushSegment = () => {
-		pushBuffer();
-		if (current.length > 0) segments.push(current);
-		current = [];
-	};
-	for (let i = 0; i < command.length; i++) {
-		const ch = command[i];
-		if (inSingle) {
-			if (ch === "'") {
-				inSingle = false;
-				continue;
-			}
-			buffer += ch;
-			continue;
-		}
-		if (inDouble) {
-			if (ch === "\\" && i + 1 < command.length) {
-				const next = command[i + 1];
-				if (next === '"' || next === "\\" || next === "$" || next === "`") {
-					buffer += next;
-					i++;
-					continue;
-				}
-			}
-			if (ch === '"') {
-				inDouble = false;
-				continue;
-			}
-			buffer += ch;
-			continue;
-		}
-		if (ch === "'") {
-			inSingle = true;
-			continue;
-		}
-		if (ch === '"') {
-			inDouble = true;
-			continue;
-		}
-		if (ch === "\\" && i + 1 < command.length) {
-			buffer += command[i + 1];
-			i++;
-			continue;
-		}
-		if (ch === " " || ch === "\t") {
-			pushBuffer();
-			continue;
-		}
-		if (ch === "\n" || ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")") {
-			pushSegment();
-			// `&&`, `||` already collapsed by the segment break above.
-			continue;
-		}
-		buffer += ch;
-	}
-	pushSegment();
-	return segments;
-}
-
-/**
  * Drop `github-cache` rows for any `gh issue|pr <mutating-subcmd>` call
  * embedded in `command`. Safe to invoke unconditionally; no-op when the
  * command does not touch GitHub state.
  */
 export function invalidateGithubCacheForBashCommand(command: string): void {
 	if (!command?.includes("gh")) return;
-	const segments = tokenize(command);
+	const segments = tokenizeShellSegments(command);
 	for (const segment of segments) {
 		const hit = detectGhMutation(segment);
 		if (!hit) continue;
@@ -250,6 +178,85 @@ export function invalidateGithubCacheForBashCommand(command: string): void {
 			invalidateAllForNumber(hit.number, hit.repo);
 		} else {
 			invalidateAllForRepo(hit.repo);
+		}
+	}
+}
+
+/** Options of `git push` that consume the next argv token. */
+const PUSH_VALUE_FLAGS: Record<string, true> = {
+	"--receive-pack": true,
+	"--exec": true,
+	"-o": true,
+	"--push-option": true,
+};
+
+/** A redirection word (`2>&1` lexes as `2>`, `>/dev/null`) ends the argv. */
+const REDIRECT = /^\d*[<>]/;
+
+/** Repository a `git push` argv sends to, or undefined for dry runs and non-push commands. */
+async function pushedRepo(tokens: readonly string[], cwd: string): Promise<string | undefined> {
+	if (path.basename(tokens[0]) !== "git") return undefined;
+	let i = 1;
+	for (; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token === "-C") cwd = path.resolve(cwd, tokens[++i] ?? "");
+		else if (token.startsWith("-C")) cwd = path.resolve(cwd, token.slice(2));
+		else if (token !== "--no-pager" && token !== "--paginate") break;
+	}
+	if (tokens[i] !== "push") return undefined;
+	let positional: string | undefined;
+	let repoFlag: string | undefined;
+	for (i++; i < tokens.length && !REDIRECT.test(tokens[i]); i++) {
+		const token = tokens[i];
+		if (token === "--dry-run" || /^-[^-]*n/.test(token)) return undefined;
+		if (token === "--repo") repoFlag = tokens[++i];
+		else if (token.startsWith("--repo=")) repoFlag = token.slice("--repo=".length);
+		else if (PUSH_VALUE_FLAGS[token]) i++;
+		else if (token === "--") {
+			positional ??= tokens[i + 1];
+			break;
+		} else if (!token.startsWith("-")) positional ??= token;
+	}
+	// Git's precedence: the positional repository wins over `--repo`.
+	let remote = positional ?? repoFlag;
+	const repository = vcs.git(cwd);
+	if (!remote) {
+		if (!repository) return undefined;
+		const branch = await repository.currentBranch();
+		remote =
+			(branch && (await repository.configGet(`branch.${branch}.pushRemote`))) ||
+			(await repository.configGet("remote.pushDefault")) ||
+			(branch && (await repository.configGet(`branch.${branch}.remote`))) ||
+			undefined;
+		if (!remote) {
+			const remotes = await repository.remoteList();
+			remote = remotes.length === 1 ? remotes[0] : "origin";
+		}
+	}
+	const url =
+		(await repository?.configGet(`remote.${remote}.pushurl`)) ?? (await repository?.remoteUrl(remote)) ?? remote;
+	const source = parseGitUrl(url);
+	return source ? formatRepoRef(source.host, source.path) : undefined;
+}
+
+/**
+ * After a bash command exits 0, drop live PR metadata/diff rows for every
+ * repository a `git push` in it sent to. Like the `gh` detector this
+ * over-invalidates (a push hidden behind `|| true` still clears): a spurious
+ * clear costs one refetch, a missed one serves the old head until the TTL.
+ */
+export async function invalidateGithubCacheForBashResult(
+	command: string,
+	cwd: string,
+	result: { exitCode?: number },
+): Promise<void> {
+	if (result.exitCode !== 0 || !command.includes("push")) return;
+	for (const tokens of tokenizeShellSegments(command)) {
+		try {
+			const repo = await pushedRepo(tokens, cwd);
+			if (repo) invalidatePullRequestsForRepo(repo);
+		} catch (err) {
+			logger.debug("github cache: push destination lookup failed", { err: String(err) });
 		}
 	}
 }

@@ -13,6 +13,7 @@
  */
 
 import type {
+	AgentTypeStats,
 	AggregatedStats,
 	CostTimeSeriesPoint,
 	ModelPerformancePoint,
@@ -53,6 +54,8 @@ export interface MessageStats {
 	stopReason: string;
 	errorMessage: string | null;
 	usage: Usage;
+	/** Ingest found no tariff to price this request from; its zero is unknown spend. */
+	costUnpriced?: boolean;
 }
 
 export interface RequestDetails extends MessageStats {
@@ -64,6 +67,7 @@ export type TimeRange = "1h" | "24h" | "7d" | "30d" | "90d" | "all";
 
 export interface OverviewStats {
 	overall: AggregatedStats;
+	byAgentType: AgentTypeStats[];
 	timeSeries: TimeSeriesPoint[];
 }
 

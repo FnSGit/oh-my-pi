@@ -1,14 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import type { Context, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { z } from "zod/v4";
 
 const echoTool: Tool = {
 	name: "echo",
 	description: "Echo input",
-	parameters: z.object({ text: z.string() }),
+	parameters: type({ text: "string" }),
 };
 
 function contextWithTools(tools: Tool[] = [echoTool]): Context {
@@ -24,12 +25,22 @@ function abortedSignal(): AbortSignal {
 	return controller.signal;
 }
 
-async function capturePayload(model: Model<"openai-completions">, tools?: Tool[]): Promise<Record<string, unknown>> {
+interface CaptureOptions {
+	tools?: Tool[];
+	reasoning?: Effort;
+	disableReasoning?: boolean;
+}
+
+async function capturePayload(
+	model: Model<"openai-completions">,
+	options: CaptureOptions = {},
+): Promise<Record<string, unknown>> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
-	streamOpenAICompletions(model, contextWithTools(tools), {
+	streamOpenAICompletions(model, contextWithTools(options.tools), {
 		apiKey: "test-key",
 		signal: abortedSignal(),
-		reasoning: "minimal",
+		reasoning: options.disableReasoning ? undefined : (options.reasoning ?? Effort.High),
+		disableReasoning: options.disableReasoning,
 		toolChoice: "auto",
 		maxTokens: 123,
 		onPayload: payload => resolve(payload),
@@ -37,7 +48,7 @@ async function capturePayload(model: Model<"openai-completions">, tools?: Tool[]
 	return (await promise) as Record<string, unknown>;
 }
 
-function customDeepseekFlash(): Model<"openai-completions"> {
+function customDeepseekFlash(legacyThinkingExtraBody = false): Model<"openai-completions"> {
 	return buildModel({
 		...getBundledModel("openai", "gpt-4o-mini"),
 		api: "openai-completions",
@@ -49,37 +60,20 @@ function customDeepseekFlash(): Model<"openai-completions"> {
 		compat: {
 			supportsReasoningEffort: true,
 			reasoningEffortMap: { xhigh: "max" },
+			...(legacyThinkingExtraBody ? { extraBody: { thinking: { type: "enabled" } } } : {}),
 		},
 	} as ModelSpec<"openai-completions">);
 }
 
 describe("issue #1207 — DeepSeek V4 keeps reasoning with tools", () => {
-	it("detects the documented direct DeepSeek V4 compat shape", () => {
-		const model = getBundledModel("deepseek", "deepseek-v4-flash") as Model<"openai-completions">;
-		const compat = model.compat;
-
-		expect(compat.supportsToolChoice).toBe(false);
-		expect(compat.maxTokensField).toBe("max_tokens");
-		expect(compat.extraBody).toEqual({ thinking: { type: "enabled" } });
-		expect(model.thinking?.effortMap).toMatchObject({
-			minimal: "high",
-			low: "high",
-			medium: "high",
-			high: "high",
-			xhigh: "max",
-		});
-	});
-
-	it("merges partial user reasoning maps with DeepSeek defaults in thinking metadata", () => {
+	it("drops user reasoning map entries outside the honest DeepSeek ladder", () => {
 		const model = customDeepseekFlash();
 
 		expect(model.compat.supportsToolChoice).toBe(false);
-		expect(model.thinking?.effortMap).toMatchObject({
-			minimal: "high",
-			low: "high",
-			medium: "high",
-			xhigh: "max",
-		});
+		// The stale user `xhigh` alias targets a tier the wire-exact
+		// [low, high, max] flash ladder does not expose, so it is filtered out.
+		expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		expect(model.thinking?.effortMap).toBeUndefined();
 	});
 
 	it("omits tool_choice but preserves documented reasoning when tools are present", async () => {
@@ -91,6 +85,18 @@ describe("issue #1207 — DeepSeek V4 keeps reasoning with tools", () => {
 		expect(body.thinking).toEqual({ type: "enabled" });
 		expect(body.max_tokens).toBe(123);
 		expect(body.max_completion_tokens).toBeUndefined();
+	});
+
+	it("disables thinking for bundled and legacy cached model definitions", async () => {
+		const bundled = getBundledModel("deepseek", "deepseek-v4-flash") as Model<"openai-completions">;
+		const legacyCached = customDeepseekFlash(true);
+
+		for (const model of [bundled, legacyCached]) {
+			const body = await capturePayload(model, { disableReasoning: true });
+			expect(model.compat.extraBody).toBeUndefined();
+			expect(body.reasoning_effort).toBeUndefined();
+			expect(body.thinking).toEqual({ type: "disabled" });
+		}
 	});
 
 	it("does not mix Fireworks DeepSeek effort with the native thinking toggle", async () => {
@@ -123,11 +129,11 @@ describe("issue #1207 — DeepSeek V4 keeps reasoning with tools", () => {
 		const unionTool: Tool = {
 			name: "union_repro",
 			description: "Union schema repro",
-			parameters: z.object({
-				paths: z.union([z.string(), z.array(z.string())]).optional(),
+			parameters: type({
+				paths: "(string | string[])?",
 			}),
 		};
-		const body = await capturePayload(model, [unionTool]);
+		const body = await capturePayload(model, { tools: [unionTool] });
 		const tools = body.tools as Array<{ function: { parameters: Record<string, unknown> } }>;
 		const properties = tools[0].function.parameters.properties as Record<string, Record<string, unknown>>;
 		const branches = properties.paths.anyOf as Array<Record<string, unknown>>;

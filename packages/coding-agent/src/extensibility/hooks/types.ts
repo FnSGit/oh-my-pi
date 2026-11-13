@@ -1,15 +1,23 @@
+import { type HookMessageRenderer } from "@oh-my-pi/pi-tui/chat/extension-types";
+export { type HookMessageRenderOptions, type HookMessageRenderer } from "@oh-my-pi/pi-tui/chat/extension-types";
+import type { type as ArkType } from "@oh-my-pi/omptype";
+import type * as TypeBox from "@oh-my-pi/omptype/typebox";
+import type * as zod from "@oh-my-pi/omptype/zod";
 import type { ImageContent, Message, Model, TextContent } from "@oh-my-pi/pi-ai";
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { z } from "zod/v4";
+import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { EditToolDetails } from "../../edit";
+import type { EditToolDetails } from "@oh-my-pi/pi-tui/tools/edit";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type * as PiCodingAgent from "../../index";
-import type { Theme } from "../../modes/theme/theme";
-import type { HookMessage } from "../../session/messages";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
-import type { BashToolDetails, FindToolDetails, ReadToolDetails, SearchToolDetails } from "../../tools";
+import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
+import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
+import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import type {
 	AgentEndEvent,
 	AgentStartEvent,
@@ -42,7 +50,6 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../shared-events";
-import type * as TypeBox from "../typebox";
 
 // Re-export for backward compatibility
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -85,8 +92,8 @@ export interface HookUIContext {
 	/**
 	 * Set status text in the footer/status bar.
 	 * Pass undefined as text to clear the status for this key.
-	 * Text can include ANSI escape codes for styling.
-	 * Note: Newlines, tabs, and carriage returns are replaced with spaces.
+	 * ANSI/VT escape sequences and most control characters are stripped; tabs and newlines become spaces.
+	 * Repeated spaces are collapsed and surrounding whitespace is trimmed.
 	 * The combined status line is truncated to terminal width.
 	 * @param key - Unique key to identify this status (e.g., hook name)
 	 * @param text - Status text to display, or undefined to clear
@@ -95,7 +102,8 @@ export interface HookUIContext {
 
 	/**
 	 * Show a custom component with keyboard focus.
-	 * The factory receives TUI, theme, and a done() callback to close the component.
+	 * The factory receives TUI, theme, keybindings, and a done() callback to close the component.
+	 * Matches the interactive controller call shape (same arity as ExtensionUIContext.custom).
 	 * Can be async for fire-and-forget work (don't await the work, just start it).
 	 *
 	 * @param factory - Function that creates the component. Call done() when finished.
@@ -103,14 +111,14 @@ export interface HookUIContext {
 	 *
 	 * @example
 	 * // Sync factory
-	 * const result = await ctx.ui.custom((tui, theme, done) => {
+	 * const result = await ctx.ui.custom((tui, theme, keybindings, done) => {
 	 *   const component = new MyComponent(tui, theme);
 	 *   component.onFinish = (value) => done(value);
 	 *   return component;
 	 * });
 	 *
 	 * // Async factory with fire-and-forget work
-	 * const result = await ctx.ui.custom(async (tui, theme, done) => {
+	 * const result = await ctx.ui.custom(async (tui, theme, keybindings, done) => {
 	 *   const loader = new CancellableLoader(tui, theme.fg("accent"), theme.fg("muted"), "Working...");
 	 *   loader.onAbort = () => done(null);
 	 *   doWork(loader.signal).then(done);  // Don't await - fire and forget
@@ -121,6 +129,7 @@ export interface HookUIContext {
 		factory: (
 			tui: TUI,
 			theme: Theme,
+			keybindings: KeybindingsManager,
 			done: (result: T) => void,
 		) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
 	): Promise<T>;
@@ -155,12 +164,7 @@ export interface HookUIContext {
 	): Promise<string | undefined>;
 
 	/**
-	 * Get the current theme for styling text with ANSI codes.
-	 * Use theme.fg() and theme.bg() to style status text.
-	 *
-	 * @example
-	 * const theme = ctx.ui.theme;
-	 * ctx.ui.setStatus("my-hook", theme.fg("success", theme.status.success) + " Ready");
+	 * Get the current theme for styling custom components.
 	 */
 	readonly theme: Theme;
 }
@@ -262,6 +266,7 @@ export type {
 	SessionBeforeSwitchEvent,
 	SessionBeforeTreeEvent,
 	SessionBranchEvent,
+	SessionBranchReason,
 	SessionCompactEvent,
 	SessionCompactingEvent,
 	SessionEvent,
@@ -351,16 +356,16 @@ export interface WriteToolResultEvent extends ToolResultEventBase {
 	details: undefined;
 }
 
-/** Tool result event for search tool */
-export interface SearchToolResultEvent extends ToolResultEventBase {
-	toolName: "search";
-	details: SearchToolDetails | undefined;
+/** Tool result event for grep tool */
+export interface GrepToolResultEvent extends ToolResultEventBase {
+	toolName: "grep";
+	details: GrepToolDetails | undefined;
 }
 
-/** Tool result event for find tool */
-export interface FindToolResultEvent extends ToolResultEventBase {
-	toolName: "find";
-	details: FindToolDetails | undefined;
+/** Tool result event for glob tool */
+export interface GlobToolResultEvent extends ToolResultEventBase {
+	toolName: "glob";
+	details: GlobToolDetails | undefined;
 }
 
 /** Tool result event for custom/unknown tools */
@@ -379,8 +384,8 @@ export type ToolResultEvent =
 	| ReadToolResultEvent
 	| EditToolResultEvent
 	| WriteToolResultEvent
-	| SearchToolResultEvent
-	| FindToolResultEvent
+	| GrepToolResultEvent
+	| GlobToolResultEvent
 	| CustomToolResultEvent;
 
 /**
@@ -424,7 +429,7 @@ export type { ToolCallEventResult, ToolResultEventResult } from "../shared-event
  */
 export interface BeforeAgentStartEventResult {
 	/** Message to inject into context (persisted to session, visible in TUI) */
-	message?: Pick<HookMessage, "customType" | "content" | "display" | "details" | "attribution">;
+	message?: CustomMessagePayload;
 }
 
 export type {
@@ -443,23 +448,7 @@ export type {
  * Handler function type for each event.
  * Handlers can return R, undefined, or void (bare return statements).
  */
-// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements in handlers
 export type HookHandler<E, R = undefined> = (event: E, ctx: HookContext) => Promise<R | void> | R | void;
-
-export interface HookMessageRenderOptions {
-	/** Whether the view is expanded */
-	expanded: boolean;
-}
-
-/**
- * Renderer for hook messages.
- * Hooks register these to provide custom TUI rendering for their message types.
- */
-export type HookMessageRenderer<T = unknown> = (
-	message: HookMessage<T>,
-	options: HookMessageRenderOptions,
-	theme: Theme,
-) => Component | undefined;
 
 /**
  * Command registration options.
@@ -518,7 +507,7 @@ export interface HookAPI {
 	 * Use this when you want the LLM to see the message content.
 	 * For hook state that should NOT be sent to the LLM, use appendEntry() instead.
 	 *
-	 * @param message - The message to send
+	 * @param message - The message object to send, or a string shorthand for visible message content
 	 * @param message.customType - Identifier for your hook (used for filtering on reload)
 	 * @param message.content - Message content (string or TextContent/ImageContent array)
 	 * @param message.display - Whether to show in TUI (true = styled display, false = hidden)
@@ -529,7 +518,7 @@ export interface HookAPI {
 	 * @param options.deliverAs - How to deliver the message: "steer" or "followUp".
 	 */
 	sendMessage<T = unknown>(
-		message: Pick<HookMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
+		message: CustomMessagePayload<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" },
 	): void;
 
@@ -582,10 +571,12 @@ export interface HookAPI {
 
 	/** File logger for error/warning/debug messages */
 	logger: typeof PiLogger;
-	/** Injected zod-backed typebox shim (legacy/compat — prefer `zod`). */
+	/** Injected TypeBox shim (legacy/compat — prefer `arktype`). */
 	typebox: typeof TypeBox;
-	/** Injected zod module for Zod-authored hooks. */
-	zod: typeof z;
+	/** Injected omptype schema builder for hooks. */
+	arktype: typeof ArkType;
+	/** Injected Zod-compatible omptype builder for hooks. */
+	zod: typeof zod;
 	/** Injected pi-coding-agent exports */
 	pi: typeof PiCodingAgent;
 }

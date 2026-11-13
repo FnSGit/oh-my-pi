@@ -1,23 +1,42 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { runConfigCommand } from "@oh-my-pi/pi-coding-agent/cli/config-cli";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { getConfigRootDir, getProjectDir, setAgentDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 
-let testAgentDir = "";
+let testAgentDir: TempDir | undefined;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+const cliEntry = path.join(import.meta.dir, "..", "src", "cli.ts");
 
-beforeEach(async () => {
+interface CliProcessResult {
+	exitCode: number;
+	output: string;
+	error: string;
+}
+
+async function runCliProcess(args: string[], env: NodeJS.ProcessEnv): Promise<CliProcessResult> {
+	const proc = Bun.spawn([process.execPath, cliEntry, ...args], {
+		stdout: "pipe",
+		stderr: "pipe",
+		env: { ...process.env, NO_COLOR: "1", ...env },
+	});
+	const stdout = new Response(proc.stdout).text();
+	const stderr = new Response(proc.stderr).text();
+	const [exitCode, output, error] = await Promise.all([proc.exited, stdout, stderr]);
+	return { exitCode, output, error };
+}
+
+beforeEach(() => {
 	resetSettingsForTest();
-	testAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-config-cli-"));
-	setAgentDir(testAgentDir);
+	testAgentDir = TempDir.createSync("@omp-config-cli-");
+	setAgentDir(testAgentDir.path());
 });
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	AgentStorage.close();
 	resetSettingsForTest();
 	if (originalAgentDir) {
 		setAgentDir(originalAgentDir);
@@ -25,7 +44,12 @@ afterEach(async () => {
 		setAgentDir(fallbackAgentDir);
 		delete process.env.PI_CODING_AGENT_DIR;
 	}
-	await fs.rm(testAgentDir, { recursive: true, force: true });
+	if (testAgentDir) {
+		try {
+			await testAgentDir.remove();
+		} catch {}
+		testAgentDir = undefined;
+	}
 });
 
 describe("config CLI schema coverage", () => {
@@ -61,6 +85,46 @@ describe("config CLI schema coverage", () => {
 		expect(parsed.value).toEqual({ default: "claude-opus-4-6" });
 	});
 
+	it("normalizes valid provider in-flight request limits from JSON objects", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({
+			action: "set",
+			key: "providers.maxInFlightRequests",
+			value: '{"openai":2.8,"anthropic":1}',
+			flags: { json: true },
+		});
+		await runConfigCommand({ action: "get", key: "providers.maxInFlightRequests", flags: { json: true } });
+
+		const payload = logSpy.mock.calls.at(-1)?.[0];
+		expect(typeof payload).toBe("string");
+		const parsed = JSON.parse(String(payload)) as { key: string; value: unknown; type: string };
+		expect(parsed.key).toBe("providers.maxInFlightRequests");
+		expect(parsed.type).toBe("record");
+		expect(parsed.value).toEqual({ openai: 2, anthropic: 1 });
+	});
+
+	it("rejects invalid provider in-flight request limit entries", async () => {
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new Error("process.exit");
+		}) as typeof process.exit);
+
+		await expect(
+			runConfigCommand({
+				action: "set",
+				key: "providers.maxInFlightRequests",
+				value: '{"openai":"2","anthropic":0}',
+				flags: { json: true },
+			}),
+		).rejects.toThrow("process.exit");
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("Provider request limits must be positive numbers: openai, anthropic"),
+		);
+	});
+
 	it("sets and gets array settings as JSON arrays", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const arrayValue = '["claude-opus-4-6","gpt-5.3-codex"]';
@@ -74,6 +138,27 @@ describe("config CLI schema coverage", () => {
 		expect(parsed.key).toBe("enabledModels");
 		expect(parsed.type).toBe("array");
 		expect(parsed.value).toEqual(["claude-opus-4-6", "gpt-5.3-codex"]);
+	});
+
+	it("rejects unknown status line segment ids", async () => {
+		vi.spyOn(console, "log").mockImplementation(() => {});
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new Error("process.exit");
+		}) as typeof process.exit);
+
+		await expect(
+			runConfigCommand({
+				action: "set",
+				key: "statusLine.leftSegments",
+				value: '["modle","git"]',
+				flags: { json: true },
+			}),
+		).rejects.toThrow("process.exit");
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining('Unknown status line segment: "modle". Valid status line segments: pi, status, model'),
+		);
 	});
 	it("sets numeric idle compaction settings from CLI values", async () => {
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -106,5 +191,186 @@ describe("config CLI schema coverage", () => {
 			type: "number",
 			value: 600,
 		});
+	});
+
+	it("accepts max as a persisted default thinking level", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({ action: "set", key: "defaultThinkingLevel", value: "max", flags: { json: true } });
+		await runConfigCommand({ action: "get", key: "defaultThinkingLevel", flags: { json: true } });
+
+		const payload = logSpy.mock.calls.at(-1)?.[0];
+		expect(typeof payload).toBe("string");
+		const parsed = JSON.parse(String(payload)) as { key: string; value: unknown; type: string };
+		expect(parsed.key).toBe("defaultThinkingLevel");
+		expect(parsed.type).toBe("enum");
+		expect(parsed.value).toBe("max");
+	});
+	it("fully flushes JSON larger than a pipe buffer", async () => {
+		if (!testAgentDir) throw new Error("Test agent directory was not initialized");
+		const { exitCode, output, error } = await runCliProcess(["config", "list", "--json"], {
+			PI_CODING_AGENT_DIR: testAgentDir.path(),
+		});
+
+		expect(exitCode).toBe(0);
+		expect(error).toBe("");
+		expect(Buffer.byteLength(output)).toBeGreaterThan(65_536);
+		const parsed: unknown = JSON.parse(output);
+		expect(parsed).toMatchObject({ modelRoles: { type: "record" } });
+	});
+	it("reports the value written to config.yml and the layer that still overrides it", async () => {
+		if (!testAgentDir) throw new Error("Test agent directory was not initialized");
+		const overlayPath = path.join(testAgentDir.path(), "overlay.yml");
+		await Bun.write(overlayPath, "compaction:\n  enabled: false\n");
+		const previousConfigFiles = process.env.PI_CONFIG_FILES;
+		process.env.PI_CONFIG_FILES = overlayPath;
+		try {
+			const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+			await runConfigCommand({ action: "set", key: "compaction.enabled", value: "true", flags: { json: true } });
+			expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]))).toEqual({
+				key: "compaction.enabled",
+				value: true,
+				overriddenBy: "overlay",
+			});
+		} finally {
+			if (previousConfigFiles === undefined) delete process.env.PI_CONFIG_FILES;
+			else process.env.PI_CONFIG_FILES = previousConfigFiles;
+		}
+	});
+	it("loads PI_CONFIG_FILES overlays in path-list order", async () => {
+		if (!testAgentDir) throw new Error("Test agent directory was not initialized");
+		const baseOverlayPath = path.join(testAgentDir.path(), "base-overlay.yml");
+		const finalOverlayPath = path.join(testAgentDir.path(), "final-overlay.yml");
+		await Promise.all([
+			Bun.write(baseOverlayPath, "defaultThinkingLevel: high\n"),
+			Bun.write(finalOverlayPath, "defaultThinkingLevel: max\n"),
+		]);
+		const { exitCode, output, error } = await runCliProcess(["config", "get", "defaultThinkingLevel", "--json"], {
+			PI_CODING_AGENT_DIR: testAgentDir.path(),
+			PI_CONFIG_FILES: [baseOverlayPath, finalOverlayPath].join(path.delimiter),
+		});
+
+		expect(exitCode).toBe(0);
+		expect(error).toBe("");
+		expect(JSON.parse(output)).toMatchObject({
+			key: "defaultThinkingLevel",
+			value: "max",
+			type: "enum",
+		});
+	});
+});
+
+describe("config list --scope", () => {
+	let projectDir: TempDir | undefined;
+	const originalProjectDir = getProjectDir();
+
+	beforeEach(() => {
+		projectDir = TempDir.createSync("@omp-config-cli-project-");
+		setProjectDir(projectDir.path());
+	});
+
+	afterEach(async () => {
+		setProjectDir(originalProjectDir);
+		await projectDir?.remove().catch(() => {});
+		projectDir = undefined;
+	});
+
+	async function listLayer(
+		scope: "global" | "project",
+	): Promise<Record<string, { value?: unknown; redacted?: true; type: string; description: string }>> {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(((
+			text: string,
+			cb?: (error?: Error | null) => void,
+		) => {
+			cb?.();
+			logSpy(text);
+			return true;
+		}) as typeof process.stdout.write);
+		try {
+			await runConfigCommand({ action: "list", flags: { json: true, scope } });
+			return JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]));
+		} finally {
+			stdoutSpy.mockRestore();
+		}
+	}
+
+	it("lists only the keys the global file sets, path-scoped entries as written", async () => {
+		if (!testAgentDir || !projectDir) throw new Error("Test directories were not initialized");
+		await Bun.write(
+			path.join(testAgentDir.path(), "config.yml"),
+			[
+				"enabledModels:",
+				"  - anthropic/claude-sonnet-4-5",
+				`  - path: ${projectDir.path()}`,
+				"    models: [openai/gpt-5]",
+				"compaction:",
+				"  enabled: false",
+				"hindsight:",
+				"  apiToken: secret-token",
+				"",
+			].join("\n"),
+		);
+		await Bun.write(path.join(projectDir.path(), ".omp", "config.yml"), "defaultThinkingLevel: high\n");
+
+		const layer = await listLayer("global");
+
+		expect(Object.keys(layer).toSorted()).toEqual(["compaction.enabled", "enabledModels", "hindsight.apiToken"]);
+		expect(layer.enabledModels.value).toEqual([
+			"anthropic/claude-sonnet-4-5",
+			{ path: projectDir.path(), models: ["openai/gpt-5"] },
+		]);
+		expect(layer["compaction.enabled"]).toMatchObject({ value: false, type: "boolean" });
+		expect(layer["hindsight.apiToken"]).toEqual({
+			redacted: true,
+			type: "string",
+			description: expect.any(String),
+		});
+		for (const entry of Object.values(layer)) expect(entry).not.toHaveProperty("source");
+	});
+
+	it("lists the project layer of the current directory", async () => {
+		if (!testAgentDir || !projectDir) throw new Error("Test directories were not initialized");
+		await Bun.write(path.join(testAgentDir.path(), "config.yml"), "compaction:\n  enabled: false\n");
+		await Bun.write(
+			path.join(projectDir.path(), ".omp", "config.yml"),
+			"defaultThinkingLevel: high\nenabledModels: [openai/gpt-5]\n",
+		);
+
+		const layer = await listLayer("project");
+
+		expect(layer).toEqual({
+			defaultThinkingLevel: expect.objectContaining({ value: "high" }),
+			enabledModels: expect.objectContaining({ value: ["openai/gpt-5"], type: "array" }),
+		});
+	});
+
+	it("prints the layer's keys in text output and masks credentials", async () => {
+		if (!testAgentDir) throw new Error("Test directory was not initialized");
+		await Bun.write(
+			path.join(testAgentDir.path(), "config.yml"),
+			"compaction:\n  enabled: false\nhindsight:\n  apiToken: secret-token\n",
+		);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({ action: "list", flags: { scope: "global" } });
+
+		const text = Bun.stripANSI(logSpy.mock.calls.map(call => String(call[0] ?? "")).join("\n"));
+		expect(text).toContain("compaction.enabled = false");
+		expect(text).toContain("hindsight.apiToken = ********");
+		expect(text).not.toContain("secret-token");
+		expect(text).not.toContain("defaultThinkingLevel");
+	});
+
+	it("rejects --scope on actions other than list", async () => {
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+			throw new Error("process.exit");
+		}) as typeof process.exit);
+
+		await expect(
+			runConfigCommand({ action: "set", key: "compaction.enabled", value: "false", flags: { scope: "project" } }),
+		).rejects.toThrow("process.exit");
+		expect(exitSpy).toHaveBeenCalledWith(1);
 	});
 });

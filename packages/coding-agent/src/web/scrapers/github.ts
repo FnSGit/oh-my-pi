@@ -1,4 +1,4 @@
-import { $env, ptree } from "@oh-my-pi/pi-utils";
+import { $env, ptree, USER_AGENT } from "@oh-my-pi/pi-utils";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, formatMediaDuration, loadPage } from "./types";
 
@@ -7,6 +7,7 @@ interface GitHubUrl {
 		| "blob"
 		| "tree"
 		| "repo"
+		| "commit"
 		| "issue"
 		| "issues"
 		| "pull"
@@ -26,7 +27,7 @@ interface GitHubUrl {
 }
 
 interface GitHubIssueComment {
-	user: { login: string };
+	user: { login: string } | null;
 	created_at: string;
 	body: string;
 }
@@ -56,6 +57,11 @@ export function parseGitHubUrl(url: string): GitHubUrl | null {
 				const [ref, ...pathParts] = subParts;
 				return { type: section, owner, repo, ref, path: pathParts.join("/") };
 			}
+			case "commit":
+				if (subParts.length > 0 && subParts[0]) {
+					return { type: "commit", owner, repo, ref: subParts[0] };
+				}
+				return { type: "other", owner, repo };
 			case "issues":
 				if (subParts.length > 0 && /^\d+$/.test(subParts[0])) {
 					return { type: "issue", owner, repo, number: parseInt(subParts[0], 10) };
@@ -115,7 +121,7 @@ export async function fetchGitHubApi(
 
 		const headers: Record<string, string> = {
 			Accept: "application/vnd.github.v3+json",
-			"User-Agent": "omp-web-fetch/1.0",
+			"User-Agent": USER_AGENT,
 		};
 
 		// Use GITHUB_TOKEN if available
@@ -197,7 +203,7 @@ async function renderGitHubIssue(
 		title: string;
 		number: number;
 		state: string;
-		user: { login: string };
+		user: { login: string } | null;
 		created_at: string;
 		updated_at: string;
 		body: string | null;
@@ -207,7 +213,7 @@ async function renderGitHubIssue(
 	};
 
 	let md = `# ${issue.title}\n\n`;
-	md += `**#${issue.number}** · ${issue.state} · opened by @${issue.user.login}\n`;
+	md += `**#${issue.number}** · ${issue.state} · opened by @${issue.user?.login ?? "ghost"}\n`;
 	md += `Created: ${issue.created_at} · Updated: ${issue.updated_at}\n`;
 	if (issue.labels.length > 0) {
 		md += `Labels: ${issue.labels.map(l => l.name).join(", ")}\n`;
@@ -224,8 +230,89 @@ async function renderGitHubIssue(
 				issue.comments > comments.length ? `${comments.length} of ${issue.comments}` : `${comments.length}`;
 			md += `## Comments (${commentCount})\n\n`;
 			for (const comment of comments) {
-				md += `### @${comment.user.login} · ${comment.created_at}\n\n`;
+				md += `### @${comment.user?.login ?? "ghost"} · ${comment.created_at}\n\n`;
 				md += `${comment.body}\n\n---\n\n`;
+			}
+		}
+	}
+
+	return { content: md, ok: true };
+}
+
+interface GitHubCommitFile {
+	filename: string;
+	status: string;
+	additions: number;
+	deletions: number;
+	changes: number;
+	patch?: string;
+	previous_filename?: string;
+}
+
+/**
+ * Render a GitHub commit (metadata, message, and per-file diff) to markdown.
+ *
+ * The commits API (`/repos/{owner}/{repo}/commits/{ref}`) returns the full
+ * unified diff inline via `files[].patch`, so a single request yields both the
+ * summary and the diff. Binary files have no `patch` and are flagged instead.
+ */
+async function renderGitHubCommit(
+	gh: GitHubUrl,
+	timeout: number,
+	signal?: AbortSignal,
+): Promise<{ content: string; ok: boolean }> {
+	const result = await fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/commits/${gh.ref}`, timeout, signal);
+	if (!result.ok || !result.data) return { content: "", ok: false };
+
+	const commit = result.data as {
+		sha: string;
+		html_url: string;
+		commit: {
+			author?: { name?: string; date?: string } | null;
+			committer?: { name?: string; date?: string } | null;
+			message: string;
+		};
+		author?: { login: string } | null;
+		committer?: { login: string } | null;
+		parents?: Array<{ sha: string }>;
+		stats?: { total?: number; additions?: number; deletions?: number };
+		files?: GitHubCommitFile[];
+	};
+
+	const message = commit.commit.message ?? "";
+	const [subject, ...bodyLines] = message.split("\n");
+	const authorName = commit.author?.login ? `@${commit.author.login}` : (commit.commit.author?.name ?? "unknown");
+	const authoredAt = commit.commit.author?.date ?? "";
+
+	let md = `# ${subject || commit.sha.slice(0, 7)}\n\n`;
+	md += `**${commit.sha.slice(0, 12)}** · authored by ${authorName}`;
+	if (authoredAt) md += ` · ${authoredAt}`;
+	md += `\n`;
+	if (commit.stats) {
+		const { additions = 0, deletions = 0 } = commit.stats;
+		const fileCount = commit.files?.length ?? 0;
+		md += `${fileCount} file${fileCount === 1 ? "" : "s"} changed · +${additions} −${deletions}\n`;
+	}
+	if (commit.parents && commit.parents.length > 0) {
+		md += `Parents: ${commit.parents.map(p => p.sha.slice(0, 12)).join(", ")}\n`;
+	}
+
+	const body = bodyLines.join("\n").trim();
+	if (body) {
+		md += `\n${body}\n`;
+	}
+
+	const files = commit.files ?? [];
+	if (files.length > 0) {
+		md += `\n---\n\n## Files (${files.length})\n\n`;
+		for (const file of files) {
+			const name = file.previous_filename ? `${file.previous_filename} → ${file.filename}` : file.filename;
+			md += `### ${name}\n\n`;
+			md += `${file.status} · +${file.additions} −${file.deletions}\n\n`;
+			if (file.patch) {
+				md += `\`\`\`diff\n${file.patch}\n\`\`\`\n\n`;
+			} else {
+				md += `*No textual diff (binary or too large).*\n\n`;
 			}
 		}
 	}
@@ -248,7 +335,7 @@ async function renderGitHubIssuesList(
 		number: number;
 		title: string;
 		state: string;
-		user: { login: string };
+		user: { login: string } | null;
 		created_at: string;
 		comments: number;
 		labels: Array<{ name: string }>;
@@ -261,7 +348,7 @@ async function renderGitHubIssuesList(
 		if (issue.pull_request) continue; // Skip PRs in issues list
 		const labels = issue.labels.length > 0 ? ` [${issue.labels.map(l => l.name).join(", ")}]` : "";
 		md += `- **#${issue.number}** ${issue.title}${labels}\n`;
-		md += `  by @${issue.user.login} · ${issue.comments} comments · ${issue.created_at}\n\n`;
+		md += `  by @${issue.user?.login ?? "ghost"} · ${issue.comments} comments · ${issue.created_at}\n\n`;
 	}
 
 	return { content: md, ok: true };
@@ -344,8 +431,13 @@ async function renderGitHubRepo(
 	timeout: number,
 	signal?: AbortSignal,
 ): Promise<{ content: string; ok: boolean }> {
-	// Fetch repo info
-	const repoResult = await fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}`, timeout, signal);
+	// Repo info, file tree and README are independent: `HEAD` resolves to the
+	// default branch, so the tree request need not wait for `default_branch`.
+	const [repoResult, treeResult, readmeResult] = await Promise.all([
+		fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}`, timeout, signal),
+		fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/git/trees/HEAD?recursive=1`, timeout, signal),
+		fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/readme`, timeout, signal),
+	]);
 	if (!repoResult.ok) return { content: "", ok: false };
 
 	const repo = repoResult.data as {
@@ -354,7 +446,6 @@ async function renderGitHubRepo(
 		stargazers_count: number;
 		forks_count: number;
 		open_issues_count: number;
-		default_branch: string;
 		language: string | null;
 		license: { name: string } | null;
 	};
@@ -366,12 +457,7 @@ async function renderGitHubRepo(
 	if (repo.license) md += `License: ${repo.license.name}\n`;
 	md += `\n---\n\n`;
 
-	// Fetch file tree
-	const treeResult = await fetchGitHubApi(
-		`/repos/${gh.owner}/${gh.repo}/git/trees/${repo.default_branch}?recursive=1`,
-		timeout,
-		signal,
-	);
+	// File tree
 	if (treeResult.ok && treeResult.data) {
 		const tree = (treeResult.data as { tree: Array<{ path: string; type: string }> }).tree;
 		md += `## Files\n\n`;
@@ -381,13 +467,12 @@ async function renderGitHubRepo(
 			md += `${prefix}${item.path}\n`;
 		}
 		if (tree.length > 100) {
-			md += `... and ${tree.length - 100} more files\n`;
+			md += `[…${tree.length - 100} files elided…]\n`;
 		}
 		md += "```\n\n";
 	}
 
-	// Fetch README
-	const readmeResult = await fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/readme`, timeout, signal);
+	// README
 	if (readmeResult.ok && readmeResult.data) {
 		const readme = readmeResult.data as { content: string; encoding: string };
 		if (readme.encoding === "base64") {
@@ -509,7 +594,7 @@ async function fetchGitHubJobLogs(
 	jobId: number,
 	timeout: number,
 	signal?: AbortSignal,
-): Promise<string | null> {
+): Promise<{ content: string; truncated: boolean } | null> {
 	const headers: Record<string, string> = {
 		Accept: "application/vnd.github+json",
 		"X-GitHub-Api-Version": "2022-11-28",
@@ -523,7 +608,7 @@ async function fetchGitHubJobLogs(
 		headers,
 		signal,
 	});
-	return result.ok && result.content ? result.content : null;
+	return result.ok && result.content ? { content: result.content, truncated: Boolean(result.truncated) } : null;
 }
 
 /**
@@ -535,7 +620,10 @@ async function renderGitHubActionsRun(
 	timeout: number,
 	signal?: AbortSignal,
 ): Promise<{ content: string; ok: boolean }> {
-	const runResult = await fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/actions/runs/${gh.runId}`, timeout, signal);
+	const [runResult, jobsResult] = await Promise.all([
+		fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/actions/runs/${gh.runId}`, timeout, signal),
+		fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/actions/runs/${gh.runId}/jobs?per_page=100`, timeout, signal),
+	]);
 	if (!runResult.ok || !runResult.data) return { content: "", ok: false };
 
 	const run = runResult.data as GitHubActionsRun;
@@ -543,11 +631,6 @@ async function renderGitHubActionsRun(
 	md += renderActionsRunMeta(run);
 	md += `\n---\n\n`;
 
-	const jobsResult = await fetchGitHubApi(
-		`/repos/${gh.owner}/${gh.repo}/actions/runs/${gh.runId}/jobs?per_page=100`,
-		timeout,
-		signal,
-	);
 	if (jobsResult.ok && jobsResult.data) {
 		const jobs = (jobsResult.data as { jobs?: GitHubActionsJob[] }).jobs ?? [];
 		md += `## Jobs (${jobs.length})\n\n`;
@@ -570,14 +653,20 @@ async function renderGitHubActionsJob(
 	gh: GitHubUrl,
 	timeout: number,
 	signal?: AbortSignal,
-): Promise<{ content: string; ok: boolean }> {
-	const jobResult = await fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/actions/jobs/${gh.jobId}`, timeout, signal);
+): Promise<{ content: string; ok: boolean; truncated?: boolean }> {
+	// The URL already names the run, so its context can load alongside the job.
+	const runEndpoint = (runId: number | undefined) => `/repos/${gh.owner}/${gh.repo}/actions/runs/${runId}`;
+	const [jobResult, urlRunResult] = await Promise.all([
+		fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/actions/jobs/${gh.jobId}`, timeout, signal),
+		fetchGitHubApi(runEndpoint(gh.runId), timeout, signal),
+	]);
 	if (!jobResult.ok || !jobResult.data) return { content: "", ok: false };
 
 	const job = jobResult.data as GitHubActionsJob;
 
 	// Best-effort run context for nicer headers; the job render stands on its own without it.
-	const runResult = await fetchGitHubApi(`/repos/${gh.owner}/${gh.repo}/actions/runs/${job.run_id}`, timeout, signal);
+	const runResult =
+		job.run_id === gh.runId ? urlRunResult : await fetchGitHubApi(runEndpoint(job.run_id), timeout, signal);
 	const run = runResult.ok && runResult.data ? (runResult.data as GitHubActionsRun) : null;
 
 	let md = `# ${escapeCell(job.name)}\n\n`;
@@ -599,10 +688,10 @@ async function renderGitHubActionsJob(
 	const logs = await fetchGitHubJobLogs(gh.owner, gh.repo, job.id, timeout, signal);
 	md += `## Logs\n\n`;
 	md += logs
-		? stripActionsLogTimestamps(logs)
+		? stripActionsLogTimestamps(logs.content)
 		: "*Logs unavailable — requires a GITHUB_TOKEN/GH_TOKEN with read access, or the run's logs have expired.*\n";
 
-	return { content: md, ok: true };
+	return { content: md, ok: true, truncated: logs?.truncated };
 }
 
 /**
@@ -633,6 +722,7 @@ export const handleGitHub: SpecialHandler = async (
 					fetchedAt,
 					notes,
 					contentType: "text/plain",
+					truncated: result.truncated,
 				});
 			}
 			break;
@@ -643,6 +733,15 @@ export const handleGitHub: SpecialHandler = async (
 			const result = await renderGitHubTree(gh, timeout, signal);
 			if (result.ok) {
 				return buildResult(result.content, { url, method: "github-tree", fetchedAt, notes });
+			}
+			break;
+		}
+
+		case "commit": {
+			notes.push(`Fetched via GitHub API`);
+			const result = await renderGitHubCommit(gh, timeout, signal);
+			if (result.ok) {
+				return buildResult(result.content, { url, method: "github-commit", fetchedAt, notes });
 			}
 			break;
 		}
@@ -693,7 +792,13 @@ export const handleGitHub: SpecialHandler = async (
 			notes.push(`Fetched via GitHub API`);
 			const result = await renderGitHubActionsJob(gh, timeout, signal);
 			if (result.ok) {
-				return buildResult(result.content, { url, method: "github-actions-job", fetchedAt, notes });
+				return buildResult(result.content, {
+					url,
+					method: "github-actions-job",
+					fetchedAt,
+					notes,
+					truncated: result.truncated,
+				});
 			}
 			break;
 		}

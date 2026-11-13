@@ -1,153 +1,277 @@
 /**
- * Zod schemas for the auth-broker wire protocol.
+ * ArkType schemas for the auth-broker wire protocol.
  *
  * Shared between the server (validates inbound request bodies) and the client
  * (validates responses from the broker). Schemas mirror the TypeScript types
  * in `./types.ts` 1:1; the types remain the source of truth for static typing,
- * and `z.infer<typeof Schema>` is asserted-compatible with them where possible.
+ * and `Type` is asserted-compatible with them where possible.
  *
- * Schemas use `.strict()` on objects with a closed set of fields so unknown
- * keys are rejected — the previous implementation used a hand-rolled
- * `hasOnlyFields` allowlist for the same effect.
+ * Envelope and fixed-shape schemas use `"+": "reject"` so unknown keys are
+ * rejected — the previous implementation used a hand-rolled `hasOnlyFields`
+ * allowlist for the same effect. The OAuth credential schema is the deliberate
+ * exception (standard type keeps extra keys): it preserves provider-specific extension fields so
+ * they round-trip through the broker instead of being dropped (see below).
  */
-import { z } from "zod/v4";
-import { REMOTE_REFRESH_SENTINEL } from "../auth-storage";
-import { usageReportSchema } from "../usage";
+import { type FluentType, type } from "@oh-my-pi/omptype";
+import {
+	type ApiKeyCredential,
+	type AuthCredential,
+	type AuthCredentialSnapshotEntry,
+	type DisabledCredentialSummary,
+	type OAuthCredential,
+	REMOTE_REFRESH_SENTINEL,
+	type RemoteOAuthCredential,
+	type SnapshotCredential,
+} from "../auth-storage";
+import type {
+	ClientUsageReportRequest,
+	ClientUsageReportResponse,
+	ClientUsageSummaryResponse,
+	CredentialBlockDeleteRequest,
+	CredentialBlockRequest,
+	CredentialBlockResponse,
+	CredentialBlockSnapshot,
+	CredentialBlocksDeleteResponse,
+	CredentialDisableResponse,
+	CredentialRefreshResponse,
+	CredentialUploadRequest,
+	CredentialUploadResponse,
+	DisabledCredentialsResponse,
+	HealthzResponse,
+	RefresherSchedule,
+	SnapshotEntry,
+	SnapshotResponse,
+	SnapshotStreamEntryEvent,
+	SnapshotStreamEvent,
+	SnapshotStreamRemovedEvent,
+	SnapshotStreamSnapshotEvent,
+	UsageHistoryResponse,
+	UsageResponse,
+	UsageStaleResponse,
+} from "./types";
 
-// ─── Credential payloads ───────────────────────────────────────────────────
+// ─── Credential payloads ─────────────────────────────────────────────────────
 
 /** Real OAuth credential (broker-side) — refresh token is the actual upstream value. */
-export const oauthCredentialSchema = z
-	.object({
-		type: z.literal("oauth"),
-		refresh: z
-			.string()
-			.min(1)
-			// Reject the sentinel literal on writes: if a client somehow round-trips
-			// a snapshot back into POST /v1/credential, accepting the sentinel as a
-			// real refresh token would silently break that credential's refresh
-			// forever (the broker would store `"__remote__"` and try to use it as
-			// the upstream refresh token).
-			.refine(value => value !== REMOTE_REFRESH_SENTINEL, {
-				message: `refresh token must not equal the remote sentinel (${REMOTE_REFRESH_SENTINEL})`,
-			}),
-		access: z.string().min(1),
-		expires: z.number(),
-		enterpriseUrl: z.string().optional(),
-		projectId: z.string().optional(),
-		email: z.string().optional(),
-		accountId: z.string().optional(),
-	})
-	.strict();
-
-/** OAuth credential as it appears in broker snapshots — refresh replaced with sentinel. */
-export const remoteOauthCredentialSchema = oauthCredentialSchema.extend({
-	refresh: z.literal(REMOTE_REFRESH_SENTINEL),
+export const oauthCredentialSchema: FluentType<OAuthCredential> = type({
+	"apiEndpoint?": "string",
+	type: "'oauth'",
+	refresh: type("string").narrow(
+		(value, ctx) =>
+			value !== REMOTE_REFRESH_SENTINEL ||
+			ctx.mustBe(`not equal to the remote sentinel (${REMOTE_REFRESH_SENTINEL})`),
+	),
+	access: type("string").atLeastLength(1),
+	expires: "number",
+	"enterpriseUrl?": "string",
+	"projectId?": "string",
+	"email?": "string",
+	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
+	"region?": "string",
+	"inferenceRegion?": "'global' | 'eu' | 'us'",
+	"activeOrganizationId?": "string",
+	"authorizedAt?": "number",
 });
 
-export const apiKeyCredentialSchema = z
-	.object({
-		type: z.literal("api_key"),
-		key: z.string().min(1),
-	})
-	.strict();
+/** OAuth credential as it appears in broker snapshots — refresh replaced with sentinel. */
+export const remoteOauthCredentialSchema: FluentType<RemoteOAuthCredential> = type({
+	"apiEndpoint?": "string",
+	type: "'oauth'",
+	refresh: type.enumerated(REMOTE_REFRESH_SENTINEL),
+	access: type("string").atLeastLength(1),
+	expires: "number",
+	"enterpriseUrl?": "string",
+	"projectId?": "string",
+	"email?": "string",
+	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
+	"region?": "string",
+	"inferenceRegion?": "'global' | 'eu' | 'us'",
+	"activeOrganizationId?": "string",
+	"authorizedAt?": "number",
+});
+
+export const apiKeyCredentialSchema: FluentType<ApiKeyCredential> = type({
+	"+": "reject",
+	type: "'api_key'",
+	key: type("string").atLeastLength(1),
+	"source?": "'login'",
+});
 
 /** Discriminated union accepted on POST /v1/credential (writes). */
-export const writableAuthCredentialSchema = z.discriminatedUnion("type", [
-	oauthCredentialSchema,
-	apiKeyCredentialSchema,
-]);
+export const writableAuthCredentialSchema: FluentType<AuthCredential> =
+	oauthCredentialSchema.or(apiKeyCredentialSchema);
 
 /** Discriminated union returned in snapshots (refresh is sentinel for OAuth). */
-export const snapshotCredentialSchema = z.discriminatedUnion("type", [
-	remoteOauthCredentialSchema,
-	apiKeyCredentialSchema,
-]);
+export const snapshotCredentialSchema: FluentType<SnapshotCredential> =
+	remoteOauthCredentialSchema.or(apiKeyCredentialSchema);
 
-// ─── Snapshot ──────────────────────────────────────────────────────────────
+// ─── Snapshot ────────────────────────────────────────────────────────────────
 
-export const credentialSnapshotEntrySchema = z
-	.object({
-		id: z.number().int(),
-		provider: z.string().min(1),
-		credential: snapshotCredentialSchema,
-		identityKey: z.string().nullable(),
-	})
-	.strict();
+export const credentialSnapshotEntrySchema: FluentType<AuthCredentialSnapshotEntry> = type({
+	"+": "reject",
+	id: "number.integer",
+	provider: type("string").atLeastLength(1),
+	credential: snapshotCredentialSchema,
+	identityKey: "string | null",
+});
 
-export const snapshotEntrySchema = credentialSnapshotEntrySchema
-	.extend({
-		rotatesInMs: z.number().nullable(),
-	})
-	.strict();
+export const credentialBlockSnapshotSchema: FluentType<CredentialBlockSnapshot> = type({
+	"+": "reject",
+	providerKey: type("string").atLeastLength(1),
+	blockScope: "string",
+	blockedUntilMs: "number",
+	"updatedAtMs?": "number",
+});
 
-export const refresherScheduleSchema = z
-	.object({
-		enabled: z.boolean(),
-		intervalMs: z.number(),
-		skewMs: z.number(),
-		nextSweepInMs: z.number(),
-	})
-	.strict();
+export const snapshotEntrySchema: FluentType<SnapshotEntry> = type({
+	"+": "reject",
+	id: "number.integer",
+	provider: type("string").atLeastLength(1),
+	credential: snapshotCredentialSchema,
+	identityKey: "string | null",
+	rotatesInMs: "number | null",
+	"blocks?": credentialBlockSnapshotSchema.array(),
+});
 
-export const snapshotResponseSchema = z
-	.object({
-		generation: z.number().int(),
-		generatedAt: z.number(),
-		serverNowMs: z.number(),
-		refresher: refresherScheduleSchema,
-		credentials: z.array(snapshotEntrySchema),
-	})
-	.strict();
+export const refresherScheduleSchema: FluentType<RefresherSchedule> = type({
+	"+": "reject",
+	enabled: "boolean",
+	intervalMs: "number",
+	skewMs: "number",
+	nextSweepInMs: "number",
+});
 
-// ─── Snapshot stream (SSE) ────────────────────────────────────────────────
+export const snapshotResponseSchema: FluentType<SnapshotResponse> = type({
+	"+": "reject",
+	generation: "number.integer",
+	generatedAt: "number",
+	serverNowMs: "number",
+	refresher: refresherScheduleSchema,
+	credentials: snapshotEntrySchema.array(),
+});
+
+// ─── Snapshot stream (SSE) ───────────────────────────────────────────────────
 
 /** First frame on connect — full snapshot embedded inline with a `kind` tag. */
-export const snapshotStreamSnapshotEventSchema = snapshotResponseSchema
-	.extend({
-		kind: z.literal("snapshot"),
-	})
-	.strict();
+export const snapshotStreamSnapshotEventSchema: FluentType<SnapshotStreamSnapshotEvent> = type({
+	"+": "reject",
+	generation: "number.integer",
+	generatedAt: "number",
+	serverNowMs: "number",
+	refresher: refresherScheduleSchema,
+	credentials: snapshotEntrySchema.array(),
+	kind: "'snapshot'",
+});
 
 /** Per-credential upsert/refresh delta. */
-export const snapshotStreamEntryEventSchema = z
-	.object({
-		kind: z.literal("entry"),
-		generation: z.number().int(),
-		serverNowMs: z.number(),
-		refresher: refresherScheduleSchema,
-		entry: snapshotEntrySchema,
-	})
-	.strict();
+export const snapshotStreamEntryEventSchema: FluentType<SnapshotStreamEntryEvent> = type({
+	"+": "reject",
+	kind: "'entry'",
+	generation: "number.integer",
+	serverNowMs: "number",
+	refresher: refresherScheduleSchema,
+	entry: snapshotEntrySchema,
+});
 
 /** Per-credential delete delta. */
-export const snapshotStreamRemovedEventSchema = z
-	.object({
-		kind: z.literal("removed"),
-		generation: z.number().int(),
-		serverNowMs: z.number(),
-		refresher: refresherScheduleSchema,
-		id: z.number().int(),
-	})
-	.strict();
+export const snapshotStreamRemovedEventSchema: FluentType<SnapshotStreamRemovedEvent> = type({
+	"+": "reject",
+	kind: "'removed'",
+	generation: "number.integer",
+	serverNowMs: "number",
+	refresher: refresherScheduleSchema,
+	id: "number.integer",
+});
 
 /** Discriminated union over every event frame the snapshot stream emits. */
-export const snapshotStreamEventSchema = z.discriminatedUnion("kind", [
-	snapshotStreamSnapshotEventSchema,
-	snapshotStreamEntryEventSchema,
-	snapshotStreamRemovedEventSchema,
-]);
+export const snapshotStreamEventSchema: FluentType<SnapshotStreamEvent> = snapshotStreamSnapshotEventSchema
+	.or(snapshotStreamEntryEventSchema)
+	.or(snapshotStreamRemovedEventSchema);
 
-// ─── Healthz ────────────────────────────────────────────────────────────────
+// ─── Healthz ─────────────────────────────────────────────────────────────────
 
-export const healthzResponseSchema = z
-	.object({
-		ok: z.boolean(),
-		version: z.string().optional(),
-	})
-	.strict();
+export const healthzResponseSchema: FluentType<HealthzResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+	"version?": "string",
+});
 
-// ─── Usage ─────────────────────────────────────────────────────────────────
+// ─── Usage ───────────────────────────────────────────────────────────────────
+
+const usageWindowSchema = type({
+	id: "string",
+	label: "string",
+	"durationMs?": "number",
+	"resetsAt?": "number",
+});
+
+const usageAmountSchema = type({
+	"used?": "number",
+	"limit?": "number",
+	"remaining?": "number",
+	"usedFraction?": "number",
+	"remainingFraction?": "number",
+	unit: "'percent' | 'tokens' | 'requests' | 'credits' | 'usd' | 'minutes' | 'bytes' | 'unknown'",
+});
+
+const usageScopeSchema = type({
+	provider: "string",
+	"accountId?": "string",
+	"projectId?": "string",
+	"orgId?": "string",
+	"modelId?": "string",
+	"tier?": "string",
+	"windowId?": "string",
+	"shared?": "boolean",
+	"sharedGroup?": "string",
+});
+
+const usageLimitSchema = type({
+	id: "string",
+	label: "string",
+	scope: usageScopeSchema,
+	"window?": usageWindowSchema,
+	amount: usageAmountSchema,
+	"status?": "'ok' | 'warning' | 'exhausted' | 'unknown'",
+	"notes?": "string[]",
+});
+
+const usageResetCreditsSchema = type({
+	availableCount: "number",
+	"redeemableCount?": "number",
+	"nextCreditId?": "string",
+	"eligible?": "boolean",
+	"reason?": "string",
+	"cooldownUntil?": "string",
+	"credits?": type({
+		"id?": "string",
+		"title?": "string",
+		"program?": "string",
+		"remainingCount?": "number",
+		"usable?": "boolean",
+		"requiresLimit?": "boolean",
+		"clears?": "string[]",
+		"blocking?": "string[]",
+		"usedFractions?": { "[string]": "number" },
+		"grantedAt?": "string",
+		"expiresAt?": "string",
+		"status?": "string",
+	}).array(),
+});
+
+const arkUsageReportSchema = type({
+	provider: "string",
+	fetchedAt: "number",
+	limits: usageLimitSchema.array(),
+	"resetCredits?": usageResetCreditsSchema,
+	"notes?": "string[]",
+	"metadata?": { "[string]": "unknown" },
+	"raw?": "unknown",
+});
 
 /**
  * Broker `/v1/usage` response. Reports are full {@link UsageReport}s minus the
@@ -155,46 +279,157 @@ export const healthzResponseSchema = z
  * keep `raw` optional in the underlying schema so a misconfigured broker that
  * forgot to strip still validates.
  */
-export const usageResponseSchema = z
-	.object({
-		generatedAt: z.number(),
-		reports: z.array(usageReportSchema),
-	})
-	.strict();
+export const usageResponseSchema: FluentType<UsageResponse> = type({
+	"+": "reject",
+	generatedAt: "number",
+	reports: arkUsageReportSchema.array(),
+});
 
-// ─── Refresh ───────────────────────────────────────────────────────────────
+const usageHistoryEntrySchema = type({
+	recordedAt: "number",
+	provider: "string",
+	accountKey: "string",
+	"email?": "string",
+	"accountId?": "string",
+	limitId: "string",
+	label: "string",
+	"windowLabel?": "string",
+	"usedFraction?": "number",
+	"status?": "'ok' | 'warning' | 'exhausted' | 'unknown'",
+	"resetsAt?": "number",
+});
 
-export const credentialRefreshResponseSchema = z
-	.object({
-		entry: credentialSnapshotEntrySchema,
-	})
-	.strict();
+/** Broker `/v1/usage/history` response — recorded usage-limit snapshots, oldest first. */
+export const usageHistoryResponseSchema: FluentType<UsageHistoryResponse> = type({
+	"+": "reject",
+	generatedAt: "number",
+	entries: usageHistoryEntrySchema.array(),
+});
 
-// ─── Disable ───────────────────────────────────────────────────────────────
+const observedUsageEntrySchema = type({
+	at: "number",
+	provider: "string",
+	model: "string",
+	requests: "number",
+	inputTokens: "number",
+	outputTokens: "number",
+	cacheReadTokens: "number",
+	cacheWriteTokens: "number",
+	costUsd: "number",
+});
 
-export const credentialDisableRequestSchema = z
-	.object({
-		cause: z.string().optional(),
-	})
-	.strict();
+/** Broker `POST /v1/usage/observed` request — one client's batched observed usage. */
+export const clientUsageReportRequestSchema: FluentType<ClientUsageReportRequest> = type({
+	"+": "reject",
+	installId: "string",
+	"hostname?": "string",
+	"app?": "string",
+	entries: observedUsageEntrySchema.array(),
+});
 
-export const credentialDisableResponseSchema = z
-	.object({
-		ok: z.boolean(),
-	})
-	.strict();
+export const clientUsageReportResponseSchema: FluentType<ClientUsageReportResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+});
 
-// ─── Upload ────────────────────────────────────────────────────────────────
+const clientUsageClientSummarySchema = type({
+	installId: "string",
+	"hostname?": "string",
+	firstSeen: "number",
+	lastSeen: "number",
+	providers: type({
+		"app?": "string",
+		provider: "string",
+		requests: "number",
+		inputTokens: "number",
+		outputTokens: "number",
+		cacheReadTokens: "number",
+		cacheWriteTokens: "number",
+		costUsd: "number",
+	}).array(),
+});
 
-export const credentialUploadRequestSchema = z
-	.object({
-		provider: z.string().min(1),
-		credential: writableAuthCredentialSchema,
-	})
-	.strict();
+/** Broker `GET /v1/usage/clients` response — per-client token burn aggregates. */
+export const clientUsageSummaryResponseSchema: FluentType<ClientUsageSummaryResponse> = type({
+	"+": "reject",
+	generatedAt: "number",
+	clients: clientUsageClientSummarySchema.array(),
+});
 
-export const credentialUploadResponseSchema = z
-	.object({
-		entries: z.array(credentialSnapshotEntrySchema),
-	})
-	.strict();
+// ─── Refresh ─────────────────────────────────────────────────────────────────
+
+export const credentialRefreshResponseSchema: FluentType<CredentialRefreshResponse> = type({
+	"+": "reject",
+	entry: credentialSnapshotEntrySchema,
+});
+
+// ─── Disable ─────────────────────────────────────────────────────────────────
+
+export const credentialDisableRequestSchema: FluentType<{ cause?: string }> = type({
+	"+": "reject",
+	"cause?": "string",
+});
+
+export const credentialDisableResponseSchema: FluentType<CredentialDisableResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+/** One disabled-credential tombstone — identity + cause, never token material. */
+export const disabledCredentialSummarySchema: FluentType<DisabledCredentialSummary> = type({
+	"+": "reject",
+	id: "number.integer",
+	provider: type("string").atLeastLength(1),
+	type: "'oauth' | 'api_key'",
+	"email?": "string",
+	"accountId?": "string",
+	"orgId?": "string",
+	"orgName?": "string",
+	cause: "string",
+	"disabledAtMs?": "number",
+});
+
+/** Broker `GET /v1/credentials/disabled` response. */
+export const disabledCredentialsResponseSchema: FluentType<DisabledCredentialsResponse> = type({
+	"+": "reject",
+	generatedAt: "number",
+	disabled: disabledCredentialSummarySchema.array(),
+});
+
+// ─── Credential blocks ───────────────────────────────────────────────────────
+
+export const credentialBlockRequestSchema: FluentType<CredentialBlockRequest> = credentialBlockSnapshotSchema;
+
+export const credentialBlockDeleteRequestSchema: FluentType<CredentialBlockDeleteRequest> = type({
+	"+": "reject",
+	providerKey: type("string").atLeastLength(1),
+	blockScope: "string",
+});
+
+export const credentialBlockResponseSchema: FluentType<CredentialBlockResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+export const credentialBlocksDeleteResponseSchema: FluentType<CredentialBlocksDeleteResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+export const usageStaleResponseSchema: FluentType<UsageStaleResponse> = type({
+	"+": "reject",
+	ok: "boolean",
+});
+
+// ─── Upload ──────────────────────────────────────────────────────────────────
+
+export const credentialUploadRequestSchema: FluentType<CredentialUploadRequest> = type({
+	"+": "reject",
+	provider: type("string").atLeastLength(1),
+	credential: writableAuthCredentialSchema,
+});
+
+export const credentialUploadResponseSchema: FluentType<CredentialUploadResponse> = type({
+	"+": "reject",
+	entries: credentialSnapshotEntrySchema.array(),
+});

@@ -2,6 +2,7 @@
  * Tool card chrome + per-tool dispatch. Works in the collab-web app and inside
  * the `<omp-tool-view>` web component embedded in HTML session exports.
  */
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { ReactNode } from "react";
 import { useState } from "react";
 import { resolveToolRenderer } from "./registry";
@@ -15,7 +16,7 @@ export interface ToolViewProps {
 	result?: ToolResultLike;
 	/** Tool is still executing (live collab view). */
 	running?: boolean;
-	/** Model-provided intent (`_i`), shown atop the body. */
+	/** Model-provided intent (`i`), shown atop the body. */
 	intent?: string;
 	/** Streaming partial output tail while running. */
 	partial?: string;
@@ -26,24 +27,42 @@ export interface ToolViewProps {
 
 function normalizeArgs(raw: unknown): { args: Record<string, unknown>; intent: string | undefined } {
 	if (!isRecord(raw)) return { args: {}, intent: undefined };
-	const intent = typeof raw._i === "string" ? raw._i.trim() : undefined;
-	if (!("_i" in raw)) return { args: raw, intent };
+	const intent = typeof raw[INTENT_FIELD] === "string" ? (raw[INTENT_FIELD] as string).trim() : undefined;
+	if (!(INTENT_FIELD in raw)) return { args: raw, intent };
 	const args: Record<string, unknown> = {};
 	for (const k in raw) {
-		if (k !== "_i") args[k] = raw[k];
+		if (k !== INTENT_FIELD) args[k] = raw[k];
 	}
 	return { args, intent };
 }
 
+interface XdevDispatch {
+	tool: string;
+	args: Record<string, unknown>;
+	inner: unknown;
+}
+
+function executeXdevDispatch(props: ToolViewProps): XdevDispatch | null {
+	if (props.name !== "write" || props.result?.isError === true || !isRecord(props.result?.details)) return null;
+	const xdev = props.result.details.xdev;
+	if (!isRecord(xdev) || xdev.mode !== "execute" || typeof xdev.tool !== "string") return null;
+	return { tool: xdev.tool, args: isRecord(xdev.args) ? xdev.args : {}, inner: xdev.inner };
+}
+
 export function ToolView(props: ToolViewProps): ReactNode {
 	const [open, setOpen] = useState(props.defaultOpen ?? false);
+	const xdev = executeXdevDispatch(props);
 	const { args, intent: argIntent } = normalizeArgs(props.args);
 	const intent = props.intent?.trim() || argIntent;
-	const renderer = resolveToolRenderer(props.name);
+	const name = xdev?.tool ?? props.name;
+	const result = xdev
+		? { content: props.result!.content, details: xdev.inner, isError: props.result!.isError }
+		: props.result;
+	const renderer = resolveToolRenderer(name);
 	const renderProps: ToolRenderProps = {
-		name: props.name,
-		args,
-		result: props.result,
+		name,
+		args: xdev?.args ?? args,
+		result,
 		running: props.running,
 		host: props.host,
 	};
@@ -66,7 +85,7 @@ export function ToolView(props: ToolViewProps): ReactNode {
 				) : (
 					<span className={`tv-status tv-status--${status}`} aria-hidden="true" />
 				)}
-				<span className="tv-name">{props.name}</span>
+				<span className="tv-name">{xdev ? `xd://${name}` : name}</span>
 				<span className="tv-sum">
 					<renderer.Summary {...renderProps} />
 				</span>

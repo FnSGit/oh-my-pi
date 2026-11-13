@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS ss_tool_calls (
     UNIQUE(session_file, call_id, seq)
 );
 CREATE INDEX IF NOT EXISTS ss_tc_tool_ts   ON ss_tool_calls(tool_name, timestamp);
+CREATE INDEX IF NOT EXISTS ss_tc_ts_tool   ON ss_tool_calls(timestamp, tool_name);
 CREATE INDEX IF NOT EXISTS ss_tc_sess_seq  ON ss_tool_calls(session_file, seq);
 
 CREATE TABLE IF NOT EXISTS ss_tool_results (
@@ -250,8 +251,12 @@ def batch_count_tokens(strings: list[str]) -> list[int]:
 _HEADER_NEW_RE = re.compile(r"^¶+\s*([^\s#¶]+)(?:#\S+)?\s*$")
 
 # Verb-based v4 (current) ops; body rows are `+TEXT` on the following lines.
-_VERB_REPLACE_RE = re.compile(r"^\s*replace\s+([1-9][0-9]*)(?:\s*(?:\.\.|-|…)\s*([1-9][0-9]*))?\s*:?\s*$")
-_VERB_DELETE_RE = re.compile(r"^\s*delete\s+([1-9][0-9]*)(?:\s*(?:\.\.|-|…)\s*([1-9][0-9]*))?\s*$")
+_VERB_REPLACE_RE = re.compile(
+    r"^\s*replace\s+([1-9][0-9]*)(?:\s*(?:\.\.|-|…)\s*([1-9][0-9]*))?\s*:?\s*$"
+)
+_VERB_DELETE_RE = re.compile(
+    r"^\s*delete\s+([1-9][0-9]*)(?:\s*(?:\.\.|-|…)\s*([1-9][0-9]*))?\s*$"
+)
 _VERB_INSERT_RE = re.compile(
     r"^\s*insert\s+(?:(?P<pos>before|after)\s+(?P<anchor>[1-9][0-9]*)|(?P<edge>head|tail))\s*:?\s*$"
 )
@@ -323,9 +328,9 @@ class EditSection:
 def parse_hashline_input(input_str: str) -> list[EditSection]:
     sections: list[EditSection] = []
     cur: EditSection | None = None
-    cur_format: str | None = None   # "hash" (¶) | "legacy" (§)
+    cur_format: str | None = None  # "hash" (¶) | "legacy" (§)
     cur_grammar: str | None = None  # within "hash": None | "verb" | "sigil"
-    open_idx: int | None = None     # current open payload block in cur
+    open_idx: int | None = None  # current open payload block in cur
 
     def open_new(s: EditSection) -> int:
         s.payload_blocks.append([])
@@ -580,6 +585,7 @@ def extract_warnings(text: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # JSONL parsing
 
+
 def parse_iso_ms(s: str | None) -> int:
     if not s:
         return 0
@@ -587,6 +593,7 @@ def parse_iso_ms(s: str | None) -> int:
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         from datetime import datetime
+
         return int(datetime.fromisoformat(s).timestamp() * 1000)
     except Exception:
         return 0
@@ -632,10 +639,12 @@ class SessionRecords:
     tool_results: list[list] = field(default_factory=list)
     assistant_msgs: list[list] = field(default_factory=list)
     user_msgs: list[list] = field(default_factory=list)
-    edit_calls: list[tuple] = field(default_factory=list)        # initial stub on toolCall
-    edit_call_results: list[tuple] = field(default_factory=list) # success+warnings on toolResult
-    edit_sections: list[tuple] = field(default_factory=list)     # one row per section
-    pending_tokens: list[tuple] = field(default_factory=list)    # (row, field_idx, text)
+    edit_calls: list[tuple] = field(default_factory=list)  # initial stub on toolCall
+    edit_call_results: list[tuple] = field(
+        default_factory=list
+    )  # success+warnings on toolResult
+    edit_sections: list[tuple] = field(default_factory=list)  # one row per section
+    pending_tokens: list[tuple] = field(default_factory=list)  # (row, field_idx, text)
     starting_seq: int = 0
     full_rebuild: bool = False
     starting_offset: int = 0
@@ -643,6 +652,66 @@ class SessionRecords:
     final_line_count: int = 0
     file_size: int = 0
     file_mtime: int = 0
+
+
+def _apply_header_event(meta: dict, ev: dict, seq: int) -> None:
+    """Fold a session-header line into `meta`.
+
+    Current sessions open with a rewritable `title` slot (seq 0) followed by
+    the `session` entry (seq 1); older files start with the `session` entry.
+    The slot title is the live one, so it wins over the header's initial title.
+    """
+    kind = ev.get("type")
+    if kind == "title" and seq == 0:
+        meta["title"] = ev.get("title")
+    elif kind == "session" and seq <= 1:
+        meta["session_uuid"] = ev.get("id")
+        meta["version"] = ev.get("version")
+        meta["title"] = meta["title"] or ev.get("title")
+        meta["cwd"] = ev.get("cwd")
+        meta["started_at"] = parse_iso_ms(ev.get("timestamp")) or None
+
+
+def backfill_session_headers(conn: sqlite3.Connection) -> None:
+    """Fill header metadata for rows synced before title-slot sessions were parsed.
+
+    Only reads the first two lines of each headerless file, so it stays cheap
+    for files that genuinely have no header.
+    """
+    rows = conn.execute(
+        "SELECT session_file FROM ss_sessions WHERE session_uuid IS NULL"
+    ).fetchall()
+    updates = []
+    for (session_file,) in rows:
+        meta = {"session_uuid": None, "version": None, "title": None, "cwd": None, "started_at": None}
+        try:
+            with open(session_file, "rb") as f:
+                for seq, raw in enumerate(f):
+                    if seq > 1:
+                        break
+                    try:
+                        _apply_header_event(meta, json.loads(raw), seq)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            continue
+        if meta["session_uuid"] is not None:
+            updates.append(
+                (
+                    meta["session_uuid"],
+                    meta["version"],
+                    meta["title"],
+                    meta["cwd"],
+                    meta["started_at"],
+                    session_file,
+                )
+            )
+    conn.executemany(
+        "UPDATE ss_sessions SET session_uuid=?, version=?, title=COALESCE(?, title), "
+        "cwd=?, started_at=COALESCE(started_at, ?) WHERE session_file=?",
+        updates,
+    )
+    print(f"-> backfilled headers:   {len(updates)}/{len(rows)}", file=sys.stderr)
 
 
 def parse_file(
@@ -693,17 +762,17 @@ def parse_file(
                 except json.JSONDecodeError:
                     seq += 1
                     continue
+                # A `\uD83D` escape without its pair decodes to a lone surrogate, which
+                # SQLite's UTF-8 encoding rejects; only such lines pay for the scrub.
+                if b"\\ud" in raw or b"\\uD" in raw:
+                    ev = _scrub_surrogates(ev)
 
                 kind = ev.get("type")
                 ts = parse_iso_ms(ev.get("timestamp"))
                 entry_id = ev.get("id")
 
-                if kind == "session" and seq == 0:
-                    rec.session_meta["session_uuid"] = ev.get("id")
-                    rec.session_meta["version"] = ev.get("version")
-                    rec.session_meta["title"] = ev.get("title")
-                    rec.session_meta["cwd"] = ev.get("cwd")
-                    rec.session_meta["started_at"] = ts or None
+                if kind in ("title", "session") and seq <= 1:
+                    _apply_header_event(rec.session_meta, ev, seq)
                 elif kind == "message":
                     msg = ev.get("message") or {}
                     role = msg.get("role")
@@ -732,6 +801,17 @@ def parse_file(
     return rec
 
 
+def _scrub_surrogates(value):
+    """`value` with every lone UTF-16 surrogate in its strings replaced by U+FFFD."""
+    if isinstance(value, str):
+        return value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    if isinstance(value, list):
+        return [_scrub_surrogates(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub_surrogates(v) for k, v in value.items()}
+    return value
+
+
 def _parse_worker(item: tuple[Path, bool, int, int]) -> SessionRecords | None:
     path, full_rebuild, start_off, start_seq = item
     return parse_file(path, start_off, start_seq, full_rebuild)
@@ -758,11 +838,21 @@ def _ingest_assistant(rec, path, seq, entry_id, ts, msg, content) -> None:
             elif isinstance(arg_obj, str):
                 arg_json = arg_obj
             else:
-                arg_json = json.dumps(arg_obj, separators=(",", ":"), ensure_ascii=False)
+                arg_json = json.dumps(
+                    arg_obj, separators=(",", ":"), ensure_ascii=False
+                )
             row = [
-                sf, seq, entry_id, call_id,
-                tool_name, raw_name, ts, model, provider,
-                arg_json, 0,
+                sf,
+                seq,
+                entry_id,
+                call_id,
+                tool_name,
+                raw_name,
+                ts,
+                model,
+                provider,
+                arg_json,
+                0,
             ]
             rec.tool_calls.append(row)
             if arg_json:
@@ -784,8 +874,16 @@ def _ingest_assistant(rec, path, seq, entry_id, ts, msg, content) -> None:
     thinking_tokens_slot = 0
     if text_blob or thinking_blob:
         row = [
-            sf, seq, entry_id, ts, model, provider,
-            text_blob, thinking_blob, text_tokens_slot, thinking_tokens_slot,
+            sf,
+            seq,
+            entry_id,
+            ts,
+            model,
+            provider,
+            text_blob,
+            thinking_blob,
+            text_tokens_slot,
+            thinking_tokens_slot,
         ]
         rec.assistant_msgs.append(row)
         if text_blob:
@@ -815,11 +913,11 @@ def _ingest_edit_call(rec, sf, seq, ts, call_id, arg_obj, arg_json) -> None:
     raw_input_len = len(input_str.encode("utf-8"))
 
     # Stub call row (success + warnings come from toolResult later).
-    rec.edit_calls.append(
-        (sf, call_id, seq, ts, raw_input_len, EDIT_PARSER_VERSION)
-    )
+    rec.edit_calls.append((sf, call_id, seq, ts, raw_input_len, EDIT_PARSER_VERSION))
 
-    if not any(line.startswith(("¶", "§")) for line in input_str.lstrip("\ufeff").splitlines()):
+    if not any(
+        line.startswith(("¶", "§")) for line in input_str.lstrip("\ufeff").splitlines()
+    ):
         # Vim-mode or other shape — no sections to record.
         return
 
@@ -848,12 +946,22 @@ def _ingest_edit_call(rec, sf, seq, ts, call_id, arg_obj, arg_json) -> None:
 
         rec.edit_sections.append(
             (
-                sf, call_id, seq, idx, sec.target_file,
-                sec.op_count, sec.deleted_lines, sec.payload_count, sec.change_size,
-                sec.min_line, sec.max_line,
+                sf,
+                call_id,
+                seq,
+                idx,
+                sec.target_file,
+                sec.op_count,
+                sec.deleted_lines,
+                sec.payload_count,
+                sec.change_size,
+                sec.min_line,
+                sec.max_line,
                 json.dumps(sec.payload_blocks, ensure_ascii=False),
                 json.dumps(sec.op_anchors, ensure_ascii=False),
-                longest_repeat_len, repeat_block_idx, sample,
+                longest_repeat_len,
+                repeat_block_idx,
+                sample,
                 json.dumps(dups, ensure_ascii=False),
                 EDIT_PARSER_VERSION,
             )
@@ -892,6 +1000,7 @@ def _ingest_user(rec, path, seq, entry_id, ts, content) -> None:
 # --------------------------------------------------------------------------- #
 # DB
 
+
 def open_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False)
@@ -904,7 +1013,9 @@ def open_db() -> sqlite3.Connection:
     return conn
 
 
-def existing_state(conn: sqlite3.Connection) -> dict[str, tuple[int, int, int, int, int]]:
+def existing_state(
+    conn: sqlite3.Connection,
+) -> dict[str, tuple[int, int, int, int, int]]:
     """{session_file: (mtime, size, byte_offset, line_count, parser_version)}"""
     rows = conn.execute(
         "SELECT session_file, mtime, size, byte_offset, line_count, parser_version "
@@ -920,9 +1031,12 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
     try:
         if rec.full_rebuild:
             for tbl in (
-                "ss_tool_calls", "ss_tool_results",
-                "ss_assistant_msgs", "ss_user_msgs",
-                "ss_edit_calls", "ss_edit_sections",
+                "ss_tool_calls",
+                "ss_tool_results",
+                "ss_assistant_msgs",
+                "ss_user_msgs",
+                "ss_edit_calls",
+                "ss_edit_sections",
             ):
                 cur.execute(f"DELETE FROM {tbl} WHERE session_file = ?", (sf,))
 
@@ -978,8 +1092,10 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
                 "ON CONFLICT(session_file, call_id) DO UPDATE SET "
                 " success=excluded.success, warnings=excluded.warnings, "
                 " parser_version=excluded.parser_version",
-                [(sf_, cid, succ, warn, EDIT_PARSER_VERSION)
-                 for (sf_, cid, succ, warn) in rec.edit_call_results],
+                [
+                    (sf_, cid, succ, warn, EDIT_PARSER_VERSION)
+                    for (sf_, cid, succ, warn) in rec.edit_call_results
+                ],
             )
         if rec.edit_sections:
             cur.executemany(
@@ -1020,10 +1136,24 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
             " schema_version=excluded.schema_version, "
             " parser_version=excluded.parser_version",
             (
-                sf, m["folder"], m["is_subagent"], m["parent_session"], m["subagent_label"],
-                m["started_at"], m["title"], m["cwd"], m["session_uuid"], m["version"],
-                rec.file_mtime, rec.file_size, rec.final_offset, rec.final_line_count,
-                now_ms, TOKENIZER_NAME, SCHEMA_VERSION, EDIT_PARSER_VERSION,
+                sf,
+                m["folder"],
+                m["is_subagent"],
+                m["parent_session"],
+                m["subagent_label"],
+                m["started_at"],
+                m["title"],
+                m["cwd"],
+                m["session_uuid"],
+                m["version"],
+                rec.file_mtime,
+                rec.file_size,
+                rec.final_offset,
+                rec.final_line_count,
+                now_ms,
+                TOKENIZER_NAME,
+                SCHEMA_VERSION,
+                EDIT_PARSER_VERSION,
             ),
         )
         cur.execute("COMMIT")
@@ -1034,6 +1164,7 @@ def write_records(conn: sqlite3.Connection, rec: SessionRecords, now_ms: int) ->
 
 # --------------------------------------------------------------------------- #
 # Driver
+
 
 def discover_sessions(root: Path, limit: int | None) -> list[Path]:
     if not root.exists():
@@ -1076,20 +1207,30 @@ def decide_action(
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=min(16, (os.cpu_count() or 4) * 2))
-    ap.add_argument("--limit", type=int, default=0,
-                    help="only sync the N most-recent files (0 = all)")
-    ap.add_argument("--full", action="store_true",
-                    help="ignore stored state, re-ingest every file from scratch")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="only sync the N most-recent files (0 = all)",
+    )
+    ap.add_argument(
+        "--full",
+        action="store_true",
+        help="ignore stored state, re-ingest every file from scratch",
+    )
     ap.add_argument("--root", default=str(SESSIONS_ROOT))
     args = ap.parse_args()
 
     root = Path(args.root).expanduser()
     print(f"-> sessions root: {root}", file=sys.stderr)
     print(f"-> db:            {DB_PATH}", file=sys.stderr)
-    print(f"-> parser_version={EDIT_PARSER_VERSION} schema_version={SCHEMA_VERSION}",
-          file=sys.stderr)
+    print(
+        f"-> parser_version={EDIT_PARSER_VERSION} schema_version={SCHEMA_VERSION}",
+        file=sys.stderr,
+    )
 
     conn = open_db()
+    backfill_session_headers(conn)
     state = existing_state(conn)
     print(f"-> known sessions in db: {len(state)}", file=sys.stderr)
 
@@ -1122,14 +1263,18 @@ def main() -> int:
             try:
                 write_records(conn, rec, now_ms)
             except Exception as e:
-                print(f"!! write failed for {rec.session_meta['session_file']}: {e}",
-                      file=sys.stderr)
+                print(
+                    f"!! write failed for {rec.session_meta['session_file']}: {e}",
+                    file=sys.stderr,
+                )
             n += 1
             now = time.monotonic()
             if now - last_log >= 1.0:
                 rate = n / max(now - t0, 1e-6)
-                print(f"   wrote {n}/{len(work)} files ({rate:.1f} files/s)",
-                      file=sys.stderr)
+                print(
+                    f"   wrote {n}/{len(work)} files ({rate:.1f} files/s)",
+                    file=sys.stderr,
+                )
                 last_log = now
         rate = n / max(time.monotonic() - t0, 1e-6)
         print(f"-> wrote {n} files total ({rate:.1f} files/s)", file=sys.stderr)

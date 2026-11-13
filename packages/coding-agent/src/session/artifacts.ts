@@ -6,6 +6,87 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { logger, toError } from "@oh-my-pi/pi-utils";
+import { replaceFileAtomically } from "../utils/atomic-file";
+
+/**
+ * Sanitize a tool name for safe use as the middle segment of the artifact
+ * filename (`${id}.${toolType}.log`). Built-in tool names are fixed, but MCP,
+ * extension, and RPC-host tool names are arbitrary and may contain path
+ * separators (`/`, `\`) or traversal sequences (`..`) that would otherwise let
+ * a spilled artifact escape the artifacts directory. Collapse everything
+ * outside `[A-Za-z0-9_-]` to `_`, and cap the length so an arbitrarily long
+ * name cannot overflow the filesystem's filename limit (ENAMETOOLONG). Fall
+ * back to `tool` when nothing survives.
+ */
+function sanitizeToolType(toolType: string): string {
+	const sanitized = toolType
+		.replace(/[^A-Za-z0-9_-]+/g, "_")
+		.slice(0, 64)
+		.replace(/^_+|_+$/g, "");
+	return sanitized.length > 0 ? sanitized : "tool";
+}
+
+/**
+ * Persist an artifact only when the filesystem confirms the complete payload is
+ * readable, then swap it into place atomically.
+ *
+ * Content is staged to a temporary sibling and verified (byte count, on-disk
+ * size, readability) before an atomic `rename` publishes it. `agent://<id>`
+ * discovers `${id}.md` by scanning the artifacts directory rather than reading
+ * `result.outputPath`, so a direct in-place write that fell short would leave a
+ * truncated file resolvable as incomplete output and a failed follow-up write
+ * would destroy the prior valid artifact. Staging keeps both hazards out: on
+ * any failure the temp file is removed and the existing artifact at `path` is
+ * untouched.
+ *
+ * Returns the verified UTF-8 byte count.
+ */
+export async function writeArtifact(path: string, content: string): Promise<number> {
+	const expectedBytes = Buffer.byteLength(content);
+	const tempPath = `${path}.tmp-${crypto.randomUUID()}`;
+	try {
+		const writtenBytes = await Bun.write(tempPath, content);
+		if (writtenBytes !== expectedBytes) {
+			throw new Error(`Artifact write incomplete: wrote ${writtenBytes} of ${expectedBytes} bytes`);
+		}
+		const file = Bun.file(tempPath);
+		if (file.size !== expectedBytes) {
+			throw new Error(`Artifact size mismatch: found ${file.size} of ${expectedBytes} bytes`);
+		}
+		await file.slice(0, Math.min(expectedBytes, 1)).arrayBuffer();
+		await replaceFileAtomically(tempPath, path);
+	} catch (error) {
+		// Best-effort cleanup: the write or publication error is the one to report.
+		await fs.rm(tempPath, { force: true }).catch(cleanupError => {
+			logger.warn("Failed to remove staged artifact", { tempPath, error: toError(cleanupError).message });
+		});
+		throw error;
+	}
+	return expectedBytes;
+}
+
+/**
+ * Artifact surface shared by a session and the subagents that adopt its
+ * manager. {@link ArtifactManager} implements it on the owning thread; a
+ * subagent worker holds a remote implementation whose ids come from the owner
+ * (`thread/services/runtime-remote.ts`), so ids stay unique across the tree.
+ */
+export interface ArtifactManagerApi {
+	/** Artifact directory path; may not exist until the first artifact is saved. */
+	readonly dir: string;
+	/** Allocate the next artifact id. */
+	allocateId(): number;
+	/** Allocate a new artifact path and id without writing content. */
+	allocatePath(toolType: string): Promise<{ id: string; path: string }>;
+	/** Save `content` as a new artifact; returns its id. */
+	save(content: string, toolType: string): Promise<string>;
+	exists(id: string): Promise<boolean>;
+	/** Every artifact file name in the directory; empty when it does not exist. */
+	listFiles(): Promise<string[]>;
+	/** Full path of an artifact file, or null when it does not exist. */
+	getPath(id: string): Promise<string | null>;
+}
 
 /**
  * Manages artifact storage for a session.
@@ -17,17 +98,27 @@ import * as path from "node:path";
  * adopted via `SessionManager.adoptArtifactManager`, so the whole parent +
  * subagent tree shares one ID space and one directory.
  */
-export class ArtifactManager {
+export class ArtifactManager implements ArtifactManagerApi {
 	#nextId = 0;
 	readonly #dir: string;
 	#dirCreated = false;
-	#initialized = false;
+	#initPromise: Promise<void> | null = null;
+	readonly #ready: Promise<void> | undefined;
+	readonly #reservedIdsDir: string | undefined;
 
 	/**
 	 * @param dir Directory that will hold artifact files. Created lazily on first save.
+	 * @param ready Settles once `dir` is seeded (a session move copying the previous
+	 *   session's artifacts in the background). Id scans and lookups wait for it,
+	 *   so new ids never collide with copied ones. Must not reject.
+	 * @param reservedIdsDir Read-only directory whose ids stay reserved: a seance
+	 *   fork allocates past its source's ids so `artifact://<n>` from the inherited
+	 *   transcript keeps naming the source artifact.
 	 */
-	constructor(dir: string) {
+	constructor(dir: string, ready?: Promise<void>, reservedIdsDir?: string) {
 		this.#dir = dir;
+		this.#ready = ready;
+		this.#reservedIdsDir = reservedIdsDir;
 	}
 
 	/**
@@ -39,14 +130,16 @@ export class ArtifactManager {
 	}
 
 	async #ensureDir(): Promise<void> {
+		await this.#ready;
 		if (!this.#dirCreated) {
 			await fs.mkdir(this.#dir, { recursive: true });
 			this.#dirCreated = true;
 		}
-		if (!this.#initialized) {
-			await this.#scanExistingIds();
-			this.#initialized = true;
-		}
+		// Memoize the first-use scan so it runs exactly once. Concurrent callers
+		// share the in-flight promise instead of each re-seeding #nextId across
+		// the readdir yield in #scanExistingIds (which would hand duplicate ids).
+		this.#initPromise ??= this.#scanExistingIds();
+		await this.#initPromise;
 	}
 
 	/**
@@ -55,6 +148,13 @@ export class ArtifactManager {
 	 */
 	async #scanExistingIds(): Promise<void> {
 		const files = await this.listFiles();
+		if (this.#reservedIdsDir) {
+			try {
+				files.push(...(await fs.readdir(this.#reservedIdsDir)));
+			} catch {
+				// A missing source artifacts dir reserves nothing.
+			}
+		}
 		let maxId = -1;
 		for (const file of files) {
 			// Files are named: {id}.{toolType}.log
@@ -83,7 +183,7 @@ export class ArtifactManager {
 	async allocatePath(toolType: string): Promise<{ id: string; path: string }> {
 		await this.#ensureDir();
 		const id = String(this.allocateId());
-		const filename = `${id}.${toolType}.log`;
+		const filename = `${id}.${sanitizeToolType(toolType)}.log`;
 		return { id, path: path.join(this.#dir, filename) };
 	}
 
@@ -96,7 +196,7 @@ export class ArtifactManager {
 	 */
 	async save(content: string, toolType: string): Promise<string> {
 		const { id, path } = await this.allocatePath(toolType);
-		await Bun.write(path, content);
+		await writeArtifact(path, content);
 		return id;
 	}
 
@@ -114,6 +214,7 @@ export class ArtifactManager {
 	 * Returns empty array if directory doesn't exist.
 	 */
 	async listFiles(): Promise<string[]> {
+		await this.#ready;
 		try {
 			return await fs.readdir(this.#dir);
 		} catch {

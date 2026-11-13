@@ -1,30 +1,39 @@
-Asks user when you need clarification or input during task execution.
+Ask the user to fill in one HTML form; blocks until they submit or cancel.
 
-<conditions>
-- Multiple approaches exist with significantly different tradeoffs user should weigh
-</conditions>
+Ask only for materially different tradeoffs the user must decide.
+Default: act using code/config/docs/history and conventions.
+Several viable choices: pick conservative/standard, proceed, state choice.
 
 <instruction>
-- Use `recommended: <index>` to mark default (0-indexed); " (Recommended)" added automatically
-- Use `questions` for multiple related questions instead of asking one at a time
-- Set `multi: true` on question to allow multiple selections
-- Use short option labels; put explanatory tradeoffs in `description` instead of merging them into the label
+- `html`: one <form> of plain semantic HTML, rendered natively in the user's terminal.
+  - NEVER <script>, <style>, style=, or buttons (<button>, type="submit"): the UI supplies Submit and Cancel.
+- Every control needs a name; the submitted form data arrives as JSON `{"name": value}`.
+- One-of: `<input type="radio">`; many-of: type="checkbox"; long lists: <select>.
+- Wrap each control in a <label>; group a question in a <fieldset> with a <legend>, or put it in a <p> right before the group.
+- Radio and checkbox groups automatically get an "Other" free-text answer. NEVER add your own "Other" option or a text field for it.
+- Preselect your recommendation with checked/selected/value: those values are submitted if the user does not answer in time.
+- Context the user needs to decide (findings, tradeoffs, diffs, drafts) goes inside the form: <p>, <ul>, <table>, <pre>.
+- Keep forms short: a few questions, 2–5 options each; ask follow-ups in a later call.
+- Answer values:
+  - radio group or <select> → the chosen value
+  - checkbox group (shared name) or <select multiple> → an array
+  - lone checkbox or radio group left unchecked → omitted
+  - type="number" → a number; text fields → their text
+  - automatic "Other" text → the radio's value, or an extra checkbox array entry
+- Free input: `<input type="text|number|date|email|url">`, <textarea>; placeholder, min/max, pattern, required are enforced.
+- Pictures: `<img src="…" alt="…">` and inline <svg> diagrams, as their own blocks.
+  - `src`: an http(s) URL, a data: URI, or a file path relative to the working directory.
+  - Inside a <label> an image shows only its alt.
+- Example, a choice with context and a number:
+```html
+<form>
+  <p>Sessions live in memory and are lost on restart.</p>
+  <fieldset>
+    <legend>Session store</legend>
+    <label><input type="radio" name="store" value="sqlite" checked> SQLite: one file, no new service</label>
+    <label><input type="radio" name="store" value="redis"> Redis: shared across instances, needs ops</label>
+  </fieldset>
+  <label>Session lifetime (days) <input type="number" name="ttl_days" value="30" min="1"></label>
+</form>
+```
 </instruction>
-
-<caution>
-- Provide 2-5 concise, distinct options
-</caution>
-
-<critical>
-- **Default to action.** Resolve ambiguity yourself using repo conventions, existing patterns, and reasonable defaults. Exhaust existing sources (code, configs, docs, history) before asking. Only ask when options have materially different tradeoffs the user must decide.
-- **If multiple choices are acceptable**, pick the most conservative/standard option and proceed; state the choice.
-- **Do NOT include "Other" option** — UI automatically adds "Other (type your own)" to every question.
-</critical>
-
-<examples>
-# Single question
-questions: [{"id": "auth_method", "question": "Which authentication method should this API use?", "options": [{"label": "JWT", "description": "Bearer tokens for stateless API clients."}, {"label": "OAuth2", "description": "Delegated authorization with external identity providers."}, {"label": "Session cookies", "description": "Browser-first authentication backed by server-side sessions."}], "recommended": 0}]
-
-# Multiple questions
-questions: [{"id": "storage_type", "question": "Which storage backend?", "options": [{"label": "SQLite"}, {"label": "PostgreSQL"}]}, {"id": "auth_method", "question": "Which auth method?", "options": [{"label": "JWT"}, {"label": "Session cookies"}]}]
-</examples>

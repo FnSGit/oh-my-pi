@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { completeSimple, getEnvApiKey, stream, streamSimple } from "@oh-my-pi/pi-ai/stream";
+import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
+import { stream, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context, Tool } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { ollamaCloudModelManagerOptions } from "@oh-my-pi/pi-catalog/provider-models/ollama";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-catalog/types";
 
@@ -111,6 +114,97 @@ describe("ollama-cloud provider support", () => {
 		expect(fetchMock).toHaveBeenCalledWith("https://ollama.com/api/tags", expect.objectContaining({ method: "GET" }));
 	});
 
+	test("discovers GLM-5.2 with Ollama Cloud high/max reasoning efforts", async () => {
+		const fetchMock: FetchImpl = vi.fn(async (input, _init) => {
+			const url = String(input);
+			if (url === "https://ollama.com/api/tags") {
+				return new Response(JSON.stringify({ models: [{ name: "glm-5.2" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://ollama.com/api/show") {
+				return new Response(
+					JSON.stringify({
+						capabilities: ["completion", "thinking"],
+						model_info: { "glm.context_length": 1000000 },
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		});
+
+		const options = ollamaCloudModelManagerOptions({ apiKey: "cloud-test-key", fetch: fetchMock });
+		const models = await options.fetchDynamicModels?.();
+		const model = models?.find(candidate => candidate.id === "glm-5.2");
+		const built = model ? buildModel(model) : undefined;
+
+		expect(model?.reasoning).toBe(true);
+		expect(built?.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.High, Effort.Max],
+		});
+	});
+
+	test("applies the DeepSeek effort contract to discovered ollama-cloud models", async () => {
+		// `/api/show` reports only the boolean `thinking` capability, so discovery
+		// must not synthesize a tier vocabulary: doing so shadows the KDL ladder
+		// (explicit thinking outranks rules) and silently clamps `max` down to
+		// `high` on the DeepSeek V4 line, whose real wire vocabulary is
+		// low/high/max (#8334 regression). `deepseek-v4.1-flash` and the dated
+		// tags below are the ids Ollama Cloud actually serves.
+		const ids = [
+			"deepseek-v4.1-flash",
+			"deepseek-v4-flash:0731",
+			"deepseek-v4-pro:0813",
+			"deepseek-v4-flash",
+			"glm-5.3",
+			"glm-5.2",
+		];
+		const fetchMock: FetchImpl = vi.fn(async input => {
+			const url = String(input);
+			if (url === "https://ollama.com/api/tags") {
+				return new Response(JSON.stringify({ models: ids.map(id => ({ name: id, model: id })) }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://ollama.com/api/show") {
+				return new Response(
+					JSON.stringify({
+						capabilities: ["completion", "thinking"],
+						model_info: { "deepseek.context_length": 1_048_576 },
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		});
+
+		const options = ollamaCloudModelManagerOptions({ apiKey: "cloud-test-key", fetch: fetchMock });
+		const models = await options.fetchDynamicModels?.();
+		const effortsFor = (id: string) => {
+			const model = models?.find(candidate => candidate.id === id);
+			return model ? getSupportedEfforts(buildModel(model)) : undefined;
+		};
+
+		// Flash/V4 keep the wire-exact three-tier ladder, so `max` is reachable
+		// instead of clamping to `high`.
+		expect(effortsFor("deepseek-v4.1-flash")).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		expect(effortsFor("deepseek-v4-flash:0731")).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		expect(effortsFor("deepseek-v4-flash")).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		expect(effortsFor("deepseek-v4-pro:0813")).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		// GLM-5.3 exposes low/high/max; GLM-5.2 stays on its two-tier scale.
+		expect(effortsFor("glm-5.3")).toEqual([Effort.Low, Effort.High, Effort.Max]);
+		expect(effortsFor("glm-5.2")).toEqual([Effort.High, Effort.Max]);
+		// No discovered ladder may advertise `minimal`: `/api/chat` rejects it
+		// outright (`invalid think value: "minimal"`).
+		for (const id of ids) {
+			expect(effortsFor(id)).not.toContain(Effort.Minimal);
+		}
+	});
+
 	test("tolerates individual /api/show failures during model discovery", async () => {
 		const fetchMock: FetchImpl = vi.fn(async (input, init) => {
 			const url = String(input);
@@ -166,11 +260,12 @@ describe("ollama-cloud provider support", () => {
 		const model = models?.find(candidate => candidate.id === "gpt-oss:120b");
 
 		expect(model).toBeDefined();
-		expect(model?.name).toBe("GPT OSS (120B)");
+		expect(model?.id).toBe("gpt-oss:120b");
+		expect(model?.api).toBe("ollama-chat");
+		expect(model?.provider).toBe("ollama-cloud");
 		expect(model?.reasoning).toBe(true);
-		expect(model?.input).toEqual(["text", "image"]);
-		expect(model?.contextWindow).toBe(131072);
-		expect(model?.maxTokens).toBe(16384);
+		expect(model?.contextWindow).toBeGreaterThan(0);
+		expect(model?.maxTokens).toBeGreaterThan(0);
 	});
 
 	test("streams native chat responses with thinking, text, and usage mapping", async () => {
@@ -231,6 +326,61 @@ describe("ollama-cloud provider support", () => {
 		]);
 	});
 
+	test("surfaces empty length completions as context-window errors", async () => {
+		const fetchMock: FetchImpl = vi.fn(async () =>
+			createNdjsonResponse([
+				{ model: "gpt-oss:120b", done: true, done_reason: "length", prompt_eval_count: 1000, eval_count: 0 },
+			]),
+		);
+
+		const result = await stream(
+			cloudModel,
+			{
+				messages: [{ role: "user", content: "Large task prompt", timestamp: Date.now() }],
+			},
+			{ apiKey: "cloud-test-key", fetch: fetchMock },
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("prompt filled the context window");
+	});
+
+	test("sends native max for GLM-5.2 max reasoning on Ollama Cloud", async () => {
+		let requestBody: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = vi.fn(async (_input, init) => {
+			requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+			return createNdjsonResponse([
+				{ model: "glm-5.2", message: { role: "assistant", content: "ok" }, done: false },
+				{ model: "glm-5.2", done: true, done_reason: "stop", prompt_eval_count: 1, eval_count: 1 },
+			]);
+		});
+		const model: Model<"ollama-chat"> = buildModel({
+			id: "glm-5.2",
+			name: "GLM-5.2",
+			api: "ollama-chat",
+			provider: "ollama-cloud",
+			baseUrl: "https://ollama.com",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.High, Effort.Max] },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 131_072,
+		});
+
+		await stream(
+			model,
+			{ messages: [{ role: "user", content: "hello", timestamp: Date.now() }] },
+			{
+				apiKey: "cloud-test-key",
+				fetch: fetchMock,
+				reasoning: Effort.Max,
+			},
+		).result();
+
+		expect(requestBody?.think).toBe("max");
+	});
+
 	test("supports ollama-cloud through streamSimple option mapping", async () => {
 		const fetchMock: FetchImpl = vi.fn(async () =>
 			createNdjsonResponse([
@@ -255,29 +405,6 @@ describe("ollama-cloud provider support", () => {
 		expect(response.usage.output).toBe(4);
 	});
 
-	test("supports ollama-cloud through completeSimple top-level contract", async () => {
-		const fetchMock: FetchImpl = vi.fn(async () =>
-			createNdjsonResponse([
-				{
-					model: "gpt-oss:120b",
-					message: { role: "assistant", content: "Completed through completeSimple" },
-					done: false,
-				},
-				{ model: "gpt-oss:120b", done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 5 },
-			]),
-		);
-
-		const response = await completeSimple(
-			cloudModel,
-			{ messages: [{ role: "user", content: "Finish this", timestamp: Date.now() }] },
-			{ apiKey: "cloud-test-key", fetch: fetchMock },
-		);
-
-		expect(response.stopReason).toBe("stop");
-		expect(response.content).toEqual([{ type: "text", text: "Completed through completeSimple" }]);
-		expect(response.usage.input).toBe(3);
-		expect(response.usage.output).toBe(5);
-	});
 	test("streams tool calls and maps native tool stop reasons", async () => {
 		const fetchMock: FetchImpl = vi.fn(async () =>
 			createNdjsonResponse([

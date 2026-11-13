@@ -1,18 +1,27 @@
 # @oh-my-pi/pi-coding-agent
 
-Core implementation package for the `omp` coding agent in the `oh-my-pi` monorepo.
+Core implementation package for the `omp` coding agent in the `omp` monorepo.
 
 For installation, setup, provider configuration, model roles, slash commands, and full CLI reference, see:
+
 - [Monorepo README (local)](../../README.md)
 - [Monorepo README (GitHub)](https://github.com/can1357/oh-my-pi#readme)
 
 Package-specific references:
+
 - [CHANGELOG](./CHANGELOG.md)
 - [MCP configuration guide](../../docs/mcp-config.md)
 - [MCP runtime lifecycle](../../docs/mcp-runtime-lifecycle.md)
 - [MCP server/tool authoring](../../docs/mcp-server-tool-authoring.md)
 - [DEVELOPMENT](./DEVELOPMENT.md)
-- [RenderMermaid guide](../../docs/render-mermaid.md)
+
+## Bash visualization
+
+Embedded-shell calls default to Python-like **Pseudo**; switch to **Raw** for the original command. Syntax appears incrementally as the shell compiles it. Active commands retain their colors while inactive code fades; only failures get `×`. Values appear beside each variable's latest observed setter.
+
+In Tern, the toggle and menu stay in the command segment; replay controls live in the inspector. In the inspector, `v` toggles Raw/Pseudo; `c/i/d/e/u` toggle color, inline variables, idioms, effects and embedded programs; `s` splits original/Pseudo. Space plays or pauses retained execution, arrows step, `r` resets, `l` returns live, and `−/+` changes speed. Escape closes.
+
+Replay retains up to 20,000 records, 2 MiB output and 8 MiB payload; evictions are indicated. Effect badges are heuristic, not safety guarantees. Remote-script interiors are marked untraced; PTY/user-shell calls keep their plain command view.
 
 ## Memory backends
 
@@ -33,4 +42,17 @@ The agent supports three mutually-exclusive memory backends, selected via the `m
    - `HINDSIGHT_RECALL_BUDGET`, `HINDSIGHT_RECALL_MAX_TOKENS` — recall sizing
    - `HINDSIGHT_BANK_MISSION`, `HINDSIGHT_DEBUG`
 
-Switching backends mid-session is honoured on the next system-prompt rebuild and the next `/memory` slash command. Existing users with `memories.enabled = true|false` are migrated to `memory.backend = "local"|"off"` exactly once on first launch.
+Switching backends mid-session immediately replaces the live backend, memory tools, listeners, and system-prompt context. Existing users with `memories.enabled = true|false` are migrated to `memory.backend = "local"|"off"` exactly once on first launch; afterward, `memory.backend` is the sole runtime selector.
+
+### Mnemopi memory index and pi-memory migration
+
+`mnemopi.indexInjection` (default off) appends a compact, quota-bounded index of remembered facts to the system prompt, similar to pi-memory's `<user_memory>` catalog. Tune it with `mnemopi.indexInjectionPrefs`, `mnemopi.indexInjectionKnowledge`, `mnemopi.indexInjectionProject`, `mnemopi.indexInjectionChars`, and `mnemopi.indexInjectionTokenLimit`; entries carry an 8-character id prefix for the follow-up `recall` or `memory://<id>` read.
+
+pi-memory's JSON sidecars can be imported into Mnemopi's shared and per-project banks:
+
+```sh
+bun packages/coding-agent/scripts/migrate-pi-memory.ts            # dry run
+bun packages/coding-agent/scripts/migrate-pi-memory.ts --apply    # write (stop omp first)
+```
+
+The importer preserves the original id, type, tags, timestamps, hit counts, and review status in `metadata`, uses `trustTier: "IMPORTED"` so working-memory TTL does not discard old rows, and re-embeds every entry with Mnemopi's configured model. Use `--scoping per-project-tagged` (the default) to keep preference/knowledge in the shared bank and project facts in their cwd-derived bank; `--no-embeddings` performs an FTS-only trial import.

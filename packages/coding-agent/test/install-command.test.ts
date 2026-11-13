@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { commands, isSubcommand, resolveCliArgv } from "@oh-my-pi/pi-coding-agent/cli-commands";
 import { looksLikeLocalPath } from "@oh-my-pi/pi-coding-agent/commands/install";
+import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("install command is registered as a top-level subcommand", () => {
 	test("CLI runner sees `install` as a known command", () => {
@@ -61,15 +62,12 @@ describe("looksLikeLocalPath", () => {
 
 	test("bare names that exist as a local directory are treated as local", () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-install-test-"));
-		const cwd = process.cwd();
 		try {
-			process.chdir(tempDir);
 			fs.mkdirSync(path.join(tempDir, "vendored-ext"));
-			expect(looksLikeLocalPath("vendored-ext")).toBe(true);
-			expect(looksLikeLocalPath("missing-pkg")).toBe(false);
+			expect(looksLikeLocalPath("vendored-ext", tempDir)).toBe(true);
+			expect(looksLikeLocalPath("missing-pkg", tempDir)).toBe(false);
 		} finally {
-			process.chdir(cwd);
-			fs.rmSync(tempDir, { recursive: true, force: true });
+			removeSyncWithRetries(tempDir);
 		}
 	});
 });

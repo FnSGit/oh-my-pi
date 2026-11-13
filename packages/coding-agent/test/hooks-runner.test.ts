@@ -10,7 +10,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import type { ContextEventResult, LoadedHook } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/loader";
+import type { ContextEventResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { LoadedHook } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/loader";
 import { HookRunner } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/runner";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";

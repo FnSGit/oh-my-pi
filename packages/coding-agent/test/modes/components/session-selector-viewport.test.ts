@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { SessionSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/session-selector";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionSelectorComponent } from "@oh-my-pi/pi-tui/overlays/session-selector";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 
 beforeAll(() => {
 	initTheme();
@@ -24,7 +24,7 @@ function makeTitledSessions(count: number): SessionInfo[] {
 	}));
 }
 
-function makeSelector(rows: number): SessionSelectorComponent {
+function makeSelector(rows: number): SessionSelectorComponent<SessionInfo> {
 	return new SessionSelectorComponent(
 		makeTitledSessions(50),
 		() => {},

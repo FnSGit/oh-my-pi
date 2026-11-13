@@ -1,5 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { type TerminalFrameProvider, TUI } from "@oh-my-pi/pi-tui";
 import { emergencyTerminalRestore, ProcessTerminal, setAltScreenActive } from "@oh-my-pi/pi-tui/terminal";
+import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
 
 // Regression coverage for the Windows shell-handoff corruption on exit:
 // `emergencyTerminalRestore()` used to write DECRST 1049 ("leave alternate
@@ -16,6 +18,11 @@ import { emergencyTerminalRestore, ProcessTerminal, setAltScreenActive } from "@
 const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
+// This suite asserts the real emergencyTerminalRestore() write path, so it opts
+// out of the test-default headless suppression. Restored in afterEach (not the
+// helper) so the blind restore branch — gated on !isTerminalHeadless() — still
+// runs while the test drives emergencyTerminalRestore() after terminal.stop().
+let previousHeadless = false;
 
 function restoreProperty(target: object, key: string, descriptor: PropertyDescriptor | undefined): void {
 	if (descriptor) {
@@ -39,7 +46,8 @@ function startCapturedTerminal() {
 		return true;
 	});
 
-	const terminal = new ProcessTerminal();
+	// conpty: false keeps kitty flags at >5u regardless of ambient WSL env.
+	const terminal = new ProcessTerminal({ conpty: false });
 	terminal.start(
 		() => {},
 		() => {},
@@ -48,8 +56,13 @@ function startCapturedTerminal() {
 }
 
 describe("emergencyTerminalRestore alt-screen gating", () => {
+	beforeEach(() => {
+		previousHeadless = setTerminalHeadless(false);
+	});
+
 	afterEach(() => {
 		setAltScreenActive(false);
+		setTerminalHeadless(previousHeadless);
 		vi.restoreAllMocks();
 		restoreProperty(process.stdin, "isTTY", stdinIsTtyDescriptor);
 		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
@@ -65,6 +78,9 @@ describe("emergencyTerminalRestore alt-screen gating", () => {
 
 		const restored = writes.join("");
 		expect(restored).not.toContain("\x1b[?1049l");
+		expect(restored).toContain("\x1b[?1006l");
+		expect(restored).toContain("\x1b[?1003l");
+		expect(restored).toContain("\x1b[?1000l");
 		// Still performs the blind restore itself (cursor visibility proves the branch ran).
 		expect(restored).toContain("\x1b[?25h");
 	});
@@ -76,7 +92,13 @@ describe("emergencyTerminalRestore alt-screen gating", () => {
 
 		writes.length = 0;
 		emergencyTerminalRestore();
-		expect(writes.join("")).toContain("\x1b[?1049l");
+		const firstRestore = writes.join("");
+		expect(firstRestore).toContain("\x1b[?1049l");
+		const altExit = firstRestore.indexOf("\x1b[?1049l");
+		expect(firstRestore.indexOf("\x1b[<u", altExit + 1)).toBeGreaterThan(altExit);
+		expect(firstRestore).toContain("\x1b[?1006l");
+		expect(firstRestore).toContain("\x1b[?1003l");
+		expect(firstRestore).toContain("\x1b[?1000l");
 
 		// State was consumed: a second restore must not leave the (now main) buffer again.
 		writes.length = 0;
@@ -88,12 +110,72 @@ describe("emergencyTerminalRestore alt-screen gating", () => {
 		const inactive = startCapturedTerminal();
 		inactive.writes.length = 0;
 		emergencyTerminalRestore(); // activeTerminal set, alt screen never entered
-		expect(inactive.writes.join("")).not.toContain("\x1b[?1049l");
+		const inactiveRestore = inactive.writes.join("");
+		expect(inactiveRestore).not.toContain("\x1b[?1049l");
+		expect(inactiveRestore).toContain("\x1b[?1006l");
+		expect(inactiveRestore).toContain("\x1b[?1003l");
+		expect(inactiveRestore).toContain("\x1b[?1000l");
 
 		const active = startCapturedTerminal();
 		setAltScreenActive(true);
 		active.writes.length = 0;
 		emergencyTerminalRestore();
-		expect(active.writes.join("")).toContain("\x1b[?1049l");
+		const activeRestore = active.writes.join("");
+		expect(activeRestore).toContain("\x1b[?1049l");
+		expect(activeRestore).toContain("\x1b[?1006l");
+		expect(activeRestore).toContain("\x1b[?1003l");
+		expect(activeRestore).toContain("\x1b[?1000l");
+	});
+	it("restores the alternate screen when a deferred replacement paint throws", () => {
+		const { writes, terminal } = startCapturedTerminal();
+		let failReplacement = false;
+		const provider: TerminalFrameProvider = {
+			renderFrame: () => {
+				if (failReplacement) throw new Error("replacement failed");
+				return { viewport: ["old session"] };
+			},
+			acknowledgeHistory: () => {},
+		};
+		const immediateScheduler = {
+			now: () => 0,
+			scheduleImmediate: (callback: () => void) => callback(),
+			scheduleRender: (callback: () => void) => {
+				callback();
+				return { cancel() {} };
+			},
+		};
+		const tui = new TUI(terminal, undefined, { renderScheduler: immediateScheduler });
+		tui.setFrameProvider(provider);
+		const overlay = tui.showOverlay(
+			{ render: () => ["session selector"] },
+			{ fullscreen: true, width: "100%", maxHeight: "100%" },
+		);
+		tui.requestRender(true, { clearScrollback: true });
+		failReplacement = true;
+
+		expect(() => overlay.hide()).toThrow("replacement failed");
+		writes.length = 0;
+		emergencyTerminalRestore();
+
+		expect(writes.join("")).toContain("\x1b[?1049l");
+	});
+	it("pops keyboard enhancement frames on both screens when crashing from a fullscreen overlay", () => {
+		const { terminal, writes } = startCapturedTerminal();
+		process.stdin.emit("data", "\x1b[?0u");
+		expect(terminal.kittyEnableSequence).toBe("\x1b[>5u");
+
+		terminal.write(`\x1b[?1049h${terminal.kittyEnableSequence}`);
+		setAltScreenActive(true);
+		writes.length = 0;
+
+		emergencyTerminalRestore();
+
+		const restored = writes.join("");
+		const altPop = restored.indexOf("\x1b[<u");
+		const altExit = restored.indexOf("\x1b[?1049l");
+		const mainPop = restored.indexOf("\x1b[<u", altExit + 1);
+		expect(altPop).toBeGreaterThanOrEqual(0);
+		expect(altPop).toBeLessThan(altExit);
+		expect(mainPop).toBeGreaterThan(altExit);
 	});
 });

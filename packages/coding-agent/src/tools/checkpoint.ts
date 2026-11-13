@@ -1,11 +1,11 @@
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
 import checkpointDescription from "../prompts/tools/checkpoint.md" with { type: "text" };
 import rewindDescription from "../prompts/tools/rewind.md" with { type: "text" };
 import type { ToolSession } from ".";
-import type { OutputMeta } from "./output-meta";
-import { ToolError } from "./tool-errors";
+import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 
 export interface CheckpointState {
@@ -17,17 +17,26 @@ export interface CheckpointState {
 	startedAt: string;
 }
 
-const checkpointSchema = z.object({
-	goal: z.string().describe("investigation goal"),
+export interface CompletedRewindState {
+	/** Report retained after a successful rewind. */
+	report: string;
+	/** Timestamp for the checkpoint that was rewound. */
+	startedAt: string;
+	/** Timestamp when the rewind completed. */
+	rewoundAt: string;
+}
+
+const checkpointSchema = type({
+	goal: type("string").describe("investigation goal"),
 });
 
-type CheckpointParams = z.infer<typeof checkpointSchema>;
+type CheckpointParams = typeof checkpointSchema.infer;
 
-const rewindSchema = z.object({
-	report: z.string().describe("investigation findings"),
+const rewindSchema = type({
+	report: type("string").describe("investigation findings"),
 });
 
-type RewindParams = z.infer<typeof rewindSchema>;
+type RewindParams = typeof rewindSchema.infer;
 
 export interface CheckpointToolDetails {
 	goal: string;
@@ -39,11 +48,6 @@ export interface RewindToolDetails {
 	report: string;
 	rewound: boolean;
 	meta?: OutputMeta;
-}
-
-function isTopLevelSession(session: ToolSession): boolean {
-	const depth = session.taskDepth;
-	return depth === undefined || depth === 0;
 }
 
 export class CheckpointTool implements AgentTool<typeof checkpointSchema, CheckpointToolDetails> {
@@ -62,7 +66,6 @@ export class CheckpointTool implements AgentTool<typeof checkpointSchema, Checkp
 	}
 
 	static createIf(session: ToolSession): CheckpointTool | null {
-		if (!isTopLevelSession(session)) return null;
 		return new CheckpointTool(session);
 	}
 
@@ -73,21 +76,12 @@ export class CheckpointTool implements AgentTool<typeof checkpointSchema, Checkp
 		_onUpdate?: AgentToolUpdateCallback<CheckpointToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<CheckpointToolDetails>> {
-		if (!isTopLevelSession(this.session)) {
-			throw new ToolError("Checkpoint not available in subagents.");
-		}
 		if (this.session.getCheckpointState?.()) {
 			throw new ToolError("Checkpoint already active.");
 		}
 		const startedAt = new Date().toISOString();
 		return toolResult<CheckpointToolDetails>({ goal: params.goal, startedAt })
-			.text(
-				[
-					"Checkpoint created.",
-					`Goal: ${params.goal}`,
-					"Run your investigation, then call rewind with a concise report.",
-				].join("\n"),
-			)
+			.text([`Checkpoint: ${params.goal}`, "Finish exploration and formulate findings."].join("\n"))
 			.done();
 	}
 }
@@ -108,7 +102,6 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 	}
 
 	static createIf(session: ToolSession): RewindTool | null {
-		if (!isTopLevelSession(session)) return null;
 		return new RewindTool(session);
 	}
 
@@ -119,11 +112,13 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 		_onUpdate?: AgentToolUpdateCallback<RewindToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<RewindToolDetails>> {
-		if (!isTopLevelSession(this.session)) {
-			throw new ToolError("Checkpoint not available in subagents.");
-		}
 		if (!this.session.getCheckpointState?.()) {
-			throw new ToolError("No active checkpoint.");
+			if (this.session.getLastCompletedRewind?.()) {
+				throw new ToolError(
+					"Checkpoint already completed; continue from the retained rewind report instead of calling rewind again.",
+				);
+			}
+			throw new ToolError("No active checkpoint. Create a checkpoint before calling rewind.");
 		}
 		const report = params.report.trim();
 		if (report.length === 0) {

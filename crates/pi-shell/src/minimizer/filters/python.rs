@@ -2,7 +2,7 @@
 //!
 //! Ported from rtk-ai/rtk@878af7de99e0ba71da2e8fd996f6b52a1836e06c
 //! Path: `src/cmds/python/pytest_cmd.rs`
-//! License: MIT (compatible with workspace MIT). See `ATTRIBUTION-RTK.md` at
+//! License: MIT (compatible with workspace MIT). See `NOTICE` at
 //! the `pi-shell` crate root.
 //!
 //! The pytest state machine (`filter_pytest`, `pytest_success`,
@@ -13,6 +13,8 @@
 //! fall through unchanged (RTK's defensive default), so xdist `[gwN]`
 //! prefixes and custom reporters never cause data loss.
 
+use std::fmt::NumBuffer;
+
 use super::lint;
 use crate::minimizer::{MinimizerCtx, MinimizerOutput, primitives};
 
@@ -20,9 +22,9 @@ use crate::minimizer::{MinimizerCtx, MinimizerOutput, primitives};
 /// sections). Mirrors RTK's `MAX_PYTEST_FAILURES` (== `CAP_WARNINGS` == 10),
 /// re-derived for the minimizer's streaming, line-based renderer: once this
 /// many traceback blocks have been emitted, further blocks are suppressed and
-/// a single `+N more failures` overflow marker stands in for the remainder.
-/// The compact `FAILED …` short-summary one-liners are NOT capped here — they
-/// name every failed test cheaply and stay intact.
+/// a single `[…N failures elided…]` overflow marker stands in for the
+/// remainder. The compact `FAILED …` short-summary one-liners are NOT capped
+/// here — they name every failed test cheaply and stay intact.
 ///
 /// The `=== ERRORS ===` section (collection / fixture-setup errors) is capped
 /// by a SEPARATE counter (see `filter_pytest`): pytest renders ERRORS *before*
@@ -99,7 +101,7 @@ fn filter_pytest(input: &str, exit_code: i32) -> String {
 		if is_pytest_summary_header(trimmed) {
 			in_failure = false;
 			suppressing = false;
-			push_line(&mut out, line);
+			primitives::push_line(&mut out, line);
 			continue;
 		}
 		if is_pytest_summary_line(trimmed) {
@@ -115,7 +117,7 @@ fn filter_pytest(input: &str, exit_code: i32) -> String {
 		if trimmed.starts_with("XFAIL ") || trimmed.starts_with("XPASS ") {
 			in_failure = false;
 			suppressing = false;
-			push_line(&mut out, line);
+			primitives::push_line(&mut out, line);
 			continue;
 		}
 
@@ -135,7 +137,7 @@ fn filter_pytest(input: &str, exit_code: i32) -> String {
 				suppressing = failure_blocks > MAX_PYTEST_FAILURES;
 			}
 			if !suppressing {
-				push_line(&mut out, line);
+				primitives::push_line(&mut out, line);
 			}
 			continue;
 		}
@@ -147,7 +149,7 @@ fn filter_pytest(input: &str, exit_code: i32) -> String {
 			// dropped too. (`FAILED ` short-summary lines only appear after the
 			// summary header has cleared `suppressing`, so they stay.)
 			if !suppressing {
-				push_line(&mut out, line);
+				primitives::push_line(&mut out, line);
 			}
 			continue;
 		}
@@ -158,13 +160,13 @@ fn filter_pytest(input: &str, exit_code: i32) -> String {
 				continue;
 			}
 			if !suppressing && !is_pytest_pass_noise(trimmed) {
-				push_line(&mut out, line);
+				primitives::push_line(&mut out, line);
 			}
 			continue;
 		}
 
 		if trimmed.starts_with("FAILED ") || trimmed.starts_with("ERROR ") {
-			push_line(&mut out, line);
+			primitives::push_line(&mut out, line);
 		}
 	}
 
@@ -172,18 +174,18 @@ fn filter_pytest(input: &str, exit_code: i32) -> String {
 	// overflow markers so the compact output reads top-to-bottom.
 	let error_overflow = error_blocks.saturating_sub(MAX_PYTEST_FAILURES);
 	if error_overflow > 0 {
-		out.push_str("… +");
-		out.push_str(&error_overflow.to_string());
-		out.push_str(" more errors\n");
+		out.push_str("[…");
+		out.push_str(error_overflow.format_into(&mut NumBuffer::new()));
+		out.push_str(" errors elided…]\n");
 	}
 	let overflow = failure_blocks.saturating_sub(MAX_PYTEST_FAILURES);
 	if overflow > 0 {
-		out.push_str("… +");
-		out.push_str(&overflow.to_string());
-		out.push_str(" more failures\n");
+		out.push_str("[…");
+		out.push_str(overflow.format_into(&mut NumBuffer::new()));
+		out.push_str(" failures elided…]\n");
 	}
 
-	if has_content(&out) {
+	if primitives::has_content(&out) {
 		out
 	} else {
 		primitives::head_tail_lines(input, 80, 80)
@@ -197,8 +199,8 @@ fn pytest_success(input: &str) -> String {
 	for line in input.lines() {
 		let trimmed = line.trim();
 		if is_pytest_summary_header(trimmed) {
-			push_line(&mut summary, line);
-			push_line(&mut out, line);
+			primitives::push_line(&mut summary, line);
+			primitives::push_line(&mut out, line);
 			continue;
 		}
 		if is_pytest_summary_line(trimmed) {
@@ -209,12 +211,12 @@ fn pytest_success(input: &str) -> String {
 		if is_pytest_pass_noise(trimmed) {
 			continue;
 		}
-		push_line(&mut out, line);
+		primitives::push_line(&mut out, line);
 	}
 
-	if has_content(&out) {
+	if primitives::has_content(&out) {
 		out
-	} else if has_content(&summary) {
+	} else if primitives::has_content(&summary) {
 		summary
 	} else {
 		primitives::head_tail_lines(input, 0, 20)
@@ -369,11 +371,11 @@ fn filter_ruff_format(input: &str) -> String {
 			continue;
 		}
 		if is_ruff_format_line(trimmed) {
-			push_line(&mut out, line);
+			primitives::push_line(&mut out, line);
 		}
 	}
 
-	if has_content(&out) {
+	if primitives::has_content(&out) {
 		out
 	} else {
 		primitives::head_tail_lines(input, 80, 80)
@@ -394,19 +396,10 @@ fn is_ruff_format_line(trimmed: &str) -> bool {
 		|| trimmed.contains(" files already formatted")
 }
 
-fn push_line(out: &mut String, line: &str) {
-	out.push_str(line);
-	out.push('\n');
-}
-
 fn push_pytest_summary_line(out: &mut String, trimmed: &str) {
 	out.push_str("pytest: ");
 	out.push_str(compact_pytest_summary_line(trimmed));
 	out.push('\n');
-}
-
-fn has_content(text: &str) -> bool {
-	text.lines().any(|line| !line.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -575,7 +568,7 @@ mod tests {
 		assert!(out.contains("test_case_0"), "got: {out}");
 		assert!(out.contains("test_case_9"), "got: {out}");
 		// The overflow marker accounts for the remaining 2 verbose blocks.
-		assert!(out.contains("… +2 more failures"), "got: {out}");
+		assert!(out.contains("[…2 failures elided…]"), "got: {out}");
 		// The traceback bodies for the capped blocks are gone, but the compact
 		// short-summary one-liners for every test survive uncapped.
 		let assert_false_lines = out.matches("E       assert False").count();
@@ -664,18 +657,19 @@ mod tests {
 		let assert_lines = out.matches("E   assert 0 == 100").count();
 		assert_eq!(assert_lines, 5, "all 5 assertion bodies must survive: {out}");
 		// 5 < cap, so there is NO failure overflow stealing real tracebacks.
-		assert!(!out.contains("more failures"), "no failures should be capped: {out}");
+		assert!(!out.contains("failures elided"), "no failures should be capped: {out}");
 		// Collection errors are still surfaced (under their own cap of 10).
 		assert!(out.contains("ERROR collecting tests/test_imp_0.py"), "got: {out}");
-		assert!(!out.contains("more errors"), "9 errors < cap, no error overflow: {out}");
+		assert!(!out.contains("errors elided"), "9 errors < cap, no error overflow: {out}");
 		assert!(out.contains("pytest: 5 failed, 9 errors"), "got: {out}");
 	}
 
 	#[test]
 	fn pytest_caps_error_blocks_independently_of_failures() {
 		// 12 collection-error banners (ERRORS section) exceed the cap and yield
-		// their OWN `+N more errors` marker, while the 2 real failure tracebacks
-		// in the FAILURES section are untouched (their counter is separate).
+		// their OWN `[…N errors elided…]` marker, while the 2 real failure
+		// tracebacks in the FAILURES section are untouched (their counter is
+		// separate).
 		let mut input = String::from(
 			"============================= test session starts \
 			 =============================\ncollected 2 items / 12 \
@@ -706,9 +700,9 @@ mod tests {
 		let out = filter_pytest(&input, 1);
 
 		// Error overflow marker fires for the 2 capped collection banners…
-		assert!(out.contains("… +2 more errors"), "got: {out}");
+		assert!(out.contains("[…2 errors elided…]"), "got: {out}");
 		// …but NOT a failure overflow — both real tracebacks render in full.
-		assert!(!out.contains("more failures"), "failures must be uncapped here: {out}");
+		assert!(!out.contains("failures elided"), "failures must be uncapped here: {out}");
 		assert!(out.contains("test_real_0"), "got: {out}");
 		assert!(out.contains("test_real_1"), "got: {out}");
 		let assert_false = out.matches("E   assert False").count();

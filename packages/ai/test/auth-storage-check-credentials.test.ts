@@ -1,5 +1,5 @@
 /**
- * Tests for `AuthStorage.checkCredentials()` — the per-credential auth probe
+ * Tests for `AuthStorage.health.check()` — the per-credential auth probe
  * that powers `omp auth-gateway check`. Contract under test:
  *
  *   1. A working credential reports `ok: true` and surfaces the probe's
@@ -15,10 +15,12 @@
  *   5. Providers with no registered `UsageProvider` report `ok: null` with
  *      "no usage probe configured" — the credential's status is unknown,
  *      not failed.
- *   6. When a `completionProbe` is supplied, it receives the post-refresh
+ *   6. Local-only usage providers opt out of health validation and leave
+ *      `ok: null` unless a separate completion probe is supplied.
+ *   7. When a `completionProbe` is supplied, it receives the post-refresh
  *      bearer for every row, runs independently of the usage probe (i.e. it
- *      still runs for providers without a `UsageProvider`), but is skipped
- *      when OAuth refresh fails.
+ *      still runs for providers without a validating `UsageProvider`), but is
+ *      skipped when OAuth refresh fails.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
@@ -30,7 +32,9 @@ import {
 	REMOTE_REFRESH_SENTINEL,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
+import type { UsageProvider } from "@oh-my-pi/pi-ai/usage";
 import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
+import { ollamaCloudUsageProvider } from "@oh-my-pi/pi-ai/usage/ollama";
 
 function oauthRow(id: number, email: string, opts?: { expired?: boolean }): StoredAuthCredential {
 	const credential: AuthCredential = {
@@ -55,17 +59,19 @@ function makeStore(
 			return rows;
 		},
 		updateAuthCredential() {},
-		deleteAuthCredential() {},
+		async deleteAuthCredential() {
+			return false;
+		},
 		tryDisableAuthCredentialIfMatches() {
 			return false;
 		},
-		replaceAuthCredentialsForProvider() {
+		async replaceAuthCredentials() {
 			return rows;
 		},
-		upsertAuthCredentialForProvider() {
+		async upsertAuthCredential() {
 			return rows;
 		},
-		deleteAuthCredentialsForProvider() {},
+		async deleteAuthCredentials() {},
 		getCache(key) {
 			const entry = cache.get(key);
 			if (!entry) return null;
@@ -80,7 +86,7 @@ function makeStore(
 	};
 }
 
-describe("AuthStorage.checkCredentials", () => {
+describe("AuthStorage.health.check", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -90,7 +96,7 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue({
 			provider: "anthropic",
@@ -100,7 +106,7 @@ describe("AuthStorage.checkCredentials", () => {
 		});
 
 		try {
-			const [result] = await storage.checkCredentials();
+			const [result] = await storage.health.check();
 			expect(result).toMatchObject({
 				id: 1,
 				provider: "anthropic",
@@ -121,14 +127,14 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockRejectedValue(
 			new Error("401 Invalid authentication credentials"),
 		);
 
 		try {
-			const [result] = await storage.checkCredentials();
+			const [result] = await storage.health.check();
 			expect(result.id).toBe(7);
 			expect(result.ok).toBe(false);
 			expect(result.reason).toContain("401");
@@ -147,12 +153,12 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue(null);
 
 		try {
-			const [result] = await storage.checkCredentials();
+			const [result] = await storage.health.check();
 			expect(result.ok).toBeNull();
 			expect(result.reason).toMatch(/no data/);
 		} finally {
@@ -168,12 +174,12 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 
 		const probe = vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage");
 
 		try {
-			const [result] = await storage.checkCredentials();
+			const [result] = await storage.health.check();
 			expect(result.ok).toBe(false);
 			expect(result.reason).toMatch(/oauth refresh failed/);
 			expect(result.reason).toContain("invalid_grant");
@@ -198,10 +204,10 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: () => undefined,
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 
 		try {
-			const [result] = await storage.checkCredentials();
+			const [result] = await storage.health.check();
 			expect(result).toMatchObject({
 				id: 9,
 				provider: "made-up-provider",
@@ -223,7 +229,7 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockImplementation(async params => {
 			const token = params.credential.accessToken;
@@ -242,7 +248,7 @@ describe("AuthStorage.checkCredentials", () => {
 		});
 
 		try {
-			const results = await storage.checkCredentials();
+			const results = await storage.health.check();
 			expect(results.map(r => ({ id: r.id, ok: r.ok }))).toEqual([
 				{ id: 1, ok: true },
 				{ id: 2, ok: false },
@@ -273,7 +279,7 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue({
 			provider: "anthropic",
 			fetchedAt: Date.now(),
@@ -288,7 +294,7 @@ describe("AuthStorage.checkCredentials", () => {
 		};
 
 		try {
-			const [result] = await storage.checkCredentials({ completionProbe: probe });
+			const [result] = await storage.health.check({ completionProbe: probe });
 			expect(refreshSpy).toHaveBeenCalledTimes(1);
 			expect(seen).toHaveLength(1);
 			const input = seen[0];
@@ -308,6 +314,65 @@ describe("AuthStorage.checkCredentials", () => {
 		}
 	});
 
+	it("persists Copilot API endpoint after usage refresh", async () => {
+		const apiEndpoint = "https://api.business.githubcopilot.com";
+		const row: StoredAuthCredential = {
+			id: 8,
+			provider: "github-copilot",
+			credential: {
+				type: "oauth",
+				access: "oat-business",
+				refresh: "refresh-business",
+				expires: Date.now() - 60_000,
+				accountId: "account-business",
+				email: "business@example.com",
+				apiEndpoint,
+			},
+			disabledCause: null,
+		};
+		const refreshSpy = vi.fn<NonNullable<AuthCredentialStore["refreshOAuthCredential"]>>().mockResolvedValue({
+			access: "oat-business-refreshed",
+			refresh: "refresh-business-refreshed",
+			expires: Date.now() + 3_600_000,
+			accountId: "account-business",
+			email: "business@example.com",
+		});
+		const store = makeStore([row], refreshSpy);
+		const updatedCredentials: AuthCredential[] = [];
+		vi.spyOn(store, "updateAuthCredential").mockImplementation((_id, credential) => {
+			updatedCredentials.push(credential);
+		});
+		const usageProvider: UsageProvider = {
+			id: "github-copilot",
+			async fetchUsage(params) {
+				expect(params.credential.apiEndpoint).toBe(apiEndpoint);
+				return {
+					provider: "github-copilot",
+					fetchedAt: Date.now(),
+					limits: [],
+					metadata: {},
+				};
+			},
+		};
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "github-copilot" ? usageProvider : undefined),
+		});
+		await storage.credentials.reload();
+
+		try {
+			const [result] = await storage.health.check();
+			expect(refreshSpy).toHaveBeenCalledTimes(1);
+			expect(result.ok).toBe(true);
+			expect(updatedCredentials).toHaveLength(1);
+			const updated = updatedCredentials[0];
+			expect(updated?.type).toBe("oauth");
+			if (updated?.type !== "oauth") throw new Error("expected OAuth credential update");
+			expect(updated.apiEndpoint).toBe(apiEndpoint);
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("runs the completionProbe even when no usage probe is configured for the provider", async () => {
 		const apiKeyRow: StoredAuthCredential = {
 			id: 11,
@@ -317,12 +382,12 @@ describe("AuthStorage.checkCredentials", () => {
 		};
 		const store = makeStore([apiKeyRow]);
 		const storage = new AuthStorage(store, { usageProviderResolver: () => undefined });
-		await storage.reload();
+		await storage.credentials.reload();
 
 		const probe = vi.fn<CompletionProbe>().mockResolvedValue({ ok: false, reason: "401 invalid_api_key" });
 
 		try {
-			const [result] = await storage.checkCredentials({ completionProbe: probe });
+			const [result] = await storage.health.check({ completionProbe: probe });
 			expect(probe).toHaveBeenCalledTimes(1);
 			const [input] = probe.mock.calls[0];
 			expect(input.credential).toEqual({ type: "api_key", apiKey: "sk-test-key" });
@@ -330,6 +395,33 @@ describe("AuthStorage.checkCredentials", () => {
 			// probe surfaces the real failure.
 			expect(result.ok).toBeNull();
 			expect(result.reason).toMatch(/no usage probe configured/);
+			expect(result.completion).toEqual({ ok: false, reason: "401 invalid_api_key" });
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("does not mark local-only usage providers healthy without upstream validation", async () => {
+		const apiKeyRow: StoredAuthCredential = {
+			id: 12,
+			provider: "ollama-cloud",
+			credential: { type: "api_key", key: "sk-ollama-cloud" },
+			disabledCause: null,
+		};
+		const store = makeStore([apiKeyRow]);
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "ollama-cloud" ? ollamaCloudUsageProvider : undefined),
+		});
+		await storage.credentials.reload();
+
+		const probe = vi.fn<CompletionProbe>().mockResolvedValue({ ok: false, reason: "401 invalid_api_key" });
+
+		try {
+			const [result] = await storage.health.check({ completionProbe: probe });
+			expect(result.ok).toBeNull();
+			expect(result.reason).toMatch(/does not validate credentials/);
+			expect(result.report).toBeUndefined();
+			expect(probe).toHaveBeenCalledTimes(1);
 			expect(result.completion).toEqual({ ok: false, reason: "401 invalid_api_key" });
 		} finally {
 			storage.close();
@@ -344,12 +436,12 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 
 		const probe = vi.fn<CompletionProbe>().mockResolvedValue({ ok: true });
 
 		try {
-			const [result] = await storage.checkCredentials({ completionProbe: probe });
+			const [result] = await storage.health.check({ completionProbe: probe });
 			expect(result.ok).toBe(false);
 			expect(result.reason).toMatch(/oauth refresh failed/);
 			// A dead refresh means the stored access token is unusable, so the
@@ -368,7 +460,7 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue({
 			provider: "anthropic",
 			fetchedAt: Date.now(),
@@ -381,7 +473,7 @@ describe("AuthStorage.checkCredentials", () => {
 		};
 
 		try {
-			const [result] = await storage.checkCredentials({ completionProbe: probe });
+			const [result] = await storage.health.check({ completionProbe: probe });
 			expect(result.ok).toBe(true); // usage probe independently succeeded
 			expect(result.completion?.ok).toBe(false);
 			expect(result.completion?.reason).toContain("ECONNRESET");
@@ -408,7 +500,7 @@ describe("AuthStorage.checkCredentials", () => {
 		const storage = new AuthStorage(store, {
 			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
 		});
-		await storage.reload();
+		await storage.credentials.reload();
 		vi.spyOn(claudeUsage.claudeUsageProvider, "fetchUsage").mockResolvedValue({
 			provider: "anthropic",
 			fetchedAt: Date.now(),
@@ -418,7 +510,7 @@ describe("AuthStorage.checkCredentials", () => {
 
 		const probe = vi.fn<CompletionProbe>().mockResolvedValue({ ok: true });
 		try {
-			const [result] = await storage.checkCredentials({ completionProbe: probe });
+			const [result] = await storage.health.check({ completionProbe: probe });
 			expect(result.remoteRefresh).toBe(true);
 			const [input] = probe.mock.calls[0];
 			expect(input.credential.type).toBe("oauth");
@@ -428,6 +520,65 @@ describe("AuthStorage.checkCredentials", () => {
 				expect(input.credential.refreshToken).toBe(REMOTE_REFRESH_SENTINEL);
 				expect(input.credential.accessToken).toBe("oat-13");
 			}
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("probes reference-stored API keys with the resolved secret", async () => {
+		// Keys stored as references (env var name, "!command") must reach the
+		// usage probe as the resolved secret — probing with the literal
+		// reference string would 401 and flag a working credential as bad.
+		const apiKeyRow: StoredAuthCredential = {
+			id: 21,
+			provider: "opencode-go",
+			credential: { type: "api_key", key: "ref:opencode" },
+			disabledCause: null,
+		};
+		const seenKeys: Array<string | undefined> = [];
+		const probeProvider: UsageProvider = {
+			id: "opencode-go",
+			validatesCredentials: true,
+			async fetchUsage(params) {
+				seenKeys.push(params.credential.type === "api_key" ? params.credential.apiKey : undefined);
+				return { provider: "opencode-go", fetchedAt: Date.now(), limits: [] };
+			},
+		};
+		const storage = new AuthStorage(makeStore([apiKeyRow]), {
+			usageProviderResolver: provider => (provider === "opencode-go" ? probeProvider : undefined),
+			configValueResolver: async config => (config === "ref:opencode" ? "sk-resolved-secret" : config),
+		});
+		await storage.credentials.reload();
+
+		try {
+			const [result] = await storage.health.check();
+			expect(seenKeys).toEqual(["sk-resolved-secret"]);
+			expect(result.ok).toBe(true);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("skips excluded providers without probing them", async () => {
+		const openrouterRow: StoredAuthCredential = {
+			id: 9,
+			provider: "openrouter",
+			credential: { type: "api_key", key: "sk-or-test" },
+			disabledCause: null,
+		};
+		const store = makeStore([oauthRow(1, "alice@example.com"), openrouterRow]);
+		const storage = new AuthStorage(store);
+		await storage.credentials.reload();
+		const probed: string[] = [];
+		const completionProbe: CompletionProbe = async (input: CompletionProbeInput) => {
+			probed.push(input.provider);
+			return { ok: true };
+		};
+
+		try {
+			const results = await storage.health.check({ completionProbe, excludeProviders: new Set(["openrouter"]) });
+			expect(results.map(row => row.provider)).toEqual(["anthropic"]);
+			expect(probed).toEqual(["anthropic"]);
 		} finally {
 			storage.close();
 		}

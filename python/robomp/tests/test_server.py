@@ -9,15 +9,74 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from robomp.config import Settings, reset_settings_cache
 from robomp.dashboard import tail_jsonl
 from robomp.db import Database, close_database, get_database, issue_key
+from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubClient
 from robomp.manual_triage import InvalidIssueRef, ManualTriageTimeout, await_terminal_state, parse_issue_ref
-from robomp.sandbox import LocalGitTransport
+from robomp.proxy_client import ProxyGitTransport
+from robomp.sandbox import LocalGitTransport, SandboxManager
 from robomp.server import create_app
+
+
+class _PausedPool:
+    def __init__(self) -> None:
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self, *, drain_timeout: float = 25.0, kill_timeout: float = 5.0) -> None:
+        self.stopped = True
+
+    def wake(self) -> None:
+        pass
+
+    async def cancel_event(self, delivery_id: str) -> bool:
+        return False
+
+    async def inflight_snapshot(self) -> list[str]:
+        return []
+
+
+class _PausedPoolFactory:
+    def __init__(self) -> None:
+        self.pools: list[_PausedPool] = []
+
+    def __call__(
+        self,
+        settings: Settings,
+        db: Database,
+        github: GitHubBackend,
+        sandbox: SandboxManager,
+        git_transport: ProxyGitTransport,
+    ) -> _PausedPool:
+        pool = _PausedPool()
+        self.pools.append(pool)
+        return pool
+
+
+def _create_app(settings: Settings | None = None) -> FastAPI:
+    return create_app(settings, pool_factory=_PausedPoolFactory())
+
+
+def test_create_app_runs_injected_pool_lifecycle(settings: Settings) -> None:
+    factory = _PausedPoolFactory()
+    app = create_app(settings, pool_factory=factory)
+
+    with TestClient(app):
+        assert len(factory.pools) == 1
+        pool = factory.pools[0]
+        assert pool.started is True
+        assert pool.stopped is False
+
+    close_database()
+    assert pool.stopped is True
 
 
 def _seed_db(settings: Settings) -> None:
@@ -57,10 +116,18 @@ def _seed_db(settings: Settings) -> None:
         pr_number=42,
     )
     db.set_issue_classification(issue_key("octo/widget", 3), "bug")
+    release = db.upsert_release(
+        repo="octo/widget",
+        tag="v1.2.3",
+        version="1.2.3",
+        current_sha="a" * 40,
+        session_dir="/tmp/release-session",
+    )
+    db.bump_release_round(release.key, failed_sha=release.current_sha)
 
 
 def test_index_serves_dashboard_html(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         resp = client.get("/")
     assert resp.status_code == 200
@@ -83,7 +150,7 @@ def test_index_substitutes_replay_token(env, monkeypatch: pytest.MonkeyPatch) ->
     reset_settings_cache()
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     try:
         with TestClient(app) as client:
             resp = client.get("/")
@@ -95,7 +162,7 @@ def test_index_substitutes_replay_token(env, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_api_status_reports_runtime_counts_and_inflight(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         _seed_db(settings)
         resp = client.get("/api/status")
@@ -133,12 +200,55 @@ def test_api_status_reports_runtime_counts_and_inflight(settings: Settings) -> N
     assert issues[fix_key]["pr_number"] == 42
     assert issues[fix_key]["branch"] == "farm/abc12345/fix"
 
+    releases = {release["key"]: release for release in body["releases"]}
+    assert releases["octo/widget#v1.2.3"]["state"] == "fixing"
+    assert releases["octo/widget#v1.2.3"]["rounds"] == 1
+    assert releases["octo/widget#v1.2.3"]["current_sha"] == "a" * 40
+
     delivery_ids = {e["delivery_id"] for e in body["recent_events"]}
     assert {"d-queued", "d-skipped", "d-running"}.issubset(delivery_ids)
 
 
+def test_releases_endpoint_returns_recent_release_state(settings: Settings) -> None:
+    app = _create_app(settings)
+    with TestClient(app) as client:
+        db = get_database(settings.sqlite_path)
+        row = db.upsert_release(
+            repo="octo/widget",
+            tag="v2.0.0",
+            version="2.0.0",
+            current_sha="b" * 40,
+            session_dir="/tmp/release-v2",
+        )
+        db.set_release_state(row.key, "failed", error="CI green but GitHub Release missing/draft")
+        updated_row = db.get_release(row.key)
+        assert updated_row is not None
+        resp = client.get("/releases?limit=1")
+    close_database()
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "releases": [
+            {
+                "key": "octo/widget#v2.0.0",
+                "repo": "octo/widget",
+                "tag": "v2.0.0",
+                "version": "2.0.0",
+                "state": "failed",
+                "current_sha": "b" * 40,
+                "last_failed_sha": None,
+                "rounds": 0,
+                "last_error": "CI green but GitHub Release missing/draft",
+                "session_dir": "/tmp/release-v2",
+                "created_at": updated_row.created_at,
+                "updated_at": updated_row.updated_at,
+            }
+        ]
+    }
+
+
 def test_api_status_reports_current_issue_event_state(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     fixed = issue_key("octo/widget", 44)
     failed = issue_key("octo/widget", 69)
     with TestClient(app) as client:
@@ -197,7 +307,7 @@ def test_api_status_reports_current_issue_event_state(settings: Settings) -> Non
 
 
 def test_api_logs_returns_empty_when_file_missing(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         resp = client.get("/api/logs?limit=10")
     close_database()
@@ -223,7 +333,7 @@ def test_api_logs_tails_jsonl_file(settings: Settings) -> None:
     ]
     log_path.write_text("\n".join(json.dumps(p) for p in payloads) + "\n", encoding="utf-8")
 
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         resp = client.get("/api/logs?limit=2")
     close_database()
@@ -239,7 +349,7 @@ def test_api_logs_tails_jsonl_file(settings: Settings) -> None:
 
 
 def test_api_logs_limit_is_clamped(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         too_low = client.get("/api/logs?limit=0").json()
         too_high = client.get("/api/logs?limit=99999").json()
@@ -334,7 +444,7 @@ def _install_github_mock(app, transport: httpx.MockTransport) -> None:
 
 
 def test_trigger_returns_404_when_token_disabled(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         resp = client.post("/api/trigger", json={"mode": "triage", "issue": "octo/widget#1"})
     close_database()
@@ -346,7 +456,7 @@ def test_trigger_rejects_missing_token(env, monkeypatch: pytest.MonkeyPatch) -> 
     _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         resp = client.post("/api/trigger", json={"mode": "triage", "issue": "octo/widget#1"})
     close_database()
@@ -386,7 +496,7 @@ def test_trigger_triage_fetches_and_enqueues(env, monkeypatch: pytest.MonkeyPatc
             )
         return httpx.Response(404)
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, httpx.MockTransport(handler))
         resp = client.post(
@@ -422,7 +532,7 @@ def test_trigger_triage_conflicts_when_manual_delivery_is_active(
         calls.append(request.url.path)
         return httpx.Response(500, json={"message": "should not fetch active manual event"})
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(
@@ -481,9 +591,20 @@ def test_trigger_triage_replaces_inactive_manual_delivery(env, monkeypatch: pyte
             )
         return httpx.Response(404)
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
+        db.record_event(
+            delivery_id="running-octo__widget-7",
+            event_type="issue_comment",
+            repo="octo/widget",
+            issue_key=issue_key("octo/widget", 7),
+            payload={"action": "created"},
+        )
+        claimed = db.claim_next_event()
+        assert claimed is not None
+        assert claimed.delivery_id == "running-octo__widget-7"
+
         db.record_event(
             delivery_id=delivery,
             event_type="issues",
@@ -542,7 +663,7 @@ def test_trigger_triage_rejects_pull_request_issue_payload(env, monkeypatch: pyt
             )
         return httpx.Response(404)
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, httpx.MockTransport(handler))
         resp = client.post(
@@ -563,7 +684,7 @@ def test_trigger_triage_rejects_repo_not_in_allowlist(env, monkeypatch: pytest.M
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, httpx.MockTransport(lambda r: httpx.Response(500)))
         resp = client.post(
@@ -585,7 +706,7 @@ def test_trigger_retry_by_delivery_rejects_active_events(
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(
@@ -612,7 +733,7 @@ def test_trigger_triage_surfaces_github_failure(env, monkeypatch: pytest.MonkeyP
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
     transport = httpx.MockTransport(lambda r: httpx.Response(404, json={"message": "Not Found"}))
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, transport)
         resp = client.post(
@@ -629,9 +750,20 @@ def test_trigger_retry_by_delivery_id_requeues(env, monkeypatch: pytest.MonkeyPa
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
+        db.record_event(
+            delivery_id="running-widget-4",
+            event_type="issue_comment",
+            repo="octo/widget",
+            issue_key=issue_key("octo/widget", 4),
+            payload={"action": "created"},
+        )
+        claimed = db.claim_next_event()
+        assert claimed is not None
+        assert claimed.delivery_id == "running-widget-4"
+
         db.record_event(
             delivery_id="d-old",
             event_type="issues",
@@ -654,10 +786,21 @@ def test_trigger_retry_by_issue_finds_latest_non_skipped_event(env, monkeypatch:
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         key = issue_key("octo/widget", 9)
+        db.record_event(
+            delivery_id="running-widget-9",
+            event_type="issue_comment",
+            repo="octo/widget",
+            issue_key=key,
+            payload={"action": "created"},
+        )
+        claimed = db.claim_next_event()
+        assert claimed is not None
+        assert claimed.delivery_id == "running-widget-9"
+
         db.record_event(
             delivery_id="d-old-1",
             event_type="issues",
@@ -701,7 +844,7 @@ def test_trigger_retry_by_issue_rejects_active_latest_event(env, monkeypatch: py
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         key = issue_key("octo/widget", 10)
@@ -737,7 +880,7 @@ def test_trigger_retry_by_issue_rejects_repo_not_in_allowlist(env, monkeypatch: 
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(
@@ -763,7 +906,7 @@ def test_trigger_retry_unknown_delivery_404s(env, monkeypatch: pytest.MonkeyPatc
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         resp = client.post(
             "/api/trigger",
@@ -778,7 +921,7 @@ def test_trigger_rejects_bad_mode(env, monkeypatch: pytest.MonkeyPatch) -> None:
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         resp = client.post(
             "/api/trigger",
@@ -870,7 +1013,7 @@ def rate_limited_settings(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) 
 
 
 def test_webhook_rate_limits_unknown_submitter_at_default_cap(rate_limited_settings: Settings) -> None:
-    app = create_app(rate_limited_settings)
+    app = _create_app(rate_limited_settings)
     with TestClient(app) as client:
         # Default cap is 2 → first two queued, third throttled.
         states = []
@@ -891,7 +1034,7 @@ def test_webhook_rate_limits_unknown_submitter_at_default_cap(rate_limited_setti
 def test_webhook_incoming_pr_comment_without_directive_skips_without_counting_budget(
     rate_limited_settings: Settings,
 ) -> None:
-    app = create_app(rate_limited_settings)
+    app = _create_app(rate_limited_settings)
     with TestClient(app) as client:
         skipped = _post_pr_issue_comment(
             client,
@@ -925,8 +1068,44 @@ def test_webhook_incoming_pr_comment_without_directive_skips_without_counting_bu
     assert states == ["queued", "queued", "skipped"]
 
 
+def test_webhook_delivery_populates_issue_index(settings: Settings) -> None:
+    """Every issue-carrying delivery upserts the local search index — including
+    ones the router skips (here: a conversation comment on an incoming PR)."""
+    app = _create_app(settings)
+    with TestClient(app) as client:
+        payload = {
+            "action": "opened",
+            "issue": {
+                "number": 501,
+                "title": "grep misses colon filenames",
+                "body": "read tool peels the selector suffix",
+                "state": "open",
+                "user": {"login": "alice"},
+                "author_association": "NONE",
+            },
+            "repository": {"full_name": "octo/widget"},
+        }
+        body = json.dumps(payload).encode()
+        resp = client.post(
+            "/webhook/github",
+            content=body,
+            headers=_signed_headers("test-webhook-secret", body, event="issues", delivery="idx-1"),
+        )
+        assert resp.status_code == 202
+
+        skipped = _post_pr_issue_comment(client, delivery="idx-2", user="stranger", pr_number=502)
+        assert skipped.json()["state"] == "skipped"
+
+        db = get_database(settings.sqlite_path)
+        by_body = db.search_issue_index("octo/widget", keywords=("selector", "suffix"))
+        pr_row = db.search_issue_index("octo/widget", is_pr=True)
+    close_database()
+    assert [e.number for e in by_body] == [501]
+    assert [e.number for e in pr_row] == [502]
+
+
 def test_webhook_contributor_gets_higher_cap(rate_limited_settings: Settings) -> None:
-    app = create_app(rate_limited_settings)
+    app = _create_app(rate_limited_settings)
     with TestClient(app) as client:
         # Default cap (2) would block at i=2; CONTRIBUTOR cap (4) allows it.
         for i in range(4):
@@ -951,7 +1130,7 @@ def test_webhook_contributor_gets_higher_cap(rate_limited_settings: Settings) ->
 
 
 def test_webhook_owner_association_bypasses_limit(rate_limited_settings: Settings) -> None:
-    app = create_app(rate_limited_settings)
+    app = _create_app(rate_limited_settings)
     with TestClient(app) as client:
         for i in range(5):  # well over default cap
             resp = _post_issue_opened(
@@ -966,7 +1145,7 @@ def test_webhook_owner_association_bypasses_limit(rate_limited_settings: Setting
 
 
 def test_webhook_unlimited_allowlist_bypasses_limit(rate_limited_settings: Settings) -> None:
-    app = create_app(rate_limited_settings)
+    app = _create_app(rate_limited_settings)
     with TestClient(app) as client:
         # NONE association would normally cap at 2, but `can1357` is whitelisted.
         for i in range(5):
@@ -983,7 +1162,7 @@ def test_webhook_unlimited_allowlist_bypasses_limit(rate_limited_settings: Setti
 
 def test_webhook_rate_limit_per_user_is_independent(rate_limited_settings: Settings) -> None:
     """One user's cap doesn't drain another user's budget."""
-    app = create_app(rate_limited_settings)
+    app = _create_app(rate_limited_settings)
     with TestClient(app) as client:
         # alice exhausts default cap.
         for i in range(2):
@@ -1025,7 +1204,7 @@ def test_webhook_rate_limit_per_user_is_independent(rate_limited_settings: Setti
 
 def test_webhook_rate_limited_event_records_reason(rate_limited_settings: Settings) -> None:
     """Throttled events must surface a useful reason on the dashboard feed."""
-    app = create_app(rate_limited_settings)
+    app = _create_app(rate_limited_settings)
     with TestClient(app) as client:
         for i in range(3):
             _post_issue_opened(
@@ -1112,7 +1291,7 @@ def _make_issues_handler(
 
 
 def test_browse_returns_404_without_token(settings: Settings) -> None:
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         resp = client.get("/api/github/issues")
     close_database()
@@ -1123,7 +1302,7 @@ def test_browse_returns_401_with_replay_enabled_without_valid_token(env, monkeyp
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
 
     with TestClient(app) as client:
         missing = client.get("/api/github/issues")
@@ -1185,7 +1364,7 @@ def test_browse_fans_out_across_allowlist_and_filters_prs(env, monkeypatch: pyte
         },
         expected_limit=20,
     )
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, transport)
         resp = client.get(
@@ -1223,7 +1402,7 @@ def test_browse_reuses_cache_until_forced_refresh(env, monkeypatch: pytest.Monke
         updated_at = "2026-05-14T10:00:00Z" if calls == 1 else "2026-05-14T11:00:00Z"
         return httpx.Response(200, json=[_issue_payload(1, title, updated_at=updated_at)])
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, httpx.MockTransport(handler))
         first = client.get(
@@ -1264,7 +1443,7 @@ def test_browse_cache_updates_from_issue_webhook(env, monkeypatch: pytest.Monkey
         calls += 1
         return httpx.Response(200, json=[_issue_payload(4, "before", comments=1)])
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, httpx.MockTransport(handler))
         first = client.get(
@@ -1330,7 +1509,7 @@ def test_browse_per_repo_failure_does_not_take_down_panel(env, monkeypatch: pyte
         failing_repos=("octo/dead",),
     )
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, transport)
         resp = client.get(
@@ -1351,7 +1530,7 @@ def test_browse_rejects_bad_state(env, monkeypatch: pytest.MonkeyPatch) -> None:
     token = _enable_replay(monkeypatch)
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, httpx.MockTransport(lambda r: httpx.Response(500)))
         resp = client.get(
@@ -1388,7 +1567,7 @@ def test_browse_marks_processed_issues_present_in_db(env, monkeypatch: pytest.Mo
         },
         expected_limit=20,
     )
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, transport)
         resp = client.get(
@@ -1418,7 +1597,7 @@ def test_browse_processed_flag_is_recomputed_on_cache_hit(env, monkeypatch: pyte
         calls += 1
         return httpx.Response(200, json=[_issue_payload(9, "fresh")])
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         _install_github_mock(app, httpx.MockTransport(handler))
         first = client.get(
@@ -1483,7 +1662,7 @@ def _post_issue_comment(
 def test_webhook_directive_on_unknown_issue_is_queued_with_metadata(env) -> None:
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         resp = _post_issue_comment(
             client,
@@ -1503,6 +1682,43 @@ def test_webhook_directive_on_unknown_issue_is_queued_with_metadata(env) -> None
     assert directive == {"body": "please refactor X", "author": "can1357", "pragmas": [], "authorizes_impl": True}
 
 
+def test_webhook_directive_authorizes_deployed_app_login_without_author_association(
+    monkeypatch: pytest.MonkeyPatch, env
+) -> None:
+    monkeypatch.setenv("ROBOMP_BOT_LOGIN", "@roboomp[bot]")
+    monkeypatch.setenv("ROBOMP_REPO_ALLOWLIST", "can1357/widget")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = _create_app(cfg)
+    payload = {
+        "action": "created",
+        "comment": {
+            "user": {"login": "can1357"},
+            "body": "@roboomp go ahead",
+        },
+        "issue": {"number": 3196},
+        "repository": {
+            "full_name": "can1357/widget",
+            "owner": {"login": "can1357", "type": "User"},
+        },
+    }
+    raw = json.dumps(payload).encode()
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhook/github",
+            content=raw,
+            headers=_signed_headers("test-webhook-secret", raw, event="issue_comment", delivery="dir-app-login"),
+        )
+        assert resp.status_code == 202
+        assert resp.json()["state"] == "queued"
+        row = get_database(cfg.sqlite_path).get_event("dir-app-login")
+    close_database()
+    assert row is not None
+    directive = row.payload.get("_robomp_directive")
+    assert directive == {"body": "go ahead", "author": "can1357", "pragmas": [], "authorizes_impl": True}
+
+
 def test_webhook_maintainer_bypasses_rate_limit(
     rate_limited_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -1513,7 +1729,7 @@ def test_webhook_maintainer_bypasses_rate_limit(
     cfg = Settings()  # type: ignore[call-arg]
     cfg.ensure_paths()
 
-    app = create_app(cfg)
+    app = _create_app(cfg)
     with TestClient(app) as client:
         states = []
         # cap=2 from rate_limited_settings — 3rd would normally be skipped.
@@ -1528,8 +1744,16 @@ def test_webhook_maintainer_bypasses_rate_limit(
             )
             assert resp.status_code == 202
             states.append(resp.json()["state"])
+        directive_event = get_database(cfg.sqlite_path).get_event("m-3")
     close_database()
     assert states == ["queued"] * 4, states
+    assert directive_event is not None
+    assert directive_event.payload.get("_robomp_directive") == {
+        "body": "do X",
+        "author": "can1357",
+        "pragmas": [],
+        "authorizes_impl": True,
+    }
 
 
 # -------- handler-level: bootstrap + reopen ----------------------------
@@ -1555,6 +1779,9 @@ class _RecordingSandbox:
         default_branch: str,
         existing_branch=None,
         pr_head: int | None = None,
+        pr_head_ref: str | None = None,
+        pr_head_sha: str | None = None,
+        pr_head_same_repo: bool = False,
         author_name: str = "",
         author_email: str = "",
         slot_uid: int | None = None,
@@ -1567,6 +1794,9 @@ class _RecordingSandbox:
                 "default_branch": default_branch,
                 "existing_branch": existing_branch,
                 "pr_head": pr_head,
+                "pr_head_ref": pr_head_ref,
+                "pr_head_sha": pr_head_sha,
+                "pr_head_same_repo": pr_head_same_repo,
                 "slot_uid": slot_uid,
             }
         )
@@ -1884,8 +2114,9 @@ async def test_handle_pr_conversation_skips_review_workspace_rows(
     close_database()
 
 
+@pytest.mark.parametrize("head_repo", ["octo/widget", "alice/widget"])
 async def test_review_pr_retries_when_ranked_but_not_submitted(
-    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
+    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch, head_repo: str
 ) -> None:
     from robomp import tasks
     from robomp.github_client import GitHubClient, IssueInfo, PullRequestInfo, RepoInfo
@@ -1913,7 +2144,8 @@ async def test_review_pr_retries_when_ranked_but_not_submitted(
         base_ref="main",
         state="open",
         author="alice",
-        head_repo="alice/widget",
+        head_repo=head_repo,
+        head_sha="abc123",
     )
 
     async def _get_repo(self, repo_full: str):
@@ -1947,6 +2179,9 @@ async def test_review_pr_retries_when_ranked_but_not_submitted(
     assert len(stub_run_task) == 1
     assert stub_run_task[0]["task_kind"] == "review_pr"
     assert sandbox.ensure_calls[0]["pr_head"] == 900
+    assert sandbox.ensure_calls[0]["pr_head_ref"] == "alice/fix-parser"
+    assert sandbox.ensure_calls[0]["pr_head_sha"] == "abc123"
+    assert sandbox.ensure_calls[0]["pr_head_same_repo"] is (head_repo == "octo/widget")
     close_database()
 
 
@@ -2208,6 +2443,87 @@ async def test_handle_comment_finalized_without_directive_still_replies(
     assert stub_run_task == [], "must not invoke run_task on plain finalized comment"
     assert post_comment_calls, "should post the finalized-issue reply"
     assert sandbox.remove_calls == []
+    close_database()
+
+
+async def test_handle_comment_resumes_needs_info_without_preemptive_cleanup(
+    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
+) -> None:
+    """A needs-info reply resumes first; host tools clear state only after actionable work."""
+    from robomp import tasks
+    from robomp.github_client import GitHubClient, IssueInfo, RepoInfo
+
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    db.upsert_issue(
+        key="octo/widget#88",
+        repo="octo/widget",
+        number=88,
+        state="needs_info",
+        branch="farm/old/branch",
+    )
+
+    repo = RepoInfo(
+        full_name="octo/widget", default_branch="main", clone_url="https://github.com/octo/widget.git", private=False
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=88,
+        title="boom",
+        body="details",
+        state="open",
+        author="alice",
+        labels=("needs-info",),
+        is_pull_request=False,
+    )
+
+    async def _resolve(_gh, _payload):
+        return repo, issue
+
+    monkeypatch.setattr(tasks, "_resolve_repo_and_issue", _resolve)
+
+    post_comment_calls: list = []
+    removed_labels: list[tuple[str, int, str]] = []
+
+    async def _capture_post(self, *args, **kwargs):
+        post_comment_calls.append((args, kwargs))
+        return None
+
+    async def _capture_remove_label(self, repo: str, number: int, label: str) -> None:
+        removed_labels.append((repo, number, label))
+
+    monkeypatch.setattr(GitHubClient, "post_comment", _capture_post)
+    monkeypatch.setattr(GitHubClient, "remove_issue_label", _capture_remove_label)
+
+    payload = {
+        "action": "created",
+        "issue": {"number": 88, "user": {"login": "alice"}, "title": "boom"},
+        "comment": {
+            "user": {"login": "alice"},
+            "body": "I am on Bun 1.3.14 and here is the trace",
+            "id": 4,
+            "created_at": "2026-05-14T23:00:00Z",
+        },
+        "repository": {"full_name": "octo/widget"},
+    }
+    await tasks.handle_comment(
+        settings=settings,
+        db=db,
+        github=GitHubClient("t"),
+        git_transport=LocalGitTransport(token=None),
+        sandbox=sandbox,
+        payload=payload,
+        delivery_id="test-delivery-needs-info",
+    )
+    assert len(stub_run_task) == 1
+    call = stub_run_task[0]
+    assert call["task_kind"] == "handle_comment"
+    assert call["comment"].body == "I am on Bun 1.3.14 and here is the trace"
+    assert sandbox.ensure_calls[0]["existing_branch"] == "farm/old/branch"
+    assert removed_labels == []
+    assert post_comment_calls == [], "needs-info replies must not get the finalized-issue notice"
+    row = db.get_issue("octo/widget#88")
+    assert row is not None and row.state == "needs_info"
     close_database()
 
 
@@ -2554,7 +2870,7 @@ def test_webhook_issue_comment_cancels_pending_closure(settings: Settings) -> No
     db = get_database(settings.sqlite_path)
     key = issue_key("octo/widget", 7)
     _seed_pending_closure(db, key=key, number=7)
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         resp = _post_issue_comment_simple(client, delivery="d-cancel-comment", issue_number=7)
     assert resp.status_code == 202
@@ -2569,7 +2885,7 @@ def test_webhook_issues_closed_cancels_pending_closure(settings: Settings) -> No
     db = get_database(settings.sqlite_path)
     key = issue_key("octo/widget", 8)
     _seed_pending_closure(db, key=key, number=8)
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         resp = _post_issues_closed(client, delivery="d-cancel-closed", issue_number=8)
     assert resp.status_code == 202
@@ -2587,7 +2903,7 @@ def test_webhook_pr_conversation_does_not_cancel_pending_closure(settings: Setti
     db = get_database(settings.sqlite_path)
     key = issue_key("octo/widget", 9)
     _seed_pending_closure(db, key=key, number=9)
-    app = create_app(settings)
+    app = _create_app(settings)
     with TestClient(app) as client:
         # Use the existing PR-issue-comment helper (number 9 here is the PR).
         resp = _post_pr_issue_comment(

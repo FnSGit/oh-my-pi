@@ -8,6 +8,8 @@ function createArgs(messages: string[]): Args {
 		messages,
 		fileArgs: [],
 		unknownFlags: new Map(),
+		unrecognizedFlags: [],
+		invalidFlagValues: [],
 	};
 }
 

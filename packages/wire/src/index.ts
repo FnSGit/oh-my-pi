@@ -205,12 +205,12 @@ export interface WireModel {
 	id: string;
 	name: string;
 	provider: string;
-	contextWindow: number;
+	contextWindow: number | null;
 }
 
 export interface ContextUsage {
 	tokens: number | null;
-	contextWindow: number;
+	contextWindow: number | null;
 	percent: number | null;
 }
 
@@ -232,6 +232,7 @@ export interface SessionState {
 	thinkingLevel?: string;
 	contextUsage?: ContextUsage;
 	participants: Participant[];
+	isAborting?: boolean;
 }
 
 export interface AgentSnapshot {
@@ -260,8 +261,12 @@ export interface AgentProgress {
 	lastIntent?: string;
 	currentTool?: string;
 	currentToolArgs?: string;
+	/** Argument key selected for the display preview, when known. */
+	currentToolArgsKey?: string;
+	/** Intent the model attached to the current call; undefined when that call carried none. */
+	currentToolIntent?: string;
 	currentToolStartMs?: number;
-	recentTools: { tool: string; args: string; endMs: number }[];
+	recentTools: { tool: string; args: string; argsKey?: string; intent?: string; isError?: boolean; endMs: number }[];
 	recentOutput: string[];
 	toolCount: number;
 	requests: number;
@@ -297,6 +302,31 @@ export interface SubagentLifecyclePayload {
 // Frames (JSON inside the AES-GCM seal)
 // ═══════════════════════════════════════════════════════════════════════════
 
+export type CollabUiSelectItem = string | { label: string; description?: string };
+
+export type CollabUiResponseValue = string | undefined;
+
+export type CollabUiRequestDraft =
+	| {
+			kind: "select";
+			title: string;
+			options: CollabUiSelectItem[];
+			initialIndex?: number;
+			selectionMarker?: "radio" | "checkbox";
+			checkedIndices?: number[];
+			markableCount?: number;
+			helpText?: string;
+			/** The select asks for a permission (a tool approval, a settings change), not an answer. */
+			approval?: boolean;
+	  }
+	| {
+			kind: "editor";
+			title: string;
+			prefill?: string;
+	  };
+
+export type CollabUiRequest = CollabUiRequestDraft & { reqId: number };
+
 export type GuestFrame =
 	| {
 			t: "hello";
@@ -310,6 +340,7 @@ export type GuestFrame =
 			writeToken?: string;
 	  }
 	| { t: "prompt"; text: string; images?: ImageContent[] }
+	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
 	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
@@ -322,27 +353,58 @@ export type HostFrame =
 			t: "welcome";
 			proto: number;
 			header: SessionHeader;
-			entries: SessionEntry[];
 			state: SessionState;
 			agents: AgentSnapshot[];
+			/**
+			 * Total number of `SessionEntry` items the host will deliver in the
+			 * `snapshot-chunk` frames that follow. Guests stay in the loading
+			 * phase until they have accumulated all of them (or a chunk arrives
+			 * with `final: true`).
+			 */
+			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
+	/**
+	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
+	 * transcript into chunks bounded by byte size so a multi-MB session is not
+	 * forced through one giant frame the relay may stall on. The last chunk
+	 * carries `final: true`; guests finalize the replica on that frame.
+	 */
+	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentEvent }
 	| { t: "state"; state: SessionState }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	| { t: "agents"; agents: AgentSnapshot[] }
+	| { t: "ui-request"; request: CollabUiRequest }
+	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
-	| { t: "error"; message: string };
+	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
+	| { t: "error"; message: string; resync?: true };
 
 export type WireFrame = GuestFrame | HostFrame;
 
-/** Wire protocol version carried in `hello`; the host rejects mismatches. */
-export const COLLAB_PROTO = 1;
+/**
+ * Wire protocol version carried in `hello`; the host rejects mismatches.
+ *
+ * - `1` (legacy): `welcome` carried the full `entries` array inline.
+ * - `2`: `welcome` carries only metadata (header/state/agents/entryCount);
+ *   transcript entries follow in `snapshot-chunk` frames, so multi-MB
+ *   sessions are not gated on a single welcome frame fitting under the
+ *   guest's first-welcome timeout.
+ * - `3`: host asks guests through `ui-request`/`ui-request-end` host frames
+ *   answered by the `ui-response` guest frame. Guests that predate the
+ *   grammar would silently drop `ui-request` (asks hang forever on the
+ *   host), so they must be rejected at hello.
+ */
+export const COLLAB_PROTO = 3;
+
+/** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
+export const INTENT_FIELD = "i";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Envelope & link constants
@@ -350,6 +412,30 @@ export const COLLAB_PROTO = 1;
 
 /** Plaintext envelope prefix: `[4B uint32 BE peerId][sealed payload]`. */
 export const ENVELOPE_HEADER_LENGTH = 4;
+
+/**
+ * Prefix `sealed` with its envelope header. Host→relay: peerId 0 broadcasts to
+ * all guests, peerId N targets guest N. Guest→relay: always 0; the relay
+ * rewrites it to the sender's id.
+ */
+export function packEnvelope(peerId: number, sealed: Uint8Array): Uint8Array<ArrayBuffer> {
+	const out = new Uint8Array(ENVELOPE_HEADER_LENGTH + sealed.byteLength);
+	new DataView(out.buffer).setUint32(0, peerId, false);
+	out.set(sealed, ENVELOPE_HEADER_LENGTH);
+	return out;
+}
+
+/** Split an envelope into its peerId and sealed payload; `null` when shorter than the header. */
+export function unpackEnvelope(data: Uint8Array): { peerId: number; payload: Uint8Array } | null {
+	if (data.byteLength < ENVELOPE_HEADER_LENGTH) return null;
+	const peerId = new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).getUint32(0, false);
+	return { peerId, payload: data.subarray(ENVELOPE_HEADER_LENGTH) };
+}
+
+/** Rewrite the peerId in place without copying the payload. */
+export function rewriteEnvelopePeer(data: Uint8Array, peerId: number): void {
+	new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).setUint32(0, peerId, false);
+}
 
 export const ROOM_ID_BYTES = 16;
 
@@ -362,6 +448,22 @@ export const ROOM_KEY_BYTES = 32;
  * proves prompt/abort/agent-cmd capability to the host.
  */
 export const WRITE_TOKEN_BYTES = 16;
+
+/**
+ * Each automatic rejoin costs the host a full snapshot, and a guest on a link
+ * too slow for the session is shed again after every one. Past the cap the
+ * guest stops rejoining on its own and leaves the decision to the user.
+ */
+export const MAX_AUTO_REJOINS = 3;
+export const AUTO_REJOIN_WINDOW_MS = 5 * 60_000;
+
+/** Records an automatic rejoin in {@link history} if the window has room for one. */
+export function takeAutoRejoin(history: number[], now = Date.now()): boolean {
+	while (history.length > 0 && now - history[0]! >= AUTO_REJOIN_WINDOW_MS) history.shift();
+	if (history.length >= MAX_AUTO_REJOINS) return false;
+	history.push(now);
+	return true;
+}
 
 /** Default public relay; bare `<roomId>.<key>` links resolve against it. */
 export const DEFAULT_RELAY_URL = "wss://my.omp.sh";
@@ -387,3 +489,8 @@ export type RelayControlToHost = { t: "peer-joined" | "peer-left"; peer: number 
 /** Relay → guest control message. */
 export type RelayControlToGuest = { t: "room-closed" };
 export type RelayControlMessage = RelayControlToHost | RelayControlToGuest;
+
+export * from "./shell-trace";
+export * from "./shell-viz";
+export * from "./stream";
+export * from "./tsp";

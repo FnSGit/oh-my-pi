@@ -1,3 +1,4 @@
+import type { ConflictBlock, ConflictEntry, ConflictScope } from "@oh-my-pi/pi-tui/tools/conflict-detect";
 /**
  * Detect and resolve unresolved git merge conflicts that surface in `read`
  * output.
@@ -19,29 +20,14 @@
  */
 
 import type { ToolSession } from "./index";
-import { ToolError } from "./tool-errors";
+import { getToolConversationState } from "./tool-state";
+import { hasFsCode, isEnoent } from "@oh-my-pi/pi-utils";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const OURS_PREFIX = "<<<<<<<";
 const BASE_PREFIX = "|||||||";
 const SEPARATOR = "=======";
 const THEIRS_PREFIX = ">>>>>>>";
-
-export interface ConflictBlock {
-	/** 1-indexed line of the `<<<<<<<` marker. */
-	startLine: number;
-	/** 1-indexed line of the `=======` separator. */
-	separatorLine: number;
-	/** 1-indexed line of the `>>>>>>>` marker. */
-	endLine: number;
-	/** 1-indexed line of the `|||||||` base marker (diff3 only). */
-	baseLine?: number;
-	oursLabel?: string;
-	baseLabel?: string;
-	theirsLabel?: string;
-	oursLines: string[];
-	baseLines?: string[];
-	theirsLines: string[];
-}
 
 /**
  * Scan an already-collected array of file lines for completed conflict
@@ -139,18 +125,25 @@ export function scanConflictLines(lines: readonly string[], firstLineNumber: num
 
 const SCAN_FILE_DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 
+/** Result of {@link scanFileForConflicts}. */
+export interface ConflictFileScan {
+	blocks: ConflictBlock[];
+	/** First line the byte cap left unscanned (possibly partial); unset when the whole file was scanned. */
+	truncatedAtLine?: number;
+}
+
 /**
  * Scan a whole file for unresolved conflict blocks.
  *
  * Reads at most `maxBytes` (default 10 MB) so this stays cheap on
- * pathological files. Files truncated by the cap report
- * `scanTruncated: true`; only complete blocks within the scanned prefix
- * are returned, so trailing partial markers never invent fake blocks.
+ * pathological files. Files truncated by the cap report the line the scan
+ * stopped at; only complete blocks within the scanned prefix are returned,
+ * so trailing partial markers never invent fake blocks.
  */
 export async function scanFileForConflicts(
 	absolutePath: string,
 	options: { maxBytes?: number } = {},
-): Promise<{ blocks: ConflictBlock[]; scanTruncated: boolean }> {
+): Promise<ConflictFileScan> {
 	const maxBytes = options.maxBytes ?? SCAN_FILE_DEFAULT_MAX_BYTES;
 	const file = Bun.file(absolutePath);
 	const size = file.size;
@@ -160,7 +153,16 @@ export async function scanFileForConflicts(
 	// `split("\n")` over a truncated read may leave a partial last line; the
 	// scanner already tolerates an unclosed opener, so no extra trimming.
 	const lines = text.split("\n");
-	return { blocks: scanConflictLines(lines, 1), scanTruncated: truncated };
+	const blocks = scanConflictLines(lines, 1);
+	return truncated ? { blocks, truncatedAtLine: lines.length } : { blocks };
+}
+
+/**
+ * Note for a scan the byte cap stopped at `line`: `:conflicts` cannot list or
+ * register blocks from there on, but a ranged read that shows them registers them.
+ */
+export function formatScanCapNote(displayPath: string, line: number): string {
+	return `- note: the conflict scan stopped at the byte cap at line ${line}; blocks from there on are not counted or registered here — range-read \`${displayPath}:${line}-\` to show and register them.`;
 }
 
 /**
@@ -175,32 +177,22 @@ function matchMarker(line: string, prefix: string): string | null {
 	return line.slice(prefix.length + 1);
 }
 
-/**
- * Recorded conflict block keyed by a session-stable id. The history is
- * append-only; ids stay valid even after later writes resolve other
- * blocks in the same file, so retries don't depend on re-reading.
- */
-export interface ConflictEntry extends ConflictBlock {
-	id: number;
-	absolutePath: string;
-	displayPath: string;
-}
-
 /** Per-session log of conflict regions surfaced by `read`. */
 export class ConflictHistory {
 	#nextId = 1;
 	#entries = new Map<number, ConflictEntry>();
 
 	/**
-	 * Register a conflict block. Returns the (possibly pre-existing) entry
-	 * — if the same `absolutePath`+`startLine` was registered before, the
-	 * earlier id is reused so a re-read does not inflate the counter or
-	 * orphan the prior id. The recorded region is overwritten on re-read
-	 * so the splice always reflects the current marker positions on disk.
+	 * Reuse an id only for the same block at the same position. Reconciliation
+	 * relocates unchanged blocks first; a changed block never inherits an old id.
 	 */
 	register(input: Omit<ConflictEntry, "id">): ConflictEntry {
 		for (const existing of this.#entries.values()) {
 			if (existing.absolutePath === input.absolutePath && existing.startLine === input.startLine) {
+				if (!conflictRegionsEqual(existing, input)) {
+					this.#entries.delete(existing.id);
+					continue;
+				}
 				const merged: ConflictEntry = { ...input, id: existing.id };
 				this.#entries.set(existing.id, merged);
 				return merged;
@@ -210,6 +202,50 @@ export class ConflictHistory {
 		const entry: ConflictEntry = { ...input, id };
 		this.#entries.set(id, entry);
 		return entry;
+	}
+
+	/**
+	 * Refresh only already-registered blocks, without registering unseen ones.
+	 * Match unchanged positions before relocations so identical distinct blocks
+	 * keep separate ids. A capped scan cannot disprove a block crossing or beyond
+	 * its unscanned boundary.
+	 */
+	reconcilePath(absolutePath: string, scan: ConflictFileScan): void {
+		const entries = this.entries().filter(entry => entry.absolutePath === absolutePath);
+		const available = new Set(scan.blocks);
+		const matched = new Map<ConflictEntry, ConflictBlock>();
+		for (const entry of entries) {
+			for (const block of available) {
+				if (block.startLine === entry.startLine && conflictRegionsEqual(entry, block)) {
+					matched.set(entry, block);
+					available.delete(block);
+					break;
+				}
+			}
+		}
+		for (const entry of entries) {
+			if (matched.has(entry)) continue;
+			let nearest: ConflictBlock | undefined;
+			let distance = Number.POSITIVE_INFINITY;
+			for (const block of available) {
+				const delta = Math.abs(block.startLine - entry.startLine);
+				if (delta < distance && conflictRegionsEqual(entry, block)) {
+					nearest = block;
+					distance = delta;
+				}
+			}
+			if (nearest) {
+				matched.set(entry, nearest);
+				available.delete(nearest);
+			}
+		}
+		for (const entry of entries) {
+			const block = matched.get(entry);
+			if (block) this.#entries.set(entry.id, { ...entry, ...block });
+			else if (scan.truncatedAtLine === undefined || entry.endLine < scan.truncatedAtLine) {
+				this.#entries.delete(entry.id);
+			}
+		}
 	}
 
 	get(id: number): ConflictEntry | undefined {
@@ -236,14 +272,108 @@ export class ConflictHistory {
 	}
 }
 
-/** Lazily attach a `ConflictHistory` to the session and return it. */
-export function getConflictHistory(session: ToolSession): ConflictHistory {
-	if (!session.conflictHistory) session.conflictHistory = new ConflictHistory();
-	return session.conflictHistory;
+/**
+ * Stream `absolutePath` for marker blocks equal to a registered entry. Unlike
+ * discovery this has no byte cap, so memory is bounded instead: only one
+ * candidate block is held, and it is dropped once it outgrows the largest
+ * registered block (in lines or line bytes). Stops early once every entry is
+ * found at its recorded line.
+ */
+async function findRegisteredBlocks(absolutePath: string, entries: readonly ConflictEntry[]): Promise<ConflictBlock[]> {
+	const regions = new Set<string>();
+	const unconfirmed = new Map<number, string>();
+	let maxLines = 0;
+	let maxLineBytes = 0;
+	for (const entry of entries) {
+		const region = buildRecordedRegion(entry);
+		const key = region.join("\n");
+		regions.add(key);
+		unconfirmed.set(entry.startLine, key);
+		maxLines = Math.max(maxLines, region.length);
+		for (const line of region) maxLineBytes = Math.max(maxLineBytes, Buffer.byteLength(line));
+	}
+	maxLineBytes += 1; // trailing CR
+
+	const found: ConflictBlock[] = [];
+	let candidate: string[] = [];
+	let candidateStart = 0;
+	/** Feed one line (`null` when over the byte bound); returns true once every entry is confirmed. */
+	const feed = (raw: string | null, lineNumber: number): boolean => {
+		const line = raw === null ? null : stripTrailingCr(raw);
+		if (line !== null && matchMarker(line, OURS_PREFIX) !== null) {
+			candidate = [line];
+			candidateStart = lineNumber;
+			return false;
+		}
+		if (candidate.length === 0) return false;
+		if (line === null || candidate.length === maxLines) {
+			candidate = [];
+			return false;
+		}
+		candidate.push(line);
+		if (matchMarker(line, THEIRS_PREFIX) === null) return false;
+		const block = scanConflictLines(candidate, candidateStart)[0];
+		candidate = [];
+		if (!block) return false;
+		const key = buildRecordedRegion(block).join("\n");
+		if (!regions.has(key)) return false;
+		found.push(block);
+		if (unconfirmed.get(block.startLine) === key) unconfirmed.delete(block.startLine);
+		return unconfirmed.size === 0;
+	};
+
+	// The decoder drops a leading BOM, as discovery's whole-file decode does.
+	const decoder = new TextDecoder();
+	let parts: Uint8Array[] = [];
+	let lineBytes = 0;
+	let lineNumber = 1;
+	const takeLine = (): string | null => {
+		const line = lineBytes > maxLineBytes ? null : decoder.decode(Buffer.concat(parts, lineBytes));
+		parts = [];
+		lineBytes = 0;
+		return line;
+	};
+	for await (const chunk of Bun.file(absolutePath).stream()) {
+		let start = 0;
+		for (let end = chunk.indexOf(10); ; end = chunk.indexOf(10, start)) {
+			const segment = chunk.subarray(start, end === -1 ? chunk.length : end);
+			lineBytes += segment.length;
+			if (lineBytes <= maxLineBytes) parts.push(segment);
+			if (end === -1) break;
+			if (feed(takeLine(), lineNumber++)) return found;
+			start = end + 1;
+		}
+	}
+	if (lineBytes > 0) feed(takeLine(), lineNumber);
+	return found;
 }
 
-/** A side of a conflict block that the `read` tool can render via `conflict://N/<scope>`. */
-export type ConflictScope = "ours" | "theirs" | "base";
+/**
+ * Re-check registered ids against the live file contents (all files, or only
+ * `absolutePath`): unchanged blocks follow line shifts, changed or vanished
+ * ones are retired, and a deleted file retires all of its ids.
+ */
+export async function reconcileRegisteredConflicts(history: ConflictHistory, absolutePath?: string): Promise<void> {
+	const byPath = Map.groupBy(
+		history.entries().filter(entry => absolutePath === undefined || entry.absolutePath === absolutePath),
+		entry => entry.absolutePath,
+	);
+	for (const [file, entries] of byPath) {
+		try {
+			history.reconcilePath(file, { blocks: await findRegisteredBlocks(file, entries) });
+		} catch (error) {
+			if (!isEnoent(error) && !hasFsCode(error, "ENOTDIR")) throw error;
+			history.invalidatePath(file);
+		}
+	}
+}
+
+/** The session's `ConflictHistory`, created on first use. */
+export function getConflictHistory(session: ToolSession): ConflictHistory {
+	const state = getToolConversationState(session);
+	state.conflictHistory ??= new ConflictHistory();
+	return state.conflictHistory;
+}
 
 const CONFLICT_SCOPES = new Set<ConflictScope>(["ours", "theirs", "base"]);
 
@@ -252,19 +382,28 @@ export interface ParsedConflictUri {
 	/** `"*"` selects every currently-registered conflict (bulk write only). */
 	id: number | "*";
 	scope?: ConflictScope;
-	/**
-	 * When `raw` was a malformed `<file-prefix>:conflict://…` path, the
-	 * stripped prefix is preserved here so callers can surface a gentle
-	 * "you don't need the file path" note. `undefined` for clean URIs.
-	 */
-	recoveredPrefix?: string;
 }
 
-// Accept an optional `<prefix>:` before the scheme so paths like
-// `path/to/file.ts:conflict://3` (where the agent mixed the `:conflicts`
-// read selector with the `conflict://` scheme) still resolve. The prefix
-// is greedy so the LAST `:conflict://` wins for multi-colon inputs.
-const CONFLICT_URI_RE = /^(?:(.+):)?conflict:\/\/(.+)$/;
+const CONFLICT_URI_RE = /^conflict:\/\/(.+)$/;
+// `path/to/file.ts:conflict://3`: the agent mixed the `:conflicts` read
+// selector with the `conflict://` scheme. The prefix is greedy so the LAST
+// `:conflict://` wins for multi-colon inputs.
+const PREFIXED_CONFLICT_URI_RE = /^(.+):(conflict:\/\/.+)$/;
+
+/**
+ * Tool-entry normalization for a `<file>:conflict://…` target, which is not a
+ * URL the router can route. Returns the bare `conflict://…` URL plus a note for
+ * the model; any other input passes through unchanged without a note.
+ */
+export function recoverConflictUriPrefix(raw: string): { path: string; note?: string } {
+	const match = raw.match(PREFIXED_CONFLICT_URI_RE);
+	if (!match) return { path: raw };
+	const [, prefix, url] = match;
+	return {
+		path: url,
+		note: `Note: stripped erroneous '${prefix}:' prefix from path; conflict URIs are global (use \`${url}\`, not \`<file>:${url}\`).`,
+	};
+}
 
 /**
  * Parse a `conflict://<N>`, `conflict://<N>/<scope>`, or `conflict://*` URI.
@@ -281,8 +420,7 @@ const CONFLICT_URI_RE = /^(?:(.+):)?conflict:\/\/(.+)$/;
 export function parseConflictUri(raw: string): ParsedConflictUri | null {
 	const match = raw.match(CONFLICT_URI_RE);
 	if (!match) return null;
-	const recoveredPrefix = match[1];
-	const tail = match[2];
+	const tail = match[1];
 	const slashIdx = tail.indexOf("/");
 	const idPart = slashIdx === -1 ? tail : tail.slice(0, slashIdx);
 	const scopePart = slashIdx === -1 ? undefined : tail.slice(slashIdx + 1);
@@ -293,7 +431,7 @@ export function parseConflictUri(raw: string): ParsedConflictUri | null {
 				`Invalid conflict URI '${raw}': wildcard 'conflict://*' does not accept a scope segment. Drop '/${scopePart}' or use a numeric id.`,
 			);
 		}
-		return recoveredPrefix !== undefined ? { id: "*", recoveredPrefix } : { id: "*" };
+		return { id: "*" };
 	}
 
 	if (!/^\d+$/.test(idPart)) {
@@ -316,7 +454,16 @@ export function parseConflictUri(raw: string): ParsedConflictUri | null {
 		scope = scopePart as ConflictScope;
 	}
 
-	return recoveredPrefix !== undefined ? { id, scope, recoveredPrefix } : { id, scope };
+	return { id, scope };
+}
+
+/** Result of {@link spliceConflict}: the new file text plus any boundary-echo repair applied. */
+export interface ConflictSplice {
+	text: string;
+	/** Replacement lines dropped because they duplicated the context directly above the region. */
+	trimmedLeading: number;
+	/** Replacement lines dropped because they duplicated the context directly below the region. */
+	trimmedTrailing: number;
 }
 
 /**
@@ -328,8 +475,16 @@ export function parseConflictUri(raw: string): ParsedConflictUri | null {
  * match), so out-of-band edits earlier in the file that shift line
  * numbers don't break resolution. Throws clearly when the marker block
  * has actually been altered or removed.
+ *
+ * Boundary-echo repair (same philosophy as the edit tool's hashline
+ * keeper repair): models frequently paste the "whole resolved function"
+ * including the lines that live directly before/after the marker block,
+ * which the verbatim splice would duplicate. Replacement lines that
+ * exactly echo the adjacent context are dropped when the echo is
+ * unambiguous — two or more consecutive lines, or a single line whose
+ * removal fixes a delimiter-balance mismatch against the recorded sides.
  */
-export function spliceConflict(originalText: string, entry: ConflictEntry, replacement: string): string {
+export function spliceConflict(originalText: string, entry: ConflictEntry, replacement: string): ConflictSplice {
 	const lines = originalText.split("\n");
 	const expected = buildRecordedRegion(entry);
 	const match = locateRegion(lines, expected, entry.startLine - 1);
@@ -341,6 +496,8 @@ export function spliceConflict(originalText: string, entry: ConflictEntry, repla
 
 	const trimmed = normalizeTrailingNewline(replacement);
 	let replacementLines = trimmed.split("\n").map(stripTrailingCr);
+	const echo = trimBoundaryEcho(replacementLines, lines, match, entry);
+	replacementLines = echo.lines;
 	// Round-trip fidelity for CRLF files: recorded sections are LF-normalized,
 	// so re-apply \r to spliced lines when the matched region used CRLF. The
 	// final replacement line only carries \r when another line follows it.
@@ -351,7 +508,79 @@ export function spliceConflict(originalText: string, entry: ConflictEntry, repla
 		);
 	}
 	const next = [...lines.slice(0, match.startIdx), ...replacementLines, ...lines.slice(match.endIdx + 1)];
-	return next.join("\n");
+	return { text: next.join("\n"), trimmedLeading: echo.leading, trimmedTrailing: echo.trailing };
+}
+
+const MAX_ECHO_LINES = 12;
+
+/**
+ * Net `{}`/`()`/`[]` count over `lines`. Crude (string/comment-blind) —
+ * used only to corroborate single-line echo trims, never alone.
+ */
+function delimiterBalance(lines: readonly string[]): number {
+	let balance = 0;
+	for (const line of lines) {
+		for (let i = 0; i < line.length; i++) {
+			const ch = line.charCodeAt(i);
+			if (ch === 123 /* { */ || ch === 40 /* ( */ || ch === 91 /* [ */) balance++;
+			else if (ch === 125 /* } */ || ch === 41 /* ) */ || ch === 93 /* ] */) balance--;
+		}
+	}
+	return balance;
+}
+
+/**
+ * Drop replacement lines that exactly echo the file lines adjacent to the
+ * located region. A multi-line echo is trimmed unconditionally (a correct
+ * resolution ending with the exact lines that already follow the region
+ * would mean intentionally duplicated code — vanishingly unlikely, and the
+ * untrimmed splice produces exactly that duplication). A single-line echo
+ * is trimmed only when the recorded sides agree on the region's delimiter
+ * balance and dropping the echo is what restores it.
+ */
+function trimBoundaryEcho(
+	replacement: string[],
+	fileLines: readonly string[],
+	match: { startIdx: number; endIdx: number },
+	entry: ConflictBlock,
+): { lines: string[]; leading: number; trailing: number } {
+	const oursBalance = delimiterBalance(entry.oursLines);
+	const expectedBalance = oursBalance === delimiterBalance(entry.theirsLines) ? oursBalance : null;
+	const singleEchoJustified = (lines: string[], without: string[]) =>
+		expectedBalance !== null &&
+		delimiterBalance(lines) !== expectedBalance &&
+		delimiterBalance(without) === expectedBalance;
+
+	let lines = replacement;
+	let trailing = 0;
+	const after: string[] = [];
+	for (let i = match.endIdx + 1; i < fileLines.length && after.length < MAX_ECHO_LINES; i++) {
+		after.push(stripTrailingCr(fileLines[i]!));
+	}
+	for (let k = Math.min(after.length, lines.length - 1); k >= 1; k--) {
+		if (!after.slice(0, k).every((line, i) => lines[lines.length - k + i] === line)) continue;
+		if (k >= 2 || singleEchoJustified(lines, lines.slice(0, -1))) {
+			trailing = k;
+			lines = lines.slice(0, lines.length - k);
+		}
+		break;
+	}
+
+	let leading = 0;
+	const before: string[] = [];
+	for (let i = match.startIdx - 1; i >= 0 && before.length < MAX_ECHO_LINES; i--) {
+		before.unshift(stripTrailingCr(fileLines[i]!));
+	}
+	for (let k = Math.min(before.length, lines.length - 1); k >= 1; k--) {
+		if (!before.slice(before.length - k).every((line, i) => lines[i] === line)) continue;
+		if (k >= 2 || singleEchoJustified(lines, lines.slice(1))) {
+			leading = k;
+			lines = lines.slice(k);
+		}
+		break;
+	}
+
+	return { lines, leading, trailing };
 }
 
 /** Reconstruct the recorded marker block as it should appear in the file. */
@@ -370,11 +599,8 @@ function buildRecordedRegion(entry: ConflictBlock): string[] {
 }
 
 /**
- * True when two registered blocks record the same marker-block content
- * (labels and all sides). Out-of-band edits can shift a block's line
- * numbers between reads, registering a fresh id while the stale one
- * persists; callers use content identity to treat a locate-miss for the
- * stale twin as "already resolved" instead of a hard failure.
+ * True when two blocks record the same marker-block content (labels and all
+ * sides), independent of source coordinates.
  */
 export function conflictRegionsEqual(a: ConflictBlock, b: ConflictBlock): boolean {
 	const ra = buildRecordedRegion(a);
@@ -384,19 +610,6 @@ export function conflictRegionsEqual(a: ConflictBlock, b: ConflictBlock): boolea
 		if (ra[i] !== rb[i]) return false;
 	}
 	return true;
-}
-
-/**
- * True when the entry's recorded marker block still occurs in `content`
- * (LF-normalized — recorded sections are stored LF). Distinguishes a stale
- * re-registration of a just-resolved region (no longer present) from a
- * DISTINCT conflict block that happens to be byte-identical (still present
- * elsewhere in the file and must stay addressable).
- */
-export function conflictRegionPresent(content: string, entry: ConflictBlock): boolean {
-	const region = buildRecordedRegion(entry).join("\n");
-	const normalized = content.includes("\r") ? content.replace(/\r\n/g, "\n") : content;
-	return normalized.includes(region);
 }
 
 /**
@@ -491,56 +704,6 @@ export function expandContentTokens(content: string, entry: ConflictEntry): stri
 	return out.join("\n");
 }
 
-/** Reconstruct a conflict-marker line from prefix and optional label. */
-function markerLine(prefix: string, label: string | undefined): string {
-	return label && label.length > 0 ? `${prefix} ${label}` : prefix;
-}
-
-/**
- * Materialise a conflict block for `conflict://<N>` reads (and their
- * `/ours` / `/theirs` / `/base` scopes).
- *
- * Returns:
- * - `lines`: the lines to render, ordered top-to-bottom.
- * - `startLine`: the 1-indexed file line number `lines[0]` corresponds
- *   to, so the read formatter can label hashline anchors with the
- *   original file positions.
- *
- * Bare (no scope) returns the full block including marker lines. A
- * scoped view returns only that side's body — `base` throws when the
- * recorded conflict is a 2-way merge with no base section.
- */
-export function renderConflictRegion(
-	entry: ConflictEntry,
-	scope: ConflictScope | undefined,
-): { lines: string[]; startLine: number } {
-	if (scope === "ours") {
-		return { lines: [...entry.oursLines], startLine: entry.startLine + 1 };
-	}
-	if (scope === "theirs") {
-		return { lines: [...entry.theirsLines], startLine: entry.separatorLine + 1 };
-	}
-	if (scope === "base") {
-		if (entry.baseLines === undefined || entry.baseLine === undefined) {
-			throw new ToolError(
-				`Conflict #${entry.id} has no base section (2-way merge). 'conflict://${entry.id}/base' is only valid for diff3 conflicts.`,
-			);
-		}
-		return { lines: [...entry.baseLines], startLine: entry.baseLine + 1 };
-	}
-	const out: string[] = [];
-	out.push(markerLine("<<<<<<<", entry.oursLabel));
-	out.push(...entry.oursLines);
-	if (entry.baseLines !== undefined) {
-		out.push(markerLine("|||||||", entry.baseLabel));
-		out.push(...entry.baseLines);
-	}
-	out.push("=======");
-	out.push(...entry.theirsLines);
-	out.push(markerLine(">>>>>>>", entry.theirsLabel));
-	return { lines: out, startLine: entry.startLine };
-}
-
 const PREVIEW_SIDE_LINES = 6;
 
 /**
@@ -574,8 +737,8 @@ export interface FormatConflictWarningOptions {
 	totalInFile?: number;
 	/** Display path used inside the `:conflicts` hint. */
 	displayPath?: string;
-	/** Whether the underlying file scan hit its byte cap. */
-	scanTruncated?: boolean;
+	/** Line where the underlying file scan hit its byte cap, if it did. */
+	truncatedAtLine?: number;
 }
 
 export function formatConflictWarning(
@@ -591,13 +754,13 @@ export function formatConflictWarning(
 	if (partial) {
 		const hintPath = options.displayPath ?? "<file>";
 		out.push(
-			`⚠ ${entries.length} of ${total} unresolved ${word} visible in this window (read \`${hintPath}:conflicts\` for the full list).`,
+			`⚠ ${entries.length} of ${total} unresolved ${word} visible in this window; this read registered only the blocks below, so don't infer ids for the others — read \`${hintPath}:conflicts\` to list and register the file's blocks.`,
 		);
 	} else {
 		out.push(`⚠ ${total} unresolved ${word} detected`);
 	}
-	if (options.scanTruncated) {
-		out.push("- note: file scan hit the byte cap; additional conflicts may exist beyond the scanned prefix.");
+	if (options.truncatedAtLine !== undefined) {
+		out.push(formatScanCapNote(options.displayPath ?? "<file>", options.truncatedAtLine));
 	}
 
 	const oursLabel = pickLabel(entries, e => e.oursLabel);
@@ -608,10 +771,16 @@ export function formatConflictWarning(
 	if (theirsLabel) out.push(`- theirs = ${theirsLabel}`);
 	if (anyBase) out.push(`- base = ${baseLabel ?? "(no label)"}`);
 	out.push(
-		'NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace the whole conflict region (markers + all sides).',
+		'NOTICE: Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` to render a single side). Resolve with `write({ path: "conflict://<N>", content })`, or bulk-resolve every registered conflict with `write({ path: "conflict://*", content })`. Writes replace ONLY the marker block (markers + all sides) — never repeat the lines before/after it; they stay in place.',
 	);
 	out.push(
-		'`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator. Lines that are not a token pass through verbatim, so `"// keep both\\n@ours\\n@theirs"` literally writes the comment, then ours, then theirs.',
+		'`content` shorthand: a line that is exactly `@ours` / `@theirs` / `@base` / `@both` expands to that recorded section. `@both` is ours-then-theirs with no separator — only for additive conflicts where each side adds something different; NEVER for competing edits of the same lines (pick a side or write the combined text). Lines that are not a token pass through verbatim, so `"// keep both\\n@ours\\n@theirs"` literally writes the comment, then ours, then theirs.',
+	);
+	out.push(
+		'Per-id bulk: `write({ path: "conflict://*", content: "1: @ours\\n2: @theirs\\n…" })` resolves each listed id with that side in ONE call — the cheapest way through many pick-one conflicts; unlisted ids stay registered.',
+	);
+	out.push(
+		"Resolve each block faithfully: keep one side (`@ours`/`@theirs`), or combine them when both intents apply — never invent content beyond the recorded sides, and never stack both sides of competing edits. Resolve several conflicts in a single turn by issuing multiple `write` calls at once; ids stay valid as earlier blocks are resolved.",
 	);
 
 	for (const entry of entries) {
@@ -654,14 +823,14 @@ export function formatConflictWarning(
  */
 export function formatConflictSummary(
 	entries: readonly ConflictEntry[],
-	options: { displayPath: string; scanTruncated?: boolean } = { displayPath: "" },
+	options: { displayPath: string; truncatedAtLine?: number } = { displayPath: "" },
 ): string {
 	const lines: string[] = [];
 	const total = entries.length;
 	const word = total === 1 ? "conflict" : "conflicts";
 	lines.push(`⚠ ${total} unresolved ${word} in ${options.displayPath || "<file>"}`);
-	if (options.scanTruncated) {
-		lines.push("- note: file scan hit the byte cap; additional conflicts may exist beyond the scanned prefix.");
+	if (options.truncatedAtLine !== undefined) {
+		lines.push(formatScanCapNote(options.displayPath || "<file>", options.truncatedAtLine));
 	}
 	const oursLabel = pickLabel(entries, e => e.oursLabel);
 	const theirsLabel = pickLabel(entries, e => e.theirsLabel);
@@ -674,7 +843,7 @@ export function formatConflictSummary(
 		'NOTICE: Bulk-resolve with `write({ path: "conflict://*", content })`, or address a single block with `write({ path: "conflict://<N>", content })`. Inspect a block by reading `conflict://<N>` (add `/ours` / `/theirs` / `/base` for a single side).',
 	);
 	lines.push(
-		"`content` shorthand: `@ours` / `@theirs` / `@base` / `@both` lines expand to the recorded sections; `@both` = ours-then-theirs. Non-token lines pass through verbatim.",
+		'`content` shorthand: `@ours` / `@theirs` / `@base` / `@both` lines expand to the recorded sections; `@both` = ours-then-theirs (additive conflicts only — never for competing edits of the same lines). Per-id bulk: content of `<id>: @side` lines (e.g. "1: @ours\\n2: @theirs") resolves each listed id in one call. Non-token lines pass through verbatim. Writes replace ONLY the marker block — never repeat the surrounding lines. Keep one side or combine faithfully; never invent content beyond the recorded sides.',
 	);
 	lines.push("");
 	const idWidth = String(entries[entries.length - 1]?.id ?? 1).length;

@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { generateId as generateTimedId, sha256Hex16, stableMemoryId } from "../../util/ids";
+import { cjkFtsTerms, containsSpacelessCjk, ftsQueryTerms, hasCjk, isCjkChar, recallTokens } from "../../util/regex";
 import { currentEmbeddingModel, embed } from "../embeddings";
 import { getMnemopiRuntimeOptions, mnemopiDebugEnabled, withMnemopiRuntimeOptions } from "../runtime-options";
 import { buildExactVectorIndex, searchExactVectorIndex } from "../vector-index";
@@ -35,76 +36,7 @@ const DEFAULT_WEIGHTS: HybridWeights = [0.5, 0.3, 0.2];
 const TS_CACHE_MAX = 2000;
 const moduleTimestampCache = new Map<string, Date>();
 
-const FACT_MATCH_STOPWORDS = new Set([
-	"a",
-	"an",
-	"and",
-	"are",
-	"as",
-	"at",
-	"be",
-	"by",
-	"can",
-	"could",
-	"did",
-	"do",
-	"does",
-	"for",
-	"from",
-	"had",
-	"has",
-	"have",
-	"how",
-	"i",
-	"in",
-	"is",
-	"it",
-	"its",
-	"me",
-	"my",
-	"of",
-	"on",
-	"or",
-	"our",
-	"related",
-	"should",
-	"that",
-	"the",
-	"their",
-	"there",
-	"this",
-	"to",
-	"totally",
-	"unrelated",
-	"use",
-	"uses",
-	"was",
-	"we",
-	"what",
-	"when",
-	"where",
-	"which",
-	"who",
-	"why",
-	"with",
-	"you",
-	"your",
-]);
-
-const RECALL_SYNONYMS: Readonly<Record<string, readonly string[]>> = {
-	branding: ["brand", "positioning", "identity", "wording"],
-	preference: ["prefer", "prefers", "want", "wants", "reject", "rejects", "avoid", "grounded"],
-	professional: ["software", "builder"],
-	url: ["link", "profile"],
-	current: ["now", "live", "latest"],
-	feeling: ["feel", "feels"],
-	imposter: ["self-doubt", "doubt", "insecure"],
-};
-
-const RECALL_TOKEN_RE = /[a-z0-9][a-z0-9_.:/+-]*/g;
-const SPLIT_TOKEN_RE = /[_:/.-]+/g;
 const WORD_RE = /[\p{L}\p{N}_]+/gu;
-
 function envNumber(name: string, fallback: number): number {
 	const raw = process.env[name];
 	if (raw === undefined || raw.trim() === "") return fallback;
@@ -121,12 +53,6 @@ function clamp01(value: number): number {
 
 function asFiniteNonNegative(value: number): number {
 	return Number.isFinite(value) && value > 0 ? value : 0;
-}
-
-function isCjkChar(ch: string): boolean {
-	return (
-		(ch >= "\u4e00" && ch <= "\u9fff") || (ch >= "\u3040" && ch <= "\u30ff") || (ch >= "\uac00" && ch <= "\ud7af")
-	);
 }
 
 function tableExists(db: Database, table: string): boolean {
@@ -250,144 +176,6 @@ export function temporalBoost(
 	return Math.exp(-hoursDelta / halflife);
 }
 
-export function recallTokens(text: string): string[] {
-	const out: string[] = [];
-	for (const match of text.toLowerCase().matchAll(RECALL_TOKEN_RE)) {
-		const token = match[0] ?? "";
-		if (token.length >= 3 && !FACT_MATCH_STOPWORDS.has(token) && !/^\d+$/.test(token)) out.push(token);
-	}
-	return out;
-}
-
-export function expandedQueryTokens(tokens: readonly string[]): string[] {
-	const expanded: string[] = [];
-	const seen = new Set<string>();
-	for (const token of tokens) {
-		const synonyms = RECALL_SYNONYMS[token] ?? [];
-		for (const candidate of [token, ...synonyms]) {
-			if (!seen.has(candidate)) {
-				seen.add(candidate);
-				expanded.push(candidate);
-			}
-		}
-	}
-	return expanded;
-}
-
-export function minimumRecallRelevance(queryTokens: readonly string[]): number {
-	if (queryTokens.length >= 4) return 0.3;
-	if (queryTokens.length === 3) return 0.5;
-	return 0.15;
-}
-
-export function factMatchTokens(text: string): Set<string> {
-	return new Set(recallTokens(text));
-}
-
-export function containsSpacelessCjk(text: string): boolean {
-	return hasCjk(text);
-}
-
-export function hasCjk(text: string): boolean {
-	for (const ch of text) if (isCjkChar(ch)) return true;
-	return false;
-}
-
-export function cjkFtsTerms(text: string): string[] {
-	const chars = Array.from(text).filter(isCjkChar);
-	if (chars.length === 0) return [];
-	const terms: string[] = [];
-	const seen = new Set<string>();
-	for (const ch of chars) {
-		if (!seen.has(ch)) {
-			seen.add(ch);
-			terms.push(ch);
-		}
-	}
-	for (let i = 0; i < chars.length - 1; i += 1) {
-		const left = chars[i];
-		const right = chars[i + 1];
-		if (left === undefined || right === undefined) continue;
-		const bigram = left + right;
-		if (!seen.has(bigram)) {
-			seen.add(bigram);
-			terms.push(`"${bigram}"`);
-		}
-	}
-	return terms;
-}
-
-export function lexicalRelevance(queryTokens: readonly string[], content: string, queryLower = ""): number {
-	const contentLower = content.toLowerCase();
-	const queryCjk = new Set(Array.from(queryLower).filter(isCjkChar));
-	if (queryTokens.length === 0 && queryCjk.size === 0) return 0;
-
-	const contentTokens = new Set(recallTokens(contentLower));
-	for (const token of Array.from(contentTokens)) {
-		for (const part of token.split(SPLIT_TOKEN_RE)) {
-			if (part.length >= 3 && !FACT_MATCH_STOPWORDS.has(part) && !/^\d+$/.test(part)) contentTokens.add(part);
-		}
-	}
-	if (contentTokens.size === 0 && queryCjk.size === 0) return 0;
-
-	let exact = 0;
-	let partial = 0;
-	for (const token of queryTokens) {
-		if (contentTokens.has(token)) {
-			exact += 1;
-			continue;
-		}
-		const synonyms = RECALL_SYNONYMS[token] ?? [];
-		if (synonyms.some(syn => contentTokens.has(syn))) {
-			partial += 0.75;
-			continue;
-		}
-		if (
-			token.length >= 4 &&
-			Array.from(contentTokens).some(
-				contentToken => contentToken.length >= 4 && (token.includes(contentToken) || contentToken.includes(token)),
-			)
-		) {
-			partial += 0.4;
-		}
-	}
-
-	const fullMatch = queryLower !== "" && contentLower.includes(queryLower) ? 1 : 0;
-	let score = (exact + partial + fullMatch) / Math.max(queryTokens.length, 1);
-	if (score === 0 && queryCjk.size > 0) {
-		const contentCjk = new Set(Array.from(contentLower).filter(isCjkChar));
-		let overlap = 0;
-		for (const ch of queryCjk) if (contentCjk.has(ch)) overlap += 1;
-		score = overlap / queryCjk.size;
-	}
-	return Math.min(score, 1);
-}
-
-export function strictFactMatches(query: string, factText: string): boolean {
-	const queryLower = query.toLowerCase().trim();
-	const factLower = factText.toLowerCase().trim();
-	if (!queryLower || !factLower) return false;
-	if (factLower.includes(queryLower)) return true;
-	const queryTokens = factMatchTokens(queryLower);
-	const factTokens = factMatchTokens(factLower);
-	if (queryTokens.size === 0 || factTokens.size === 0) return false;
-	const overlap = Array.from(queryTokens).filter(token => factTokens.has(token));
-	if (overlap.length >= 2) return true;
-	const token = overlap[0];
-	if (token === undefined) return false;
-	if (token.length >= 8 && /[./:_-]/.test(token)) return true;
-	return token.length >= 5;
-}
-
-export function ftsQueryTerms(query: string): string[] {
-	const terms: string[] = [];
-	for (const term of expandedQueryTokens(recallTokens(query))) {
-		const escaped = term.replaceAll('"', '""').trim();
-		if (escaped) terms.push(`"${escaped}"`);
-	}
-	return terms;
-}
-
 export function buildFtsQuery(query: string): string {
 	return ftsQueryTerms(query).join(" OR ");
 }
@@ -409,8 +197,9 @@ export function cjkLikeSearch(
 	const conditions = cjkChars.map(() => "content LIKE ? ESCAPE '\\'").join(" OR ");
 	try {
 		const rows = db
-			.query(`SELECT ${idColumn}, content FROM ${table} WHERE ${conditions} LIMIT ?`)
-			.all(...cjkChars.map(ch => `%${ch}%`), k * 5) as Record<string, unknown>[];
+			.query(`SELECT ${idColumn}, content FROM ${table} WHERE superseded_by IS NULL AND (valid_until IS NULL OR valid_until > ?)
+				   AND (${conditions}) LIMIT ?`)
+			.all(new Date().toISOString(), ...cjkChars.map(ch => `%${ch}%`), k * 5) as Record<string, unknown>[];
 		const scored: Array<{ id: string | number; score: number }> = [];
 		for (const row of rows) {
 			const content = String(row.content ?? "");
@@ -435,8 +224,12 @@ export function ftsSearch(db: Database, query: string, k = 20): FtsRankResult[] 
 	if (!ftsQuery) return hasCjk(query) ? (cjkLikeSearch(db, query, k, false) as FtsRankResult[]) : [];
 	try {
 		const rows = db
-			.query("SELECT rowid, rank FROM fts_episodes WHERE fts_episodes MATCH ? ORDER BY rank, rowid LIMIT ?")
-			.all(ftsQuery, k) as Record<string, unknown>[];
+			.query(`SELECT f.rowid, f.rank FROM fts_episodes f
+				 WHERE f.fts_episodes MATCH ?
+				   AND EXISTS (SELECT 1 FROM episodic_memory e WHERE e.rowid = f.rowid AND e.superseded_by IS NULL
+			       AND (e.valid_until IS NULL OR e.valid_until > ?))
+				 ORDER BY f.rank, f.rowid LIMIT ?`)
+			.all(ftsQuery, new Date().toISOString(), k) as Record<string, unknown>[];
 		if (rows.length === 0 && hasCjk(query)) return cjkLikeSearch(db, query, k, false) as FtsRankResult[];
 		return rows.map(row => ({ rowid: Number(row.rowid), rank: Number(row.rank) }));
 	} catch {
@@ -449,8 +242,12 @@ export function ftsSearchWorking(db: Database, query: string, k = 20): WorkingFt
 	if (!ftsQuery) return hasCjk(query) ? (cjkLikeSearch(db, query, k, true) as WorkingFtsRankResult[]) : [];
 	try {
 		const rows = db
-			.query("SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank, id LIMIT ?")
-			.all(ftsQuery, k) as Record<string, unknown>[];
+			.query(`SELECT f.id, f.rank FROM fts_working f
+				 WHERE f.fts_working MATCH ?
+				   AND EXISTS (SELECT 1 FROM working_memory w WHERE w.id = f.id AND w.superseded_by IS NULL
+				       AND (w.valid_until IS NULL OR w.valid_until > ?))
+				 ORDER BY f.rank, f.id LIMIT ?`)
+			.all(ftsQuery, new Date().toISOString(), k) as Record<string, unknown>[];
 		if (rows.length === 0 && hasCjk(query)) return cjkLikeSearch(db, query, k, true) as WorkingFtsRankResult[];
 		return rows.map(row => ({ id: String(row.id), rank: Number(row.rank) }));
 	} catch {
@@ -482,19 +279,29 @@ export function vecAvailable(db: Database): boolean {
 	return tableExists(db, "vec_episodes");
 }
 
+// Per-Database memo for the vec table shape: schema is fixed at open, so
+// probing sqlite_master on every insert/search is pure overhead. WeakMap
+// keeps no Database alive.
+const vecTypeMemo = new WeakMap<Database, "float32" | "int8" | "bit">();
+
 export function effectiveVecType(db: Database): "float32" | "int8" | "bit" {
-	if (!vecAvailable(db)) return "float32";
-	try {
-		const row = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_episodes'").get() as {
-			sql?: string;
-		} | null;
-		const sql = row?.sql ?? "";
-		if (sql.includes("int8")) return "int8";
-		if (sql.includes("bit")) return "bit";
-	} catch {
-		return "float32";
+	const cached = vecTypeMemo.get(db);
+	if (cached !== undefined) return cached;
+	let resolved: "float32" | "int8" | "bit" = "float32";
+	if (vecAvailable(db)) {
+		try {
+			const row = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_episodes'").get() as {
+				sql?: string;
+			} | null;
+			const sql = row?.sql ?? "";
+			if (sql.includes("int8")) resolved = "int8";
+			else if (sql.includes("bit")) resolved = "bit";
+		} catch {
+			resolved = "float32";
+		}
 	}
-	return "float32";
+	vecTypeMemo.set(db, resolved);
+	return resolved;
 }
 
 export function vecInsert(db: Database, rowid: number, embedding: readonly number[]): void {
@@ -908,7 +715,7 @@ export {
 	maximallyInformativeBinarization,
 	quantizeInt8,
 } from "../binary-vectors";
-export { sha256Hex16 };
+export { cjkFtsTerms, containsSpacelessCjk, ftsQueryTerms, recallTokens, sha256Hex16 };
 
 /** Identifies one freshly stored memory whose embedding still needs to be derived. */
 export interface EmbedItem {
@@ -916,23 +723,87 @@ export interface EmbedItem {
 	readonly content: string;
 }
 
+/** One derived vector waiting to be written, keyed to the memory and the exact text embedded. */
+export interface StagedEmbedding extends EmbedItem {
+	readonly json: string;
+}
+
+const INSERT_LIVE_EMBEDDING_SQL = `
+	INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model)
+	SELECT ?, ?, ?
+	WHERE EXISTS (
+		SELECT 1 FROM working_memory
+		WHERE id = ? AND superseded_by IS NULL AND COALESCE(embed_text, content) = ?
+	) OR EXISTS (
+		SELECT 1 FROM episodic_memory
+		WHERE id = ? AND superseded_by IS NULL AND content = ?
+	)
+`;
+
+/**
+ * Upsert each staged vector only if its memory is still live (not superseded) and its
+ * effective embedding text -- `COALESCE(embed_text, content)` for working memories,
+ * `content` for episodic ones -- still equals the text that was embedded. Returns the
+ * number of rows actually written, which is what gates callers' cache invalidation.
+ * `memory_embeddings` rows are only ever written here, so this is the one place that
+ * rejects the two stale writes of a slow `embed()` call: a late vector for a memory
+ * whose text changed after an update, and a late vector for a deleted memory.
+ *
+ * Relies on every `scheduleEmbedding` caller passing exactly the stored effective text
+ * (`remember`, `rememberBatch`, `updateWorking` -- which nulls `embed_text` -- and
+ * `consolidateToEpisodic`); a mismatched text is silently dropped, not re-embedded.
+ */
+export function insertLiveEmbeddings(db: Database, rows: readonly StagedEmbedding[], model: string): number {
+	using insertEmbedding = db.prepare(INSERT_LIVE_EMBEDDING_SQL);
+	let committed = 0;
+	for (const row of rows) {
+		const result = insertEmbedding.run(
+			row.memoryId,
+			row.json,
+			model,
+			row.memoryId,
+			row.content,
+			row.memoryId,
+			row.content,
+		);
+		committed += result.changes;
+	}
+	return committed;
+}
+
 async function runEmbedding(beam: BeamMemoryState, items: readonly EmbedItem[]): Promise<void> {
 	try {
 		const matrix = await embed(items.map(item => item.content));
 		if (matrix === null) return;
-		const model = currentEmbeddingModel();
-		const insertEmbedding = beam.db.prepare(
-			"INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model) VALUES (?, ?, ?)",
-		);
-		const insertMany = beam.db.transaction((rows: readonly EmbedItem[]) => {
-			for (let i = 0; i < rows.length; i += 1) {
+		// Persisting the vectors runs synchronously on the caller's event loop; label it so a
+		// stall is attributable. The embedding itself is awaited above, outside the label.
+		withLoopPhase("mnemopi.embed-persist", () => {
+			const model = currentEmbeddingModel();
+			const staged: StagedEmbedding[] = [];
+			for (let i = 0; i < items.length; i += 1) {
 				const vector = matrix[i];
-				const item = rows[i];
+				const item = items[i];
 				if (vector === undefined || item === undefined) continue;
-				insertEmbedding.run(item.memoryId, JSON.stringify(Array.from(vector)), model);
+				staged.push({
+					memoryId: item.memoryId,
+					content: item.content,
+					json: JSON.stringify(Array.from(vector)),
+				});
 			}
+			const insertMany = beam.db.transaction((rows: readonly StagedEmbedding[]) =>
+				insertLiveEmbeddings(beam.db, rows, model),
+			);
+			const committed = insertMany(staged);
+			// A recall taken while these vectors were still generating cached an FTS-only ranking, and
+			// committing vectors changes what recall returns -- so that cache must be dropped, or the
+			// pre-embedding order keeps being served for the whole cache TTL. Gated on `committed`: a
+			// batch whose provider returned a short or empty matrix inserts nothing, and a row whose
+			// memory was updated or deleted while its vector was in flight is discarded instead of
+			// written; neither changes a ranking, and invalidating there would only discard a
+			// still-valid cache. Only the query cache is affected; the polyphonic subject dictionary
+			// is built from facts/gists, which an embedding batch never touches.
+			if (committed > 0) beam.caches.queryCache?.invalidate();
 		});
-		insertMany(items);
 	} catch (error) {
 		// Background embedding generation is best-effort: a failing provider, a closed DB
 		// during shutdown, or a transient API error must never disrupt the synchronous

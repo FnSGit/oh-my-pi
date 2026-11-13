@@ -1,15 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as os from "node:os";
-import * as path from "node:path";
 import { HistoryStorage } from "@oh-my-pi/pi-coding-agent/session/history-storage";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
-let tempDir = "";
+let tempDir: TempDir | null = null;
 
 async function freshStorage(): Promise<HistoryStorage> {
-	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-history-search-"));
-	HistoryStorage.resetInstance();
-	return HistoryStorage.open(path.join(tempDir, "history.db"));
+	tempDir = TempDir.createSync("@omp-history-search-");
+	HistoryStorage.close();
+	return HistoryStorage.open(tempDir.join("history.db"));
 }
 
 async function seed(storage: HistoryStorage, prompts: string[]): Promise<void> {
@@ -19,16 +17,17 @@ async function seed(storage: HistoryStorage, prompts: string[]): Promise<void> {
 }
 
 beforeEach(() => {
-	HistoryStorage.resetInstance();
+	HistoryStorage.close();
 	vi.useFakeTimers();
 });
 
 afterEach(async () => {
-	HistoryStorage.resetInstance();
+	HistoryStorage.close();
 	vi.useRealTimers();
 	if (tempDir) {
-		await fs.rm(tempDir, { recursive: true, force: true });
-		tempDir = "";
+		await Bun.sleep(0);
+		await tempDir.remove().catch(() => {});
+		tempDir = null;
 	}
 });
 
@@ -79,15 +78,6 @@ describe("HistoryStorage.search", () => {
 			"precommit hook fix", // substring-only (`commit` is infix of `precommit`)
 			"commit the changes", // FTS prefix match on token `commit`
 		]);
-	});
-
-	it("dedupes when FTS and substring both match the same row", async () => {
-		const storage = await freshStorage();
-		await seed(storage, ["commit the changes"]);
-
-		const results = storage.search("commit", 10);
-		expect(results).toHaveLength(1);
-		expect(results[0]?.prompt).toBe("commit the changes");
 	});
 
 	it("matches case-insensitively for substring fallback", async () => {

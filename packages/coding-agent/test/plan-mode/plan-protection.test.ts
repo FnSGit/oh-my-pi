@@ -1,11 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import type { AgentToolCall } from "@oh-my-pi/pi-agent-core";
+import { type AgentToolCall, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import type { SessionMessageEntry } from "@oh-my-pi/pi-agent-core/compaction/entries";
 import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "@oh-my-pi/pi-agent-core/compaction/pruning";
 import { AGGRESSIVE_SHAKE_CONFIG, collectShakeRegions } from "@oh-my-pi/pi-agent-core/compaction/shake";
 import type { ProtectedToolContext } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
 import type { AssistantMessage, TextContent, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai";
 import { createPlanReadMatcher } from "@oh-my-pi/pi-coding-agent/plan-mode/plan-protection";
+
+const tokenizer = new Tokenizer();
 
 function context(opts: { toolName?: string; callName?: string | undefined; path?: string }): ProtectedToolContext {
 	const toolResult = {
@@ -123,7 +125,7 @@ describe("plan-read protection in compaction", () => {
 
 	it("prunes regular reads but keeps the plan read intact", () => {
 		const planResult = readResult("plan-read", "plan body that must remain intact");
-		const fileResult = readResult("file-read", "file body that can be pruned");
+		const fileResult = readResult("file-read", "file body that can be pruned ".repeat(20));
 		const entries = [
 			readCall("plan-read", "local://wp-migration.md"),
 			planResult,
@@ -131,7 +133,7 @@ describe("plan-read protection in compaction", () => {
 			fileResult,
 		];
 
-		const result = pruneToolOutputs(entries, {
+		const result = pruneToolOutputs(entries, tokenizer, {
 			...DEFAULT_PRUNE_CONFIG,
 			protectTokens: 0,
 			minimumSavings: 0,
@@ -153,8 +155,9 @@ describe("plan-read protection in compaction", () => {
 			fileResult,
 		];
 
-		const regions = collectShakeRegions(entries, {
+		const regions = collectShakeRegions(entries, tokenizer, {
 			...AGGRESSIVE_SHAKE_CONFIG,
+			protectTokens: 0,
 			protectedTools: [...AGGRESSIVE_SHAKE_CONFIG.protectedTools, matcher],
 		});
 

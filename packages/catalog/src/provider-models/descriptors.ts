@@ -1,456 +1,219 @@
 /**
- * The provider catalog table: one entry per chat-model provider, carrying the
- * catalog half of what used to live in `@oh-my-pi/pi-ai`'s registry definitions
- * (default model, runtime model-manager factory, discovery wiring). The auth
- * half (env keys, OAuth login/refresh) stays in the pi-ai registry, which
- * type-checks itself against `KnownProvider` from this table.
+ * Runtime model-manager factories for catalog providers. Everything else a
+ * provider entry carries — default model, env keys, discovery wiring, seed
+ * rows — is authored in `src/compat/rules/providers/<id>.kdl` and read from
+ * the compiled entry (`src/compat/providers.ts`); this table holds only the
+ * code half. Providers without a factory (`amazon-bedrock`, `azure`,
+ * `gitlab-duo`, MiniMax, and the bespoke OAuth-driven managers
+ * `google-antigravity` / `google-gemini-cli` / `openai-codex` built by the
+ * coding-agent runtime) still have a KDL entry but no runtime discovery here.
  */
-import type { ModelManagerConfig, ProviderCatalogEntry, ProviderDescriptor } from "./descriptor-types";
+import type { KnownProvider } from "../compat/provider-ids";
+import { providerEntries, providerEntry } from "../compat/providers";
+import type { Api } from "../types";
+import type { ModelManagerOptions } from "../model-manager";
+import type { ModelManagerConfig, ProviderDescriptor } from "./descriptor-types";
 import { googleModelManagerOptions, googleVertexModelManagerOptions } from "./google";
 import { ollamaCloudModelManagerOptions } from "./ollama";
 import {
+	abliterationModelManagerOptions,
+	aiandModelManagerOptions,
 	aimlApiModelManagerOptions,
 	alibabaCodingPlanModelManagerOptions,
+	alibabaTokenPlanModelManagerOptions,
 	anthropicModelManagerOptions,
+	basetenModelManagerOptions,
+	bedrockMantleModelManagerOptions,
 	cerebrasModelManagerOptions,
+	charmHyperModelManagerOptions,
+	clinePassModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
+	commandCodeModelManagerOptions,
+	coralbricksModelManagerOptions,
+	coreWeaveModelManagerOptions,
+	deepinfraModelManagerOptions,
 	deepseekModelManagerOptions,
 	firepassModelManagerOptions,
 	fireworksModelManagerOptions,
 	githubCopilotModelManagerOptions,
+	gmiCloudModelManagerOptions,
 	groqModelManagerOptions,
+	helmcodeModelManagerOptions,
 	huggingfaceModelManagerOptions,
+	inceptionModelManagerOptions,
 	kiloModelManagerOptions,
 	kimiCodeModelManagerOptions,
 	litellmModelManagerOptions,
 	lmStudioModelManagerOptions,
+	metaModelManagerOptions,
+	museCodeModelManagerOptions,
 	mistralModelManagerOptions,
 	moonshotModelManagerOptions,
 	nanoGptModelManagerOptions,
+	novitaModelManagerOptions,
 	nvidiaModelManagerOptions,
 	ollamaModelManagerOptions,
 	openaiModelManagerOptions,
 	opencodeGoModelManagerOptions,
 	opencodeZenModelManagerOptions,
 	openrouterModelManagerOptions,
+	otariModelManagerOptions,
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
+	sakanaModelManagerOptions,
+	sambanovaModelManagerOptions,
+	scalewayModelManagerOptions,
+	siliconflowCnModelManagerOptions,
+	siliconflowModelManagerOptions,
+	singularityApiDevModelManagerOptions,
+	singularityApiTechModelManagerOptions,
+	stepfunModelManagerOptions,
 	syntheticModelManagerOptions,
 	togetherModelManagerOptions,
+	umansModelManagerOptions,
 	veniceModelManagerOptions,
 	vercelAiGatewayModelManagerOptions,
 	vllmModelManagerOptions,
-	waferPassModelManagerOptions,
 	waferServerlessModelManagerOptions,
 	xaiModelManagerOptions,
 	xaiOAuthModelManagerOptions,
 	xiaomiModelManagerOptions,
+	yoloAutoModelManagerOptions,
 	zenmuxModelManagerOptions,
 	zhipuCodingPlanModelManagerOptions,
 } from "./openai-compat";
-import { cursorModelManagerOptions, zaiModelManagerOptions } from "./special";
+import {
+	cloudflareWorkersAiModelManagerOptions,
+	cursorModelManagerOptions,
+	devinModelManagerOptions,
+	factoryDroidModelManagerOptions,
+	gitLabDuoWorkflowModelManagerOptions,
+	liquidModelManagerOptions,
+	localModelManagerOptions,
+	naceModelManagerOptions,
+	typesafeModelManagerOptions,
+	webModelManagerOptions,
+	zaiModelManagerOptions,
+} from "./special";
 
-export const CATALOG_PROVIDERS = [
-	{
-		id: "aimlapi",
-		defaultModel: "gpt-4o",
-		envVars: ["AIMLAPI_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => aimlApiModelManagerOptions(config),
-		dynamicModelsAuthoritative: true,
-		catalogDiscovery: { label: "AIML API" },
-	},
-	{
-		id: "alibaba-coding-plan",
-		defaultModel: "qwen3.5-plus",
-		envVars: ["ALIBABA_CODING_PLAN_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => alibabaCodingPlanModelManagerOptions(config),
-		catalogDiscovery: { label: "Alibaba Coding Plan" },
-	},
-	{
-		id: "amazon-bedrock",
-		defaultModel: "us.anthropic.claude-opus-4-6-v1",
-	},
-	{
-		id: "anthropic",
-		defaultModel: "claude-opus-4-6",
-		createModelManagerOptions: (config: ModelManagerConfig) => anthropicModelManagerOptions(config),
-	},
-	{
-		id: "cerebras",
-		defaultModel: "zai-glm-4.6",
-		envVars: ["CEREBRAS_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => cerebrasModelManagerOptions(config),
-		catalogDiscovery: { label: "Cerebras" },
-	},
-	{
-		id: "cloudflare-ai-gateway",
-		defaultModel: "claude-sonnet-4-5",
-		envVars: ["CLOUDFLARE_AI_GATEWAY_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => cloudflareAiGatewayModelManagerOptions(config),
-		catalogDiscovery: { label: "Cloudflare AI Gateway" },
-	},
-	{
-		id: "cursor",
-		defaultModel: "claude-sonnet-4-6",
-		envVars: ["CURSOR_ACCESS_TOKEN"],
-		createModelManagerOptions: (config: ModelManagerConfig) => cursorModelManagerOptions(config),
-		catalogDiscovery: { label: "Cursor", envVars: ["CURSOR_API_KEY"], oauthProvider: "cursor" },
-	},
-	{
-		id: "deepseek",
-		defaultModel: "deepseek-v4-pro",
-		envVars: ["DEEPSEEK_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => deepseekModelManagerOptions(config),
-		catalogDiscovery: { label: "DeepSeek" },
-	},
-	{
-		id: "firepass",
-		defaultModel: "kimi-k2.6-turbo",
-		envVars: ["FIREPASS_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => firepassModelManagerOptions(config),
-	},
-	{
-		id: "fireworks",
-		defaultModel: "kimi-k2.6",
-		envVars: ["FIREWORKS_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => fireworksModelManagerOptions(config),
-		catalogDiscovery: { label: "Fireworks" },
-	},
-	{
-		id: "github-copilot",
-		defaultModel: "gpt-4o",
-		envVars: ["COPILOT_GITHUB_TOKEN"],
-		createModelManagerOptions: (config: ModelManagerConfig) => githubCopilotModelManagerOptions(config),
-	},
-	{
-		id: "gitlab-duo",
-		defaultModel: "duo-chat-sonnet-4-5",
-		envVars: ["GITLAB_TOKEN"],
-	},
-	{
-		id: "google",
-		defaultModel: "gemini-2.5-pro",
-		envVars: ["GEMINI_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => googleModelManagerOptions(config),
-	},
-	{
-		id: "google-antigravity",
-		defaultModel: "gemini-3.1-pro",
-		specialModelManager: true,
-	},
-	{
-		id: "google-gemini-cli",
-		defaultModel: "gemini-2.5-pro",
-		specialModelManager: true,
-	},
-	{
-		id: "google-vertex",
-		defaultModel: "gemini-3-pro-preview",
-		createModelManagerOptions: (config: ModelManagerConfig) => googleVertexModelManagerOptions(config),
-		allowUnauthenticated: true,
-	},
-	{
-		id: "groq",
-		defaultModel: "openai/gpt-oss-120b",
-		envVars: ["GROQ_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => groqModelManagerOptions(config),
-	},
-	{
-		id: "huggingface",
-		defaultModel: "deepseek-ai/DeepSeek-R1",
-		envVars: ["HUGGINGFACE_HUB_TOKEN", "HF_TOKEN"],
-		createModelManagerOptions: (config: ModelManagerConfig) => huggingfaceModelManagerOptions(config),
-		catalogDiscovery: { label: "Hugging Face" },
-	},
-	{
-		id: "kilo",
-		defaultModel: "anthropic/claude-sonnet-4.5",
-		envVars: ["KILO_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => kiloModelManagerOptions(config),
-		catalogDiscovery: { label: "Kilo Gateway", allowUnauthenticated: true },
-	},
-	{
-		id: "kimi-code",
-		defaultModel: "kimi-k2.5",
-		createModelManagerOptions: (config: ModelManagerConfig) => kimiCodeModelManagerOptions(config),
-		catalogDiscovery: { label: "Kimi Code", envVars: ["KIMI_API_KEY"] },
-	},
-	{
-		id: "litellm",
-		defaultModel: "claude-opus-4-6",
-		envVars: ["LITELLM_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => litellmModelManagerOptions(config),
-		catalogDiscovery: { label: "LiteLLM", allowUnauthenticated: true },
-	},
-	{
-		id: "lm-studio",
-		defaultModel: "llama-3-8b",
-		envVars: ["LM_STUDIO_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => lmStudioModelManagerOptions(config),
-		allowUnauthenticated: true,
-	},
-	{
-		id: "minimax",
-		defaultModel: "MiniMax-M3",
-		envVars: ["MINIMAX_API_KEY"],
-	},
-	{
-		id: "minimax-code",
-		defaultModel: "MiniMax-M3",
-		envVars: ["MINIMAX_CODE_API_KEY"],
-	},
-	{
-		id: "minimax-code-cn",
-		defaultModel: "MiniMax-M3",
-		envVars: ["MINIMAX_CODE_CN_API_KEY"],
-	},
-	{
-		id: "mistral",
-		defaultModel: "devstral-medium-latest",
-		envVars: ["MISTRAL_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => mistralModelManagerOptions(config),
-	},
-	{
-		id: "moonshot",
-		defaultModel: "kimi-k2.5",
-		envVars: ["MOONSHOT_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => moonshotModelManagerOptions(config),
-		catalogDiscovery: { label: "Moonshot" },
-	},
-	{
-		id: "nanogpt",
-		defaultModel: "openai/gpt-5.4",
-		envVars: ["NANO_GPT_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => nanoGptModelManagerOptions(config),
-		catalogDiscovery: { label: "NanoGPT" },
-	},
-	{
-		id: "nvidia",
-		defaultModel: "nvidia/llama-3.1-nemotron-70b-instruct",
-		envVars: ["NVIDIA_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => nvidiaModelManagerOptions(config),
-		catalogDiscovery: { label: "NVIDIA" },
-	},
-	{
-		id: "ollama",
-		defaultModel: "gpt-oss:20b",
-		envVars: ["OLLAMA_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => ollamaModelManagerOptions(config),
-		allowUnauthenticated: true,
-	},
-	{
-		id: "ollama-cloud",
-		defaultModel: "gpt-oss:120b",
-		envVars: ["OLLAMA_CLOUD_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => ollamaCloudModelManagerOptions(config),
-		catalogDiscovery: { label: "Ollama Cloud", oauthProvider: "ollama-cloud" },
-	},
-	{
-		id: "openai",
-		defaultModel: "gpt-5.4",
-		envVars: ["OPENAI_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => openaiModelManagerOptions(config),
-	},
-	{
-		id: "openai-codex",
-		defaultModel: "gpt-5.4",
-		envVars: ["OPENAI_CODEX_OAUTH_TOKEN"],
-		specialModelManager: true,
-	},
-	{
-		id: "opencode-go",
-		defaultModel: "kimi-k2.5",
-		envVars: ["OPENCODE_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => opencodeGoModelManagerOptions(config),
-	},
-	{
-		id: "opencode-zen",
-		defaultModel: "claude-sonnet-4-6",
-		envVars: ["OPENCODE_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => opencodeZenModelManagerOptions(config),
-	},
-	{
-		id: "openrouter",
-		defaultModel: "openai/gpt-5.4",
-		envVars: ["OPENROUTER_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => openrouterModelManagerOptions(config),
-		catalogDiscovery: { label: "OpenRouter", allowUnauthenticated: true },
-	},
-	{
-		id: "qianfan",
-		defaultModel: "deepseek-v3.2",
-		envVars: ["QIANFAN_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => qianfanModelManagerOptions(config),
-		catalogDiscovery: { label: "Qianfan" },
-	},
-	{
-		id: "qwen-portal",
-		defaultModel: "coder-model",
-		envVars: ["QWEN_OAUTH_TOKEN", "QWEN_PORTAL_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => qwenPortalModelManagerOptions(config),
-		catalogDiscovery: {
-			label: "Qwen Portal",
-			oauthProvider: "qwen-portal",
-		},
-	},
-	{
-		id: "synthetic",
-		defaultModel: "hf:zai-org/GLM-5.1",
-		envVars: ["SYNTHETIC_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => syntheticModelManagerOptions(config),
-		dynamicModelsAuthoritative: true,
-		catalogDiscovery: { label: "Synthetic" },
-	},
-	{
-		id: "together",
-		defaultModel: "moonshotai/Kimi-K2.5",
-		envVars: ["TOGETHER_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => togetherModelManagerOptions(config),
-		catalogDiscovery: { label: "Together" },
-	},
-	{
-		id: "venice",
-		defaultModel: "llama-3.3-70b",
-		envVars: ["VENICE_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => veniceModelManagerOptions(config),
-		catalogDiscovery: { label: "Venice", allowUnauthenticated: true },
-	},
-	{
-		id: "vercel-ai-gateway",
-		defaultModel: "anthropic/claude-sonnet-4-6",
-		envVars: ["AI_GATEWAY_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => vercelAiGatewayModelManagerOptions(config),
-		catalogDiscovery: {
-			label: "Vercel AI Gateway",
-			envVars: ["VERCEL_AI_GATEWAY_API_KEY"],
-			allowUnauthenticated: true,
-		},
-	},
-	{
-		id: "vllm",
-		defaultModel: "gpt-oss-20b",
-		envVars: ["VLLM_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => vllmModelManagerOptions(config),
-		catalogDiscovery: { label: "vLLM", allowUnauthenticated: true },
-	},
-	{
-		id: "wafer-pass",
-		defaultModel: "GLM-5.1",
-		envVars: ["WAFER_PASS_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => waferPassModelManagerOptions(config),
-		catalogDiscovery: { label: "Wafer Pass", oauthProvider: "wafer-pass" },
-	},
-	{
-		id: "wafer-serverless",
-		defaultModel: "GLM-5.1",
-		envVars: ["WAFER_SERVERLESS_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => waferServerlessModelManagerOptions(config),
-		catalogDiscovery: {
-			label: "Wafer Serverless",
-			oauthProvider: "wafer-serverless",
-		},
-	},
-	{
-		id: "xai",
-		defaultModel: "grok-4-fast-non-reasoning",
-		envVars: ["XAI_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => xaiModelManagerOptions(config),
-	},
-	{
-		id: "xai-oauth",
-		defaultModel: "grok-4.3",
-		envVars: ["XAI_OAUTH_TOKEN", "XAI_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => xaiOAuthModelManagerOptions(config),
-		catalogDiscovery: {
-			label: "xAI Grok OAuth (SuperGrok)",
-			oauthProvider: "xai-oauth",
-		},
-	},
-	{
-		id: "xiaomi",
-		defaultModel: "mimo-v2-flash",
-		envVars: ["XIAOMI_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => xiaomiModelManagerOptions(config),
-		catalogDiscovery: { label: "Xiaomi" },
-	},
-	{
-		id: "xiaomi-token-plan-ams",
-		defaultModel: "mimo-v2.5",
-		envVars: ["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) =>
-			xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-ams", tokenPlanRegion: "ams" }),
-	},
-	{
-		id: "xiaomi-token-plan-cn",
-		defaultModel: "mimo-v2.5",
-		envVars: ["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) =>
-			xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-cn", tokenPlanRegion: "cn" }),
-	},
-	{
-		id: "xiaomi-token-plan-sgp",
-		defaultModel: "mimo-v2.5",
-		envVars: ["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) =>
-			xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-sgp", tokenPlanRegion: "sgp" }),
-	},
-	{
-		id: "zai",
-		defaultModel: "glm-5.1",
-		envVars: ["ZAI_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => zaiModelManagerOptions(config),
-		catalogDiscovery: { label: "zAI" },
-	},
-	{
-		id: "zenmux",
-		defaultModel: "anthropic/claude-opus-4.6",
-		envVars: ["ZENMUX_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => zenmuxModelManagerOptions(config),
-		catalogDiscovery: { label: "ZenMux" },
-	},
-	{
-		id: "zhipu-coding-plan",
-		defaultModel: "glm-5.1",
-		envVars: ["ZHIPU_API_KEY"],
-		createModelManagerOptions: (config: ModelManagerConfig) => zhipuCodingPlanModelManagerOptions(config),
-		catalogDiscovery: { label: "Zhipu Coding Plan" },
-	},
-] as const satisfies readonly ProviderCatalogEntry[];
+export type { KnownProvider } from "../compat/provider-ids";
 
-/** Chat-model providers — every entry in the catalog table. */
-export type KnownProvider = (typeof CATALOG_PROVIDERS)[number]["id"];
+type ModelManagerFactory = (config: ModelManagerConfig) => ModelManagerOptions<Api>;
+
+const MODEL_MANAGER_FACTORIES: Readonly<Partial<Record<KnownProvider, ModelManagerFactory>>> = {
+	abliteration: config => abliterationModelManagerOptions(config),
+	aiand: config => aiandModelManagerOptions(config),
+	aimlapi: config => aimlApiModelManagerOptions(config),
+	"alibaba-coding-plan": config => alibabaCodingPlanModelManagerOptions(config),
+	"alibaba-token-plan": config => alibabaTokenPlanModelManagerOptions(config),
+	baseten: config => basetenModelManagerOptions(config),
+	"bedrock-mantle": config => bedrockMantleModelManagerOptions(config),
+	anthropic: config => anthropicModelManagerOptions(config),
+	cerebras: config => cerebrasModelManagerOptions(config),
+	"charm-hyper": config => charmHyperModelManagerOptions(config),
+	"cloudflare-ai-gateway": config => cloudflareAiGatewayModelManagerOptions(config),
+	"cloudflare-workers-ai": () => cloudflareWorkersAiModelManagerOptions(),
+	commandcode: config => commandCodeModelManagerOptions(config),
+	coralbricks: config => coralbricksModelManagerOptions(config),
+	cursor: config => cursorModelManagerOptions(config),
+	deepinfra: config => deepinfraModelManagerOptions(config),
+	deepseek: config => deepseekModelManagerOptions(config),
+	devin: config => devinModelManagerOptions(config),
+	"factory-droid": config => factoryDroidModelManagerOptions(config),
+	"cline-pass": config => clinePassModelManagerOptions(config),
+	firepass: config => firepassModelManagerOptions(config),
+	fireworks: config => fireworksModelManagerOptions(config),
+	"github-copilot": config => githubCopilotModelManagerOptions(config),
+	"gitlab-duo-agent": config => gitLabDuoWorkflowModelManagerOptions(config),
+	"gmi-cloud": config => gmiCloudModelManagerOptions(config),
+	google: config => googleModelManagerOptions(config),
+	"google-vertex": config => googleVertexModelManagerOptions(config),
+	groq: config => groqModelManagerOptions(config),
+	helmcode: config => helmcodeModelManagerOptions(config),
+	huggingface: config => huggingfaceModelManagerOptions(config),
+	inception: config => inceptionModelManagerOptions(config),
+	kilo: config => kiloModelManagerOptions(config),
+	"kimi-code": config => kimiCodeModelManagerOptions(config),
+	liquid: () => liquidModelManagerOptions(),
+	litellm: config => litellmModelManagerOptions(config),
+	local: () => localModelManagerOptions(),
+	"lm-studio": config => lmStudioModelManagerOptions(config),
+	mistral: config => mistralModelManagerOptions(config),
+	"muse-code": config => museCodeModelManagerOptions(config),
+	meta: config => metaModelManagerOptions(config),
+	moonshot: config => moonshotModelManagerOptions(config),
+	nace: () => naceModelManagerOptions(),
+	nanogpt: config => nanoGptModelManagerOptions(config),
+	nvidia: config => nvidiaModelManagerOptions(config),
+	novita: config => novitaModelManagerOptions(config),
+	ollama: config => ollamaModelManagerOptions(config),
+	"ollama-cloud": config => ollamaCloudModelManagerOptions(config),
+	openai: config => openaiModelManagerOptions(config),
+	"opencode-go": config => opencodeGoModelManagerOptions(config),
+	"opencode-zen": config => opencodeZenModelManagerOptions(config),
+	openrouter: config => openrouterModelManagerOptions(config),
+	otari: config => otariModelManagerOptions(config),
+	qianfan: config => qianfanModelManagerOptions(config),
+	"qwen-portal": config => qwenPortalModelManagerOptions(config),
+	sakana: config => sakanaModelManagerOptions(config),
+	sambanova: config => sambanovaModelManagerOptions(config),
+	scaleway: config => scalewayModelManagerOptions(config),
+	siliconflow: config => siliconflowModelManagerOptions(config),
+	"siliconflow-cn": config => siliconflowCnModelManagerOptions(config),
+	"singularityapi-dev": config => singularityApiDevModelManagerOptions(config),
+	"singularityapi-tech": config => singularityApiTechModelManagerOptions(config),
+	stepfun: config => stepfunModelManagerOptions(config),
+	synthetic: config => syntheticModelManagerOptions(config),
+	together: config => togetherModelManagerOptions(config),
+	typesafe: config => typesafeModelManagerOptions(config),
+	umans: config => umansModelManagerOptions(config),
+	venice: config => veniceModelManagerOptions(config),
+	"vercel-ai-gateway": config => vercelAiGatewayModelManagerOptions(config),
+	vllm: config => vllmModelManagerOptions(config),
+	"wafer-serverless": config => waferServerlessModelManagerOptions(config),
+	web: () => webModelManagerOptions(),
+	coreweave: config => coreWeaveModelManagerOptions(config),
+	xai: config => xaiModelManagerOptions(config),
+	"xai-oauth": config => xaiOAuthModelManagerOptions(config),
+	xiaomi: config => xiaomiModelManagerOptions(config),
+	"xiaomi-token-plan-ams": config =>
+		xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-ams", tokenPlanRegion: "ams" }),
+	"xiaomi-token-plan-cn": config =>
+		xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-cn", tokenPlanRegion: "cn" }),
+	"xiaomi-token-plan-sgp": config =>
+		xiaomiModelManagerOptions({ ...config, providerId: "xiaomi-token-plan-sgp", tokenPlanRegion: "sgp" }),
+	"yolo-auto": config => yoloAutoModelManagerOptions(config),
+	zai: config => zaiModelManagerOptions(config),
+	zenmux: config => zenmuxModelManagerOptions(config),
+	"zhipu-coding-plan": config => zhipuCodingPlanModelManagerOptions(config),
+};
+
+function isKnownProvider(id: string): id is KnownProvider {
+	return providerEntry(id) !== undefined;
+}
 
 /**
- * Runtime model-discovery descriptors: every catalog provider that exposes a
- * standard model-manager factory. Special-managed providers
- * (`google-antigravity`/`google-gemini-cli`/`openai-codex`) are built bespoke in
- * the coding-agent runtime and are excluded here.
+ * Runtime model-discovery descriptors: every catalog provider with a
+ * model-manager factory, paired with its compiled KDL entry.
  */
-const CATALOG_ENTRY_LIST: readonly ProviderCatalogEntry[] = CATALOG_PROVIDERS;
-
-export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = CATALOG_ENTRY_LIST.flatMap(provider => {
-	if (!provider.createModelManagerOptions || provider.specialModelManager) {
-		return [];
-	}
+export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = Object.values(providerEntries()).flatMap(entry => {
+	const createModelManagerOptions = isKnownProvider(entry.id) ? MODEL_MANAGER_FACTORIES[entry.id] : undefined;
+	if (!createModelManagerOptions) return [];
+	const discovery = entry.discovery;
 	return [
 		{
-			providerId: provider.id,
-			defaultModel: provider.defaultModel,
-			createModelManagerOptions: provider.createModelManagerOptions,
-			allowUnauthenticated: provider.allowUnauthenticated,
-			dynamicModelsAuthoritative: provider.dynamicModelsAuthoritative,
-			catalogDiscovery: provider.catalogDiscovery
-				? { ...provider.catalogDiscovery, envVars: provider.catalogDiscovery.envVars ?? provider.envVars ?? [] }
-				: undefined,
+			providerId: entry.id,
+			defaultModel: entry.defaultModel,
+			createModelManagerOptions,
+			allowUnauthenticated: entry.allowUnauthenticated,
+			dynamicModelsAuthoritative: entry.dynamicModelsAuthoritative,
+			skipCrossProviderReferenceFills: entry.skipCrossProviderReferenceFills,
+			catalogDiscovery: discovery ? { ...discovery, envVars: discovery.envVars ?? entry.envVars ?? [] } : undefined,
 		},
 	];
 });
 
-/** Default model IDs for all known providers, derived from the catalog table. */
-export const DEFAULT_MODEL_PER_PROVIDER: Record<KnownProvider, string> = Object.fromEntries(
-	CATALOG_PROVIDERS.map(provider => [provider.id, provider.defaultModel] as [string, string]),
+/** Default model IDs for all known providers, from their KDL entries. */
+export const DEFAULT_MODEL_PER_PROVIDER: Readonly<Record<KnownProvider, string>> = Object.fromEntries(
+	Object.values(providerEntries()).map(entry => [entry.id, entry.defaultModel] as const),
 ) as Record<KnownProvider, string>;
-
-export function getCatalogProviderEntry(id: string): ProviderCatalogEntry | undefined {
-	return CATALOG_PROVIDERS.find(provider => provider.id === id);
-}

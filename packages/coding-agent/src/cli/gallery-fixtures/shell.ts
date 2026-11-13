@@ -1,5 +1,13 @@
-/** Gallery fixtures for the shell tools (bash, eval). */
+/** Gallery fixtures for shell and supervised-service tools. */
 import type { GalleryFixture } from "./types";
+
+const GALLERY_DEPS = {
+	"@ai-sdk/anthropic": "^1.2.0",
+	"@oh-my-pi/pi-ai": "workspace:*",
+	"@oh-my-pi/pi-tui": "workspace:*",
+};
+const GALLERY_DEPS_TEXT =
+	"{'@ai-sdk/anthropic': '^1.2.0', '@oh-my-pi/pi-ai': 'workspace:*', '@oh-my-pi/pi-tui': 'workspace:*'}";
 
 export const shellFixtures: Record<string, GalleryFixture> = {
 	bash: {
@@ -56,46 +64,59 @@ export const shellFixtures: Record<string, GalleryFixture> = {
 		},
 	},
 
+	bash_service: {
+		label: "Bash service",
+		renderer: "bash",
+		streamingArgs: { command: "bun run dev", name: "web" },
+		args: {
+			command: "bun run dev",
+			name: "web",
+			ready: { log: "Local:.*http", port: 5173, timeout: 30 },
+		},
+		result: {
+			content: [{ type: "text", text: "web: ready pid=51234 ready\nLocal: http://localhost:5173" }],
+			details: {
+				service: { name: "web", state: "ready", ready: true, timedOut: false, pid: 51234 },
+			},
+		},
+		errorResult: {
+			content: [{ type: "text", text: "web: failed — process exited before readiness" }],
+			isError: true,
+			details: { service: { name: "web", state: "failed", ready: false, timedOut: false } },
+		},
+	},
+
 	eval: {
 		label: "Eval",
 		streamingArgs: {
-			cells: [
-				{
-					language: "py",
-					code: 'import json\nfrom pathlib import Path\n\ndata = json.loads(Path("package.js',
-					title: "load config",
-				},
-			],
+			language: "py",
+			code: 'import json\nfrom pathlib import Path\n\ndata = json.loads(Path("package.js',
+			title: "load config",
 		},
 		args: {
-			cells: [
-				{
-					language: "py",
-					title: "load config",
-					code: [
-						"import json",
-						"from pathlib import Path",
-						"",
-						'data = json.loads(Path("package.json").read_text())',
-						'deps = data.get("dependencies", {})',
-						'print(f"{data[\\"name\\"]} v{data[\\"version\\"]}")',
-						'print(f"{len(deps)} dependencies")',
-						"display(sorted(deps)[:3])",
-					].join("\n"),
-				},
-			],
+			language: "py",
+			title: "load config",
+			code: [
+				"import json",
+				"from pathlib import Path",
+				"",
+				'data = json.loads(Path("package.json").read_text())',
+				'deps = data.get("dependencies", {})',
+				'print(f"{data[\\"name\\"]} v{data[\\"version\\"]}")',
+				'print(f"{len(deps)} dependencies")',
+				"print({k: deps[k] for k in sorted(deps)[:3]})",
+			].join("\n"),
 		},
 		result: {
 			content: [
 				{
 					type: "text",
-					text: ["@oh-my-pi/coding-agent v0.42.0", "37 dependencies"].join("\n"),
+					text: ["@oh-my-pi/coding-agent v0.42.0", "37 dependencies", GALLERY_DEPS_TEXT].join("\n"),
 				},
 			],
 			details: {
 				language: "python",
 				languages: ["python"],
-				jsonOutputs: [["@ai-sdk/anthropic", "@oh-my-pi/pi-ai", "@oh-my-pi/pi-tui"]],
 				cells: [
 					{
 						index: 0,
@@ -109,9 +130,10 @@ export const shellFixtures: Record<string, GalleryFixture> = {
 							'deps = data.get("dependencies", {})',
 							'print(f"{data[\\"name\\"]} v{data[\\"version\\"]}")',
 							'print(f"{len(deps)} dependencies")',
-							"display(sorted(deps)[:3])",
+							"print({k: deps[k] for k in sorted(deps)[:3]})",
 						].join("\n"),
-						output: ["@oh-my-pi/coding-agent v0.42.0", "37 dependencies"].join("\n"),
+						output: ["@oh-my-pi/coding-agent v0.42.0", "37 dependencies", GALLERY_DEPS_TEXT].join("\n"),
+						views: [{ text: GALLERY_DEPS_TEXT, view: { kind: "json", value: GALLERY_DEPS } }],
 						status: "complete",
 						durationMs: 64,
 						exitCode: 0,

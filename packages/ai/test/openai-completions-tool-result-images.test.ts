@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { convertMessages } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import type { AssistantMessage, Context, Model, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
 
@@ -22,6 +23,8 @@ const compat: ResolvedOpenAICompat = {
 	reasoningEffortMap: {},
 	supportsUsageInStreaming: true,
 	supportsToolChoice: true,
+	supportsForcedToolChoice: true,
+	supportsNamedToolChoice: true,
 	disableReasoningOnForcedToolChoice: false,
 	disableReasoningOnToolChoice: false,
 	maxTokensField: "max_completion_tokens",
@@ -30,9 +33,17 @@ const compat: ResolvedOpenAICompat = {
 	requiresThinkingAsText: false,
 	requiresMistralToolIds: false,
 	thinkingFormat: "openai",
+	reasoningDisableMode: "lowest-effort",
+	omitReasoningEffort: false,
+	includeEncryptedReasoning: true,
+	filterReasoningHistory: false,
 	reasoningContentField: "reasoning_content",
 	requiresReasoningContentForToolCalls: false,
+	requiresReasoningContentForAllAssistantTurns: false,
 	allowsSyntheticReasoningContentForToolCalls: true,
+	replayReasoningContent: false,
+	qwenPreserveThinking: false,
+	qwenTemplateReasoningEffort: false,
 	requiresAssistantContentForToolCalls: false,
 	openRouterRouting: {},
 	vercelGatewayRouting: {},
@@ -40,9 +51,24 @@ const compat: ResolvedOpenAICompat = {
 	supportsStrictMode: true,
 	toolStrictMode: "none",
 	supportsReasoningParams: true,
+	supportsSamplingParams: true,
+	supportsPenaltyAndStopParams: true,
 	alwaysSendMaxTokens: false,
 	isOpenRouterHost: false,
 	isVercelGatewayHost: false,
+	wireModelIdMode: "raw",
+	stripDeepseekSpecialTokens: false,
+	reasoningDeltasMayBeCumulative: false,
+	emptyLengthFinishIsContextError: false,
+	usesOpenAIToolCallIdLimit: false,
+	dropThinkingWhenReasoningEffort: false,
+	nativeKimiK3Reasoning: false,
+	zaiReasoningEffortDialect: false,
+	clampOutputToModelMax: false,
+	stripImageInput: false,
+	rejectRootObjectUnion: false,
+	retryWithoutStrictOnGrammarError: false,
+	supportsPromptCacheKey: false,
 };
 
 function buildToolResult(toolCallId: string, timestamp: number): ToolResultMessage {
@@ -52,7 +78,7 @@ function buildToolResult(toolCallId: string, timestamp: number): ToolResultMessa
 		toolName: "read",
 		content: [
 			{ type: "text", text: "Read image file [image/png]" },
-			{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+			{ type: "image", data: "ZmFrZQ==", mimeType: "image/png", detail: "original" },
 		],
 		isError: false,
 		timestamp,
@@ -60,7 +86,49 @@ function buildToolResult(toolCallId: string, timestamp: number): ToolResultMessa
 }
 
 describe("openai-completions convertMessages", () => {
-	it("batches tool-result images after consecutive tool results", () => {
+	it("serializes Cerebras gemma image inputs as Chat Completions data URIs", () => {
+		const model = buildModel({
+			id: "gemma-4-31b",
+			name: "Gemma 4 31B",
+			api: "openai-completions",
+			provider: "cerebras",
+			baseUrl: "https://api.cerebras.ai/v1",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		});
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "Identify the shapes and colors. Return JSON only." },
+						{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
+					],
+					timestamp: 1,
+				},
+			],
+		};
+
+		const messages = convertMessages(model, context, compat);
+
+		expect(messages).toEqual([
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "Identify the shapes and colors. Return JSON only." },
+					{
+						type: "image_url",
+						image_url: { url: "data:image/png;base64,ZmFrZQ==" },
+					},
+				],
+			},
+		]);
+	});
+
+	it("batches tool-result images without unsupported original-detail metadata", () => {
 		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 		const model: Model<"openai-completions"> = {
 			...baseModel,
@@ -100,8 +168,13 @@ describe("openai-completions convertMessages", () => {
 		expect(imageMessage.role).toBe("user");
 		expect(Array.isArray(imageMessage.content)).toBe(true);
 
-		const imageParts = (imageMessage.content as Array<{ type?: string }>).filter(part => part?.type === "image_url");
-		expect(imageParts.length).toBe(2);
+		const imageParts = (
+			imageMessage.content as Array<{ type?: string; image_url?: { url: string; detail?: string } }>
+		).filter(part => part?.type === "image_url");
+		expect(imageParts).toEqual([
+			{ type: "image_url", image_url: { url: "data:image/png;base64,ZmFrZQ==" } },
+			{ type: "image_url", image_url: { url: "data:image/png;base64,ZmFrZQ==" } },
+		]);
 	});
 	it("serializes assistant tool-call turns with string content for strict OpenAI-compatible backends", () => {
 		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
@@ -145,7 +218,7 @@ describe("openai-completions convertMessages", () => {
 		expect(assistantParam?.content).toBe("");
 	});
 
-	it("uses generated tool_call_id values when assistant/tool IDs are empty", () => {
+	it("generates fallback tool_call_id values when assistant/tool IDs normalize to empty", () => {
 		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 		const model: Model<"openai-completions"> = {
 			...baseModel,
@@ -154,10 +227,16 @@ describe("openai-completions convertMessages", () => {
 		};
 
 		const now = Date.now();
+		// OpenAI-Responses composite ids have the shape `{call_id}|{item_id}`; a
+		// missing `call_id` leaves `|fc_...`. That is non-empty (so it survives the
+		// malformed-tool-call sanitizer in `transformMessages`) but `normalizeCompletionsToolCallId`
+		// splits on `|` and yields an empty string, so `ensureToolCallId` must synthesize
+		// a stable fallback and remap the matching tool result onto it.
+		const emptyNormalizingId = "|fc_readme";
 		const assistantMessage: AssistantMessage = {
 			role: "assistant",
-			content: [{ type: "toolCall", id: "", name: "read", arguments: { path: "README.md" } }],
-			api: model.api,
+			content: [{ type: "toolCall", id: emptyNormalizingId, name: "read", arguments: { path: "README.md" } }],
+			api: "openai-responses",
 			provider: model.provider,
 			model: model.id,
 			usage: emptyUsage,
@@ -171,7 +250,7 @@ describe("openai-completions convertMessages", () => {
 				assistantMessage,
 				{
 					role: "toolResult",
-					toolCallId: "",
+					toolCallId: emptyNormalizingId,
 					toolName: "read",
 					content: [{ type: "text", text: "done" }],
 					isError: false,
@@ -187,7 +266,11 @@ describe("openai-completions convertMessages", () => {
 		expect(assistantParam).toBeDefined();
 		expect(assistantParam?.tool_calls).toBeDefined();
 		const generatedId = assistantParam!.tool_calls![0].id;
-		expect(generatedId.length).toBeGreaterThan(0);
+		// The fallback branch must have fired: the raw id must not leak through, and
+		// `generateFallbackToolCallId` always mints a `call_`-prefixed hash.
+		expect(generatedId).not.toBe(emptyNormalizingId);
+		expect(generatedId).not.toContain("|");
+		expect(generatedId).toStartWith("call_");
 
 		const toolParam = messages.find(message => message.role === "tool") as { tool_call_id: string } | undefined;
 		expect(toolParam).toBeDefined();
@@ -243,16 +326,20 @@ describe("openai-completions convertMessages", () => {
 		// turn (text-only message) and the tool-result image batching path drop
 		// images for that combination, substituting the standard placeholder.
 		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
-		const model: Model<"openai-completions"> = {
-			...baseModel,
+		const model: Model<"openai-completions"> = buildModel({
 			id: "qwen3.7-max",
-			provider: "bailian" as Model<"openai-completions">["provider"],
+			name: "qwen3.7-max",
+			provider: "alibaba-token-plan",
 			baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
 			api: "openai-completions",
+			reasoning: false,
 			// Wrong-but-realistic user config: claims vision capability even
 			// though qwen3.7-max on this endpoint is text-only upstream.
 			input: ["text", "image"],
-		};
+			cost: baseModel.cost,
+			contextWindow: baseModel.contextWindow,
+			maxTokens: baseModel.maxTokens,
+		});
 
 		const now = Date.now();
 		const assistantMessage: AssistantMessage = {
@@ -320,17 +407,24 @@ describe("openai-completions convertMessages", () => {
 	it("preserves image_url for DashScope compatible-mode multimodal Qwen models", () => {
 		// Counter-cases for the issue #1859 guard: DashScope also exposes
 		// genuinely multimodal Qwen ids without `vl` in the name (`qwen3.7-plus`),
-		// so the text-only override must be limited to known text-only families.
-		for (const id of ["qwen3.7-plus", "qwen-vl-max"]) {
+		// and Qwen-Max is multimodal from `qwen3.8-max` onward (issue #8305) —
+		// including `qwen3.10-max`, which a decimal-float compare would wrongly
+		// sort below 3.8 — so the text-only override must stay limited to the
+		// known text-only families.
+		for (const id of ["qwen3.7-plus", "qwen-vl-max", "qwen3.8-max", "qwen3.8-max-preview", "qwen3.10-max"]) {
 			const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
-			const model: Model<"openai-completions"> = {
-				...baseModel,
+			const model: Model<"openai-completions"> = buildModel({
 				id,
-				provider: "bailian" as Model<"openai-completions">["provider"],
+				name: id,
+				provider: "alibaba-token-plan",
 				baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
 				api: "openai-completions",
+				reasoning: false,
 				input: ["text", "image"],
-			};
+				cost: baseModel.cost,
+				contextWindow: baseModel.contextWindow,
+				maxTokens: baseModel.maxTokens,
+			});
 
 			const now = Date.now();
 			const assistantMessage: AssistantMessage = {
@@ -359,5 +453,148 @@ describe("openai-completions convertMessages", () => {
 			const imageParts = (trailingUser.content as Array<{ type?: string }>).filter(p => p?.type === "image_url");
 			expect(imageParts.length).toBe(1);
 		}
+	});
+	it("strips image_url content for DeepSeek models on OpenAI-compatible endpoints", () => {
+		// DeepSeek API rejects `image_url` content parts with 400
+		// "unknown variant `image_url`, expected `text`". Even if a model entry
+		// or custom models.yml misconfigures `input: ["text", "image"]`,
+		// convertMessages must never forward `image_url` parts.
+		const deepseekModelIds = [
+			{ id: "deepseek-v4-pro", provider: "deepseek", baseUrl: "https://api.deepseek.com/v1" },
+			{ id: "deepseek-v4-flash", provider: "deepseek", baseUrl: "https://api.deepseek.com/v1" },
+			{ id: "deepseek-chat", provider: "deepseek", baseUrl: "https://api.deepseek.com" },
+			{ id: "deepseek-reasoner", provider: "deepseek", baseUrl: "https://api.deepseek.com" },
+			{ id: "deepseek-ai/DeepSeek-V4-Pro", provider: "litellm", baseUrl: "https://llm-proxy.example.com/v1" },
+			// `vision` inside `revision` is a substring, not a multimodal token.
+			{ id: "deepseek-r1-revision-0528", provider: "litellm", baseUrl: "https://llm-proxy.example.com/v1" },
+			// `vision` inside `provisioned` is a substring, not a multimodal token.
+			{ id: "deepseek-v4-provisioned", provider: "litellm", baseUrl: "https://llm-proxy.example.com/v1" },
+		];
+
+		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+
+		for (const spec of deepseekModelIds) {
+			const model: Model<"openai-completions"> = buildModel({
+				id: spec.id,
+				name: spec.id,
+				provider: spec.provider as Model<"openai-completions">["provider"],
+				baseUrl: spec.baseUrl,
+				api: "openai-completions",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: baseModel.cost,
+				contextWindow: baseModel.contextWindow,
+				maxTokens: baseModel.maxTokens,
+			});
+
+			const now = Date.now();
+			const assistantMessage: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tool-1", name: "browser", arguments: { action: "screenshot" } }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: emptyUsage,
+				stopReason: "toolUse",
+				timestamp: now,
+			};
+
+			const context: Context = {
+				messages: [
+					{
+						role: "user",
+						content: [
+							{ type: "text", text: "Take a screenshot" },
+							{ type: "image", data: "ZmFrZQ==", mimeType: "image/webp" },
+						],
+						timestamp: now - 2,
+					},
+					assistantMessage,
+					buildToolResult("tool-1", now + 1),
+				],
+			};
+
+			const messages = convertMessages(model, context, compat);
+
+			for (const m of messages) {
+				if (Array.isArray(m.content)) {
+					for (const part of m.content as Array<{ type?: string }>) {
+						expect(part?.type).not.toBe("image_url");
+					}
+				}
+			}
+
+			const userMessage = messages.find(m => m.role === "user");
+			expect(userMessage).toBeDefined();
+			const userContent = userMessage?.content;
+			const userText =
+				typeof userContent === "string"
+					? userContent
+					: (userContent as Array<{ type?: string; text?: string }>)
+							.filter(p => p?.type === "text")
+							.map(p => p?.text ?? "")
+							.join("\n");
+			expect(userText).toContain("Take a screenshot");
+			expect(userText).toContain(NON_VISION_IMAGE_PLACEHOLDER);
+
+			const toolMessage = messages.find(m => m.role === "tool");
+			expect(toolMessage).toBeDefined();
+			expect(typeof toolMessage?.content).toBe("string");
+			expect(toolMessage?.content as string).toContain(NON_VISION_IMAGE_PLACEHOLDER);
+		}
+	});
+	it("preserves image_url for the multimodal DeepSeek OCR model", () => {
+		const model = getBundledModel("novita", "deepseek/deepseek-ocr-2") as Model<"openai-completions">;
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "Read this document" },
+						{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+					],
+					timestamp: Date.now(),
+				},
+			],
+		};
+
+		const messages = convertMessages(model, context, compat);
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0].content).toEqual([
+			{ type: "text", text: "Read this document" },
+			{
+				type: "image_url",
+				image_url: { url: "data:image/png;base64,ZmFrZQ==" },
+			},
+		]);
+	});
+	it("preserves image_url for the multimodal DeepSeek vision SKU", () => {
+		// deepseek-v4-flash-vision-exp is genuinely multimodal: the blanket
+		// DeepSeek text-only guard must not strip its image parts.
+		const model = getBundledModel("deepseek", "deepseek-v4-flash-vision-exp") as Model<"openai-completions">;
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "Describe this image" },
+						{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+					],
+					timestamp: Date.now(),
+				},
+			],
+		};
+
+		const messages = convertMessages(model, context, compat);
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0].content).toEqual([
+			{ type: "text", text: "Describe this image" },
+			{
+				type: "image_url",
+				image_url: { url: "data:image/png;base64,ZmFrZQ==" },
+			},
+		]);
 	});
 });

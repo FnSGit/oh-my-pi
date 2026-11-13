@@ -1,11 +1,11 @@
 import { type FetchImpl, getEnvApiKey } from "@oh-my-pi/pi-ai";
-import type { AgentStorage } from "../session/agent-storage";
+import type { AgentStorageApi } from "../session/agent-storage";
 import { findCredential, withHardTimeout } from "./search/providers/utils";
 
 const PARALLEL_API_URL = "https://api.parallel.ai";
-const PARALLEL_SEARCH_URL = `${PARALLEL_API_URL}/v1beta/search`;
+export const PARALLEL_SEARCH_URL = `${PARALLEL_API_URL}/v1beta/search`;
 const PARALLEL_EXTRACT_URL = `${PARALLEL_API_URL}/v1beta/extract`;
-const PARALLEL_BETA_HEADER = "search-extract-2025-10-10";
+export const PARALLEL_BETA_HEADER = "search-extract-2025-10-10";
 
 export interface ParallelUsageItem {
 	name?: string;
@@ -76,22 +76,6 @@ export class ParallelApiError extends Error {
 	}
 }
 
-export function findParallelApiKey(storage: AgentStorage | null | undefined): string | null {
-	return findCredential(storage, getEnvApiKey("parallel"), "parallel");
-}
-
-export function getParallelExtractContent(document: ParallelExtractDocument): string {
-	const excerptContent = document.excerpts
-		.filter(excerpt => excerpt.trim().length > 0)
-		.join("\n\n")
-		.trim();
-	if (excerptContent.length > 0) {
-		return excerptContent;
-	}
-
-	return document.fullContent?.trim() ?? "";
-}
-
 function isObject(value: unknown): value is object {
 	return typeof value === "object" && value !== null;
 }
@@ -148,7 +132,7 @@ function createParallelApiError(statusCode: number, detail?: string): ParallelAp
 	);
 }
 
-function parseParallelErrorResponse(statusCode: number, responseText: string): ParallelApiError {
+export function parseParallelErrorResponse(statusCode: number, responseText: string): ParallelApiError {
 	const trimmedResponseText = responseText.trim();
 	if (trimmedResponseText.length === 0) {
 		return createParallelApiError(statusCode);
@@ -159,6 +143,15 @@ function parseParallelErrorResponse(statusCode: number, responseText: string): P
 		return createParallelApiError(statusCode, extractParallelErrorMessage(payload) ?? trimmedResponseText);
 	} catch {
 		return createParallelApiError(statusCode, trimmedResponseText);
+	}
+}
+
+export async function parseParallelJsonResponse(response: Response, operation: "search" | "extract"): Promise<unknown> {
+	try {
+		return await response.json();
+	} catch (err) {
+		const detail = err instanceof Error ? err.message : String(err);
+		throw new ParallelApiError(`Parallel ${operation} returned invalid JSON: ${detail}`);
 	}
 }
 
@@ -174,24 +167,6 @@ function getAuthHeaders(apiKey: string): {
 		"x-api-key": apiKey,
 		"parallel-beta": PARALLEL_BETA_HEADER,
 	};
-}
-
-function normalizeSearchMode(mode: ParallelSearchOptions["mode"]): "fast" | "one-shot" {
-	return mode === "research" ? "one-shot" : "fast";
-}
-
-function parseUsageItems(payload: unknown): ParallelUsageItem[] {
-	if (!Array.isArray(payload)) return [];
-
-	const usageItems: ParallelUsageItem[] = [];
-	for (const item of payload) {
-		if (!isObject(item)) continue;
-		usageItems.push({
-			name: getString(item, "name"),
-			count: getNumber(item, "count"),
-		});
-	}
-	return usageItems;
 }
 
 function parseWarnings(payload: unknown): string[] {
@@ -212,7 +187,24 @@ function parseWarnings(payload: unknown): string[] {
 	return warnings;
 }
 
-function parseSearchPayload(payload: unknown): ParallelSearchResult {
+function parseUsageItems(payload: unknown): ParallelUsageItem[] {
+	if (!Array.isArray(payload)) return [];
+
+	const usageItems: ParallelUsageItem[] = [];
+	for (const item of payload) {
+		if (!isObject(item)) continue;
+		usageItems.push({
+			name: getString(item, "name"),
+			count: getNumber(item, "count"),
+		});
+	}
+	return usageItems;
+}
+
+export function parseParallelSearchPayload(
+	payload: unknown,
+	options?: { parseMetadata?: boolean },
+): ParallelSearchResult {
 	if (!isObject(payload)) {
 		throw new ParallelApiError("Parallel search returned an invalid response payload.");
 	}
@@ -236,12 +228,30 @@ function parseSearchPayload(payload: unknown): ParallelSearchResult {
 		});
 	}
 
+	const parseMetadata = options?.parseMetadata ?? true;
+
 	return {
 		requestId,
 		sources,
-		warnings: parseWarnings(getOwnValue(payload, "warnings")),
-		usage: parseUsageItems(getOwnValue(payload, "usage")),
+		warnings: parseMetadata ? parseWarnings(getOwnValue(payload, "warnings")) : [],
+		usage: parseMetadata ? parseUsageItems(getOwnValue(payload, "usage")) : [],
 	};
+}
+
+export function findParallelApiKey(storage: AgentStorageApi | null | undefined): string | null {
+	return findCredential(storage, getEnvApiKey("parallel"), "parallel");
+}
+
+export function getParallelExtractContent(document: ParallelExtractDocument): string {
+	const excerptContent = document.excerpts
+		.filter(excerpt => excerpt.trim().length > 0)
+		.join("\n\n")
+		.trim();
+	if (excerptContent.length > 0) {
+		return excerptContent;
+	}
+
+	return document.fullContent?.trim() ?? "";
 }
 
 function parseExtractPayload(payload: unknown): ParallelExtractResult {
@@ -288,7 +298,7 @@ export async function searchWithParallel(
 	objective: string,
 	queries: string[],
 	options: ParallelSearchOptions,
-	storage: AgentStorage | null | undefined,
+	storage: AgentStorageApi | null | undefined,
 ): Promise<ParallelSearchResult> {
 	const apiKey = findParallelApiKey(storage);
 	if (!apiKey) {
@@ -304,7 +314,7 @@ export async function searchWithParallel(
 		body: JSON.stringify({
 			objective,
 			search_queries: queries,
-			mode: normalizeSearchMode(options.mode),
+			mode: options.mode === "research" ? "one-shot" : "fast",
 			excerpts: {
 				max_chars_per_result: options.maxCharsPerResult ?? 10_000,
 			},
@@ -315,14 +325,14 @@ export async function searchWithParallel(
 		throw parseParallelErrorResponse(response.status, await response.text());
 	}
 
-	const payload: unknown = await response.json();
-	return parseSearchPayload(payload);
+	const payload = await parseParallelJsonResponse(response, "search");
+	return parseParallelSearchPayload(payload);
 }
 
 export async function extractWithParallel(
 	urls: string[],
 	options: ParallelExtractOptions,
-	storage: AgentStorage | null | undefined,
+	storage: AgentStorageApi | null | undefined,
 ): Promise<ParallelExtractResult> {
 	const apiKey = findParallelApiKey(storage);
 	if (!apiKey) {
@@ -348,6 +358,6 @@ export async function extractWithParallel(
 		throw parseParallelErrorResponse(response.status, await response.text());
 	}
 
-	const payload: unknown = await response.json();
+	const payload = await parseParallelJsonResponse(response, "extract");
 	return parseExtractPayload(payload);
 }
