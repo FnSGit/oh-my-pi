@@ -13,6 +13,8 @@ export interface ExecOptions {
 	timeout?: number;
 	/** Working directory */
 	cwd?: string;
+	/** Stdin data to pipe to the command (string = text, Buffer = binary) */
+	stdin?: string | Buffer;
 }
 
 /**
@@ -44,6 +46,7 @@ export async function execCommand(
 		allowNonZero: true,
 		allowAbort: true,
 		stderr: "full",
+		input: options?.stdin,
 	});
 
 	const killed = Boolean(result.exitError?.aborted);
