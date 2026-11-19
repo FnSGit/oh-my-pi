@@ -766,7 +766,9 @@ describe("AgentSession empty stop guard", () => {
 		expect(retryScheduledLogs.map(([, ctx]) => (ctx as { attempt: number }).attempt)).toEqual([1, 2, 3]);
 
 		// warn: one cap-hit log (existing behavior)
-		const capLogs = warnSpy.mock.calls.filter(([msg]) => msg.startsWith("Assistant returned empty stop after retry cap"));
+		const capLogs = warnSpy.mock.calls.filter(([msg]) =>
+			msg.startsWith("Assistant returned empty stop after retry cap"),
+		);
 		expect(capLogs).toHaveLength(1);
 	});
 });

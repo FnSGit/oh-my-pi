@@ -491,7 +491,11 @@ async function searchSequential(
 			const activeProvider = context.sessionModel?.provider;
 			// Search-only catalog entries use the synthetic "web" provider; their
 			// backend is not the session's model endpoint, so do not infer a match.
-			if (!activeProvider || candidate.model.provider !== activeProvider || modelKind(candidate.model) === "search") {
+			if (
+				!activeProvider ||
+				candidate.model.provider !== activeProvider ||
+				modelKind(candidate.model) === "search"
+			) {
 				continue;
 			}
 		}
@@ -545,11 +549,7 @@ async function searchSequential(
 				throw new SearchProviderError(provider.id, `${provider.label} returned no renderable search content.`, 204);
 			}
 			const failed = failureDetails(stats.failures);
-			return renderOutcome(
-				constrained.response,
-				[...fallbackNotes(failed, provider), ...notes],
-				stats.failures,
-			);
+			return renderOutcome(constrained.response, [...fallbackNotes(failed, provider), ...notes], stats.failures);
 		} catch (error) {
 			// Surface user-initiated cancellation immediately so the session sees
 			// a clean abort instead of a generic "all providers failed" message.
@@ -585,7 +585,11 @@ async function searchDeep(
 		if (engines.length >= DEEP_MAX_PROVIDERS) break;
 		if (cfgOffline.get(context.settings)) {
 			const activeProvider = context.sessionModel?.provider;
-			if (!activeProvider || candidate.model.provider !== activeProvider || modelKind(candidate.model) === "search") {
+			if (
+				!activeProvider ||
+				candidate.model.provider !== activeProvider ||
+				modelKind(candidate.model) === "search"
+			) {
 				continue;
 			}
 		}
@@ -639,10 +643,7 @@ async function searchDeep(
 			stats.failedResponseProvider = loaded.provider.id;
 			stats.failures.push({ provider: loaded.provider, error: outcome.reason });
 			if (outcome.reason instanceof SearchProviderError && outcome.reason.status === 429) {
-				rateLimitedUntil.set(
-					`${loaded.model.provider}/${loaded.model.id}`,
-					Date.now() + RATE_LIMIT_COOLDOWN_MS,
-				);
+				rateLimitedUntil.set(`${loaded.model.provider}/${loaded.model.id}`, Date.now() + RATE_LIMIT_COOLDOWN_MS);
 			}
 			continue;
 		}
