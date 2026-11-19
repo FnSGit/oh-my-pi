@@ -28,6 +28,8 @@ const DEFAULT_NUM_RESULTS = 10;
 const MAX_NUM_RESULTS = 50;
 /** The API rejects queries longer than 128 Unicode characters. */
 const MAX_QUERY_CHARACTERS = 128;
+/** Deep mode keeps page bodies, capped per result so one page cannot dominate the result budget. */
+const MAX_CONTENT_CHARACTERS = 4_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_ERROR_BYTES = 8 * 1024;
 
@@ -38,7 +40,12 @@ interface DeepSeekSearchResult {
 	url?: unknown;
 	snippet?: unknown;
 	summary?: unknown;
+	content?: unknown;
 	date?: unknown;
+	/** Relevance 0–3; >= 1.5 marks a high-quality result. */
+	rerank_score?: unknown;
+	/** Site authority 0–4; -1 means unknown. */
+	authority?: unknown;
 }
 
 interface DeepSeekSearchResponse {
@@ -74,6 +81,12 @@ function buildDeepSeekQuery(parsed: StructuredQuery, recency: SearchParams["rece
 	return parts.join(" ");
 }
 
+/** Clamp an engine score into [0,1]; negative or non-numeric values are unknown. */
+function unitScore(value: unknown, max: number): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+	return Math.min(1, value / max);
+}
+
 async function callDeepSeekSearch(
 	apiKey: string,
 	query: string,
@@ -81,6 +94,11 @@ async function callDeepSeekSearch(
 	params: SearchParamsWithFetch,
 ): Promise<DeepSeekSearchResponse> {
 	const fetchImpl = params.fetch ?? fetch;
+	const body: Record<string, unknown> = { query, count };
+	if (params.depth === "deep") body.need_content = true;
+	// The raw question helps intent; the formatted query above carries the operators.
+	const original = params.query.trim();
+	if (original && original !== query && [...original].length <= MAX_QUERY_CHARACTERS) body.ori_question = original;
 	const response = await fetchImpl(DEEPSEEK_SEARCH_URL, {
 		method: "POST",
 		headers: {
@@ -88,7 +106,7 @@ async function callDeepSeekSearch(
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
 		},
-		body: JSON.stringify({ query, count }),
+		body: JSON.stringify(body),
 		signal: withHardTimeout(params.signal, params.timeoutMs),
 	});
 
@@ -139,13 +157,23 @@ export async function searchDeepSeek(params: SearchParamsWithFetch): Promise<Sea
 		const url = normalizeHttpUrl(result.url);
 		if (!url) continue;
 		const publishedDate = typeof result.date === "string" && result.date ? result.date : undefined;
+		const content = normalizeSearchText(result.content);
+		const summary = normalizeSearchText(result.summary);
+		const relevance = unitScore(result.rerank_score, 3);
+		const authority = unitScore(result.authority, 4);
 		sources.push({
 			title: normalizeSearchText(result.title) ?? url,
 			url,
-			// `summary` is the long, model-oriented excerpt; `snippet` is the short UI blurb.
-			snippet: normalizeSearchText(result.summary) ?? normalizeSearchText(result.snippet),
+			// Deep mode buys page bodies; otherwise `summary` is the long,
+			// model-oriented excerpt and `snippet` the short UI blurb.
+			snippet:
+				(params.depth === "deep" ? content?.slice(0, MAX_CONTENT_CHARACTERS) : undefined) ??
+				summary ??
+				normalizeSearchText(result.snippet),
 			publishedDate,
 			ageSeconds: dateToAgeSeconds(publishedDate),
+			...(relevance !== undefined ? { relevance } : {}),
+			...(authority !== undefined ? { authority } : {}),
 		});
 	}
 

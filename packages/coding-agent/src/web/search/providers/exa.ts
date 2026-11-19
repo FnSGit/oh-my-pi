@@ -120,6 +120,8 @@ export interface ExaSearchParams {
 	exclude_domains?: string[];
 	start_published_date?: string;
 	end_published_date?: string;
+	/** Deep retrieval asks for page text instead of the query-scoped summary. */
+	deep?: boolean;
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	fetch?: FetchImpl;
@@ -250,11 +252,8 @@ export function buildExaRequestBody(params: ExaSearchParams): Record<string, unk
 		query: params.query,
 		numResults: params.num_results ?? 10,
 		type: normalizeSearchType(params.type),
-		contents: {
-			summary: { query: params.query },
-		},
+		contents: params.deep ? { text: { maxCharacters: 2_000 } } : { summary: { query: params.query } },
 	};
-
 	if (params.include_domains?.length) {
 		body.includeDomains = params.include_domains;
 	}
@@ -475,6 +474,7 @@ export class ExaProvider extends SearchProvider {
 		return searchExa({
 			...directiveParams(parsed),
 			num_results: params.numSearchResults ?? params.limit,
+			deep: params.depth === "deep",
 			signal: params.signal,
 			timeoutMs: params.timeoutMs,
 			authStorage: params.authStorage,

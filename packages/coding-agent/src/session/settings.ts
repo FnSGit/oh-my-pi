@@ -1491,7 +1491,7 @@ export const cfgProvidersOpenrouterVariant = register({
 export const cfgProvidersFetch = register({
 	id: "providers.fetch",
 	type: "enum",
-	values: ["auto", "native", "trafilatura", "lynx", "parallel", "firecrawl", "jina"] as const,
+	values: ["auto", "quality", "native", "trafilatura", "lynx", "parallel", "firecrawl", "jina"] as const,
 	default: "auto",
 	ui: {
 		tab: "providers",
@@ -1503,6 +1503,12 @@ export const cfgProvidersFetch = register({
 				value: "auto",
 				label: "Auto",
 				description: "Priority: native > trafilatura > lynx > parallel > firecrawl > jina",
+			},
+			{
+				value: "quality",
+				label: "Quality",
+				description:
+					"Quality-first priority: trafilatura > parallel > firecrawl > jina > native > lynx (paid backends skipped without a key)",
 			},
 			{ value: "native", label: "Native", description: "In-process HTML→Markdown converter (always available)" },
 			{ value: "trafilatura", label: "Trafilatura", description: "Auto-installs via uv/pip" },

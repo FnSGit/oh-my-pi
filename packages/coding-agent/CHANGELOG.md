@@ -348,6 +348,11 @@
 - Reduced default `grep` output by showing only matching lines and limiting matches per file; configure `grep.contextBefore` and `grep.contextAfter` to include surrounding context.
 - Changed the default `spotlight.thinking` level from `low` to `med` for deeper result analysis and improved ranking, at a higher request cost.
 - When Spotlight is enabled, commonly reread source and issue or pull-request content is shown more completely before outlining, including support for additional source file types.
+### Added
+
+- `web_search` accepts `depth: "quick" | "standard" | "deep"` (and `omp q --depth`): `deep` queries up to three available engines concurrently and returns one merged, cross-engine-ranked result set with 1,200-character excerpts instead of 240
+- Search results now carry engine-reported `relevance` and `authority` (DeepSeek's `rerank_score`/`authority`), and Deep mode asks DeepSeek for page bodies and Exa for page text instead of only summaries
+- `providers.fetch: quality` orders the read/fetch readers by extraction fidelity (`trafilatura`, `parallel`, `firecrawl`, `jina`, `native`, `lynx`)
 
 ### Fixed
 
@@ -592,7 +597,10 @@
 ### Added
 
 - `/usage` and `omp usage` show LiteLLM key and user budgets for the built-in `litellm` provider and every models.yml provider with `discovery.type: litellm`, unless listed in `disabledProviders` ([#17873](https://github.com/can1357/oh-my-pi/pull/17873) by [@maykonmichel](https://github.com/maykonmichel))
+- `omp memory` reports recall counts per bank, the most-recalled entries, cold memories, and recent recall events, with `--json` for scripting
+- Recall audit rows record their origin (`auto`, `tool`, `compaction`), so memory usage can be broken down by what triggered it
 - Extensions can ask the operator before an interactive quit, or cancel it, with `session_before_shutdown`; a further `/exit` or Ctrl+D skips the pending prompts and closes ([#18424](https://github.com/can1357/oh-my-pi/pull/18424) by [@aw1cks](https://github.com/aw1cks))
+- `resources_discover` now feeds skill discovery: an extension can contribute skill roots at startup (merged into `skills.customDirectories`, never written to the stored settings), so one `.agents/skills` tree in a domain directory serves every project below it
 
 ### Changed
 
@@ -667,6 +675,8 @@
 - Retries on the same model now stop after three consecutive generic aborts instead of spending the whole retry budget ([#18535](https://github.com/can1357/oh-my-pi/pull/18535) by [@nick-maderight](https://github.com/nick-maderight))
 - `lsp.formatOnWrite` no longer re-indents 2/4-space files at 1 space per level when they contain JSDoc/block comments or one-off odd indents, and no longer converts tab-indented files that open with a JSDoc block to spaces ([#18544](https://github.com/can1357/oh-my-pi/issues/18544))
 - Isolated task sandboxes now finish cleanup after a SIGHUP or other signal even when releasing them takes longer than the agent shutdown grace period ([#18519](https://github.com/can1357/oh-my-pi/issues/18519)).
+- Added `mnemopi.indexInjection` (with per-section quotas, line length, and token budget) so the Mnemopi backend can inject a compact pi-memory-style memory index into the system prompt, with id prefixes for follow-up `recall` or `memory://<id>` reads
+- Added `scripts/migrate-pi-memory.ts` to import pi-memory sidecars into Mnemopi shared/per-project banks, with a dry run, database backups, idempotent re-runs, and fresh embeddings
 
 ## [18.18.3] - 2026-11-09
 

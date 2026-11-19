@@ -10,16 +10,18 @@ import { Settings } from "../config/settings";
 import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import { renderSearchResult } from "@oh-my-pi/pi-tui/tools/web-search";
 import { runSearchQuery, type SearchQueryParams } from "../web/search/index";
+import type { SearchDepth } from "../web/search/types";
 
 export interface SearchCommandArgs {
 	query: string;
 	model?: string;
 	recency?: "day" | "week" | "month" | "year";
 	limit?: number;
+	depth?: SearchDepth;
 	expanded: boolean;
 }
-
 const RECENCY_OPTIONS: SearchCommandArgs["recency"][] = ["day", "week", "month", "year"];
+const DEPTH_OPTIONS: SearchDepth[] = ["quick", "standard", "deep"];
 
 /**
  * Parse web search subcommand arguments.
@@ -47,6 +49,10 @@ export function parseSearchArgs(args: string[]): SearchCommandArgs | undefined {
 			result.recency = args[++i] as SearchCommandArgs["recency"];
 		} else if (arg === "--limit" || arg === "-l") {
 			result.limit = Number.parseInt(args[++i], 10);
+		} else if (arg === "--depth") {
+			result.depth = args[++i] as SearchDepth;
+		} else if (arg.startsWith("--depth=")) {
+			result.depth = arg.slice("--depth=".length) as SearchDepth;
 		} else if (arg === "--compact") {
 			result.expanded = false;
 		} else if (!arg.startsWith("-")) {
@@ -78,6 +84,12 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		process.exit(1);
 	}
 
+	if (cmd.depth && !DEPTH_OPTIONS.includes(cmd.depth)) {
+		process.stderr.write(`${chalk.red(`Error: Invalid depth "${cmd.depth}"`)}\n`);
+		process.stderr.write(`${chalk.dim(`Valid depth values: ${DEPTH_OPTIONS.join(", ")}`)}\n`);
+		process.exit(1);
+	}
+
 	await Settings.init({ cwd: getProjectDir() });
 
 	await initTheme();
@@ -87,6 +99,7 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		model: cmd.model,
 		recency: cmd.recency,
 		limit: cmd.limit,
+		depth: cmd.depth,
 	};
 
 	const result = await runSearchQuery(params);
@@ -116,6 +129,7 @@ ${chalk.bold("Arguments:")}
 ${chalk.bold("Options:")}
   --model <selector>  Catalog model selector (for example, web/duckduckgo)
   --recency <value>   Recency filter (when supported): ${RECENCY_OPTIONS.join(", ")}
+  --depth <mode>      Retrieval effort: ${DEPTH_OPTIONS.join(", ")} (default standard)
   -l, --limit <n>     Max results to return
   --compact           Render condensed output
   -h, --help          Show this help

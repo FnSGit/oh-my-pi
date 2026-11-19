@@ -4,4 +4,5 @@ Query: site: or -site:, after: or before: YYYY-MM-DD, inurl:, intitle:, filetype
 X posts/reactions → site:x.com, site:x.com/<handle>, or from:<handle>; -from:<handle> excludes.
 {{/if}}
 Hacker News stories/comments → site:news.ycombinator.com.
+Multi-source research or comparison → depth: "deep"; one factual lookup → depth: "quick".
 Prefer primary sources; MUST link citations.
