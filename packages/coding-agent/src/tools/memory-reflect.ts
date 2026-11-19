@@ -52,7 +52,7 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 					const query = params.context?.trim()
 						? `${params.query.trim()}\n\nAdditional context:\n${params.context.trim()}`
 						: params.query;
-					const results = await state.recallResultsScoped(query);
+					const results = await state.recallResultsScoped(query, "tool");
 					if (results.length === 0) {
 						return {
 							content: [{ type: "text", text: "No relevant information found to reflect on." }],

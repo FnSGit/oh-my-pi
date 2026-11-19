@@ -315,6 +315,9 @@ export interface MnemopiSessionStateOptions {
 	automaticRecallJudge?: Pick<ChainJudge, "withCandidate">;
 }
 
+/** Who issued a scoped recall; recorded in the mnemopi `recall_events` audit table. */
+export type MnemopiRecallChannel = "auto" | "tool" | "compaction" | "other";
+
 /**
  * What subagent aliases and the backend's `primary` reads use on a parent state: its
  * identity, config, and every scoped-bank operation. A subagent worker holds a remote
@@ -335,8 +338,8 @@ export interface MnemopiSessionStateApi {
 		id: string,
 		options?: MnemopiMemoryEditOptions,
 	): MnemopiMemoryEditResult;
-	collectScopedRecallResults(query: string): Promise<RecallResult[]>;
-	recallResultsScoped(query: string): Promise<RecallResult[]>;
+	collectScopedRecallResults(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]>;
+	recallResultsScoped(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]>;
 	formatScopedRecallContext(results: readonly RecallResult[], format?: "bullet" | "json"): string | undefined;
 	rememberScoped(memory: MnemopiRememberInput, options?: MnemopiRememberOptions, target?: MnemopiBankTarget): string;
 	getScopedStats(): MnemopiBankStats[];
@@ -679,9 +682,9 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		});
 	}
 
-	async collectScopedRecallResults(query: string): Promise<RecallResult[]> {
+	async collectScopedRecallResults(query: string, channel: MnemopiRecallChannel = "other"): Promise<RecallResult[]> {
 		const parent = this.#remoteParent();
-		if (parent) return await parent.collectScopedRecallResults(query);
+		if (parent) return await parent.collectScopedRecallResults(query, channel);
 		const scoped = this.#local();
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
@@ -698,6 +701,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 					const results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, {
 						includeFacts: true,
 						channelId: target.bank,
+						recallContext: { sessionId: this.sessionId, channel },
 					});
 					targetSucceeded = true;
 					withLoopPhase("mnemopi.recall", () => {
@@ -731,8 +735,8 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		});
 	}
 
-	recallResultsScoped(query: string): Promise<RecallResult[]> {
-		return this.collectScopedRecallResults(query);
+	recallResultsScoped(query: string, channel: MnemopiRecallChannel = "other"): Promise<RecallResult[]> {
+		return this.collectScopedRecallResults(query, channel);
 	}
 
 	formatScopedRecallContext(
@@ -782,8 +786,12 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		});
 	}
 
-	async recallForContext(query: string, signal?: AbortSignal): Promise<string | undefined> {
-		return (await this.#recallBlock(query, signal))?.text || undefined;
+	async recallForContext(
+		query: string,
+		signal?: AbortSignal,
+		channel: MnemopiRecallChannel = "auto",
+	): Promise<string | undefined> {
+		return (await this.#recallBlock(query, signal, channel))?.text || undefined;
 	}
 
 	/**
@@ -794,9 +802,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	async #recallBlock(
 		query: string,
 		signal?: AbortSignal,
+		channel: MnemopiRecallChannel = "other",
 		budget?: (block: string) => string,
 	): Promise<RecallBlock | undefined> {
-		const recalled = await this.collectScopedRecallResults(query);
+		const recalled = await this.collectScopedRecallResults(query, channel);
 		if (signal?.aborted) return undefined;
 		const results: RecallCandidate[] | undefined = this.#relevanceFilterActive()
 			? await this.#filterAutomaticRecall(query, budget ? visibleCandidates(recalled, budget) : recalled, signal)
@@ -970,7 +979,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 			return truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
 		});
-		const recall = await this.#recallBlock(truncated, signal, budget);
+		const recall = await this.#recallBlock(truncated, signal, "auto", budget);
 		// An aborted or failed relevance check delivers nothing yet still consumes the first turn: one
 		// attempt per session, so the system prompt never changes mid-session. Nothing is persisted, so a
 		// resume recalls afresh.
@@ -1003,7 +1012,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			const query = composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns);
 			return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 		});
-		return await this.recallForContext(truncated, signal);
+		return await this.recallForContext(truncated, signal, "compaction");
 	}
 
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
@@ -1139,7 +1148,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			});
 			try {
 				const budget = (block: string) => this.budgetRecallBlock(block);
-				const recall = await this.#recallBlock(truncated, undefined, budget);
+				const recall = await this.#recallBlock(truncated, undefined, "auto", budget);
 				record = recall && this.#deliveredRecall(recall, budget);
 				context = recall?.text;
 			} catch (error) {

@@ -2,7 +2,7 @@ import type { Api, AuthStorage, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { ModelRegistry } from "../../../config/model-registry";
 import type { StructuredQuery } from "../query";
-import type { SearchProviderId, SearchResponse } from "../types";
+import type { SearchDepth, SearchProviderId, SearchResponse } from "../types";
 
 /**
  * Shared web search parameters passed to providers.
@@ -31,6 +31,12 @@ export interface SearchParams {
 	 * absent (direct provider calls), parse with `parseSearchQuery(params.query)`.
 	 */
 	parsedQuery?: StructuredQuery;
+	/**
+	 * Retrieval effort the dispatcher chose. Providers MAY use it to spend more
+	 * upstream work (e.g. request page bodies) for `deep`, and MUST treat an
+	 * absent value as `standard`.
+	 */
+	depth?: SearchDepth;
 	limit?: number;
 	/**
 	 * Temporal filter narrowing results to the specified time window.

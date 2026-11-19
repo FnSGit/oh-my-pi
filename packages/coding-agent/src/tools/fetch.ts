@@ -634,6 +634,22 @@ const FETCH_PROVIDER_ORDER: readonly FetchProvider[] = [
 	"jina",
 ];
 
+/**
+ * Quality-first order for `providers.fetch: quality`: extractors that strip
+ * navigation and preserve article structure run before the in-process
+ * converter, which is fastest but keeps page chrome. Unavailable/keyless-paid
+ * backends return `null` immediately, so the order costs nothing when their
+ * credential is absent.
+ */
+const QUALITY_FETCH_PROVIDER_ORDER: readonly FetchProvider[] = [
+	"trafilatura",
+	"parallel",
+	"firecrawl",
+	"jina",
+	"native",
+	"lynx",
+];
+
 /** Reader backends that fetch the URL from their own servers, so a wall refusing this host may let them in. */
 const REMOTE_FETCH_PROVIDERS: readonly FetchProvider[] = ["parallel", "firecrawl", "jina"];
 /** Wording of a page that shows nothing until JavaScript runs. */
@@ -753,9 +769,11 @@ export async function renderHtmlToText(
 
 	const preference = cfgProvidersFetch.get(settings);
 	const order: readonly FetchProvider[] =
-		preference === "auto" || !providers.includes(preference)
-			? providers
-			: [preference, ...providers.filter(method => method !== preference)];
+		preference === "quality"
+			? QUALITY_FETCH_PROVIDER_ORDER.filter(method => providers.includes(method))
+			: preference === "auto" || !providers.includes(preference)
+				? providers
+				: [preference, ...providers.filter(method => method !== preference)];
 
 	// Highest-priority output that is substantial but fails the low-quality gate.
 	// Surfaced (ok: true) only when no backend clears the gate, so the caller's

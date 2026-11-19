@@ -170,7 +170,17 @@ export interface RememberBatchItem extends RememberOptions {
 	content: string;
 }
 
+/** Caller context recorded per recall into the `recall_events` audit table. */
+export interface RecallAuditContext {
+	/** Session that issued the recall; defaults to the store's own session id. */
+	sessionId?: string | null;
+	/** Caller label (`auto`, `tool`, `compaction`, …) for usage reports. */
+	channel?: string | null;
+}
+
 export interface RecallOptions {
+	/** Audit context written to `recall_events` alongside the recall counts. */
+	recallContext?: RecallAuditContext;
 	fromDate?: string | null;
 	toDate?: string | null;
 	authorId?: string | null;

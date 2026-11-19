@@ -1,6 +1,7 @@
 import type { AuthStorage } from "@oh-my-pi/pi-ai";
-import type { SearchProviderId, SearchResponse, SearchSource } from "../types";
+import type { SearchProviderId, SearchResponse } from "../types";
 import { SearchProviderError } from "../types";
+import { mergeSearchSources } from "../merge";
 import { clampNumResults } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
@@ -46,63 +47,10 @@ export interface PublicWebDeadlines {
 	hardMs?: number;
 }
 
-/** Accumulator for one deduplicated URL across engines. */
-interface MergedSource {
-	source: SearchSource;
-	/** Number of engines that returned this URL — the primary ranking signal. */
-	engines: number;
-	/** Best (lowest) per-engine rank observed. */
-	bestRank: number;
-	/** First-seen insertion index; final tiebreak keeps ordering deterministic. */
-	order: number;
-}
-
-/**
- * Canonical dedup key for a result URL: case-normalized host without a
- * leading `www.`, path without a trailing slash, query preserved, fragment
- * dropped. Engines disagree on exactly these variations for the same page.
- */
-function dedupKey(rawUrl: string): string {
-	try {
-		const url = new URL(rawUrl);
-		const host = url.hostname.toLowerCase().replace(/^www\./, "");
-		let path = url.pathname;
-		if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
-		return `${host}${path}${url.search}`;
-	} catch {
-		return rawUrl;
-	}
-}
-
-/** Merge one engine's ranked sources into the accumulator map. */
-function mergeSources(merged: Map<string, MergedSource>, sources: readonly SearchSource[]): void {
-	for (const [rank, source] of sources.entries()) {
-		const key = dedupKey(source.url);
-		const existing = merged.get(key);
-		if (!existing) {
-			merged.set(key, { source: { ...source }, engines: 1, bestRank: rank, order: merged.size });
-			continue;
-		}
-		existing.engines += 1;
-		if (rank < existing.bestRank) {
-			existing.bestRank = rank;
-			existing.source.title = source.title;
-			existing.source.url = source.url;
-		}
-		// Keep the most informative snippet regardless of which engine ranked it best.
-		if (source.snippet && source.snippet.length > (existing.source.snippet?.length ?? 0)) {
-			existing.source.snippet = source.snippet;
-		}
-		existing.source.publishedDate ??= source.publishedDate;
-		existing.source.ageSeconds ??= source.ageSeconds;
-	}
-}
-
 /**
  * Execute a web search against every credential-free engine in parallel and
- * consolidate the results: URLs are deduplicated across engines, ranked by
- * cross-engine consensus (how many engines returned them), then by best
- * per-engine rank.
+ * consolidate the results: URLs are deduplicated across engines and ranked by
+ * {@link mergeSearchSources} (consensus, per-engine rank, authority, freshness).
  *
  * The fan-out races three exits and returns at the earliest: every engine
  * settled; the soft deadline elapsed with at least one success in hand; the
@@ -155,12 +103,12 @@ export async function searchPublicWeb(
 
 	// Merge in engine-priority order (not settlement order) so ranking
 	// tiebreaks stay deterministic.
-	const merged = new Map<string, MergedSource>();
-	for (const response of responses) {
-		if (response) mergeSources(merged, response.sources);
-	}
+	const merged = mergeSearchSources(
+		responses.filter((response): response is SearchResponse => response !== undefined).map(r => r.sources),
+		{ limit: numResults },
+	);
 
-	if (merged.size === 0 && failures.length === engineIds.length) {
+	if (merged.length === 0 && failures.length === engineIds.length) {
 		throw new SearchProviderError(
 			"public",
 			`All public engines failed: ${formatSearchProviderFailures(failures)}`,
@@ -168,12 +116,7 @@ export async function searchPublicWeb(
 		);
 	}
 
-	const sources = [...merged.values()]
-		.sort((a, b) => b.engines - a.engines || a.bestRank - b.bestRank || a.order - b.order)
-		.slice(0, numResults)
-		.map(entry => entry.source);
-
-	return { provider: "public", sources };
+	return { provider: "public", sources: merged };
 }
 
 /**

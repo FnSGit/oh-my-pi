@@ -866,8 +866,10 @@ function updateRecallCounts(
 	beam: BeamMemoryState,
 	results: readonly RecallResult[],
 	options: RecallOptionsInternal,
+	query?: string,
 ): void {
 	const timestamp = nowIso();
+	if (query !== undefined) recordRecallEvent(beam, query, results, options, timestamp);
 	for (const tierLabel of ["working", "episodic"] as const) {
 		const ids = results.filter(r => r.tier_label === tierLabel).map(r => r.id);
 		if (ids.length === 0) continue;
@@ -877,6 +879,49 @@ function updateRecallCounts(
 			`UPDATE ${table} SET recall_count = COALESCE(recall_count, 0) + 1, last_recalled = ? WHERE id IN (${placeholders(ids.length)}) AND ${where}`,
 			[timestamp, ...ids, ...params],
 		);
+	}
+}
+
+/**
+ * Append one audit row per served recall so usage reports can tell which
+ * session, caller channel and memories each recall involved. Best-effort:
+ * a missing table (older database opened read-only) must never break recall.
+ */
+function recordRecallEvent(
+	beam: BeamMemoryState,
+	query: string,
+	results: readonly RecallResult[],
+	options: RecallOptionsInternal,
+	timestamp: string,
+): void {
+	const ids: string[] = [];
+	const tierCounts: Record<string, number> = {};
+	let topScore: number | null = null;
+	for (const result of results) {
+		if (result.id) ids.push(result.id);
+		const tier = result.tier_label ?? result.tier;
+		if (tier) tierCounts[tier] = (tierCounts[tier] ?? 0) + 1;
+		if (typeof result.score === "number" && (topScore === null || result.score > topScore)) {
+			topScore = result.score;
+		}
+	}
+	try {
+		beam.db.run(
+			`INSERT INTO recall_events (timestamp, session_id, channel, query, bank, memory_ids, tier_counts, top_score)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			[
+				timestamp,
+				options.recallContext?.sessionId ?? beam.sessionId,
+				options.recallContext?.channel ?? null,
+				query,
+				options.channelId ?? beam.channelId,
+				JSON.stringify(ids),
+				JSON.stringify(tierCounts),
+				topScore,
+			],
+		);
+	} catch {
+		// Audit is observational: never fail a recall because the table is unavailable.
 	}
 }
 
@@ -986,7 +1031,7 @@ export async function recall(
 		} else {
 			finalResults = finalResults.slice(0, topK);
 		}
-		if (temporalOptions.updateRecallCounts !== false) updateRecallCounts(beam, finalResults, temporalOptions);
+		if (temporalOptions.updateRecallCounts !== false) updateRecallCounts(beam, finalResults, temporalOptions, query);
 		return finalResults;
 	});
 }
@@ -1090,7 +1135,7 @@ export async function recallEnhanced(
 			const cached = cache.get(query, queryEmbedding, scope);
 			if (cached !== null) {
 				const results = structuredClone(cached) as RecallResult[];
-				if (countRecalls) countRecallsKeepingCache(beam, results, runOptions, token);
+				if (countRecalls) countRecallsKeepingCache(beam, results, runOptions, token, query);
 				return results;
 			}
 		}
@@ -1106,7 +1151,7 @@ export async function recallEnhanced(
 		// put and keep the stale token so the next lookup starts from an empty cache.
 		const cacheable = cache !== null && databaseWriteToken(beam) === token;
 		if (cacheable) cache?.put(query, structuredClone(results), queryEmbedding, scope);
-		if (countRecalls) countRecallsKeepingCache(beam, results, runOptions, cacheable ? token : null);
+		if (countRecalls) countRecallsKeepingCache(beam, results, runOptions, cacheable ? token : null, query);
 		return results;
 	});
 }
@@ -1135,7 +1180,7 @@ async function linearRecallEnhanced(
 		}
 		results.sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
 		const finalResults = rerankRecallResults(results, options.mmrLambda ?? 0.7, topK);
-		if (enhancedOptions.updateRecallCounts !== false) updateRecallCounts(beam, finalResults, enhancedOptions);
+		if (enhancedOptions.updateRecallCounts !== false) updateRecallCounts(beam, finalResults, enhancedOptions, query);
 		return finalResults;
 	});
 }
@@ -1227,9 +1272,10 @@ function countRecallsKeepingCache(
 	results: readonly RecallResult[],
 	options: RecallOptionsInternal,
 	validToken: string | null,
+	query: string,
 ): void {
 	const before = validToken === null ? null : databaseWriteToken(beam);
-	updateRecallCounts(beam, results, options);
+	updateRecallCounts(beam, results, options, query);
 	if (before === null || before !== validToken) return;
 	const after = databaseWriteToken(beam);
 	if (after.split(":")[0] === before.split(":")[0]) beam.caches.queryCacheToken = after;

@@ -405,6 +405,26 @@ export function initBeam(db: Database): void {
 	]);
 
 	db.run(`
+		CREATE TABLE IF NOT EXISTS recall_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp TEXT NOT NULL,
+			session_id TEXT,
+			channel TEXT,
+			query TEXT NOT NULL,
+			bank TEXT,
+			memory_ids TEXT NOT NULL DEFAULT '[]',
+			tier_counts TEXT NOT NULL DEFAULT '{}',
+			top_score REAL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`);
+	runAll(db, [
+		"CREATE INDEX IF NOT EXISTS idx_recall_events_ts ON recall_events(timestamp)",
+		"CREATE INDEX IF NOT EXISTS idx_recall_events_session ON recall_events(session_id)",
+		"CREATE INDEX IF NOT EXISTS idx_recall_events_channel ON recall_events(channel)",
+	]);
+
+	db.run(`
 		CREATE TABLE IF NOT EXISTS triples (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			subject TEXT NOT NULL,

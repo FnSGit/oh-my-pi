@@ -310,7 +310,7 @@ export const mnemopiBackend: MemoryBackend = {
 			return { backend: "mnemopi", query, count: 0, items: [], message: "Search aborted." };
 		}
 		const limit = clampLimit(options?.limit);
-		const results = (await primary.recallResultsScoped(query)).slice(0, limit);
+		const results = (await primary.recallResultsScoped(query, "tool")).slice(0, limit);
 		if (options?.signal?.aborted) {
 			return { backend: "mnemopi", query, count: 0, items: [], message: "Search aborted." };
 		}

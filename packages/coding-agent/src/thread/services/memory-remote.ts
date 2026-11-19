@@ -42,6 +42,7 @@ import type {
 	MnemopiMemoryEditOperation,
 	MnemopiMemoryEditOptions,
 	MnemopiMemoryEditResult,
+	MnemopiRecallChannel,
 	MnemopiRememberInput,
 	MnemopiRememberOptions,
 	MnemopiScopedIndexEntry,
@@ -262,12 +263,12 @@ export class RemoteMnemopiSessionState implements MnemopiSessionStateApi {
 		return this.#remote.callSync("editScopedMemory", op, id, options);
 	}
 
-	collectScopedRecallResults(query: string): Promise<RecallResult[]> {
-		return this.#remote.call("collectScopedRecallResults", query);
+	collectScopedRecallResults(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]> {
+		return this.#remote.call("collectScopedRecallResults", query, channel);
 	}
 
-	recallResultsScoped(query: string): Promise<RecallResult[]> {
-		return this.#remote.call("collectScopedRecallResults", query);
+	recallResultsScoped(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]> {
+		return this.#remote.call("collectScopedRecallResults", query, channel);
 	}
 
 	formatScopedRecallContext(results: readonly RecallResult[], format?: "bullet" | "json"): string | undefined {

@@ -26,6 +26,9 @@
 ### Fixed
 
 - Fixed fact extraction storing decimals, prices, and IP-address fragments as `version` facts and leaving symbols such as `→` in `metric` fact keys ([#18886](https://github.com/can1357/oh-my-pi/issues/18886))
+### Added
+
+- Recall requests append an audit row to `recall_events` with the caller channel, session, query, and served memory ids, so usage reports can distinguish automatic injection from tool-driven recall
 
 ## [18.18.4] - 2026-11-09
 

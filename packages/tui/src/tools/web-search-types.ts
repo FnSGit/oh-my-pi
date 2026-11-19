@@ -60,6 +60,10 @@ export interface SearchSource {
 	/** Age in seconds for consistent formatting */
 	ageSeconds?: number;
 	author?: string;
+	/** Engine-reported relevance in [0,1]; absent when the engine gives no score. */
+	relevance?: number;
+	/** Engine-reported site authority in [0,1]; absent when the engine gives no rating. */
+	authority?: number;
 }
 
 /** Citation with text reference (LLM-mediated providers) */

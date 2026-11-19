@@ -30,6 +30,15 @@ export const MAX_WEB_SEARCH_TIMEOUT_SECONDS = 300;
 /** Pure search engines represented by `web/*` catalog models. */
 export type SearchEngineId = Exclude<SearchProviderId, WebSearchGrounding>;
 
+/**
+ * Retrieval effort for one search:
+ * - `quick` — attempt the first available engine only (no chain walk).
+ * - `standard` — walk the configured chain in order, first usable answer wins.
+ * - `deep` — query up to three available engines concurrently, merge and rank
+ *   their results, and keep longer per-source excerpts.
+ */
+export type SearchDepth = "quick" | "standard" | "deep";
+
 /** Provider-specific error with optional HTTP status */
 export class SearchProviderError extends Error {
 	constructor(
