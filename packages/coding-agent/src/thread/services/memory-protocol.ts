@@ -43,8 +43,10 @@ import type {
 	MnemopiMemoryEditOperation,
 	MnemopiMemoryEditOptions,
 	MnemopiMemoryEditResult,
+	MnemopiRecallChannel,
 	MnemopiRememberInput,
 	MnemopiRememberOptions,
+	MnemopiScopedIndexEntry,
 	MnemopiScopedMemoryHit,
 	MnemopiSessionStateApi,
 } from "../../mnemopi/state";
@@ -115,7 +117,7 @@ export type MnemopiSessionStateProtocol = {
 		[op: MnemopiMemoryEditOperation, id: string, options?: MnemopiMemoryEditOptions],
 		MnemopiMemoryEditResult
 	>;
-	collectScopedRecallResults: RpcMethod<[query: string], RecallResult[]>;
+	collectScopedRecallResults: RpcMethod<[query: string, channel?: MnemopiRecallChannel], RecallResult[]>;
 	formatScopedRecallContext: RpcMethod<
 		[results: readonly RecallResult[], format?: "bullet" | "json"],
 		string | undefined
@@ -125,5 +127,7 @@ export type MnemopiSessionStateProtocol = {
 		string
 	>;
 	getScopedStats: RpcMethod<[], MnemopiBankStats[]>;
+	listScopedIndexEntries: RpcMethod<[options?: { limit?: number }], MnemopiScopedIndexEntry[]>;
+	formatScopedIndex: RpcMethod<[], string | undefined>;
 	consolidate: RpcMethod<[options?: MnemopiConsolidateOptions], void>;
 };

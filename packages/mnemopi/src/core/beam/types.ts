@@ -170,7 +170,17 @@ export interface RememberBatchItem extends RememberOptions {
 	content: string;
 }
 
+/** Caller context recorded per recall into the `recall_events` audit table. */
+export interface RecallAuditContext {
+	/** Session that issued the recall; defaults to the store's own session id. */
+	sessionId?: string | null;
+	/** Caller label (`auto`, `tool`, `compaction`, …) for usage reports. */
+	channel?: string | null;
+}
+
 export interface RecallOptions {
+	/** Audit context written to `recall_events` alongside the recall counts. */
+	recallContext?: RecallAuditContext;
 	fromDate?: string | null;
 	toDate?: string | null;
 	authorId?: string | null;
@@ -289,6 +299,31 @@ export type RecallResult = RecallRowFields & {
 	voice_scores?: RecallVoiceScores;
 	metadata?: Metadata;
 };
+
+/**
+ * One row of the compact memory index the coding agent injects into its
+ * system prompt. Index reads are intentionally lighter than recall: no
+ * embeddings, no scoring, just the most important live rows of a bank.
+ */
+export interface MemoryIndexEntry {
+	id: string;
+	content: string;
+	source: string | null;
+	timestamp: string | null;
+	importance: number;
+	memory_type: string | null;
+	veracity: string | null;
+	store: "working" | "episodic";
+	tier: number | null;
+}
+
+export interface MemoryIndexOptions {
+	limit?: number;
+	includeWorking?: boolean;
+	includeEpisodic?: boolean;
+	memoryType?: string | null;
+	minImportance?: number;
+}
 
 export interface BeamStats {
 	count: number;

@@ -10,6 +10,7 @@ import {
 	getWorkingStats,
 	importFromDict,
 	invalidate,
+	listIndex,
 	remember,
 	rememberBatch,
 	scratchpadClear,
@@ -433,6 +434,25 @@ describe("fact-id read path (issue #4725)", () => {
 		beam.db.run("ALTER TABLE facts ADD COLUMN scope TEXT DEFAULT 'session'");
 		beam.db.run("UPDATE facts SET scope = 'global' WHERE fact_id = 'fact-other'");
 		expect(get(beam, "fact-other")?.memory_store).toBe("fact");
+	});
+
+	it("lists only live rows and honors type, importance, and limit filters", () => {
+		const beam = makeState();
+		remember(beam, "preference row", { memoryType: "preference", importance: 0.9 });
+		remember(beam, "fact row", { memoryType: "fact", importance: 0.5 });
+		const retired = remember(beam, "retired row", { memoryType: "fact", importance: 0.4 });
+		invalidate(beam, retired);
+
+		expect(
+			listIndex(beam)
+				.map(row => row.content)
+				.sort(),
+		).toEqual(["fact row", "preference row"]);
+		expect(listIndex(beam, { memoryType: "preference" }).map(row => row.content)).toEqual(["preference row"]);
+		expect(listIndex(beam, { minImportance: 0.6 }).map(row => row.content)).toEqual(["preference row"]);
+		expect(listIndex(beam, { limit: 1 })).toHaveLength(1);
+		expect(listIndex(beam, { includeWorking: false })).toEqual([]);
+		expect(listIndex(beam, { limit: 0 })).toEqual([]);
 	});
 
 	it("keeps working rows first on id collision and never deletes facts via forgetWorking", () => {

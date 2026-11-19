@@ -81,10 +81,12 @@ const serveMnemopiState: RpcServe<MnemopiSessionState, MnemopiSessionStateProtoc
 	getGlobalRetainTarget: state => ({ bank: state.getGlobalRetainTarget().bank }),
 	getScopedMemory: (state, id) => state.getScopedMemory(id),
 	editScopedMemory: (state, op, id, options) => state.editScopedMemory(op, id, options),
-	collectScopedRecallResults: (state, query) => state.collectScopedRecallResults(query),
+	collectScopedRecallResults: (state, query, channel) => state.collectScopedRecallResults(query, channel),
 	formatScopedRecallContext: (state, results, format) => state.formatScopedRecallContext(results, format),
 	rememberScoped: (state, memory, options, target) => state.rememberScoped(memory, options, target),
 	getScopedStats: state => state.getScopedStats(),
+	listScopedIndexEntries: (state, options) => state.listScopedIndexEntries(options),
+	formatScopedIndex: state => state.formatScopedIndex(),
 	consolidate: (state, options) => state.consolidate(options),
 };
 

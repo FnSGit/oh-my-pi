@@ -31,6 +31,7 @@ import {
 	getWorkingStats,
 	importFromDict,
 	invalidate,
+	listIndex,
 	remember,
 	rememberBatch,
 	scratchpadClear,
@@ -47,6 +48,8 @@ import type {
 	BeamStats,
 	ImportStats,
 	MemoriaRetrieveResult,
+	MemoryIndexEntry,
+	MemoryIndexOptions,
 	Metadata,
 	RecallEnhancedOptions,
 	RecallOptions,
@@ -223,6 +226,11 @@ export class BeamMemory implements BeamMemoryState {
 
 	getContext(limit = 10): unknown[] {
 		return getContext(this, limit);
+	}
+
+	/** Live rows for the coding agent's compact prompt index (no embeddings). */
+	listIndex(options: MemoryIndexOptions = {}): MemoryIndexEntry[] {
+		return listIndex(this, options);
 	}
 
 	invalidate(memoryId: string, replacementId: string | null = null): boolean {

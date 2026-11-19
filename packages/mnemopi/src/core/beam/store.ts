@@ -21,6 +21,8 @@ import type {
 	BeamMemoryState,
 	BeamStats,
 	ImportStats,
+	MemoryIndexEntry,
+	MemoryIndexOptions,
 	Metadata,
 	RememberBatchItem,
 	RememberBatchOptions,
@@ -697,6 +699,77 @@ export function getContext(beam: BeamMemoryState, limit = 10): Row[] {
 		LIMIT ?
 	`);
 	return (statement.all(beam.sessionId, now, limit) as Row[]).map(rowToDict);
+}
+
+const INDEX_DEFAULT_LIMIT = 200;
+const INDEX_MAX_LIMIT = 1000;
+
+/**
+ * List live rows for a compact prompt index, without embeddings or scoring.
+ *
+ * Each bank is a separate database whose `sessionId` is the bank name, so the
+ * session clause is what keeps a bank's rows visible to every session opening
+ * that bank. Rows superseded by `memory_edit invalidate` or past `valid_until`
+ * are excluded, matching recall visibility. Working and episodic rows are
+ * merged by importance then recency; callers slice per type as needed.
+ */
+export function listIndex(beam: BeamMemoryState, options: MemoryIndexOptions = {}): MemoryIndexEntry[] {
+	const rawLimit = options.limit ?? INDEX_DEFAULT_LIMIT;
+	const limit = Number.isFinite(rawLimit)
+		? Math.min(INDEX_MAX_LIMIT, Math.max(0, Math.trunc(rawLimit)))
+		: INDEX_DEFAULT_LIMIT;
+	if (limit === 0) return [];
+
+	const now = toUtcIso();
+	const filters: string[] = [];
+	const filterParams: SQLQueryBindings[] = [];
+	if (options.memoryType !== undefined && options.memoryType !== null && options.memoryType.length > 0) {
+		filters.push("memory_type = ?");
+		filterParams.push(options.memoryType);
+	}
+	if (options.minImportance !== undefined && Number.isFinite(options.minImportance)) {
+		filters.push("importance >= ?");
+		filterParams.push(options.minImportance);
+	}
+	const filterSql = filters.length > 0 ? ` AND ${filters.join(" AND ")}` : "";
+
+	const rows: MemoryIndexEntry[] = [];
+	if (options.includeWorking !== false) {
+		using statement = beam.db.prepare(`
+			SELECT id, content, source, timestamp, importance, memory_type, veracity,
+			       'working' AS store, NULL AS tier
+			FROM working_memory
+			WHERE (session_id = ? OR scope = 'global')
+			  AND superseded_by IS NULL
+			  AND (valid_until IS NULL OR valid_until > ?)
+			  ${filterSql}
+			ORDER BY importance DESC, timestamp DESC
+			LIMIT ?
+		`);
+		rows.push(...(statement.all(beam.sessionId, now, ...filterParams, limit) as unknown as MemoryIndexEntry[]));
+	}
+	if (options.includeEpisodic !== false) {
+		using statement = beam.db.prepare(`
+			SELECT id, content, source, timestamp, importance, memory_type, veracity,
+			       'episodic' AS store, tier
+			FROM episodic_memory
+			WHERE (session_id = ? OR scope = 'global')
+			  AND superseded_by IS NULL
+			  AND (valid_until IS NULL OR valid_until > ?)
+			  ${filterSql}
+			ORDER BY importance DESC, timestamp DESC
+			LIMIT ?
+		`);
+		rows.push(...(statement.all(beam.sessionId, now, ...filterParams, limit) as unknown as MemoryIndexEntry[]));
+	}
+
+	rows.sort(
+		(left, right) =>
+			right.importance - left.importance ||
+			(right.timestamp ?? "").localeCompare(left.timestamp ?? "") ||
+			left.id.localeCompare(right.id),
+	);
+	return rows.slice(0, limit);
 }
 
 export function invalidate(beam: BeamMemoryState, memoryId: string, replacementId: string | null = null): boolean {

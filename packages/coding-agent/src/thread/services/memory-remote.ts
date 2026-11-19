@@ -42,8 +42,10 @@ import type {
 	MnemopiMemoryEditOperation,
 	MnemopiMemoryEditOptions,
 	MnemopiMemoryEditResult,
+	MnemopiRecallChannel,
 	MnemopiRememberInput,
 	MnemopiRememberOptions,
+	MnemopiScopedIndexEntry,
 	MnemopiScopedMemoryHit,
 	MnemopiSessionStateApi,
 } from "../../mnemopi/state";
@@ -261,12 +263,12 @@ export class RemoteMnemopiSessionState implements MnemopiSessionStateApi {
 		return this.#remote.callSync("editScopedMemory", op, id, options);
 	}
 
-	collectScopedRecallResults(query: string): Promise<RecallResult[]> {
-		return this.#remote.call("collectScopedRecallResults", query);
+	collectScopedRecallResults(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]> {
+		return this.#remote.call("collectScopedRecallResults", query, channel);
 	}
 
-	recallResultsScoped(query: string): Promise<RecallResult[]> {
-		return this.#remote.call("collectScopedRecallResults", query);
+	recallResultsScoped(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]> {
+		return this.#remote.call("collectScopedRecallResults", query, channel);
 	}
 
 	formatScopedRecallContext(results: readonly RecallResult[], format?: "bullet" | "json"): string | undefined {
@@ -279,6 +281,14 @@ export class RemoteMnemopiSessionState implements MnemopiSessionStateApi {
 
 	getScopedStats(): MnemopiBankStats[] {
 		return this.#remote.callSync("getScopedStats");
+	}
+
+	listScopedIndexEntries(options?: { limit?: number }): MnemopiScopedIndexEntry[] {
+		return this.#remote.callSync("listScopedIndexEntries", options);
+	}
+
+	formatScopedIndex(): string | undefined {
+		return this.#remote.callSync("formatScopedIndex");
 	}
 
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void> {

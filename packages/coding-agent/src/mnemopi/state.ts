@@ -3,6 +3,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
 import type {
 	MemoryFacadeStats,
+	MemoryIndexEntry,
 	Mnemopi,
 	RecallResult,
 	RememberFacadeOptions,
@@ -114,6 +115,12 @@ export function requireMnemopiCore(): typeof MnemopiCoreNs {
 
 const kMnemopiSessionState = Symbol("mnemopi.sessionState");
 
+/**
+ * Source of automatic transcript retention. Raw episodes are recall material,
+ * not durable facts, so the compact prompt index excludes them.
+ */
+const TRANSCRIPT_MEMORY_SOURCE = "coding-agent-transcript";
+
 interface AgentSessionWithMnemopiState extends AgentSession {
 	[kMnemopiSessionState]?: MnemopiSessionState;
 }
@@ -144,6 +151,13 @@ export interface MnemopiBankTarget {
 export interface MnemopiBankStats {
 	bank: string;
 	stats: MemoryFacadeStats;
+}
+
+/** One live memory row as shown in the compact prompt index. */
+export interface MnemopiScopedIndexEntry extends MemoryIndexEntry {
+	bank: string;
+	/** True for rows from the shared bank every project recalls. */
+	global: boolean;
 }
 
 /** Options of {@link MnemopiSessionState.consolidate}. */
@@ -223,6 +237,14 @@ interface MnemopiRetentionCursorRow {
 	retainedThroughUserTurn: number | null;
 }
 
+/** Collapse whitespace and bound one memory-index line without splitting a surrogate pair. */
+function clipIndexText(text: string, maxChars: number): string {
+	const one = text.replace(/\s+/g, " ").trim();
+	if (one.length <= maxChars) return one;
+	const sliced = one.slice(0, Math.max(0, maxChars - 1));
+	return /[\uD800-\uDBFF]$/.test(sliced) ? `${sliced.slice(0, -1)}…` : `${sliced}…`;
+}
+
 function countRetainedUserTurns(transcript: string): number {
 	let turns = 0;
 	for (const line of transcript.split(/\r?\n/)) {
@@ -293,6 +315,9 @@ export interface MnemopiSessionStateOptions {
 	automaticRecallJudge?: Pick<ChainJudge, "withCandidate">;
 }
 
+/** Who issued a scoped recall; recorded in the mnemopi `recall_events` audit table. */
+export type MnemopiRecallChannel = "auto" | "tool" | "compaction" | "other";
+
 /**
  * What subagent aliases and the backend's `primary` reads use on a parent state: its
  * identity, config, and every scoped-bank operation. A subagent worker holds a remote
@@ -313,11 +338,13 @@ export interface MnemopiSessionStateApi {
 		id: string,
 		options?: MnemopiMemoryEditOptions,
 	): MnemopiMemoryEditResult;
-	collectScopedRecallResults(query: string): Promise<RecallResult[]>;
-	recallResultsScoped(query: string): Promise<RecallResult[]>;
+	collectScopedRecallResults(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]>;
+	recallResultsScoped(query: string, channel?: MnemopiRecallChannel): Promise<RecallResult[]>;
 	formatScopedRecallContext(results: readonly RecallResult[], format?: "bullet" | "json"): string | undefined;
 	rememberScoped(memory: MnemopiRememberInput, options?: MnemopiRememberOptions, target?: MnemopiBankTarget): string;
 	getScopedStats(): MnemopiBankStats[];
+	listScopedIndexEntries(options?: { limit?: number }): MnemopiScopedIndexEntry[];
+	formatScopedIndex(): string | undefined;
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void>;
 }
 
@@ -423,6 +450,101 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			stats.push({ bank: target.bank, stats: target.memory.getStats() });
 		}
 		return stats;
+	}
+
+	/**
+	 * Live rows across every bank this session recalls from, newest/most important first.
+	 * Deduplicates rows and identical content repeated across the project and shared banks.
+	 * Index reads never touch embeddings; failures in one bank are logged and skipped.
+	 */
+	listScopedIndexEntries(options: { limit?: number } = {}): MnemopiScopedIndexEntry[] {
+		const parent = this.#remoteParent();
+		if (parent) return parent.listScopedIndexEntries(options);
+		const scoped = this.#local();
+		const globalBank = scoped.global?.bank ?? (this.config.scoping === "global" ? scoped.retain.bank : undefined);
+		const targets = dedupeScopedTargets([scoped.retain, ...scoped.recall, ...(scoped.global ? [scoped.global] : [])]);
+		const limit = Math.max(1, Math.min(1000, Math.trunc(options.limit ?? 200)));
+		const entries: MnemopiScopedIndexEntry[] = [];
+		const seenIds = new Set<string>();
+		const seenContent = new Set<string>();
+		for (const target of targets) {
+			let rows: MemoryIndexEntry[];
+			try {
+				rows = target.memory.listIndex({ limit });
+			} catch (error) {
+				logger.debug("Mnemopi: memory index read failed", {
+					bank: target.bank,
+					error: toError(error).message,
+				});
+				continue;
+			}
+			for (const row of rows) {
+				const contentKey = `${row.memory_type === "preference" ? "preference" : "other"}:${row.content}`;
+				const idKey = `${target.bank}:${row.id}`;
+				if (seenIds.has(idKey) || seenContent.has(contentKey)) continue;
+				seenIds.add(idKey);
+				seenContent.add(contentKey);
+				entries.push({ ...row, bank: target.bank, global: target.bank === globalBank });
+			}
+		}
+		entries.sort(
+			(left, right) =>
+				right.importance - left.importance ||
+				(right.timestamp ?? "").localeCompare(left.timestamp ?? "") ||
+				left.id.localeCompare(right.id),
+		);
+		return entries;
+	}
+
+	/**
+	 * Compact pi-memory-style index of remembered facts for the system prompt.
+	 * Quotas keep the block bounded; `mnemopi.indexInjection` is the master switch.
+	 * Returns undefined when disabled or when every bank is empty.
+	 */
+	formatScopedIndex(): string | undefined {
+		if (!this.config.indexInjection) return undefined;
+		const quotas = {
+			prefs: this.config.indexInjectionPrefs,
+			knowledge: this.config.indexInjectionKnowledge,
+			project: this.config.indexInjectionProject,
+		};
+		if (quotas.prefs + quotas.knowledge + quotas.project <= 0) return undefined;
+		let entries: MnemopiScopedIndexEntry[];
+		try {
+			entries = this.listScopedIndexEntries({
+				limit: Math.max(40, (quotas.prefs + quotas.knowledge + quotas.project) * 3),
+			});
+		} catch (error) {
+			logger.debug("Mnemopi: memory index render failed", { error: toError(error).message });
+			return undefined;
+		}
+		const indexEntries = entries.filter(
+			entry => entry.source !== TRANSCRIPT_MEMORY_SOURCE && entry.memory_type !== "episode",
+		);
+		if (indexEntries.length === 0) return undefined;
+
+		const globalEntries = indexEntries.filter(entry => entry.global);
+		const preferences = globalEntries.filter(entry => entry.memory_type === "preference").slice(0, quotas.prefs);
+		const knowledge = globalEntries.filter(entry => entry.memory_type !== "preference").slice(0, quotas.knowledge);
+		const project = indexEntries.filter(entry => !entry.global).slice(0, quotas.project);
+
+		const lines = ["Long-term memory index (auto-injected from Mnemopi; summaries only, not full text):"];
+		const renderSection = (title: string, rows: readonly MnemopiScopedIndexEntry[], label: string) => {
+			if (rows.length === 0) return;
+			lines.push(title);
+			for (const row of rows) {
+				const warning = row.veracity === "false" || row.veracity === "contested" ? "⚠️ " : "";
+				lines.push(
+					`- ${warning}[${label}] ${clipIndexText(row.content, this.config.indexInjectionChars)} (id=${row.id.slice(0, 8)})`,
+				);
+			}
+		};
+		renderSection("User preferences:", preferences, "preference");
+		renderSection("Knowledge:", knowledge, "knowledge");
+		renderSection("Project memory:", project, "project");
+		if (lines.length === 1) return undefined;
+		lines.push("Use the recall tool for full text, or read memory://<id> (Mnemopi only).");
+		return truncateApproxTokens(lines.join("\n"), this.config.indexInjectionTokenLimit);
 	}
 
 	/**
@@ -560,9 +682,9 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		});
 	}
 
-	async collectScopedRecallResults(query: string): Promise<RecallResult[]> {
+	async collectScopedRecallResults(query: string, channel: MnemopiRecallChannel = "other"): Promise<RecallResult[]> {
 		const parent = this.#remoteParent();
-		if (parent) return await parent.collectScopedRecallResults(query);
+		if (parent) return await parent.collectScopedRecallResults(query, channel);
 		const scoped = this.#local();
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
@@ -579,6 +701,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 					const results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, {
 						includeFacts: true,
 						channelId: target.bank,
+						recallContext: { sessionId: this.sessionId, channel },
 					});
 					targetSucceeded = true;
 					withLoopPhase("mnemopi.recall", () => {
@@ -612,8 +735,8 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		});
 	}
 
-	recallResultsScoped(query: string): Promise<RecallResult[]> {
-		return this.collectScopedRecallResults(query);
+	recallResultsScoped(query: string, channel: MnemopiRecallChannel = "other"): Promise<RecallResult[]> {
+		return this.collectScopedRecallResults(query, channel);
 	}
 
 	formatScopedRecallContext(
@@ -663,8 +786,12 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		});
 	}
 
-	async recallForContext(query: string, signal?: AbortSignal): Promise<string | undefined> {
-		return (await this.#recallBlock(query, signal))?.text || undefined;
+	async recallForContext(
+		query: string,
+		signal?: AbortSignal,
+		channel: MnemopiRecallChannel = "auto",
+	): Promise<string | undefined> {
+		return (await this.#recallBlock(query, signal, channel))?.text || undefined;
 	}
 
 	/**
@@ -675,9 +802,10 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	async #recallBlock(
 		query: string,
 		signal?: AbortSignal,
+		channel: MnemopiRecallChannel = "other",
 		budget?: (block: string) => string,
 	): Promise<RecallBlock | undefined> {
-		const recalled = await this.collectScopedRecallResults(query);
+		const recalled = await this.collectScopedRecallResults(query, channel);
 		if (signal?.aborted) return undefined;
 		const results: RecallCandidate[] | undefined = this.#relevanceFilterActive()
 			? await this.#filterAutomaticRecall(query, budget ? visibleCandidates(recalled, budget) : recalled, signal)
@@ -851,7 +979,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 			return truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
 		});
-		const recall = await this.#recallBlock(truncated, signal, budget);
+		const recall = await this.#recallBlock(truncated, signal, "auto", budget);
 		// An aborted or failed relevance check delivers nothing yet still consumes the first turn: one
 		// attempt per session, so the system prompt never changes mid-session. Nothing is persisted, so a
 		// resume recalls afresh.
@@ -884,7 +1012,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			const query = composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns);
 			return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 		});
-		return await this.recallForContext(truncated, signal);
+		return await this.recallForContext(truncated, signal, "compaction");
 	}
 
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
@@ -934,7 +1062,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			const { transcript: embedText } = prepareEmbeddableRetentionTranscript(messages);
 			const shouldExtract = options.extract !== false && extractText !== null;
 			this.rememberInScope(transcript, {
-				source: "coding-agent-transcript",
+				source: TRANSCRIPT_MEMORY_SOURCE,
 				importance: 0.65,
 				metadata: {
 					session_id: this.sessionId,
@@ -966,7 +1094,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 					CAST(json_extract(metadata_json, '$.retained_through_user_turn') AS INTEGER)
 						AS retainedThroughUserTurn
 				FROM working_memory
-				WHERE source = 'coding-agent-transcript'
+				WHERE source = '${TRANSCRIPT_MEMORY_SOURCE}'
 				  AND json_extract(metadata_json, '$.session_id') = ?
 				ORDER BY rowid
 		`);
@@ -1020,7 +1148,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			});
 			try {
 				const budget = (block: string) => this.budgetRecallBlock(block);
-				const recall = await this.#recallBlock(truncated, undefined, budget);
+				const recall = await this.#recallBlock(truncated, undefined, "auto", budget);
 				record = recall && this.#deliveredRecall(recall, budget);
 				context = recall?.text;
 			} catch (error) {
