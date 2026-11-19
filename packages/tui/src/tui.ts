@@ -1346,6 +1346,26 @@ export class TUI extends Container {
 	 */
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle {
 		component.setIgnoreTight?.(true);
+		// Dedup: if the same component instance is already on the stack, reuse
+		// its entry instead of pushing a second one. Without this, every
+		// `#compositeOverlays` frame paints the component once per duplicate
+		// entry — the "整屏都是同一份选项" symptom observed when an overlay
+		// is re-shown before its handle's `hide()` lands (race during async
+		// factory, double `custom()` from a chained UI flow, etc.). Original
+		// `options` are preserved on the existing entry; re-mounting with new
+		// geometry should `hide()` first.
+		const existing = this.overlayStack.find(o => o.component === component);
+		if (existing) {
+			if (existing.hidden) {
+				existing.hidden = false;
+			}
+			if (this.#isOverlayVisible(existing)) {
+				this.setFocus(component);
+			}
+			this.requestRender();
+			return this.#buildOverlayHandle(component, existing);
+		}
+
 		const entry = { component, options, preFocus: this.#focusedComponent, hidden: false, released: false };
 		this.overlayStack.push(entry);
 		// Only focus if overlay is actually visible
@@ -1356,7 +1376,17 @@ export class TUI extends Container {
 		this.#recordHardwareCursorHidden();
 		this.requestRender();
 
-		// Return handle for controlling this overlay
+		return this.#buildOverlayHandle(component, entry);
+	}
+
+	/**
+	 * Build the public `OverlayHandle` for an entry on the stack. Centralising
+	 * the handle factory is what lets `showOverlay` dedup by component
+	 * instance: every call resolves to a handle bound to the same entry, so
+	 * `hide()` from any duplicate call splices the same row and stays
+	 * idempotent.
+	 */
+	#buildOverlayHandle(component: Component, entry: (typeof this.overlayStack)[number]): OverlayHandle {
 		return {
 			hide: () => {
 				const index = this.overlayStack.indexOf(entry);

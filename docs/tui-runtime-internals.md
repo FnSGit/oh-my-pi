@@ -136,3 +136,5 @@ native frames. See [native rendering](./tui-core-renderer.md#native-rendering-te
 ## Shutdown
 
 Interactive shutdown disposes session-owned work, drains terminal input, restores title/protocol state, and calls `TUI.stop()`. TUI exits any alternate buffer, asks the provider to Flush all eligible finalized history, cancels render/resize timers, preserves terminal-owned image state, places the shell cursor directly after visible TUI content, restores cursor visibility, then delegates terminal-mode restoration to `ProcessTerminal.stop()`.
+
+> Overlay lifecycle (mount/dedup/close) and the "整屏都是同一份选项" regression: see [`tui-overlay-dedup.md`](./tui-overlay-dedup.md).
