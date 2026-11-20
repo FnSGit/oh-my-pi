@@ -99,3 +99,6 @@ packages/coding-agent/bench/boot-baseline.json
 /.bazelrc.user
 
 .parity/
+
+# Local omp runtime symlink (machine-specific, points at ~/.omp)
+.omp-link
