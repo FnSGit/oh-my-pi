@@ -81,11 +81,13 @@ git diff "$mb" HEAD -- 'crates/vendor/*/Cargo.toml' | rg '^[-+](name|version) '
 命中任一条 → 发 manager 一条固定格式：`[vendor-watch] <crate> <文件> <类型> <mb..HEAD>`。
 **不报**：`[lints.*]`、`homepage`/`description`/`readme` 等元数据、README/docs 改动——不改变行为。
 
-### 6. 推送到 origin
+### 6. 推送到 fork
 
 ```bash
-git push origin {work_branch} main
+git push {fork_remote} {work_branch}
 ```
+
+main 是否推送由 manager 决定，不要自行推。
 
 ### 7. 本地部署
 
@@ -113,10 +115,12 @@ bun install && bun run build:native
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| `repo_root` | `~/IDE/oh-my-pi/oh-my-pi` | 仓库根目录 |
+| `repo_root` | `~/IDE/ai-agent/oh-my-pi` | 仓库根目录 |
 | `work_branch` | `dev/blunt` | 当前工作分支 |
-| `upstream_remote` | `upstream` | 上游 remote（can1357/oh-my-pi） |
+| `upstream_remote` | `origin` | 上游 remote（can1357/oh-my-pi，只读，push 会 403） |
 | `upstream_branch` | `main` | 上游目标分支 |
+| `fork_remote` | `fork` | 自己的 fork（git@github.com:FnSGit/oh-my-pi.git），可推 |
+| `push_target` | `fork` | **不要推到 `origin`** |
 | `cli_binary` | `omp` | CLI 命令名 |
 | `build_cmd` | `bun install && bun run build:native` | 构建命令 |
 
