@@ -10,6 +10,7 @@ description: 合并上游仓库新版本到本地 fork 分支并部署。Use whe
 ## 必须遵守
 
 - **merge 完上游后立刻跑检查**：每次合并上游并解决冲突后，立即执行 `bun run check`（至少 `bun run check:ts` + 受影响包的 `bun test`）。发现红测当场处理，不要攒到后面——避免 merge 静默丢弃代码后长期无感知。
+- **merge 完上游后跑 vendor-watch**：`crates/vendor/` 下的 vendored crate 被外部项目（如 armillary）通过 `[patch.crates-io]` 反向依赖，同版本号下内容与 crates.io 不等价。只在三类改动时告 manager，其余不发（见步骤 5.5）。
 
 ## 前置条件
 
@@ -64,6 +65,21 @@ git checkout --theirs {file} && git add {file}
 ```bash
 git commit --no-edit
 ```
+
+### 5.5 vendor-watch（外部契约）
+
+`crates/vendor/` 的 crate 被外部仓以 `path` 反向依赖（`armillary` patch 了 `grep-searcher` 与 `tree-sitter-go`）。同版本号下 vendor 内容与 crates.io 不一致，回退可编译但**行为静默改变**，因此只在触及行为时报告：
+
+```bash
+mb=$(git merge-base HEAD {upstream_remote}/{upstream_branch})
+# 三类：pub 项签名变化 / parser 重生成 / version|name 变化
+git diff "$mb" HEAD -- 'crates/vendor/*/src/searcher/push.rs' 'crates/vendor/*/src/*.rs' | rg '^[-+].*\bpub (fn|struct|trait|enum|use)'
+git diff --name-only "$mb" HEAD -- 'crates/vendor/*/src/**/{parser.c,grammar.json,node-types.json}'
+git diff "$mb" HEAD -- 'crates/vendor/*/Cargo.toml' | rg '^[-+](name|version) '
+```
+
+命中任一条 → 发 manager 一条固定格式：`[vendor-watch] <crate> <文件> <类型> <mb..HEAD>`。
+**不报**：`[lints.*]`、`homepage`/`description`/`readme` 等元数据、README/docs 改动——不改变行为。
 
 ### 6. 推送到 origin
 
