@@ -7,6 +7,10 @@ description: 合并上游仓库新版本到本地 fork 分支并部署。Use whe
 
 将上游仓库（upstream）的新版本合并到本地 fork 分支，构建并部署。
 
+## 必须遵守
+
+- **merge 完上游后立刻跑检查**：每次合并上游并解决冲突后，立即执行 `bun run check`（至少 `bun run check:ts` + 受影响包的 `bun test`）。发现红测当场处理，不要攒到后面——避免 merge 静默丢弃代码后长期无感知。
+
 ## 前置条件
 
 - 本地仓库已配置 `upstream` remote（指向上游原始仓库）

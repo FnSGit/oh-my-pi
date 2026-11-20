@@ -5535,6 +5535,18 @@ function buildParams(
 		conversion,
 	);
 
+	// Defense in depth: Anthropic (and any compatible proxy) rejects a request
+	// with `messages: []` (HTTP 400, "messages is required"). If upstream
+	// filtering — extension/hook context handlers, aborts, compaction, image
+	// resize — produced an empty conversation, surface the bug here instead of
+	// burning a 400 round-trip and a noisy proxy error log.
+	if (wireMessages.length === 0) {
+		throw new Error(
+			`anthropic: refusing to build request with empty messages for model ${model.id} (provider ${model.provider}). ` +
+				`Context had ${context.messages.length} input messages; all were filtered out before reaching the provider.`,
+		);
+	}
+
 	// Anchor the stable tools+system head so it stays cached across turns; the
 	// moving message tail is anchored separately in applyPromptCaching below.
 	applyHeadCaching(systemBlocks, tools, cacheControl);
