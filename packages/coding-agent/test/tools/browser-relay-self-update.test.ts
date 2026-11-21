@@ -518,7 +518,7 @@ describe("writing the omp extension", () => {
 		const dir = home.join("extension");
 		expect(await writeRelayExtension(dir, VERSION)).toBe(true);
 
-		const files = relayExtensionFiles(VERSION);
+		const files = await relayExtensionFiles(VERSION);
 		for (const name of [
 			"LICENSE",
 			"background.js",
@@ -583,7 +583,7 @@ describe("writing the omp extension", () => {
 			spy.mockRestore();
 		}
 		expect(await Bun.file(home.join("extension/background.js")).text()).toBe(
-			relayExtensionFiles(OLD)["background.js"],
+			(await relayExtensionFiles(OLD))["background.js"],
 		);
 		expect((await fs.readdir(dir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
@@ -608,7 +608,7 @@ describe("writing the omp extension", () => {
 		expect(refused).toBeGreaterThan(1);
 		expect(await installedRelayExtensionVersion(dir)).toBe(VERSION);
 		expect(await Bun.file(home.join("extension/background.js")).text()).toBe(
-			relayExtensionFiles(VERSION)["background.js"],
+			(await relayExtensionFiles(VERSION))["background.js"],
 		);
 		expect((await fs.readdir(dir)).filter(name => name.endsWith(".tmp") || name.endsWith(".bak"))).toEqual([]);
 	});
