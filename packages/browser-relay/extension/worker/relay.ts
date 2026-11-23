@@ -5,7 +5,8 @@
  *
  * Each `linked` from the host starts a link epoch, ended by `unlinked` (the relay went away; the host finds or becomes
  * the next one and links again by itself) or by losing the port (the host exited; the worker reconnects with
- * backoff). RPC ids and calls belong to one epoch.
+ * backoff). RPC ids and calls belong to one epoch. An attempt the host never answers is dropped after
+ * {@link LINK_DEADLINE_MS} and retried, so a port Chrome kept alive past its host cannot block the relay forever.
  *
  * Service-worker lifetime: the open native port keeps the worker alive; a chrome.alarms tick revives it and
  * reconnects after Chrome reaps it.
@@ -44,6 +45,9 @@ declare const OMP_INSTALL_BUILD: string | undefined;
 
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 10_000;
+/** How long a link attempt may stay unlinked before the worker drops it and retries. */
+const LINK_DEADLINE_MS = 15_000;
+
 
 /** One link epoch, from a `linked` to the next `unlinked` or port loss; open while it lasts. */
 export interface RelayLink {
@@ -83,8 +87,11 @@ let handlers: RelayHandlers | null = null;
 let hostPort: chrome.runtime.Port | null = null;
 /** The current link epoch, while a relay listens for this browser. */
 let link: Link | null = null;
+/** The browser's reason the last native host port closed; cleared by a link. See {@link RelayStatus.hostError}. */
+let hostError: string | undefined;
 let reconnectDelay = RECONNECT_MIN_MS;
 let reconnectTimer: NodeJS.Timeout | null = null;
+let deadlineTimer: NodeJS.Timeout | null = null;
 /** Reasons the worker is doing work an extension reload would destroy. */
 const busyReasons = new Set<string>();
 
@@ -125,12 +132,14 @@ export function relayStatus(): RelayStatus {
 		connected: link !== null,
 		extensionVersion:
 			typeof OMP_INSTALL_VERSION === "string" ? OMP_INSTALL_VERSION : undefined,
+		hostError,
 	};
 }
 
 async function setBadge(connected: boolean): Promise<void> {
 	try {
-		await chrome.action.setBadgeText({ text: connected ? "on" : "off" });
+		await chrome.action.setBadgeText({ text: connected ? "on" : "" });
+		await chrome.action.setTitle({ title: connected ? "omp · Terminal browser relay connected" : "omp · Terminal browser relay disconnected" });
 		await chrome.action.setBadgeBackgroundColor({
 			color: connected ? "#1a7f37" : "#8b8b8b",
 		});
@@ -177,9 +186,7 @@ async function buildHello(): Promise<ExtToRelayMessage> {
 	};
 }
 
-function handleRelayLine(raw: string): void {
-	const origin = link;
-	if (!origin) return;
+function handleRelayLine(raw: string, origin: Link, sendReply: (message: ExtToRelayMessage) => void): void {
 	let msg: RelayToExtMessage;
 	try {
 		msg = JSON.parse(raw);
@@ -201,7 +208,7 @@ function handleRelayLine(raw: string): void {
 			// Answer only within the epoch the RPC came in on: RPC ids are local to it, and the relay already failed
 			// the call when it ended.
 			const answer = (reply: ExtToRelayMessage): void => {
-				if (origin.open) post(reply);
+				if (origin.open) sendReply(reply);
 			};
 			const { id } = msg;
 			const run = handlers
@@ -222,10 +229,43 @@ function handleRelayLine(raw: string): void {
 	}
 }
 
+const chatLinks = new Set<(message: ExtToRelayMessage) => void>();
+
+/** Forward browser lifecycle events to each bridge tracking this Chrome profile. */
+export function broadcastRelayEvent(message: ExtToRelayMessage): void {
+	post(message);
+	for (const send of chatLinks) send(message);
+}
+
+/** Bind browser traffic to an already-open chat port, independently of the discovery relay. */
+export function connectChatRelay(port: chrome.runtime.Port): { receive(line: string): void; close(): void } {
+	const origin = new Link();
+	const send = (message: ExtToRelayMessage): void => {
+		if (!origin.open) return;
+		try {
+			port.postMessage({ t: "relay", line: JSON.stringify(message) } satisfies ToNativeHost);
+		} catch {
+			close();
+		}
+	};
+	const close = (): void => {
+		origin.close("chat relay disconnected");
+		chatLinks.delete(send);
+	};
+	void buildHello().then(hello => {
+		if (!origin.open) return;
+		chatLinks.add(send);
+		send(hello);
+	}).catch(() => port.disconnect());
+	return { receive: line => handleRelayLine(line, origin, send), close };
+}
+
 /** A relay listens for this browser: start a new epoch and say hello. */
 function linked(): void {
 	if (link) unlinked("omp relay changed");
+	clearLinkDeadline();
 	reconnectDelay = RECONNECT_MIN_MS;
+	hostError = undefined;
 	const epoch = new Link();
 	link = epoch;
 	void setBadge(true);
@@ -239,6 +279,7 @@ function linked(): void {
 
 /** The relay went away: end the epoch, failing its calls with `reason`. */
 function unlinked(reason: string): void {
+	clearLinkDeadline();
 	const epoch = link;
 	link = null;
 	void setBadge(false);
@@ -258,11 +299,28 @@ function scheduleReconnect(): void {
 	}, delay);
 }
 
+function clearLinkDeadline(): void {
+	clearTimeout(deadlineTimer ?? undefined);
+	deadlineTimer = null;
+}
+
+function enforceLinkDeadline(port: chrome.runtime.Port): void {
+	clearLinkDeadline();
+	deadlineTimer = setTimeout(() => {
+		deadlineTimer = null;
+		if (link || hostPort !== port) return;
+		hostPort = null;
+		port.disconnect();
+		scheduleReconnect();
+	}, LINK_DEADLINE_MS);
+}
+
 /** Open the port to the native host and ask it to link this browser, unless the port is open. */
 export function connectRelay(): void {
 	if (hostPort) return;
 	const port = chrome.runtime.connectNative(NATIVE_HOST);
 	hostPort = port;
+	enforceLinkDeadline(port);
 	/** Partial oversized relay lines by chunk id. */
 	const chunks = new Map<number, string[]>();
 	port.onMessage.addListener((message: FromNativeHost) => {
@@ -275,7 +333,7 @@ export function connectRelay(): void {
 				unlinked(message.reason);
 				return;
 			case "relay":
-				handleRelayLine(message.line);
+				if (link) handleRelayLine(message.line, link, post);
 				return;
 			case "chunk": {
 				const parts = chunks.get(message.id) ?? [];
@@ -285,7 +343,7 @@ export function connectRelay(): void {
 					return;
 				}
 				chunks.delete(message.id);
-				handleRelayLine(parts.join(""));
+				if (link) handleRelayLine(parts.join(""), link, post);
 				return;
 			}
 		}
@@ -295,11 +353,19 @@ export function connectRelay(): void {
 		const detail = chrome.runtime.lastError?.message;
 		if (hostPort !== port) return;
 		hostPort = null;
+		clearLinkDeadline();
+		const hadLink = link !== null;
 		unlinked(
 			detail
 				? `omp native host disconnected: ${detail}`
 				: "omp native host disconnected",
 		);
+		// A port that never linked was refused by the browser (host missing, blocked by policy): `unlinked` reported
+		// nothing, so publish the browser's reason. A linked host's exit ("Native host has exited.") is no such refusal.
+		if (!hadLink && detail !== hostError) {
+			hostError = detail;
+			handlers?.status(relayStatus());
+		}
 		scheduleReconnect();
 	});
 	const request: ToNativeHost = { t: "link", extensionId: chrome.runtime.id };

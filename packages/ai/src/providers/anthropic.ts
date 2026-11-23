@@ -2390,6 +2390,11 @@ const streamAnthropicOnce = (
 				if (dropFastMode) {
 					dropAnthropicFastMode(nextParams);
 				}
+				// Snapshot the encoder's output before the caller's hook runs, so
+				// the empty-request diagnosis below can name which side emptied the
+				// conversation. `Array.isArray` (not `?.length ?? 0`) states the
+				// contract: a missing or non-array `messages` counts as empty.
+				const encodedMessageCount = Array.isArray(nextParams.messages) ? nextParams.messages.length : 0;
 				const replacementPayload = transport ? undefined : await options?.onPayload?.(nextParams, model);
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
@@ -2430,6 +2435,28 @@ const streamAnthropicOnce = (
 						url: `${baseUrl}/v1/messages${isOAuthToken ? "?beta=true" : ""}`,
 						body: nextParams,
 					};
+				}
+				// Diagnose an empty provider request on the body that will actually
+				// be sent: after the caller's `onPayload` hook on the normal path,
+				// and after the transport's own request shaping on the transport
+				// path — which is where Bedrock runs the hook, so checking earlier
+				// would judge a body the transport is free to rewrite. Anthropic
+				// answers `messages: []` with a bare HTTP 400 "messages is
+				// required" that does not say who emptied the conversation, so name
+				// the model, provider, and — from the pre-hook snapshot — which side
+				// emptied it.
+				const sentMessages = transport
+					? (transportPayload as { messages?: unknown } | undefined)?.messages
+					: nextParams.messages;
+				const sentMessageCount = Array.isArray(sentMessages) ? sentMessages.length : 0;
+				if (sentMessageCount === 0) {
+					const detail =
+						encodedMessageCount === 0
+							? `Context had ${context.messages.length} input messages; none survived encoding.`
+							: `Context had ${context.messages.length} input messages; encoding produced ${encodedMessageCount}, then the onPayload hook returned an empty list.`;
+					throw new Error(
+						`anthropic: refusing to send a request with no messages for model ${model.id} (provider ${model.provider}). ${detail}`,
+					);
 				}
 				return nextParams;
 			};
@@ -2801,6 +2828,8 @@ const streamAnthropicOnce = (
 					let response: Response;
 					let requestId: string | null;
 					let recordsRawSseEvents: boolean;
+					// Cleared here, not per retry rung: an attempt that throws before its response must not keep the last one's id.
+					output.requestId = undefined;
 					try {
 						({
 							events: anthropicStream,
@@ -2816,6 +2845,7 @@ const streamAnthropicOnce = (
 					} finally {
 						if (requestTimeout !== undefined) clearTimeout(requestTimeout);
 					}
+					output.requestId = requestId ?? undefined;
 					await notifyProviderResponse(options, response, sourceModel, requestId);
 					if (slowMode) {
 						const slowSignal = parseAnthropicSlowModeHeaders(response.headers);
@@ -5547,18 +5577,6 @@ function buildParams(
 		isOAuthToken,
 		conversion,
 	);
-
-	// Defense in depth: Anthropic (and any compatible proxy) rejects a request
-	// with `messages: []` (HTTP 400, "messages is required"). If upstream
-	// filtering — extension/hook context handlers, aborts, compaction, image
-	// resize — produced an empty conversation, surface the bug here instead of
-	// burning a 400 round-trip and a noisy proxy error log.
-	if (wireMessages.length === 0) {
-		throw new Error(
-			`anthropic: refusing to build request with empty messages for model ${model.id} (provider ${model.provider}). ` +
-				`Context had ${context.messages.length} input messages; all were filtered out before reaching the provider.`,
-		);
-	}
 
 	// Anchor the stable tools+system head so it stays cached across turns; the
 	// moving message tail is anchored separately in applyPromptCaching below.

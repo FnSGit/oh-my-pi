@@ -29,12 +29,12 @@ import {
 	formatSearchProviderFailures,
 	getGroundedSearchProvider,
 	getSearchProvider,
+	type SearchParams,
 	type SearchProvider,
 	type SearchProviderFailure,
 } from "./provider";
 import { rankXAIProviders, targetsX, xaiModelChain, xSearchAvailable } from "./providers/xai";
 import { mergeSearchSources } from "./merge";
-import type { SearchParams } from "./providers/base";
 import { applyQueryConstraints, parseSearchQuery, scopeConstraints, type StructuredQuery } from "./query";
 import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
@@ -533,7 +533,9 @@ async function searchSequential(
 		stats.lastProvider = { id: provider.id, label: provider.label };
 		try {
 			const sentAt = Date.now();
-			const response = await provider.search(buildProviderParams(context, load.loaded, depth));
+			const searchParams = buildProviderParams(context, load.loaded, depth);
+			const extensionSearch = context.modelRegistry.getProviderWebSearch(load.loaded.model.provider);
+			const response = await (extensionSearch ? extensionSearch(searchParams) : provider.search(searchParams));
 			// Before any rejection below: a response a later check discards was still billed.
 			const billed = searchUsageMessage(load.loaded.model, response, Date.now() - sentAt);
 			if (billed) context.journal?.(billed);
@@ -632,7 +634,11 @@ async function searchDeep(
 	const settled = await Promise.allSettled(
 		selected.map(async loaded => {
 			const sentAt = Date.now();
-			const response = await loaded.provider.search(buildProviderParams(context, loaded, "deep"));
+			const searchParams = buildProviderParams(context, loaded, "deep");
+			const extensionSearch = context.modelRegistry.getProviderWebSearch(loaded.model.provider);
+			const response = await (extensionSearch
+				? extensionSearch(searchParams)
+				: loaded.provider.search(searchParams));
 			// Before any rejection below: a response a later check discards was still billed.
 			const billed = searchUsageMessage(loaded.model, response, Date.now() - sentAt);
 			if (billed) context.journal?.(billed);

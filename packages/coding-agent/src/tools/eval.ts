@@ -63,7 +63,7 @@ import { hasWaitTool } from "./wait";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
-import { docTopicsReadable } from "./xdev";
+import { docTopicsReadable } from "./doc-topics";
 
 import {
 	cfgEvalAutoBackgroundEnabled,
@@ -125,12 +125,14 @@ const evalCellCommonFields = {
 
 function evalTimeoutSchema(maxTimeout?: number) {
 	const { min, max } = TOOL_TIMEOUTS.eval;
+	// The deadline an omitted `timeout` resolves to, after any configured ceiling.
+	const defaultTimeout = clampTimeout("eval", undefined, maxTimeout);
 	const configured =
 		maxTimeout !== undefined && maxTimeout > 0
 			? ` Configured tools.maxTimeout: ${maxTimeout}s (effective ceiling ${clampTimeout("eval", max, maxTimeout)}s).`
 			: "";
 	return type("number").describe(
-		`Cell deadline in seconds; nonzero values clamp to ${min}–${max}; 0 disables it.${configured}`,
+		`Cell deadline in seconds (default ${defaultTimeout}); nonzero values clamp to ${min}–${max}; 0 disables it.${configured}`,
 	);
 }
 
@@ -305,7 +307,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	}
 
 	/**
-	 * `xd://eval/<topic>` docs follow the live prelude set so a prelude announced
+	 * `help://eval/<topic>` docs follow the live prelude set so a prelude announced
 	 * by the mid-session notice is readable before the description catches up.
 	 */
 	docTopics(): Record<string, string> {
@@ -348,6 +350,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			perCallModel,
 			perCallModelAdvertisement,
 			toolNames: session.getAdvertisedEvalToolNames?.(),
+			maxTimeout: cfgToolsMaxTimeout.get(session.settings),
 		};
 	}
 
@@ -864,7 +867,6 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 			const sessionFile = session.getSessionFile?.() ?? undefined;
 			const kernelOwnerId = session.getEvalKernelOwnerId?.() ?? undefined;
-			session.assertEvalExecutionAllowed?.();
 			outputSink = new OutputSink({
 				allocateArtifact: session.allocateOutputArtifact,
 				headBytes: resolveOutputSinkHeadBytes(session.settings),

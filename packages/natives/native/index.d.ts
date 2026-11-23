@@ -1012,6 +1012,8 @@ export declare class VcsGitRepo {
   submodulePaths(signal?: unknown | undefined | null): Promise<Array<string>>
   /** Read blob bytes. */
   showBlob(spec: string, maxBytes?: number | undefined | null, signal?: unknown | undefined | null): Promise<VcsShowResult>
+  /** Write bytes as a blob and return its full object id. */
+  writeBlob(data: Uint8Array, signal?: unknown | undefined | null): Promise<string>
   /**
    * Convert worktree content to the blob `git add` would store per path
    * (EOL/`text` attributes, `core.autocrlf`, `ident`, clean filters such as
@@ -1026,6 +1028,11 @@ export declare class VcsGitRepo {
   diffText(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<string>
   /** Render a no-index patch between two filesystem paths. */
   diffNoIndex(left: string, right: string, binary: boolean, signal?: unknown | undefined | null): Promise<string>
+  /**
+   * Render a same-path patch between blobs already stored in the object
+   * database.
+   */
+  diffBlobs(change: VcsBlobChange, binary: boolean, signal?: unknown | undefined | null): Promise<string>
   /** Changed paths. */
   changedFiles(options: VcsDiffOptions, signal?: unknown | undefined | null): Promise<Array<string>>
   /** Per-file line counts. */
@@ -3603,6 +3610,18 @@ export interface PipeStreamInfo {
   open: boolean
   /** The stream is a file a command redirected its output into. */
   file: boolean
+  /**
+   * Run-trace node key (`unit:0:node`) of the stage writing into the pipe,
+   * or of the command whose redirection opened the file. Absent when the
+   * run has no trace or the writer's unit is not in it.
+   */
+  node?: string
+  /**
+   * When it was last written, in ms since the UNIX epoch: a pipe's last
+   * write (its opening before any), a file's modification time (0 when
+   * unreadable).
+   */
+  modified: number
 }
 
 export interface PointerOptions {
@@ -3939,6 +3958,36 @@ export declare function setHangulCompatJamoWidthOverride(value: number): void
  * model.
  */
 export declare function shellBuiltins(sessionEnv?: Record<string, string>): Array<string>
+
+/** One invocation of a host-provided session command in the embedded shell. */
+export interface ShellCommandRequest {
+  /** Command name as invoked. */
+  name: string
+  /** Arguments after the command name. */
+  argv: Array<string>
+  /** Shell working directory at invocation time. */
+  cwd: string
+  /**
+   * UTF-8 stdin read to EOF, only when `argv` contains a bare `-`; empty
+   * otherwise.
+   */
+  stdin: string
+}
+
+/** Shell-composable response of a session command. */
+export interface ShellCommandResult {
+  stdout: string
+  stderr: string
+  /** 0..=255 */
+  exitCode: number
+}
+
+/** Host-provided commands installed for one `Shell.run`. */
+export interface ShellCommands {
+  /** Names resolvable as commands during this run. */
+  names: Array<string>
+  handler: (request: ShellCommandRequest) => Promise<ShellCommandResult>
+}
 
 /**
  *  Options for executing a shell command via the embedded bash engine
@@ -4322,6 +4371,12 @@ export interface ShellOptions {
   process?: boolean
 }
 
+/**
+ * Every name the engine resolves before a session command (reserved words,
+ * shell builtins, pi shell tools, in-process utilities, bash/sh/zsh).
+ */
+export declare function shellReservedCommandNames(): Array<string>
+
 /** Options for running a shell command. */
 export interface ShellRunOptions {
   /** Command string to execute in the shell. */
@@ -4344,6 +4399,12 @@ export interface ShellRunOptions {
    * it has one configured; absent leaves `say` to the system's.
    */
   speech?: ShellSpeech
+  /**
+   * Host-provided commands installed for this run only, resolved after
+   * the shell's builtins, pi's shell tools and in-process utilities, and
+   * before shell functions, aliases and `PATH`.
+   */
+  commands?: ShellCommands
   /** Receives a copy of every byte crossing the run's pipeline pipes. */
   streams?: PipeStreams
   /** Folds the run's engine events into a live model of the command. */
@@ -4681,6 +4742,15 @@ export interface VcsApplyOptions {
   indexPath?: string
   reverse?: boolean
   threeWay?: boolean
+}
+
+/** One same-path change between blobs already stored in the object database. */
+export interface VcsBlobChange {
+  path: string
+  oldId?: string
+  newId?: string
+  oldMode?: string
+  newMode?: string
 }
 
 /** Clean options. */

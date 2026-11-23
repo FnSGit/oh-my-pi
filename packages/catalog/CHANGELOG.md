@@ -2,14 +2,46 @@
 
 ## [Unreleased]
 
+## [19.1.1] - 2026-11-23
+
 ### Added
 
-- Added `uncached-instructions` compatibility flag, enabled for GPT-6.2 models on every host, which moves the system prompt out of the uncached Responses `instructions` field
+- Z.AI (`zai`) now discovers the models available to your GLM Coding Plan key, so newly released GLM models appear without waiting for a catalog update.
+- Added `getUpstreamPin()` and `routedModelsAreEqual()` to `@oh-my-pi/pi-catalog/models` for distinguishing aggregator models routed to different upstream providers.
+- Added `@oh-my-pi/pi-catalog/discovery/pi-native` and `piNativeModelManagerOptions()` for reading a provider's model roster from an auth gateway's `GET /v1/pi/models`.
 
 ### Fixed
 
-- Cursor's newly served models (Claude Fable 5.2, Claude Haiku 4.5, Claude Sonnet 5.5, Gemini 2.5 Flash, Gemini 4 Hydrogen/Neon, GLM 5.3, GPT-5.1, Muse Wonder 1.0) now use their documented per-token prices instead of $0 ([#19842](https://github.com/can1357/oh-my-pi/pull/19842) by [@fenilmodi00](https://github.com/fenilmodi00)).
-- Fixed the Codex client version cache so `codex-client-version.json` is read and written under `$XDG_CACHE_HOME/omp` when that root is initialized, instead of the agent directory ([#19776](https://github.com/can1357/oh-my-pi/pull/19776) by [@Parsifa1](https://github.com/Parsifa1))
+- Fixed Llama 3.x models failing after turns that invoked multiple tools when served through vLLM-based hosts, including CoreWeave through OpenRouter.
+- Devin usage is now kept separate for organizations that share the same email address.
+- Updated Devin image token accounting to match Devin’s published 1,089-token charge per image across supported Gemini image models.
+- Corrected Devin pricing and context limits for GPT-5.6 Sol, Terra, and Luna Fast lanes, including long-context rates above 272K input tokens and the standard 272K limit when Extended Context is disabled.
+- Corrected Cursor pricing for GPT-5.6 Sol, Terra, and Luna models so output above 272K input tokens uses the documented 1.5× rate.
+- Turning thinking off for GPT-6.1 Terra now uses the supported `none` reasoning effort.
+- Fixed GPT-6.2 and later OpenAI Responses models losing reasoning context after session pruning and subsequent tool calls.
+- Corrected Bedrock Kimi K3.1 Pro Highspeed reasoning options and effort handling.
+- GitHub Copilot now lists only models available to the account, including after restarting.
+- Codex models discovered before being bundled now use their formatted display names, such as `GPT-6.2 Sol`.
+
+## [19.1.0] - 2026-11-21
+
+### Breaking Changes
+
+- Removed the built-in Gemini CLI OAuth provider (`google-gemini-cli`). Google Antigravity and Antigravity CLI remain available.
+
+### Added
+
+- Added runtime provider rules (`setRuntimeProviderRule` in `compat/cascade`). They apply KDL directives to one provider's models, win ties with bundled rules, and clear rule-derived caches when they change.
+- Added the `prompt-perturbation` catalog axis, which opts a provider or model into per-install prompt paraphrasing.
+- Added the `uncached-instructions` compatibility flag for GPT-6.2 models across all hosts, moving system prompts out of the uncached Responses `instructions` field.
+
+### Fixed
+
+- Fixed Vercel AI Gateway model refreshes so public models remain discoverable when a stored API key has expired.
+- Fixed OpenRouter models that require reasoning but do not advertise effort levels; requests that disable thinking now use the lowest supported reasoning effort instead of failing.
+- Fixed Gemini 4 models (Argon, Carbon, Hydrogen, and Neon) failing with empty malformed responses when messages arrived immediately after tool results.
+- Updated pricing for newly served Cursor models to use their documented per-token rates instead of being reported as free.
+- Fixed Codex client version caching so its cache file is stored under the configured `$XDG_CACHE_HOME/omp` directory.
 
 ## [19.0.1] - 2026-11-19
 
