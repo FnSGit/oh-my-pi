@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { XMLParser } from "@oh-my-pi/pi-utils/xml";
 import type { ConversionResult, Converter, StreamInfo } from "../types";
 import { ZipPackage } from "@oh-my-pi/pi-utils/ar";
+import { resolvePartPath } from "../ooxml";
 
 const EXTENSIONS = [".pptx"];
 const MIMETYPES = ["application/vnd.openxmlformats-officedocument.presentationml.presentation"];
@@ -133,7 +134,7 @@ export class PptxConverter implements Converter {
 		for (const sld of sldIds) {
 			const rId = sld["@_r:id"];
 			const target = relMap.get(rId);
-			if (target) slidePaths.push(`ppt/${target}`);
+			if (target) slidePaths.push(resolvePartPath("ppt/presentation.xml", target));
 		}
 		// If we couldn't resolve from rels, fall back to finding slide files
 		if (slidePaths.length === 0) {
@@ -188,17 +189,8 @@ export class PptxConverter implements Converter {
 				if (!rEmbed) continue;
 				const target = slideRelMap.get(rEmbed);
 				if (!target) continue;
-				// Resolve relative target against slide directory
-				const imagePath = target.startsWith("/") ? target.slice(1) : `ppt/slides/${target}`;
-				// Normalize path (e.g. ppt/slides/../media/image1.png → ppt/media/image1.png)
-				const normalizedPath = imagePath
-					.split("/")
-					.reduce<string[]>((parts, seg) => {
-						if (seg === "..") parts.pop();
-						else parts.push(seg);
-						return parts;
-					}, [])
-					.join("/");
+				// Resolve the target against the slide part (absolute targets included) and flatten `..`.
+				const normalizedPath = resolvePartPath(slidePaths[i], target);
 				if (!zip.members.has(normalizedPath)) continue;
 				imageCount++;
 				const name =

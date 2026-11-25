@@ -55,4 +55,25 @@ describe("XlsxConverter", () => {
 			].join("\n"),
 		);
 	});
+
+	it("reads workbooks that prefix every element and use package-absolute targets", async () => {
+		const bytes = await encodeArchive("zip", [
+			[
+				"xl/workbook.xml",
+				`<x:workbook xmlns:x="${NS}" xmlns:r="${REL_NS}"><x:sheets><x:sheet name="数据" sheetId="1" r:id="R1"/></x:sheets></x:workbook>`,
+			],
+			[
+				"xl/_rels/workbook.xml.rels",
+				`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="R1" Type="${REL_NS}/worksheet" Target="/xl/worksheets/sheet1.xml"/></Relationships>`,
+			],
+			[
+				"xl/worksheets/sheet1.xml",
+				`<x:worksheet xmlns:x="${NS}"><x:sheetData><x:row r="1"><x:c r="A1" t="str"><x:v>地区</x:v></x:c></x:row></x:sheetData></x:worksheet>`,
+			],
+		]);
+
+		const { markdown } = await new XlsxConverter().convert(Buffer.from(bytes), { extension: ".xlsx" });
+
+		expect(markdown).toBe(["## 数据", "", "| 地区 |", "| --- |"].join("\n"));
+	});
 });

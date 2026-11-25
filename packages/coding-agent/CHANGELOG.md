@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Office documents whose OOXML parts use namespaced element names or package-absolute relationship targets now read instead of returning no content.
+
 ## [19.1.1] - 2026-11-23
 
 ### Breaking Changes
