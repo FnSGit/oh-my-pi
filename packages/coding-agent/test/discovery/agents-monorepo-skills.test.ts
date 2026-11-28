@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { clearCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import type { LoadContext } from "@oh-my-pi/pi-coding-agent/capability/types";
-import { getProjectPathCandidates, getSkillPathCandidates } from "@oh-my-pi/pi-coding-agent/discovery/agents";
+import { getProjectPathCandidates } from "@oh-my-pi/pi-coding-agent/discovery/agents";
 import { scanSkillsFromDir } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -94,7 +94,7 @@ describe("agents provider project-level discovery", () => {
 			writeSkill(path.join(tempDir, ".agents", "skills"), "above-repo-skill", "Above repo");
 			writeSkill(path.join(repoRoot, ".agents", "skills"), "root-skill", "At repo root");
 
-			const candidates = getSkillPathCandidates(outsideCtx, "skills");
+			const candidates = getProjectPathCandidates(outsideCtx, "skills");
 			expect(candidates).not.toContain(path.join(tempDir, ".agents", "skills"));
 
 			const results = await Promise.all(
@@ -119,7 +119,7 @@ describe("agents provider project-level discovery", () => {
 			writeSkill(path.join(domainRepo, ".agents", "skills"), "root-skill", "From repo root");
 			const domainCtx: LoadContext = { cwd: domainCwd, home, repoRoot: domainRepo };
 
-			const candidates = getSkillPathCandidates(domainCtx, "skills");
+			const candidates = getProjectPathCandidates(domainCtx, "skills");
 			expect(candidates).toContain(path.join(domain, ".agents", "skills"));
 			expect(candidates).toContain(path.join(domainRepo, ".agents", "skills"));
 			expect(candidates).not.toContain(path.join(home, ".agents", "skills"));

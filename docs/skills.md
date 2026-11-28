@@ -120,7 +120,7 @@ Filter order is:
 
 The `agents` provider (`.agent[s]/skills`) has its own `enableAgentsUser`/`enableAgentsProject` toggles — disabling Claude/Codex/Pi does **not** turn it off. Claude, Codex, and OpenCode skills load only from project roots (`.claude/skills`, `.codex/skills`, `.opencode/skills`); their home-directory skills are never read. Native OMP sources and marketplace plugins registered under `~/.omp/plugins` load by default.
 
-The `agents` provider's project walk for **skills** stops at home rather than the git repository root when the repository is nested below home, so a domain directory — one that is not itself a git repository and holds several repositories, e.g. `~/projects/acme` with `api/` and `web/` under it — can carry one `.agents/skills` tree shared by every project below it. The home directory itself is never project scope (`~/.agents/skills` is already the user-level root), and a repository outside home still stops at its own root. Other surfaces (rules, prompts, commands, AGENTS.md, SYSTEM.md) keep the repository root as their boundary.
+Every `agents` surface — skills, rules, prompts, commands, `.agents/AGENTS.md`, and `.agents/SYSTEM.md` — walks to home instead of stopping at the git repository root when the repository is nested below home. A domain directory, one that is not itself a git repository and holds several repositories (e.g. `~/projects/acme` with `api/` and `web/` under it), can therefore carry one `.agents/` tree shared by every project below it. The home directory itself is never project scope (`~/.agents/` is already the user-level root), and a repository outside home still stops at its own root.
 
 ### Manual-only skills
 

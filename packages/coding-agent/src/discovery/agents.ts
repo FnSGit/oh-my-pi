@@ -129,32 +129,27 @@ export function getUserPathCandidates(ctx: LoadContext, ...segments: string[]): 
 }
 
 /**
- * Project-level paths: walk up from cwd to repoRoot, returning `.agent/<segments>`
- * and `.agents/<segments>` at each ancestor.
+ * Project-level paths: walk up from cwd, returning `.agent/<segments>` and
+ * `.agents/<segments>` at each ancestor.
  *
  * The user home directory is skipped: `~/.agent[s]/` is by definition
  * user-level config and is already enumerated by {@link getUserPathCandidates}.
  * Without this guard, any cwd under `$HOME` (with no closer git repoRoot) would
  * walk up to home and yield duplicate project+user entries for the same
  * directory — see https://github.com/can1357/oh-my-pi/issues/1116.
+ *
+ * A repository nested below home walks to home instead of stopping at the git
+ * repository root, so a domain directory — one that is not itself a git
+ * repository and holds several repositories, e.g. `~/projects/acme` with
+ * `api/` and `web/` under it — can carry one `.agents/` tree shared by every
+ * project below it. This matches the standalone AGENTS.md walk
+ * (`loadStandaloneContextFiles`, helpers.ts). A repository outside home, or one
+ * rooted at home, keeps the repository root (or home) as its boundary.
  */
 export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
-	return agentDirPathCandidates(ctx, ...segments, ctx.repoRoot ?? ctx.home);
-}
-
-/**
- * Skills 专用走链：仓库嵌在 home 之下时越过 git 仓库根，一路到 home（不含 home），
- * 让域目录层（自身不是 git 仓库、下面挂多个仓库的目录，如 `~/projects/acme`）的
- * `.agent[s]/skills` 对域内任意 cwd 生效。语义与 AGENTS.md 的走链同源
- * （`loadStandaloneContextFiles`，helpers.ts）。
- *
- * home 永远不作为 project scope 返回：`~/.agent[s]/skills` 已由
- * {@link getUserPathCandidates} 覆盖，重复注册会产生同名别名。仓库不在 home 之下时
- * 停点仍是 repoRoot，不爬到文件系统根。
- */
-export function getSkillPathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
 	const walkToHome = ctx.repoRoot !== null && ctx.repoRoot !== ctx.home && pathIsWithin(ctx.home, ctx.repoRoot);
-	return agentDirPathCandidates(ctx, ...segments, walkToHome ? ctx.home : (ctx.repoRoot ?? ctx.home));
+	const stopAt = walkToHome ? ctx.home : (ctx.repoRoot ?? ctx.home);
+	return agentDirPathCandidates(ctx, ...segments, stopAt);
 }
 
 /** 自 cwd 向上逐级产出 `.agent[s]/<segments>`，到 stopAt 为止（不含 stopAt 自身）。 */
@@ -182,7 +177,7 @@ function agentDirPathCandidates(
 
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const projectScans = getSkillPathCandidates(ctx, "skills").map(dir =>
+	const projectScans = getProjectPathCandidates(ctx, "skills").map(dir =>
 		scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "project" }),
 	);
 	const userScans = getUserPathCandidates(ctx, "skills").map(dir =>
