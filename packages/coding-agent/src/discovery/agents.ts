@@ -6,7 +6,7 @@
  * Project-level discovery walks up from cwd to repoRoot.
  */
 import * as path from "node:path";
-import { isWsl, windowsPathToWslMount } from "@oh-my-pi/pi-utils";
+import { isWsl, pathIsWithin, windowsPathToWslMount } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import { readFile } from "../capability/fs";
@@ -139,6 +139,31 @@ export function getUserPathCandidates(ctx: LoadContext, ...segments: string[]): 
  * directory — see https://github.com/can1357/oh-my-pi/issues/1116.
  */
 export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
+	return agentDirPathCandidates(ctx, ...segments, ctx.repoRoot ?? ctx.home);
+}
+
+/**
+ * Skills 专用走链：仓库嵌在 home 之下时越过 git 仓库根，一路到 home（不含 home），
+ * 让域目录层（自身不是 git 仓库、下面挂多个仓库的目录，如 `~/projects/acme`）的
+ * `.agent[s]/skills` 对域内任意 cwd 生效。语义与 AGENTS.md 的走链同源
+ * （`loadStandaloneContextFiles`，helpers.ts）。
+ *
+ * home 永远不作为 project scope 返回：`~/.agent[s]/skills` 已由
+ * {@link getUserPathCandidates} 覆盖，重复注册会产生同名别名。仓库不在 home 之下时
+ * 停点仍是 repoRoot，不爬到文件系统根。
+ */
+export function getSkillPathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
+	const walkToHome = ctx.repoRoot !== null && ctx.repoRoot !== ctx.home && pathIsWithin(ctx.home, ctx.repoRoot);
+	return agentDirPathCandidates(ctx, ...segments, walkToHome ? ctx.home : (ctx.repoRoot ?? ctx.home));
+}
+
+/** 自 cwd 向上逐级产出 `.agent[s]/<segments>`，到 stopAt 为止（不含 stopAt 自身）。 */
+function agentDirPathCandidates(
+	ctx: LoadContext,
+	...args: [...segments: string[], stopAt: string]
+): string[] {
+	const segments = args.slice(0, -1) as string[];
+	const stopAt = args[args.length - 1] as string;
 	const paths: string[] = [];
 	let current = ctx.cwd;
 	while (true) {
@@ -147,7 +172,7 @@ export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]
 				paths.push(path.join(current, baseDir, ...segments));
 			}
 		}
-		if (current === (ctx.repoRoot ?? ctx.home)) break;
+		if (current === stopAt) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
@@ -157,7 +182,7 @@ export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]
 
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const projectScans = getProjectPathCandidates(ctx, "skills").map(dir =>
+	const projectScans = getSkillPathCandidates(ctx, "skills").map(dir =>
 		scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "project" }),
 	);
 	const userScans = getUserPathCandidates(ctx, "skills").map(dir =>

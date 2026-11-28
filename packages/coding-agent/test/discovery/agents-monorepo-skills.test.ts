@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { clearCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import type { LoadContext } from "@oh-my-pi/pi-coding-agent/capability/types";
-import { getProjectPathCandidates } from "@oh-my-pi/pi-coding-agent/discovery/agents";
+import { getProjectPathCandidates, getSkillPathCandidates } from "@oh-my-pi/pi-coding-agent/discovery/agents";
 import { scanSkillsFromDir } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -82,18 +82,60 @@ describe("agents provider project-level discovery", () => {
 			expect(names).toContain("agents-skill");
 		});
 
-		test("walk-up stops at repo root", async () => {
+		test("walk-up stops at repo root when the repo is outside home", async () => {
+			// 仓库不在 home 之下：skills 走链的停点仍是 repoRoot，不爬到文件系统根。
+			const outsideHome = path.join(tempDir, "home");
+			fs.mkdirSync(outsideHome, { recursive: true });
+			const outsideCtx: LoadContext = {
+				cwd: subProject,
+				home: outsideHome,
+				repoRoot,
+			};
 			writeSkill(path.join(tempDir, ".agents", "skills"), "above-repo-skill", "Above repo");
 			writeSkill(path.join(repoRoot, ".agents", "skills"), "root-skill", "At repo root");
 
+			const candidates = getSkillPathCandidates(outsideCtx, "skills");
+			expect(candidates).not.toContain(path.join(tempDir, ".agents", "skills"));
+
 			const results = await Promise.all(
-				getProjectPathCandidates(ctx, "skills").map(dir =>
+				candidates.map(dir =>
 					scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "project" }),
 				),
 			);
 			const names = results.flatMap(r => r.items).map(s => s.name);
 			expect(names).toContain("root-skill");
 			expect(names).not.toContain("above-repo-skill");
+		});
+
+		test("skills walk past a repo root nested under home to the domain dir", async () => {
+			// 仓库嵌在 home 之下：越过 repoRoot 一路到 home（不含 home），域目录层的
+			// .agents/skills 对域内任意 cwd 生效。域目录是 home 与仓库之间的那一层
+			// （home 自身不是 project scope，见 #1116）。
+			const home = path.join(tempDir, "home");
+			const domain = path.join(home, "acme");
+			const domainRepo = path.join(domain, "api");
+			const domainCwd = path.join(domainRepo, "src");
+			fs.mkdirSync(domainCwd, { recursive: true });
+			fs.mkdirSync(path.join(domainRepo, ".git"), { recursive: true });
+			writeSkill(path.join(domain, ".agents", "skills"), "domain-skill", "From domain dir");
+			writeSkill(path.join(domainRepo, ".agents", "skills"), "root-skill", "From repo root");
+			const domainCtx: LoadContext = { cwd: domainCwd, home, repoRoot: domainRepo };
+
+			const candidates = getSkillPathCandidates(domainCtx, "skills");
+			expect(candidates).toContain(path.join(domain, ".agents", "skills"));
+			expect(candidates).toContain(path.join(domainRepo, ".agents", "skills"));
+			expect(candidates).not.toContain(path.join(home, ".agents", "skills"));
+
+			const results = await Promise.all(
+				candidates.map(dir =>
+					scanSkillsFromDir(domainCtx, { dir, providerId: PROVIDER_ID, level: "project" }),
+				),
+			);
+			const names = results.flatMap(r => r.items).map(s => s.name);
+			expect(names).toContain("domain-skill");
+			expect(names).toContain("root-skill");
+			// 近者在前：loadSkills 的 first-wins 让 root-skill 拿裸名。
+			expect(names.indexOf("root-skill")).toBeLessThan(names.indexOf("domain-skill"));
 		});
 
 		test("project walk-up skips home directory (no repo root)", async () => {
