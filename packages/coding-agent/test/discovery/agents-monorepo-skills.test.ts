@@ -98,9 +98,7 @@ describe("agents provider project-level discovery", () => {
 			expect(candidates).not.toContain(path.join(tempDir, ".agents", "skills"));
 
 			const results = await Promise.all(
-				candidates.map(dir =>
-					scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "project" }),
-				),
+				candidates.map(dir => scanSkillsFromDir(ctx, { dir, providerId: PROVIDER_ID, level: "project" })),
 			);
 			const names = results.flatMap(r => r.items).map(s => s.name);
 			expect(names).toContain("root-skill");
@@ -127,9 +125,7 @@ describe("agents provider project-level discovery", () => {
 			expect(candidates).not.toContain(path.join(home, ".agents", "skills"));
 
 			const results = await Promise.all(
-				candidates.map(dir =>
-					scanSkillsFromDir(domainCtx, { dir, providerId: PROVIDER_ID, level: "project" }),
-				),
+				candidates.map(dir => scanSkillsFromDir(domainCtx, { dir, providerId: PROVIDER_ID, level: "project" })),
 			);
 			const names = results.flatMap(r => r.items).map(s => s.name);
 			expect(names).toContain("domain-skill");

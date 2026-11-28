@@ -19,10 +19,7 @@ import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 async function writeSkill(dir: string, name: string, description: string): Promise<void> {
 	const file = path.join(dir, name, "SKILL.md");
 	await fs.mkdir(path.dirname(file), { recursive: true });
-	await fs.writeFile(
-		file,
-		["---", `name: ${name}`, `description: ${description}`, "---", "", `# ${name}`].join("\n"),
-	);
+	await fs.writeFile(file, ["---", `name: ${name}`, `description: ${description}`, "---", "", `# ${name}`].join("\n"));
 }
 
 describe("domain skills (repo nested under home)", () => {
