@@ -19,6 +19,7 @@
 ### Added
 
 - Added `--prepaint=on|off|force` to control the composer drawn before startup finishes: `off` waits for the full interface, `force` draws it even for flags that would change it
+- A `.agents/skills` tree in a domain directory — one that is not itself a git repository and holds several repositories, e.g. `~/projects/acme` with `api/` and `web/` under it — is now discovered by every project below it: the `agents` provider's skills walk continues past the git repository root up to the home directory, matching the AGENTS.md walk
 - Todo backends can define an optional `apply`: the selected backend is asked before the model's `todo` call commits, and returning `{ block: true, reason }` refuses the call with the list unchanged ([#20355](https://github.com/can1357/oh-my-pi/pull/20355) by [@Dangerboi](https://github.com/Dangerboi))
 - `models.yml` `compat.neutralizeDeepseekSpecialTokens` turns DeepSeek chat-template token breaking on or off per model (on by default for DeepSeek-class models on chat-completions) ([#20832](https://github.com/can1357/oh-my-pi/pull/20832) by [@dany-on-demand](https://github.com/dany-on-demand))
 - Added `--preset <name>` to start a session on a saved model preset (`/modelpreset save`), applying its roles and default thinking level for that run only ([#20306](https://github.com/can1357/oh-my-pi/pull/20306) by [@nick-maderight](https://github.com/nick-maderight))
