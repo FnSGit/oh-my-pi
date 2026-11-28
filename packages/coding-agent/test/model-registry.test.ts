@@ -8,18 +8,20 @@ import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-comple
 import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { toPiNativeModelSpec } from "@oh-my-pi/pi-catalog/discovery/pi-native";
 import { resolveMaxContextWindow } from "@oh-my-pi/pi-catalog/compat/context-window";
 import { factoryDroidRegistry, resolveFactoryDroidPolicy } from "@oh-my-pi/pi-catalog/compat/factory-droid";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { writeThinkingCapability } from "@oh-my-pi/pi-catalog/thinking-capability";
 import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
+import { resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import * as catalogModels from "@oh-my-pi/pi-catalog/models";
 import { calculateUsageCost, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { finalizeCustomModel } from "@oh-my-pi/pi-coding-agent/config/custom-models";
 import { applyModelPatch, mergeDiscoveredModel } from "@oh-my-pi/pi-coding-agent/config/model-patch";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { resolveRoleChain } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { resolveRoleChain, resolveSessionModelSelector } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { roleCandidatePool } from "@oh-my-pi/pi-coding-agent/config/model-roles";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -61,8 +63,9 @@ describe("ModelRegistry", () => {
 		modelsJsonPath = path.join(tempDir, "models.json");
 		// In-memory auth DB: tests need a fresh, isolated credential store per case but
 		// never reopen it from disk, so :memory: avoids the WAL/chmod disk-open cost
-		// (~3ms/test) while preserving per-test isolation.
-		authStorage = await AuthStorage.create(":memory:");
+		// (~3ms/test) while preserving per-test isolation. Fake Copilot tokens must
+		// not reach github.com through the background billing probe.
+		authStorage = await AuthStorage.create(":memory:", { copilotBillingProbe: false });
 	});
 
 	afterEach(() => {
@@ -640,9 +643,9 @@ describe("ModelRegistry", () => {
 			// `mergeDiscoveredModel` dropped `transport: pi-native` (raw catalog
 			// rows carry no transport), so the next stream went out as plain
 			// openai-completions to `${baseUrl}/chat/completions` instead of the
-			// gateway's `/v1/pi/stream`. A pi-native provider no longer runs the
-			// provider's own discovery at all: the gateway serves none of
-			// OpenRouter's listing routes.
+			// gateway's `/v1/pi/stream`. A pi-native provider never runs the
+			// provider's own discovery: its roster comes from the gateway's
+			// `/v1/pi/models`, and a gateway without that route keeps the bundled one.
 			writeRawModelsJson({
 				openrouter: {
 					baseUrl: "http://localhost:4000",
@@ -667,7 +670,7 @@ describe("ModelRegistry", () => {
 			expect(preRefresh.every(m => m.baseUrl === "http://localhost:4000")).toBe(true);
 
 			await registry.refreshProvider("openrouter", "online");
-			expect(requestedUrls).toEqual([]);
+			expect(requestedUrls).toEqual(["http://localhost:4000/v1/pi/models"]);
 
 			// Post-refresh: every openrouter model must still route through the
 			// pi-native transport.
@@ -677,6 +680,72 @@ describe("ModelRegistry", () => {
 				expect(model.transport).toBe("pi-native");
 				expect(model.baseUrl).toBe("http://localhost:4000");
 			}
+		});
+
+		test("pi-native provider takes its roster from the gateway", async () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					baseUrl: "http://localhost:4000",
+					apiKey: "gateway-token",
+					transport: "pi-native",
+				},
+			});
+			const [kept, pruned] = getBundledModels("openai-codex").filter(model => modelKind(model) === "chat");
+			const gatewayOnly = buildModel({
+				id: "gpt-gateway-only",
+				name: "Gateway Only",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "https://chatgpt.com/backend-api",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 500_000,
+				maxTokens: 128_000,
+			});
+			const otherProvider = getBundledModels("anthropic")[0];
+			const requests: Request[] = [];
+			const fetchMock: FetchImpl = async (input, init) => {
+				const request = new Request(input instanceof Request ? input.url : String(input), init);
+				requests.push(request);
+				return Response.json({ models: [kept, gatewayOnly, otherProvider].map(toPiNativeModelSpec) });
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+			await registry.refreshProvider("openai-codex", "online");
+
+			expect(requests.map(request => request.url)).toEqual(["http://localhost:4000/v1/pi/models"]);
+			expect(requests[0].headers.get("Authorization")).toBe("Bearer gateway-token");
+			expect(registry.find("openai-codex", "gpt-gateway-only")).toMatchObject({
+				transport: "pi-native",
+				baseUrl: "http://localhost:4000",
+				contextWindow: 500_000,
+				thinking: { efforts: gatewayOnly.thinking?.efforts },
+			});
+			expect(registry.find("openai-codex", kept.id)?.transport).toBe("pi-native");
+			expect(registry.find("openai-codex", pruned.id)).toBeUndefined();
+			expect(registry.find("openai-codex", otherProvider.id)).toBeUndefined();
+		});
+
+		test("provider base URL ignores a judge row's own endpoint after discovery (#20581)", async () => {
+			// OpenCode Go seeds its Jev judge on the Console System One endpoint and
+			// discovery lists that seed ahead of the chat rows. The usage probe reads
+			// the provider base URL; answering with the judge's URL sent it to
+			// `/inference/systemone/v1/usage`, which 404s.
+			authStorage.keys.setRuntime("opencode-go", "go-key");
+			const fetchMock: FetchImpl = async input => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url === "https://opencode.ai/inference/go/v1/models") {
+					return Response.json({ object: "list", data: [{ id: "kimi-k2.7-code", object: "model" }] });
+				}
+				return new Response("Not Found", { status: 404 });
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+			await registry.refreshProvider("opencode-go", "online");
+
+			expect(registry.find("opencode-go", "jev-1.13-free")?.baseUrl).toBe("https://opencode.ai/inference/systemone");
+			expect(registry.getProviderBaseUrl("opencode-go")).toBe("https://opencode.ai/inference/go/v1");
 		});
 	});
 
@@ -883,6 +952,7 @@ describe("ModelRegistry", () => {
 						api: "openai-responses",
 						compat: {
 							supportsConfigurationUpdate: false,
+							supportsPromptCacheBreakpoints: true,
 						},
 						models: [
 							{
@@ -1029,6 +1099,11 @@ describe("ModelRegistry", () => {
 			expect(getOpenAICompat(model)?.supportsConfigurationUpdate).toBe(false);
 			// …and beats the gpt-6-astra class rule on the resolved view the driver reads.
 			expect(getSupportsConfigurationUpdate(model)).toBe(false);
+		});
+
+		test("custom Responses providers can declare explicit prompt-cache breakpoints", () => {
+			const model = customAstraProxyCompat.find("astra-proxy", "gpt-6-astra");
+			expect(getOpenAICompat(model)?.supportsPromptCacheBreakpoints).toBe(true);
 		});
 
 		test("custom Responses providers preserve compaction config", () => {
@@ -2538,6 +2613,100 @@ describe("ModelRegistry", () => {
 			expect(requestedUrls).toContain("https://copilot-api.ghe.example.com/models");
 			expect(requestedUrls).not.toContain("https://api.githubcopilot.com/models");
 		});
+		test("lists only the Copilot models the account can select, before and after a restart", async () => {
+			await authStorage.credentials.set("github-copilot", [
+				{
+					type: "oauth",
+					access: "ghu_business_token",
+					refresh: "ghu_business_token",
+					expires: Date.now() + 60_000,
+					apiEndpoint: "https://api.business.githubcopilot.com",
+				},
+			]);
+			const fetchMock: FetchImpl = async input => {
+				const url = input instanceof Request ? input.url : String(input);
+				if (url !== "https://api.business.githubcopilot.com/models") throw new Error(`Unexpected URL: ${url}`);
+				return Response.json({
+					data: [
+						{ id: "gpt-4o", capabilities: { type: "chat" }, policy: { state: "enabled" } },
+						{ id: "claude-haiku-5.5", capabilities: { type: "chat" }, policy: { state: "disabled" } },
+						{ id: "claude-sonnet-4.5", capabilities: { type: "chat" }, policy: { state: "unconfigured" } },
+						{ id: "gpt-4o-mini", capabilities: { type: "chat" }, model_picker_enabled: false },
+					],
+				});
+			};
+			const cacheDbPath = path.join(tempDir, "copilot-models.db");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock, cacheDbPath });
+			await registry.refreshProvider("github-copilot", "online");
+			expect(
+				registry
+					.getAvailable()
+					.filter(model => model.provider === "github-copilot")
+					.map(model => model.id),
+			).toEqual(["claude-sonnet-4.5", "gpt-4o", "gpt-4o-mini"]);
+
+			const restarted = new ModelRegistry(authStorage, modelsJsonPath, { cacheDbPath });
+			await restarted.refreshProvider("github-copilot", "online-if-uncached");
+			expect(
+				restarted
+					.getAvailable()
+					.filter(model => model.provider === "github-copilot")
+					.map(model => model.id),
+			).toEqual(["claude-sonnet-4.5", "gpt-4o", "gpt-4o-mini"]);
+		});
+
+		test("keeps a discovered Copilot 1M model restorable during background refresh without models.yml", async () => {
+			const provider = "github-copilot";
+			const baseId = "claude-opus-5.5";
+			const variantId = `${baseId}-1m`;
+			await authStorage.credentials.set(provider, {
+				type: "oauth",
+				access: "ghu_business_token",
+				refresh: "ghu_business_token",
+				expires: Date.now() + 60_000,
+				apiEndpoint: "https://api.business.githubcopilot.com",
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+				fetch: async input => {
+					const url = input instanceof Request ? input.url : String(input);
+					if (url !== "https://api.business.githubcopilot.com/models") return new Response(null, { status: 503 });
+					return Response.json({
+						data: [
+							{
+								id: baseId,
+								capabilities: {
+									type: "chat",
+									limits: { max_context_window_tokens: 1_000_000, max_output_tokens: 64_000 },
+								},
+								billing: {
+									token_prices: {
+										default: { context_max: 200_000 },
+										long_context: { context_max: 936_000 },
+									},
+								},
+							},
+						],
+					});
+				},
+			});
+			await registry.refreshDiscoverableProviders([provider], "online");
+			expect(registry.getAvailableForProviders(new Set([provider])).some(model => model.id === variantId)).toBe(
+				true,
+			);
+
+			registry.refreshInBackground();
+			try {
+				// The refresh has started, but its async discovery cannot have published a new catalog yet.
+				await Promise.resolve();
+				expect(resolveSessionModelSelector(registry, `${provider}/${variantId}`)?.model).toMatchObject({
+					id: variantId,
+					requestModelId: baseId,
+					contextWindow: 1_000_000,
+				});
+			} finally {
+				await registry.awaitBackgroundRefresh();
+			}
+		});
 	});
 
 	describe("Factory Droid account residency", () => {
@@ -3626,7 +3795,7 @@ describe("ModelRegistry", () => {
 				{
 					seedCache: dbPath =>
 						writeModelCache(
-							"cached-compact-proxy:openai-models-list-context-v6",
+							"cached-compact-proxy:openai-models-list-context-v8",
 							Date.now(),
 							[
 								buildModel({
@@ -3803,24 +3972,6 @@ describe("ModelRegistry", () => {
 			expect(vertexAuthoritative.find("google-vertex", "gemini-1.5-pro")).toBeUndefined();
 		});
 
-		test("does not offer bundled Antigravity chat ids absent from a fresh account roster after restart", () => {
-			const served = getBundledModels("google-antigravity").find(model => model.id === "claude-sonnet-4-6");
-			if (!served) throw new Error("Missing bundled Antigravity control model");
-			writeModelCache(
-				"google-antigravity",
-				Date.now(),
-				[served],
-				true,
-				fingerprintStaticModels(getBundledModels("google-antigravity"), { authoritative: true }),
-				path.join(tempDir, "models.db"),
-			);
-			const restarted = new ModelRegistry(authStorage, modelsJsonPath);
-
-			expect(restarted.find("google-antigravity", "claude-sonnet-4-6")).toBeDefined();
-			expect(restarted.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
-			expect(restarted.find("google-antigravity", "gemini-3-pro-image")).toBeDefined();
-		});
-
 		test("does not re-add bundled synthetic models after authoritative cache load", () => {
 			const syntheticModels = getModelsForProvider(syntheticCacheLoad, "synthetic");
 			expect(syntheticModels.map(model => model.id)).toEqual(["hf:zai-org/GLM-5.1"]);
@@ -3908,8 +4059,6 @@ describe("ModelRegistry", () => {
 
 	describe("effort-tier variant collapsing", () => {
 		let kiroTwins: ModelRegistry;
-		let antigravityOverride: ModelRegistry;
-		let suppressible: ModelRegistry;
 		beforeAll(() => {
 			kiroTwins = readonlyRegistry({
 				providers: {
@@ -3919,13 +4068,6 @@ describe("ModelRegistry", () => {
 					]),
 				},
 			});
-			antigravityOverride = readonlyRegistry({
-				providers: {
-					"google-antigravity": { modelOverrides: { "gemini-3-pro-high": { contextWindow: 222_222 } } },
-				},
-			});
-			// Dedicated instance: the suppression test mutates it via suppressSelector.
-			suppressible = readonlyRegistry({ providers: {} });
 		});
 
 		test("collapses X/X-thinking twins from custom providers", () => {
@@ -3940,50 +4082,41 @@ describe("ModelRegistry", () => {
 			expect(kiroTwins.find("newapi", "[Kiro] claude-opus-4-7-thinking")?.id).toBe("[Kiro] claude-opus-4-7");
 		});
 
-		test("modelOverrides keyed by retired variant ids re-key onto the collapsed model", () => {
-			const collapsed = antigravityOverride.find("google-antigravity", "gemini-3-pro");
-			expect(collapsed?.contextWindow).toBe(222_222);
-			// The retired selector resolves to the same collapsed model.
-			expect(antigravityOverride.find("google-antigravity", "gemini-3-pro-high")?.id).toBe("gemini-3-pro");
-		});
-
-		test("retired variant maximum override wins over a larger custom maximum", async () => {
-			writeRawModelsJson({
-				"google-antigravity": {
-					baseUrl: "https://example.com/v1",
-					api: "google-gemini-cli",
-					auth: "none",
-					models: [{ id: "gemini-3-pro", contextWindow: 128_000, maxContextWindow: 800_000 }],
-					modelOverrides: { "gemini-3-pro-high": { maxContextWindow: 512_000 } },
-				},
-			});
-			const testSettings = Settings.isolated();
-			cfgExtendedContext.set(testSettings, true);
-			const registry = new ModelRegistry(authStorage, modelsJsonPath, { settings: testSettings });
-			expect(registry.getError()).toBeUndefined();
-			expect(registry.find("google-antigravity", "gemini-3-pro")?.contextWindow).toBe(512_000);
-			expect(registry.find("google-antigravity", "gemini-3-pro-high")).toMatchObject({
-				id: "gemini-3-pro",
-				contextWindow: 512_000,
-			});
-
-			cfgExtendedContext.set(testSettings, false);
-			await registry.reapplyModelPolicies();
-			expect(registry.find("google-antigravity", "gemini-3-pro")?.contextWindow).toBe(128_000);
-
-			cfgExtendedContext.set(testSettings, true);
-			await registry.reapplyModelPolicies();
-			await registry.refresh("offline");
-			expect(registry.getError()).toBeUndefined();
-			expect(registry.find("google-antigravity", "gemini-3-pro")?.contextWindow).toBe(512_000);
-			expect(registry.find("google-antigravity", "gemini-3-pro-high")?.contextWindow).toBe(512_000);
-		});
-
-		test("suppressed selectors keyed by retired variant ids bind to the collapsed id", () => {
-			suppressible.suppressSelector("google-antigravity/gemini-3-pro-high", Date.now() + 60_000);
-			expect(suppressible.isSelectorSuppressed("google-antigravity/gemini-3-pro")).toBe(true);
-			expect(suppressible.isSelectorSuppressed("google-antigravity/gemini-3-pro-low")).toBe(true);
-			expect(suppressible.isSelectorSuppressed("google-antigravity/gemini-2.5-pro")).toBe(false);
+		test("a gateway model id with an @upstream prefix keeps its full wire id at every effort", () => {
+			const modelsPath = path.join(tempDir, "models.yml");
+			fs.writeFileSync(
+				modelsPath,
+				`providers:
+  gateway:
+    baseUrl: https://gateway.example.com/v1
+    api: openai-completions
+    apiKey: test
+    authHeader: true
+    headers:
+      x-portkey-api-key: test
+    models:
+      - id: "@modal/GLM-5-2-FP8"
+        name: glm-5p2 (modal)
+        reasoning: true
+        input: [text]
+        contextWindow: 1048576
+        maxTokens: 131072
+        compat:
+          thinkingFormat: openai
+          supportsReasoningEffort: true
+          reasoningEffortMap:
+            minimal: none
+            low: low
+            medium: medium
+            high: high
+            xhigh: max
+`,
+			);
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			const model = registry.find("gateway", "@modal/GLM-5-2-FP8");
+			expect(model).toBeDefined();
+			expect(resolveWireModelId(model!, Effort.High)).toBe("@modal/GLM-5-2-FP8");
+			expect(resolveWireModelId(model!, undefined)).toBe("@modal/GLM-5-2-FP8");
 		});
 	});
 });

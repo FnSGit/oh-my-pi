@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [19.2.0] - 2026-11-25
+
+### Fixed
+
+- Fixed relay sessions leaving an unwanted “omp” tab group in Chrome’s bookmarks bar after closing relay tabs.
+
+## [19.1.1] - 2026-11-23
+
+### Fixed
+
+- The side panel’s Connection settings now show the browser’s specific reason when it refuses the native host (for example, because native messaging is blocked by enterprise policy), instead of incorrectly suggesting that the host may be missing.
+
+## [19.1.0] - 2026-11-21
+
 ### Breaking Changes
 
 - The omp extension now uses a pinned Chrome extension ID and connects to the browser relay through its native host. Reinstall the extension using Chrome’s “Load unpacked” flow; the relay port and token options have been removed.

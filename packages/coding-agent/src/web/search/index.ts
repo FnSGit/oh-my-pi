@@ -21,7 +21,7 @@ import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { ty
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
 import { type CompletionJournal, journalCompletion, type ModelUsageLedger } from "../../session/model-usage-journal";
 import { resolveConfiguredModelTarget } from "../../session/role-models";
-import { discoverAuthStorage } from "../../sdk";
+import { discoverSessionAuthStorage as discoverAuthStorage } from "../../session/auth-broker-config";
 import type { ToolSession } from "../../tools";
 import { throwIfAborted } from "../../tools/tool-errors";
 import {
@@ -29,12 +29,12 @@ import {
 	formatSearchProviderFailures,
 	getGroundedSearchProvider,
 	getSearchProvider,
+	type SearchParams,
 	type SearchProvider,
 	type SearchProviderFailure,
 } from "./provider";
 import { rankXAIProviders, targetsX, xaiModelChain, xSearchAvailable } from "./providers/xai";
 import { mergeSearchSources } from "./merge";
-import type { SearchParams } from "./providers/base";
 import { applyQueryConstraints, parseSearchQuery, scopeConstraints, type StructuredQuery } from "./query";
 import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
@@ -47,11 +47,7 @@ import {
 	type SearchSource,
 } from "./types";
 
-import {
-	cfgProvidersAntigravityEndpoint,
-	cfgProvidersWebKeyless,
-	cfgProvidersWebSearchTimeoutSeconds,
-} from "../../session/settings";
+import { cfgProvidersWebKeyless, cfgProvidersWebSearchTimeoutSeconds } from "../../session/settings";
 
 /** Web search tool parameters schema */
 export const webSearchSchema = type({
@@ -307,7 +303,6 @@ interface SearchAttemptContext {
 	/** The session's active model; `--offline` restricts search to its provider. */
 	sessionModel?: Model<Api>;
 	signal?: AbortSignal;
-	antigravityEndpointMode?: "auto" | "production" | "sandbox";
 	timeoutMs: number;
 	/** Settings layer the caller used; policy reads must use the same one. */
 	settings: Settings;
@@ -398,8 +393,22 @@ function buildProviderParams(context: SearchAttemptContext, loaded: LoadedCandid
 		modelRegistry: context.modelRegistry,
 		explicit: loaded.candidate.explicit,
 		sessionId: context.sessionId,
-		antigravityEndpointMode: context.antigravityEndpointMode,
 	};
+}
+
+/**
+ * Run one candidate's search. An extension may own the request for its
+ * provider's models; availability (credentials, keyless gating) stays the
+ * backend's, resolved by {@link loadCandidate} before this runs.
+ */
+function searchCandidate(
+	context: SearchAttemptContext,
+	loaded: LoadedCandidate,
+	depth: SearchDepth,
+): Promise<SearchResponse> {
+	const params = buildProviderParams(context, loaded, depth);
+	const extensionSearch = context.modelRegistry.getProviderWebSearch(loaded.model.provider);
+	return extensionSearch ? extensionSearch(params) : loaded.provider.search(params);
 }
 
 /**
@@ -533,7 +542,7 @@ async function searchSequential(
 		stats.lastProvider = { id: provider.id, label: provider.label };
 		try {
 			const sentAt = Date.now();
-			const response = await provider.search(buildProviderParams(context, load.loaded, depth));
+			const response = await searchCandidate(context, load.loaded, depth);
 			// Before any rejection below: a response a later check discards was still billed.
 			const billed = searchUsageMessage(load.loaded.model, response, Date.now() - sentAt);
 			if (billed) context.journal?.(billed);
@@ -632,7 +641,7 @@ async function searchDeep(
 	const settled = await Promise.allSettled(
 		selected.map(async loaded => {
 			const sentAt = Date.now();
-			const response = await loaded.provider.search(buildProviderParams(context, loaded, "deep"));
+			const response = await searchCandidate(context, loaded, "deep");
 			// Before any rejection below: a response a later check discards was still billed.
 			const billed = searchUsageMessage(loaded.model, response, Date.now() - sentAt);
 			if (billed) context.journal?.(billed);
@@ -741,14 +750,6 @@ async function executeSearch(
 		parsedQuery.sites.length > 0 && parsedQuery.sites.every(site => site.split("/", 1)[0] === "news.ycombinator.com");
 	if (!params.model && hnOnly) expanded = preferHackerNews(expanded, pool);
 
-	// Invariant across candidates; resolve once before walking the role chain.
-	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
-	try {
-		antigravityEndpointMode = cfgProvidersAntigravityEndpoint.get(activeSettings);
-	} catch {
-		antigravityEndpointMode = undefined;
-	}
-
 	let timeoutMs = DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS * 1_000;
 	try {
 		const configuredSeconds = cfgProvidersWebSearchTimeoutSeconds.get(activeSettings);
@@ -773,7 +774,6 @@ async function executeSearch(
 		sessionId,
 		sessionModel: options.sessionModel,
 		signal,
-		antigravityEndpointMode,
 		timeoutMs,
 		settings: activeSettings,
 		keylessAllowed,

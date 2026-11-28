@@ -11,7 +11,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { readBinary } from "@oh-my-pi/pi-coding-agent/tools/read-binary";
 import { parseSel } from "@oh-my-pi/pi-coding-agent/tools/read-selector";
-import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
+import type { ReadToolDetails } from "@oh-my-pi/pi-coding-agent/tools/details/read";
 
 /** One __TEXT segment, one section and LC_MAIN; arm64 and x86_64 share the same layout. */
 function macho(cpu = 0x0100000c): Buffer {
@@ -455,7 +455,7 @@ describe("read metadata and explicit analysis boundary", () => {
 				parseSel(undefined),
 			);
 			expect(textOutput(full)).toContain("sample.bin:overview");
-			expect(textOutput(full)).toContain("xd://eval/dsm");
+			expect(textOutput(full)).toContain("help://eval/dsm");
 			expect(acquire).not.toHaveBeenCalled();
 		} finally {
 			acquire.mockRestore();

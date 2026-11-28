@@ -4,10 +4,18 @@
 
 ### Added
 
+- Added a `gitlab` tool renderer for shared sessions and HTML exports.
+- Shared-session and HTML-exported edit cards now display cross-worktree edit notices when an edit modifies a sibling Git worktree ([#20823](https://github.com/can1357/oh-my-pi/pull/20823) by [@Quantum-Quasar](https://github.com/Quantum-Quasar)).
+
+## [19.1.0] - 2026-11-21
+
+### Added
+
 - Enhanced guest collaboration APIs: `GuestClient.sendPrompt` now supports sending images, while `sendResume`, `sendDeliverQueue`, and the `followUp` option enable continuing the host’s agent, interrupting it to deliver queued messages, or queueing a follow-up prompt.
 
 ### Changed
 
+- Tool commands run inside a bash call render as nested cards under the bash card
 - Tool cards in shared sessions and HTML exports show brief intent labels instead of detailed ranking instructions.
 
 ## [19.0.0] - 2026-11-18

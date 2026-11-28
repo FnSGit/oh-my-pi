@@ -29,9 +29,9 @@ import {
 	persistRecall,
 	type RecalledMemory,
 } from "../memory-backend/recall-entry";
-import { memoryToolRefs } from "../memory-backend/tool-names";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/redact";
+import type { Settings } from "../config/settings";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import memoryRecallChangesPrompt from "../prompts/system/memory-recall-changes.md" with { type: "text" };
@@ -39,7 +39,7 @@ import mnemopiInstructions from "../prompts/system/mnemopi-instructions.md" with
 import { type MnemopiBackendConfig, type MnemopiScoping, truncateApproxTokens } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
 import { filterRelevantMemories } from "./relevance";
-import { cfgMnemopiInjectionTokenLimit, cfgMnemopiRecallRelevance } from "./settings";
+import { cfgMnemopiAutoRetain, cfgMnemopiInjectionTokenLimit, cfgMnemopiRecallRelevance } from "./settings";
 
 /** A rendered recall block and where each tracked memory's text starts in it. */
 interface RecallBlock {
@@ -346,6 +346,20 @@ export interface MnemopiSessionStateApi {
 	listScopedIndexEntries(options?: { limit?: number }): MnemopiScopedIndexEntry[];
 	formatScopedIndex(): string | undefined;
 	consolidate(options?: MnemopiConsolidateOptions): Promise<void>;
+}
+
+/**
+ * The memory instructions. They say automatic retention of completed turns is enabled
+ * only when it is: `mnemopi.autoRetain` is on and the session is top-level. A subagent
+ * aliases its parent's banks and retains nothing of its own
+ * ({@link MnemopiSessionState.maybeRetainOnAgentEnd}). The line states the policy, not
+ * that a turn was saved: retention runs every `mnemopi.retainEveryNTurns` turns, and a
+ * backend that failed to start retains nothing. Read from the settings, not from a
+ * Mnemopi state: a session renders its first system prompt before its state exists.
+ * A live `mnemopi.*` edit re-applies the backend, so the state's config agrees with the settings.
+ */
+export function renderMnemopiInstructions(settings: Settings, subagent: boolean): string {
+	return prompt.render(mnemopiInstructions, { autoRetain: !subagent && cfgMnemopiAutoRetain.get(settings) });
 }
 
 export class MnemopiSessionState implements MnemopiSessionStateApi {
@@ -880,9 +894,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 	 * that ends in "…" when it cut one.
 	 */
 	budgetRecallBlock(block: string): string {
-		const instructions = prompt.render(mnemopiInstructions, {
-			toolRefs: memoryToolRefs(this.session.getXdevToolEntries()),
-		});
+		const instructions = renderMnemopiInstructions(this.session.settings, this.aliasOf !== undefined);
 		return truncateApproxTokens(
 			[instructions, block].join("\n\n").trim(),
 			cfgMnemopiInjectionTokenLimit.get(this.session.settings),
@@ -974,7 +986,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 			};
 		}
 		const truncated = withLoopPhase("mnemopi.recall", () => {
-			const history = extractMessages(this.session.sessionManager);
+			const history = extractMessages(this.session.sessionManager.getEntries());
 			const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 			const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 			return truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
@@ -1020,11 +1032,11 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		const userTurns = withLoopPhase("mnemopi.retain", () => {
 			this.#restoreRetainedTurnCursor();
 			// Cheap gate first: most agent_end events are not retain turns, so skip text extraction.
-			return countUserTurns(this.session.sessionManager);
+			return countUserTurns(this.session.sessionManager.getEntries());
 		});
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
 		const messages = withLoopPhase("mnemopi.retain", () => {
-			const flat = extractMessages(this.session.sessionManager);
+			const flat = extractMessages(this.session.sessionManager.getEntries());
 			return sliceUnretainedMessages(flat, this.lastRetainedTurn);
 		});
 		await this.retainMessages(messages, `${this.sessionId}-${Date.now()}`, {
@@ -1035,7 +1047,7 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 
 	async forceRetainCurrentSession(options: { extract?: boolean } = {}): Promise<void> {
 		if (this.aliasOf) return;
-		const flat = withLoopPhase("mnemopi.retain", () => extractMessages(this.session.sessionManager));
+		const flat = withLoopPhase("mnemopi.retain", () => extractMessages(this.session.sessionManager.getEntries()));
 		const userTurns = withLoopPhase("mnemopi.retain", () => {
 			this.#restoreRetainedTurnCursor();
 			return flat.filter(message => message.role === "user").length;
@@ -1139,7 +1151,9 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		let context = persisted?.text;
 		let record: PersistedRecall | undefined;
 		if (persisted === undefined) {
-			const messages = withLoopPhase("mnemopi.recall", () => extractMessages(this.session.sessionManager));
+			const messages = withLoopPhase("mnemopi.recall", () =>
+				extractMessages(this.session.sessionManager.getEntries()),
+			);
 			const lastUser = messages.findLast(message => message.role === "user");
 			if (!lastUser) return;
 			const truncated = withLoopPhase("mnemopi.recall", () => {

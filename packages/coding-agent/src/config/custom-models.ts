@@ -10,7 +10,7 @@ import { runnerApiKind } from "@oh-my-pi/pi-catalog/types";
 import { logger } from "@oh-my-pi/pi-utils";
 import { type ConfigHeaderResolver, type ConfigHeaderSource, createConfigHeaderResolver } from "./resolve-config-value";
 import { type ModelPatch, mergeCompat, mergeRemoteCompactionConfig } from "./model-patch";
-import { parseModelString } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import { parseModelString } from "./model-selector";
 import type { ModelOverride, ProviderAuthMode } from "./models-config-schema";
 export interface CustomModelDefinitionLike extends ModelPatch {
 	id: string;
@@ -105,6 +105,8 @@ export function buildCustomModelOverlay(
 		compactionModel: modelDef.compactionModel,
 		remoteCompaction: mergeRemoteCompactionConfig(providerRemoteCompaction, modelDef.remoteCompaction),
 		premiumMultiplier: modelDef.premiumMultiplier,
+		voice: modelDef.voice,
+		speechFormats: modelDef.speechFormats,
 		isOAuth: resolveCustomModelIsOAuth(api, providerAuth),
 	};
 }
@@ -137,6 +139,7 @@ export function finalizeCustomModel(resolvedModel: CustomModelOverlay, options: 
 		promptCache: resolvedModel.promptCache,
 		promptCacheConfig: resolvedModel.promptCache,
 		contextWindow: resolvedModel.contextWindow ?? reference?.contextWindow ?? (options.useDefaults ? 128000 : null),
+		maxContextWindow: resolvedModel.maxContextWindow,
 		maxTokens: resolvedModel.maxTokens ?? reference?.maxTokens ?? (options.useDefaults ? 16384 : null),
 		headers: resolvedModel.headers,
 		resolveHeaders: resolvedModel.resolveHeaders,
@@ -148,6 +151,8 @@ export function finalizeCustomModel(resolvedModel: CustomModelOverlay, options: 
 		compactionModel: resolvedModel.compactionModel,
 		remoteCompaction: resolvedModel.remoteCompaction,
 		premiumMultiplier: resolvedModel.premiumMultiplier,
+		voice: resolvedModel.voice,
+		speechFormats: resolvedModel.speechFormats,
 		isOAuth: resolvedModel.isOAuth,
 	} as ModelSpec<Api>);
 	if (resolvedModel.cost) {

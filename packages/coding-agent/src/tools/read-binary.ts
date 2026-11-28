@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import type { ReadToolDetails } from "./details/read";
+import { ToolError } from "./tool-errors";
 import {
 	cfgDisasmBackend,
 	DISASM_BACKEND_IDS,
@@ -113,7 +113,7 @@ export async function readBinary(
 		const guidance =
 			target.backend === undefined
 				? `Analysis disabled: set disassembler.backend to ${BACKEND_CHOICES} to enable explicit analysis views and dsm.`
-				: `Analysis (explicit opt-in): ${p}:overview, ${p}:<func|0xaddr>, ${p}:<func>:asm, :imports, :exports, :strings, :xrefs:<func|0xaddr>. Use the dsm namespace at xd://eval/dsm for scripting or dsm.open.`;
+				: `Analysis (explicit opt-in): ${p}:overview, ${p}:<func|0xaddr>, ${p}:<func>:asm, :imports, :exports, :strings, :xrefs:<func|0xaddr>. Use the dsm namespace at help://eval/dsm for scripting or dsm.open.`;
 		const slices = metadata.fat
 			? `\nPick a universal slice with ${bin}${SLICE_SEPARATOR}<arch> (metadata only until a view is added).`
 			: "";

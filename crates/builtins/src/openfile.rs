@@ -6,7 +6,7 @@
 #![allow(dead_code, reason = "consumed by the feature-gated utility modules")]
 
 use std::{
-	io::{self, IsTerminal as _, Read, Write},
+	io::{self, IsTerminal as _, Read, Seek as _, SeekFrom, Write},
 	path::Path,
 	sync::Arc,
 };
@@ -136,6 +136,19 @@ pub(crate) enum OpenFile {
 #[derive(Clone)]
 pub(crate) struct SharedStream(Arc<parking_lot::Mutex<Box<dyn Stream>>>);
 
+/// `ESPIPE` ("Illegal seek"): what seeking a pipe or an in-process stream
+/// reports.
+pub(crate) fn espipe() -> io::Error {
+	#[cfg(unix)]
+	{
+		io::Error::from_raw_os_error(libc::ESPIPE)
+	}
+	#[cfg(not(unix))]
+	{
+		io::Error::new(io::ErrorKind::NotSeekable, "Illegal seek")
+	}
+}
+
 impl OpenFile {
 	/// Wraps an in-process stream.
 	pub fn stream(stream: Box<dyn Stream>) -> Self {
@@ -211,6 +224,53 @@ impl OpenFile {
 		Ok(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) })
 	}
 
+	/// `lseek` on the open file, moving the offset every handle shares: `dd`
+	/// skips and seeks a standard stream, and `head` hands back the bytes its
+	/// read buffer took past what it printed.
+	///
+	/// # Errors
+	///
+	/// [`espipe`] for a pipe, a terminal, or a stream with no descriptor;
+	/// otherwise the OS or provider error.
+	pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
+		if let Some(mut file) = self.as_vfs() {
+			return file.seek(pos);
+		}
+		#[cfg(unix)]
+		{
+			let Ok(fd) = self.try_borrow_as_fd() else {
+				return Err(espipe());
+			};
+			let pos = match pos {
+				SeekFrom::Start(offset) => rustix::fs::SeekFrom::Start(offset),
+				SeekFrom::End(offset) => rustix::fs::SeekFrom::End(offset),
+				SeekFrom::Current(offset) => rustix::fs::SeekFrom::Current(offset),
+			};
+			Ok(rustix::fs::seek(fd, pos)?)
+		}
+		#[cfg(not(unix))]
+		match self {
+			Self::File(file) => {
+				let mut file: &std::fs::File = file;
+				file.seek(pos)
+			},
+			_ => Err(espipe()),
+		}
+	}
+
+	/// [`Self::seek`] for async callers: a provider-backed file seeks through
+	/// its async API instead of blocking the runtime thread.
+	///
+	/// # Errors
+	///
+	/// As [`Self::seek`].
+	pub async fn seek_async(&self, pos: SeekFrom) -> io::Result<u64> {
+		match self.as_vfs() {
+			Some(file) => file.seek_async(pos).await,
+			None => self.seek(pos),
+		}
+	}
+
 	/// Whether the open file is the write end of a pipe whose reader has
 	/// exited, as GNU `tail -f` checks while idle. Never blocks or writes data.
 	///
@@ -238,6 +298,27 @@ impl OpenFile {
 			Self::Stream(_) => self.try_borrow_as_fd().is_ok_and(|fd| fd.is_terminal()),
 			#[cfg(not(unix))]
 			Self::Stream(_) => false,
+		}
+	}
+
+	/// The terminal window behind the open file as `(columns, rows)`, when it
+	/// is a terminal that reports one (`TIOCGWINSZ`). Either value may be 0
+	/// when the terminal leaves it unset; `None` off unix.
+	pub fn window_size(&self) -> Option<(u16, u16)> {
+		#[cfg(unix)]
+		{
+			use std::os::fd::AsRawFd as _;
+
+			let fd = self.try_borrow_as_fd().ok()?;
+			let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+			// SAFETY: `size` is writable for the duration of the ioctl, and `fd`
+			// stays borrowed from `self` until it returns.
+			(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0)
+				.then_some((size.ws_col, size.ws_row))
+		}
+		#[cfg(not(unix))]
+		{
+			None
 		}
 	}
 }
@@ -362,7 +443,7 @@ pub(crate) fn is_piped_input(file: &OpenFile) -> bool {
 }
 
 #[cfg(unix)]
-fn is_pipe(file: &std::fs::File) -> bool {
+pub(crate) fn is_pipe(file: &std::fs::File) -> bool {
 	use std::os::unix::fs::FileTypeExt as _;
 
 	file.metadata().is_ok_and(|metadata| {
@@ -371,8 +452,13 @@ fn is_pipe(file: &std::fs::File) -> bool {
 	})
 }
 
+/// Whether `file` is a Windows pipe, so a read of it can block with no
+/// pollable descriptor (see [`omp_vfs::wait_pipe_readable`]).
+///
+/// `GetFileType` answers `FILE_TYPE_PIPE` for sockets too; that misclassification
+/// is harmless because the readiness probe treats any peek failure as ready.
 #[cfg(windows)]
-fn is_pipe(file: &std::fs::File) -> bool {
+pub(crate) fn is_pipe(file: &std::fs::File) -> bool {
 	use std::os::windows::io::AsRawHandle as _;
 
 	use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};

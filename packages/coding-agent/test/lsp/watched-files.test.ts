@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { FileChangeType, type FileEvent } from "@oh-my-pi/pi-coding-agent/lsp/types";
-import { fileToUri } from "@oh-my-pi/pi-coding-agent/lsp/utils";
-import { WatchedFilesForwarder } from "@oh-my-pi/pi-coding-agent/lsp/watched-files";
+import { fileToUri } from "@oh-my-pi/pi-coding-agent/lsp/uri";
+import { InotifyBudget, WatchedFilesForwarder } from "@oh-my-pi/pi-coding-agent/lsp/watched-files";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 /**
@@ -24,11 +24,15 @@ describe("WatchedFilesForwarder", () => {
 		for (const cleanup of cleanups.splice(0)) cleanup();
 	});
 
-	function setup(): { root: string; sent: FileEvent[]; forwarder: WatchedFilesForwarder } {
+	function setup(budget?: InotifyBudget): { root: string; sent: FileEvent[]; forwarder: WatchedFilesForwarder } {
 		const tempDir = TempDir.createSync("@omp-lsp-watched-files-");
 		const root = tempDir.path();
 		const sent: FileEvent[] = [];
-		const forwarder = new WatchedFilesForwarder({ roots: () => [root], send: changes => void sent.push(...changes) });
+		const forwarder = new WatchedFilesForwarder({
+			roots: () => [root],
+			send: changes => void sent.push(...changes),
+			inotifyBudget: budget,
+		});
 		cleanups.push(() => {
 			forwarder.close();
 			tempDir.removeSync();
@@ -337,6 +341,103 @@ describe("WatchedFilesForwarder", () => {
 			expect(inotifyWatches()).toBeGreaterThan(before);
 			await forwarder.unregister("types");
 			expect(inotifyWatches()).toBe(before);
+		},
+	);
+
+	// The inotify watch limit is per user: a process that used it up would break unrelated programs (#20117).
+	it.skipIf(process.platform !== "linux")(
+		"watches no more directories than its inotify budget, shallowest first",
+		async () => {
+			const { root, sent, forwarder } = setup(new InotifyBudget(3));
+			const shallow = path.join(root, "src");
+			const deep = path.join(root, ".lake", "build", "ir", "Mathlib");
+			await fs.mkdir(shallow);
+			await fs.mkdir(deep, { recursive: true });
+			const before = inotifyWatches();
+			await forwarder.register("ts", {
+				watchers: [{ globPattern: { baseUri: fileToUri(root), pattern: "**/*.ts" } }],
+			});
+			// root, src and .lake.
+			expect(inotifyWatches() - before).toBe(3);
+
+			const unwatched = path.join(deep, "a.ts");
+			const source = path.join(shallow, "index.ts");
+			fsSync.writeFileSync(unwatched, "export {};\n");
+			fsSync.writeFileSync(source, "export {};\n");
+			await waitForEvent(sent, { uri: fileToUri(source), type: FileChangeType.Created });
+			await Bun.sleep(QUIET_MS);
+			expect(sent.filter(change => change.uri === fileToUri(unwatched))).toEqual([]);
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")(
+		"gives watches back and stops adding them when the kernel refuses one",
+		async () => {
+			const { root, sent, forwarder } = setup(new InotifyBudget(1000));
+			for (let i = 0; i < 10; i++) await fs.mkdir(path.join(root, `d${i}`));
+			const refused = path.join(root, "d0", "refused");
+			await fs.mkdir(refused);
+			const watch = fsSync.watch;
+			const spy = spyOn(fsSync, "watch").mockImplementation((...args: unknown[]) => {
+				if (args[0] === refused) {
+					throw Object.assign(new Error(`ENOSPC: no space left on device, watch '${refused}'`), {
+						code: "ENOSPC",
+					});
+				}
+				return Reflect.apply(watch, fsSync, args);
+			});
+			cleanups.push(() => spy.mockRestore());
+			const before = inotifyWatches();
+			await forwarder.register("ts", {
+				watchers: [{ globPattern: { baseUri: fileToUri(root), pattern: "**/*.ts" } }],
+			});
+			// 11 held (root and d0-d9) when refused: half of them stay, root among them.
+			expect(inotifyWatches() - before).toBe(5);
+
+			// A directory created later stays unwatched, so the process does not climb back to the limit.
+			await fs.mkdir(path.join(root, "later"));
+			const file = path.join(root, "index.ts");
+			fsSync.writeFileSync(file, "export {};\n");
+			await waitForEvent(sent, { uri: fileToUri(file), type: FileChangeType.Created });
+			await Bun.sleep(QUIET_MS);
+			expect(inotifyWatches() - before).toBe(5);
+		},
+	);
+
+	// Windows watches through the native DirectoryWatcher, which `fs.watch` cannot stand in for.
+	it.skipIf(process.platform === "win32")(
+		"rescans after the watcher lost changes, reporting only files touched since its last change",
+		async () => {
+			const { root, sent, forwarder } = setup();
+			const deep = path.join(root, "src", "deep");
+			await fs.mkdir(deep, { recursive: true });
+			const untouched = path.join(deep, "untouched.ts");
+			fsSync.writeFileSync(untouched, "export {};\n");
+			const hourAgo = new Date(Date.now() - 3_600_000);
+			fsSync.utimesSync(untouched, hourAgo, hourAgo);
+			// Every watcher is muted, so only the rescan can report anything.
+			let lose: (() => void) | undefined;
+			const watch = fsSync.watch;
+			const spy = spyOn(fsSync, "watch").mockImplementation((...args: unknown[]) => {
+				const listener = args[2];
+				if (args[0] === root && typeof listener === "function") {
+					lose = () => Reflect.apply(listener, undefined, ["rename", null]);
+				}
+				args[2] = () => {};
+				return Reflect.apply(watch, fsSync, args);
+			});
+			cleanups.push(() => spy.mockRestore());
+			await forwarder.register("ts", {
+				watchers: [{ globPattern: { baseUri: fileToUri(root), pattern: "**/*.ts" } }],
+			});
+
+			const changed = path.join(deep, "changed.ts");
+			fsSync.writeFileSync(changed, "export {};\n");
+			expect(lose).toBeDefined();
+			lose?.();
+			await waitForEvent(sent, { uri: fileToUri(changed), type: FileChangeType.Created });
+			await Bun.sleep(QUIET_MS);
+			expect(sent.filter(change => change.uri === fileToUri(untouched))).toEqual([]);
 		},
 	);
 

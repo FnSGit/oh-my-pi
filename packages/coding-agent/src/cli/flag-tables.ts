@@ -31,11 +31,12 @@
  */
 
 import { isServiceTierOpenAISettingValue, SERVICE_TIER_OPENAI_VALUES } from "../config/service-tier";
-import { parseMaxFps } from "@oh-my-pi/pi-tui/frame-rate";
+import { parseMaxFps } from "../config/frame-rate";
 import { parseMotionMode } from "../config/motion-presets";
-import { parseSpinnerInterval } from "@oh-my-pi/pi-tui/spinner-clock";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { parseSpinnerInterval } from "../config/spinner-interval";
+import type { ConfiguredThinkingLevel } from "../utils/render-utils";
 import type { Args } from "./args";
+import { PREPAINT_MODES, parsePrepaintMode } from "./prepaint";
 import { CliUsageError } from "./usage-error";
 
 /**
@@ -171,6 +172,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--plan": (result, value) => {
 		result.plan = value;
 	},
+	"--preset": (result, value) => {
+		result.preset = value;
+	},
 	"--prewalk-into": (result, value) => {
 		result.prewalkInto = value;
 	},
@@ -213,6 +217,15 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 			result.motion = parseMotionMode(value);
 		} catch (error) {
 			throw new CliUsageError(`--motion: ${(error as Error).message}`);
+		}
+	},
+	// `cli.ts` reads it before this parse (the first frame paints before the command loads);
+	// validated here so a bad value fails the launch.
+	"--prepaint": (result, value) => {
+		if (parsePrepaintMode(value) === undefined) {
+			result.invalidFlagValues.push(
+				`Invalid --prepaint value: ${JSON.stringify(value)}. Expected one of: ${PREPAINT_MODES.join(", ")}.`,
+			);
 		}
 	},
 	"--api-key": (result, value) => {
@@ -411,11 +424,14 @@ export function flagConsumesValue(flag: string, next: string | undefined): boole
 	// `--flag=value` carries its own value inline.
 	if (flag.startsWith("--") && flag.includes("=")) return false;
 	if (next === undefined) return false;
+	// Extension-shadowable built-in string flags (e.g. `--plan`) are in
+	// `STRING_VALUE_FLAGS` too, so check them first: they consume value-like
+	// successors (`--plan opus`) while leaving flag-looking ones untouched.
+	const valueLike = !next.startsWith("-");
+	if (EXTENSION_SHADOWABLE_STRING_FLAGS.has(flag)) return valueLike;
 	// Known string flags consume any successor, even a flag-looking one
 	// (`--system-prompt --foo` ⇒ the system prompt is literally `--foo`).
 	if (STRING_VALUE_FLAGS.has(flag)) return true;
-	const valueLike = !next.startsWith("-");
-	if (EXTENSION_SHADOWABLE_STRING_FLAGS.has(flag)) return valueLike;
 	if (OPTIONAL_VALUE_FLAGS.has(flag)) {
 		const config = OPTIONAL_FLAGS[flag];
 		return valueLike && !(config.rejectEmpty === true && next.length === 0);

@@ -11,7 +11,7 @@ use std::{
 	path::Path,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::Duration,
 };
@@ -34,6 +34,7 @@ use crate::{
 		trace::{RunTrace, SegmentSource, viz::model::NodeKey},
 	},
 	cancel::{AbortReason, AbortToken, CancelToken},
+	commands::{RunLease, SessionCommands},
 	git::is_git_repo_location_var,
 	minimizer,
 	mounts::Mounts,
@@ -57,22 +58,52 @@ struct ShellSessionCore {
 	filesystem: Fs,
 	/// The shell's working directory after the last command.
 	cwd:        BString,
+	/// `errexit` was on when the last run ended.
+	errexit:    bool,
 }
 
+impl ShellSessionCore {
+	/// Record where a finished run left the shell.
+	fn track(&mut self, outcome: &RunOutcome) {
+		self.cwd.clone_from(&outcome.cwd);
+		self.errexit = outcome.errexit;
+	}
+}
+
+/// The abort token of the run that holds the session, tagged with that run's
+/// id: a run's cleanup runs after it released the session, so by then a
+/// queued run may have published its own token, which the cleanup must keep.
 #[derive(Clone, Default)]
-struct ShellAbortState(Arc<TokioMutex<Option<AbortToken>>>);
+struct ShellAbortState {
+	next_run: Arc<AtomicU64>,
+	current:  Arc<TokioMutex<Option<(u64, AbortToken)>>>,
+}
 
 impl ShellAbortState {
-	async fn set(&self, abort_token: AbortToken) {
-		*self.0.lock().await = Some(abort_token);
+	/// A fresh id to publish and clear a run's token under.
+	fn next_run(&self) -> u64 {
+		self.next_run.fetch_add(1, Ordering::Relaxed)
 	}
 
-	async fn clear(&self) {
-		*self.0.lock().await = None;
+	async fn set(&self, run: u64, abort_token: AbortToken) {
+		*self.current.lock().await = Some((run, abort_token));
+	}
+
+	/// Drop `run`'s token, unless another run's has replaced it.
+	async fn clear(&self, run: u64) {
+		let mut current = self.current.lock().await;
+		if current.as_ref().is_some_and(|(owner, _)| *owner == run) {
+			*current = None;
+		}
 	}
 
 	async fn abort(&self) {
-		let abort_token = self.0.lock().await.clone();
+		let abort_token = self
+			.current
+			.lock()
+			.await
+			.as_ref()
+			.map(|(_, token)| token.clone());
 		if let Some(abort_token) = abort_token {
 			abort_token.abort(AbortReason::Signal);
 		}
@@ -172,6 +203,9 @@ struct ShellRunConfig {
 	trace:      Option<Arc<RunTrace>>,
 	/// The speech synthesizer `say` speaks through.
 	speech:     Option<Arc<dyn SpeechHost>>,
+	/// The run's session commands; they end when the run's config is
+	/// dropped.
+	commands:   Option<RunLease>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -192,6 +226,11 @@ pub struct ShellRunOptions {
 	/// The application's speech synthesizer, which `say` speaks through
 	/// when it has one configured; `None` leaves `say` to the system's.
 	pub speech:     Option<Arc<dyn SpeechHost>>,
+	/// Commands the host provides for this run ([`crate::commands`]):
+	/// resolved after the shell's builtins, pi's tools and extras, and before
+	/// shell functions, aliases and `PATH`; ended with the run, so a
+	/// background job that outlives it cannot reach the handler.
+	pub commands:   Option<SessionCommands>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -210,6 +249,12 @@ pub struct ShellRunResult {
 	pub timed_out:   bool,
 	pub minimized:   Option<MinimizerResult>,
 	pub working_dir: Option<String>,
+	/// The command ended in another directory than it started in (a `cd` in
+	/// it); a later command that passes `cwd` starts there instead.
+	pub moved_cwd:   bool,
+	/// The command ended with `errexit` on; the next command starts with it
+	/// off.
+	pub errexit:     bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -378,6 +423,7 @@ impl Shell {
 			pipe_taps:  options.pipe_taps,
 			trace:      options.trace,
 			speech:     options.speech,
+			commands:   options.commands.as_ref().map(RunLease::new),
 		};
 		let result = run_shell_session(
 			self.session.clone(),
@@ -415,6 +461,20 @@ impl Shell {
 			.lock()
 			.as_ref()
 			.map_or_else(Vec::new, |active| active.children.pids())
+	}
+
+	/// Every live external the session holds, in or between runs, with
+	/// whether it runs in a detached (`nohup`) tree
+	/// ([`crate::session::Children::held`]): the background jobs earlier runs
+	/// left running included. Empty once the session is gone. Never blocks on
+	/// the session lock held by a running command.
+	#[must_use]
+	pub fn held_processes(&self) -> Vec<(i32, bool)> {
+		self
+			.active
+			.lock()
+			.as_ref()
+			.map_or_else(Vec::new, |active| active.children.held())
 	}
 
 	/// Number of live external background jobs tracked by the persistent
@@ -460,6 +520,7 @@ pub async fn execute_shell(
 		pipe_taps: None,
 		trace: None,
 		speech: None,
+		commands: None,
 	};
 	run_shell_oneshot(config, run_config, on_chunk, cancel_token).await
 }
@@ -502,6 +563,7 @@ pub async fn execute_shell_streams(
 		pipe_taps:  None,
 		trace:      None,
 		speech:     None,
+		commands:   None,
 	};
 	run_shell_oneshot_streams(config, run_config, streams, cancel_token).await
 }
@@ -537,9 +599,28 @@ struct CommandResult {
 	status:      i32,
 	minimized:   Option<MinimizerResult>,
 	working_dir: String,
+	moved_cwd:   bool,
+	errexit:     bool,
 }
 
 impl CommandResult {
+	/// How a command that started in `started_in` ended, as `session` now
+	/// stands.
+	fn ended(
+		session: &ShellSessionCore,
+		started_in: &[u8],
+		status: i32,
+		minimized: Option<MinimizerResult>,
+	) -> Self {
+		Self {
+			status,
+			minimized,
+			working_dir: session.cwd.to_str_lossy().into_owned(),
+			moved_cwd: session.cwd != started_in,
+			errexit: session.errexit,
+		}
+	}
+
 	fn into_run_result(self) -> ShellRunResult {
 		ShellRunResult {
 			exit_code:   Some(self.status),
@@ -547,6 +628,8 @@ impl CommandResult {
 			timed_out:   false,
 			minimized:   self.minimized,
 			working_dir: Some(self.working_dir),
+			moved_cwd:   self.moved_cwd,
+			errexit:     self.errexit,
 		}
 	}
 }
@@ -559,6 +642,8 @@ const fn cancelled_result(reason: AbortReason) -> ShellRunResult {
 		timed_out:   matches!(reason, AbortReason::Timeout),
 		minimized:   None,
 		working_dir: None,
+		moved_cwd:   false,
+		errexit:     false,
 	}
 }
 
@@ -574,6 +659,7 @@ async fn run_shell_session(
 	ct: &mut CancelToken,
 ) -> Result<ShellRunResult> {
 	let tokio_cancel = CancellationToken::new();
+	let run = abort_state.next_run();
 	let mut run_task = tokio::spawn({
 		let session = session.clone();
 		let abort_state = abort_state.clone();
@@ -589,7 +675,7 @@ async fn run_shell_session(
 				*active.lock() = Some(SessionHandles::of(&core.session));
 				session_guard.insert(core)
 			};
-			abort_state.set(at).await;
+			abort_state.set(run, at).await;
 			if process {
 				run_process_command(core, &run_config, tokio_cancel).await
 			} else {
@@ -613,7 +699,7 @@ async fn run_shell_session(
 				run_task.abort();
 				let _ = run_task.await;
 			}
-			abort_state.clear().await;
+			abort_state.clear(run).await;
 			// Use try_lock to avoid deadlocking if another task holds the session.
 			// If we can't acquire the lock, the session will be cleaned up when the
 			// holding task finishes.
@@ -626,7 +712,7 @@ async fn run_shell_session(
 	};
 	let res =
 		res.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	abort_state.clear().await;
+	abort_state.clear(run).await;
 
 	// `exit`, errexit, or a stray top-level `return`/`break` ends this command,
 	// not the session: the next run keeps the variables, functions, and options
@@ -982,7 +1068,13 @@ async fn create_session_as(
 		None => Session::new(session_config),
 	}
 	.map_err(|err| Error::msg(format!("Failed to initialize shell: {err}")))?;
-	let mut core = ShellSessionCore { session, slot, filesystem: config.filesystem.clone(), cwd };
+	let mut core = ShellSessionCore {
+		session,
+		slot,
+		filesystem: config.filesystem.clone(),
+		cwd,
+		errexit: false,
+	};
 
 	// A seed already holds both.
 	if config.seed.is_none() {
@@ -1053,11 +1145,8 @@ async fn run_process_command(
 	install_run_filesystem(session, options, &cancel_token);
 	let result: Result<CommandResult> = async {
 		let cwd = requested_cwd(session, options.cwd.as_deref()).await?;
-		let scope = CommandScope {
-			options,
-			env: command_env(options.env.as_ref()),
-			cancel: cancel_token.clone(),
-		};
+		let started_in = cwd.clone().unwrap_or_else(|| session.cwd.clone());
+		let scope = CommandScope::new(options, cancel_token.clone());
 		let mut command = options.command.clone();
 		ensure_trailing_newline_for_heredoc(&mut command);
 		let run = scope.run_options(command, cwd, None);
@@ -1066,7 +1155,7 @@ async fn run_process_command(
 			.run_with(run, process_stdio(), cancel_token.clone())
 			.await;
 		if let Ok(outcome) = &result {
-			session.cwd.clone_from(&outcome.cwd);
+			session.track(outcome);
 		}
 		if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await
 			&& let Some(mut stderr) = process_stdio().stderr
@@ -1074,11 +1163,7 @@ async fn run_process_command(
 			report_close_failure(&mut stderr, &err, &mut result);
 		}
 		let outcome = result.map_err(|err| Error::msg(format!("Shell execution failed: {err}")))?;
-		Ok(CommandResult {
-			status:      outcome.status,
-			minimized:   None,
-			working_dir: session.cwd.to_str_lossy().into_owned(),
-		})
+		Ok(CommandResult::ended(session, &started_in, outcome.status, None))
 	}
 	.await;
 	restore_session_filesystem(session);
@@ -1095,7 +1180,7 @@ async fn run_setup(
 		.session
 		.run_with(RunOptions::new(command), null_stdio()?, cancel.clone())
 		.await?;
-	core.cwd = outcome.cwd;
+	core.track(&outcome);
 	Ok(())
 }
 
@@ -1203,12 +1288,24 @@ struct CommandRunOutput {
 
 /// What every session run of one command shares.
 struct CommandScope<'a> {
-	options: &'a ShellRunConfig,
-	env:     Vec<(BString, BString)>,
-	cancel:  CancellationToken,
+	options:   &'a ShellRunConfig,
+	env:       Vec<(BString, BString)>,
+	cancel:    CancellationToken,
+	/// No run of the command has started yet: the first turns `errexit`
+	/// off, so an earlier command's `set -e` never stops this one.
+	first_run: AtomicBool,
 }
 
-impl CommandScope<'_> {
+impl<'a> CommandScope<'a> {
+	fn new(options: &'a ShellRunConfig, cancel: CancellationToken) -> Self {
+		Self {
+			options,
+			env: command_env(options.env.as_ref()),
+			cancel,
+			first_run: AtomicBool::new(true),
+		}
+	}
+
 	/// The session run of `command`; `cwd` moves the shell first.
 	fn run_options(
 		&self,
@@ -1231,12 +1328,14 @@ impl CommandScope<'_> {
 			}),
 			reported_error,
 			speech: self.options.speech.clone(),
+			commands: self.options.commands.as_ref().map(RunLease::commands),
 			text_capture: false,
 			events: self
 				.options
 				.trace
 				.as_ref()
 				.map(|trace| Arc::clone(trace) as Arc<dyn crate::bash::EventSink>),
+			reset_errexit: self.first_run.swap(false, Ordering::Relaxed),
 		}
 	}
 }
@@ -1361,8 +1460,8 @@ async fn run_shell_command_in_filesystem(
 	cancel_token: CancellationToken,
 ) -> Result<CommandResult> {
 	let cwd = requested_cwd(session, options.cwd.as_deref()).await?;
-	let scope =
-		CommandScope { options, env: command_env(options.env.as_ref()), cancel: cancel_token };
+	let started_in = cwd.clone().unwrap_or_else(|| session.cwd.clone());
+	let scope = CommandScope::new(options, cancel_token);
 
 	let minimizer_mode = if let Some(config) = options.minimizer.as_ref() {
 		minimizer::engine::mode_for(&options.command, config)
@@ -1379,7 +1478,7 @@ async fn run_shell_command_in_filesystem(
 		},
 	};
 
-	Ok(CommandResult { status, minimized, working_dir: session.cwd.to_str_lossy().into_owned() })
+	Ok(CommandResult::ended(session, &started_in, status, minimized))
 }
 
 async fn run_shell_command_single(
@@ -1680,7 +1779,7 @@ async fn run_shell_command_once(
 		.run_with(run, stdio, cancel_token.clone())
 		.await;
 	if let Ok(outcome) = &result {
-		session.cwd.clone_from(&outcome.cwd);
+		session.track(outcome);
 	}
 
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
@@ -1768,11 +1867,8 @@ async fn run_shell_command_streams_in_filesystem(
 	cancel_token: CancellationToken,
 ) -> Result<CommandResult> {
 	let cwd = requested_cwd(session, options.cwd.as_deref()).await?;
-	let scope = CommandScope {
-		options,
-		env: command_env(options.env.as_ref()),
-		cancel: cancel_token.clone(),
-	};
+	let started_in = cwd.clone().unwrap_or_else(|| session.cwd.clone());
+	let scope = CommandScope::new(options, cancel_token.clone());
 
 	let (stdout_reader, stdout_writer) = pipe_to_files("stdout")?;
 	let (stderr_reader, stderr_writer) = pipe_to_files("stderr")?;
@@ -1819,7 +1915,7 @@ async fn run_shell_command_streams_in_filesystem(
 		.run_with(run, stdio, cancel_token.clone())
 		.await;
 	if let Ok(outcome) = &result {
-		session.cwd.clone_from(&outcome.cwd);
+		session.track(outcome);
 	}
 
 	if let Err(err) = drain_dropped_files(&session.slot, &cancel_token).await {
@@ -1888,11 +1984,7 @@ async fn run_shell_command_streams_in_filesystem(
 	let _ = cancel_bridge.await;
 
 	let outcome = result.map_err(|err| Error::msg(format!("Shell execution failed: {err}")))?;
-	Ok(CommandResult {
-		status:      outcome.status,
-		minimized:   None,
-		working_dir: session.cwd.to_str_lossy().into_owned(),
-	})
+	Ok(CommandResult::ended(session, &started_in, outcome.status, None))
 }
 
 async fn read_output_bytes(
@@ -2173,7 +2265,9 @@ async fn read_output_buffered(
 #[cfg(unix)]
 fn register_nonblocking_pipe(reader: fs::File) -> io::Result<tokio::io::unix::AsyncFd<fs::File>> {
 	set_nonblocking(&reader)?;
-	tokio::io::unix::AsyncFd::new(reader)
+	// SAFETY: the `File` keeps its descriptor open and unchanged for the
+	// `AsyncFd`'s lifetime.
+	Ok(unsafe { tokio::io::unix::AsyncFd::register(reader) }?)
 }
 
 #[cfg(unix)]

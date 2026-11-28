@@ -1,6 +1,6 @@
-import { collapseCommand } from "@oh-my-pi/pi-tui/apps/ps-data";
-import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
-import type { UnitSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
+import { collapseCommand } from "../cli/ps-model";
+import { formatDuration } from "@oh-my-pi/pi-utils";
+import type { UnitSnapshot } from "../daemon/daemon-types";
 import { formatBytes, logger, sanitizeText, spillUrl, truncate } from "@oh-my-pi/pi-utils";
 import type { AsyncJob } from "../async";
 import {
@@ -24,7 +24,8 @@ import {
 	serviceUnitLogPath,
 	stopService,
 } from "../launch/services";
-import type { ProcReadDetails } from "@oh-my-pi/pi-tui/tools/proc-render";
+import { AGENT_KILL_LABEL } from "../session/messages";
+import type { ProcReadDetails } from "../tools/details/proc-render";
 import procPromptDoc from "../prompts/internal-urls/proc.md" with { type: "text" };
 import procReferenceDoc from "../prompts/internal-urls/proc-reference.md" with { type: "text" };
 import type { ToolSession } from "../tools";
@@ -387,7 +388,7 @@ export class ProcProtocolHandler implements ProtocolHandler {
 			return { content: result.content, details: { proc: result.details } };
 		}
 		if (agent) {
-			const outcome = await cancelAgentRegistration(session, ownerId, id);
+			const outcome = await cancelAgentRegistration(session, ownerId, id, AGENT_KILL_LABEL);
 			return {
 				content: [{ type: "text", text: outcome.message }],
 				details: { proc: { op: "cancel", jobs: [], cancelled: [{ id, status: outcome.status }] } },

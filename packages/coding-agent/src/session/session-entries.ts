@@ -7,8 +7,8 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
-import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { StructuredSubagentSchemaMode } from "../task/task-details";
+import type { ConfiguredThinkingLevel } from "../utils/render-utils";
 import type { CompactionMethod } from "./compaction-methods";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
@@ -21,6 +21,9 @@ export const SESSION_TITLE_SLOT_BYTES = 256;
 export const SESSION_TITLE_SLOT_ENTRY_TYPE = "title";
 
 export const TITLE_CHANGE_ENTRY_TYPE = "title_change";
+
+/** Marks the end of a `/tan` session's inherited history; data is the fork's session ID. */
+export const TAN_FORK_BOUNDARY_CUSTOM_TYPE = "tan-fork-boundary";
 
 export type SessionTitleSource = "auto" | "user";
 
@@ -96,6 +99,12 @@ export interface SessionHeader {
 	providerPromptCacheKey?: string;
 	/** Local-only Task candidate, gated by the actual request model's cache policy; omitted from shares and HTML. */
 	taskPromptCacheKey?: string;
+	/**
+	 * Last entry a fork copied from its parent with the inherited spend reset (`forkFrom` with
+	 * `resetInheritedCost`). Model calls at or before it, in file order, are the parent's: billing
+	 * readers that see both transcripts leave them to the parent. Kept by sessions derived from the fork.
+	 */
+	inheritedThroughEntryId?: string;
 }
 
 export interface NewSessionOptions {
@@ -217,6 +226,21 @@ export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	configured?: string | null;
 }
 
+/** Why a retry fallback moved the session off a model. */
+export interface ModelFallbackCause {
+	/** The model the session left, named as in `retry_fallback_applied.from` (`provider/modelId`, plus any `:thinking` level). */
+	from: string;
+	/**
+	 * - `request-error`: a request to `from` failed.
+	 * - `agent-loop`: the agent loop stopped the turn itself (e.g. an unmet soft tool requirement); no request failed.
+	 * - `usage-preflight`: usage health moved the request before it was sent.
+	 * - `missing-credential`: `from`'s provider had no usable credential.
+	 */
+	trigger: "request-error" | "agent-loop" | "usage-preflight" | "missing-credential";
+	/** The failed turn's error, or the usage or credential condition. */
+	reason?: string;
+}
+
 export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	/** Model in "provider/modelId" format */
@@ -225,6 +249,8 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	role?: string;
 	/** True when this transition selected a retry-fallback model rather than the configured model. */
 	resolvedModelIsFallback?: boolean;
+	/** Why the retry fallback that wrote this entry switched models. */
+	fallback?: ModelFallbackCause;
 }
 
 export interface ServiceTierChangeEntry extends SessionEntryBase {
@@ -354,7 +380,7 @@ export interface SessionInitEntry extends SessionEntryBase {
 	task: string;
 	/** Tools available to the agent */
 	tools: string[];
-	/** Names in `tools` presented as `xd://` devices instead of top-level tools (absent from older files). */
+	/** Names in `tools` presented as tool commands instead of top-level tools (absent from older files). */
 	mountedTools?: string[];
 	/** Agent definition name (for example `scout` or `reviewer`). */
 	agent?: string;
@@ -497,4 +523,8 @@ export interface UsageStatistics {
 	cost: number;
 	/** Portion of {@link cost} carried by completed `task` results (direct children's spend). */
 	subagentCost: number;
+	/** Server-reported AI credits (nano-AIU) of this session's own calls: assistant messages and `model_usage`. */
+	aiuNano: number;
+	/** Own calls whose model declares a billing frame that never arrived; positive makes `aiuNano` a lower bound. */
+	aiuUnknownCalls: number;
 }

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { seedModels } from "@oh-my-pi/pi-catalog/compat/providers";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { readModelCache, writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
@@ -12,6 +13,7 @@ import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
 	fetchWellKnownModels,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
+	type ModelsDevModel,
 	modelsDevCatalogFallback,
 	opencodeGoModelManagerOptions,
 	opencodeZenModelManagerOptions,
@@ -29,6 +31,9 @@ const LIVE_FREE_MODEL_IDS = [
 ] as const;
 
 const LIVE_PAID_MODEL_IDS = ["claude-opus-4-8", "gpt-5.5"] as const;
+
+/** Zen's System One rows, appended to every successful discovery. */
+const ZEN_SEED_IDS = seedModels("opencode-zen").map(model => model.id);
 
 test.each([
 	["opencode-go", "https://opencode.ai/zen/go/v1"],
@@ -612,6 +617,41 @@ describe("OpenCode provider discovery", () => {
 		expect(jevRows[0]).toMatchObject({ api: "typesafe", kind: "judge" });
 	});
 
+	test("routes Go's free Jev judge to the Console System One endpoint, not the Go gateway", async () => {
+		const fetchMock: FetchImpl = async () =>
+			Response.json({ data: [{ id: "kimi-k3", name: "Kimi K3", context_length: 262_144 }] });
+		for (const baseUrl of [undefined, "https://proxy.example/go/v1"]) {
+			const options = opencodeGoModelManagerOptions({ apiKey: "go-account-key", baseUrl, fetch: fetchMock });
+			const models = ((await options.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+			expect(models.find(model => model.id === "jev-1.13-free")).toMatchObject({
+				api: "typesafe",
+				baseUrl: "https://opencode.ai/inference/systemone",
+				kind: "judge",
+				cost: { input: 0, output: 0 },
+			});
+		}
+	});
+
+	test("routes Zen decision models to System One judges instead of chat", async () => {
+		const fetchMock: FetchImpl = async () =>
+			Response.json({
+				data: [
+					{ id: "gpt-5.6-sol", name: "GPT-5.6 Sol" },
+					{ id: "jev-1.14", name: "Jev 1.14", type: "decision" },
+					{ id: "decision-next", name: "Decision Next", type: "decision" },
+				],
+			});
+		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
+		const models = ((await options.fetchDynamicModels?.()) ?? []).map(spec => buildModel(spec));
+		const judge = { api: "typesafe", baseUrl: "https://opencode.ai/zen", kind: "judge" };
+
+		expect(models.filter(model => model.id === "jev-1.14")).toEqual([
+			expect.objectContaining({ ...judge, cost: expect.objectContaining({ input: 0.042 }) }),
+		]);
+		expect(models.find(model => model.id === "decision-next")).toMatchObject({ ...judge, name: "Decision Next" });
+		expect(models.find(model => model.id === "gpt-5.6-sol")?.kind).not.toBe("judge");
+	});
+
 	test("returns null from a failed Zen discovery instead of the jev seed alone", async () => {
 		const fetchMock: FetchImpl = async () => new Response("unavailable", { status: 503 });
 		const options = opencodeZenModelManagerOptions({ apiKey: "user_test", fetch: fetchMock });
@@ -1148,7 +1188,7 @@ describe("OpenCode provider discovery", () => {
 				cacheDbPath: path.join(tempDir, "models.db"),
 				modelsDev: baseOptions.modelsDev ? { ...baseOptions.modelsDev, additiveOnly: true } : undefined,
 			};
-			const expectedIds = [...LIVE_FREE_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort();
+			const expectedIds = [...LIVE_FREE_MODEL_IDS, ...ZEN_SEED_IDS].sort();
 
 			const online = await resolveProviderModels(managerOptions, "online");
 			expect(online.stale).toBe(false);
@@ -1183,7 +1223,7 @@ describe("OpenCode provider discovery", () => {
 				cacheDbPath: path.join(tempDir, "models.db"),
 				modelsDev: baseOptions.modelsDev ? { ...baseOptions.modelsDev, additiveOnly: true } : undefined,
 			};
-			const expectedIds = [...LIVE_FREE_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort();
+			const expectedIds = [...LIVE_FREE_MODEL_IDS, ...ZEN_SEED_IDS].sort();
 			const online = await resolveProviderModels(managerOptions, "online");
 			expect(online.models.map(model => model.id).sort()).toEqual(expectedIds);
 
@@ -1266,11 +1306,11 @@ describe("OpenCode provider discovery", () => {
 			expect(freeOptions.cacheProviderId).not.toBe(paidOptions.cacheProviderId);
 			expect(freeResult.stale).toBe(false);
 			expect(freeResult.models.map(model => model.id).sort()).toEqual(
-				[...LIVE_FREE_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort(),
+				[...LIVE_FREE_MODEL_IDS, ...ZEN_SEED_IDS].sort(),
 			);
 			expect(paidResult.stale).toBe(false);
 			expect(paidResult.models.map(model => model.id).sort()).toEqual(
-				[...LIVE_PAID_MODEL_IDS, "jev-1.13", "jev-1.13-free"].sort(),
+				[...LIVE_PAID_MODEL_IDS, ...ZEN_SEED_IDS].sort(),
 			);
 			expect([freeFetches, paidFetches]).toEqual([1, 1]);
 		} finally {
@@ -1327,6 +1367,74 @@ describe("OpenCode provider discovery", () => {
 		const plain = discovered("deepseek-v4-flash");
 		expect(plain.input).toEqual(["text"]);
 		expect(sendsImageInputOnWire(plain)).toBe(false);
+	});
+});
+
+describe("OpenCode MiniMax M3 routing", () => {
+	const OPENCODE_ZEN_BASE = "https://opencode.ai/zen/v1";
+	const OPENCODE_GO_BASE = "https://opencode.ai/inference/go/v1";
+	const zenDescriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(d => d.providerId === "opencode-zen");
+	const goDescriptor = MODELS_DEV_PROVIDER_DESCRIPTORS.find(d => d.providerId === "opencode-go");
+
+	// stencil.so declares these ids with `provider.npm = "@ai-sdk/anthropic"`,
+	// but the gateways serve them only at /v1/chat/completions; the per-id
+	// overrides must win over the @ai-sdk/anthropic → /v1/messages rule.
+	const npmAnthropic: ModelsDevModel = { provider: { npm: "@ai-sdk/anthropic" }, tool_call: true };
+
+	describe("opencode-zen", () => {
+		test.each([["minimax-m3"], ["minimax-m3-free"]])(
+			"%s resolves to openai-completions on /v1/chat/completions",
+			modelId => {
+				const resolved = zenDescriptor?.resolveApi?.(modelId, npmAnthropic);
+				expect(resolved).toEqual({ api: "openai-completions", baseUrl: OPENCODE_ZEN_BASE });
+			},
+		);
+	});
+
+	describe("opencode-go", () => {
+		test.each([["minimax-m3"], ["minimax-m3-free"]])(
+			"%s resolves to openai-completions on /v1/chat/completions",
+			modelId => {
+				const resolved = goDescriptor?.resolveApi?.(modelId, npmAnthropic);
+				expect(resolved).toEqual({ api: "openai-completions", baseUrl: OPENCODE_GO_BASE });
+			},
+		);
+	});
+
+	test("opencode-zen /v1/models refresh routes a freshly-discovered M3 to openai-completions", async () => {
+		let requestedUrl = "";
+		const mockFetch: FetchImpl = async input => {
+			requestedUrl = input instanceof Request ? input.url : String(input);
+			return Response.json({
+				data: [{ id: "minimax-m3-free", name: "MiniMax M3 Free", context_length: 200000 }],
+			});
+		};
+
+		const options = opencodeZenModelManagerOptions({ apiKey: "opencode-test-key", fetch: mockFetch });
+		const models = await options.fetchDynamicModels?.();
+		const m3 = models?.find(model => model.id === "minimax-m3-free");
+
+		expect(requestedUrl).toBe("https://opencode.ai/zen/v1/models");
+		expect(m3?.api).toBe("openai-completions");
+		expect(m3?.baseUrl).toBe("https://opencode.ai/zen/v1");
+	});
+
+	test("opencode-go /v1/models refresh routes a freshly-discovered M3 to openai-completions", async () => {
+		let requestedUrl = "";
+		const mockFetch: FetchImpl = async input => {
+			requestedUrl = input instanceof Request ? input.url : String(input);
+			return Response.json({
+				data: [{ id: "minimax-m3", name: "MiniMax M3", context_length: 200000 }],
+			});
+		};
+
+		const options = opencodeGoModelManagerOptions({ apiKey: "opencode-test-key", fetch: mockFetch });
+		const models = await options.fetchDynamicModels?.();
+		const m3 = models?.find(model => model.id === "minimax-m3");
+
+		expect(requestedUrl).toBe(`${OPENCODE_GO_BASE}/models`);
+		expect(m3?.api).toBe("openai-completions");
+		expect(m3?.baseUrl).toBe(OPENCODE_GO_BASE);
 	});
 });
 

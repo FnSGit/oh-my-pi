@@ -1,4 +1,5 @@
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
+import { isKimiCodeEndpoint } from "@oh-my-pi/pi-catalog/compat/kimi-code";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
@@ -48,7 +49,11 @@ import type {
 import { normalizeSystemPrompts, normalizeToolCallId, resolveCacheRetention } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { isDemotedThinking, kStreamingLastParseLen } from "../utils/block-symbols";
-import { hasVisibleAssistantContent, withReplaySafeStreamRetry } from "../utils/empty-completion-retry";
+import {
+	hasVisibleAssistantContent,
+	transportExhaustedMessages,
+	withReplaySafeStreamRetry,
+} from "../utils/empty-completion-retry";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import type { RawHttpRequestDump } from "../utils/http-inspector";
 import {
@@ -65,6 +70,7 @@ import {
 	findStrictToolSchemaViolation,
 	flattenExclusiveRequiredRootUnion,
 	NO_STRICT,
+	normalizeSchemaForGoogle,
 	normalizeSchemaForMoonshot,
 	sanitizeSchemaForGrammar,
 	toolWireSchema,
@@ -118,8 +124,10 @@ import {
 	getOpenAIStrictToolsScope,
 	isCompiledGrammarTooLargeStrictError,
 	isStrictToolsDisabledForScope,
+	markOpenAIPromptCacheBoundaries,
 	type OpenAICompatPolicy,
 	type OpenAICompletionsParams,
+	type OpenAIPromptCacheBoundary,
 	type OpenAIPromptCacheOptions,
 	type OpenAIRequestSetup,
 	type OpenAIStrictToolsState,
@@ -131,6 +139,7 @@ import {
 	resolveOpenAIRequestSetup,
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
+	withOpenAIPromptCacheBreakpoint,
 } from "./openai-shared";
 import { completionsSendsOwnThinking, transformMessages } from "./transform-messages";
 import {
@@ -178,7 +187,8 @@ type GeminiThoughtSignatureExtraContent = Partial<
 	Record<GeminiThoughtSignatureNamespace, { thought_signature: string }>
 >;
 
-type OpenAICompletionsFunctionToolCall = ChatCompletionMessageFunctionToolCall & {
+type OpenAICompletionsFunctionToolCall = Omit<ChatCompletionMessageFunctionToolCall, "function"> & {
+	function: ChatCompletionMessageFunctionToolCall["function"] & { thought_signature?: string };
 	extra_content?: GeminiThoughtSignatureExtraContent;
 };
 
@@ -202,6 +212,16 @@ function getGeminiThoughtSignatureExtraContent(value: unknown): GeminiThoughtSig
 			: { vertex: { thought_signature: thoughtSignature } };
 	}
 	return undefined;
+}
+
+// When strict OpenAI compliance is off, Portkey sends the per-call Gemini signature
+// on the `function` object of the tool call instead of in `extra_content`.
+function getGeminiFunctionThoughtSignature(toolCall: unknown): string | undefined {
+	if (typeof toolCall !== "object" || toolCall === null) return undefined;
+	const toolCallFunction = Reflect.get(toolCall, "function");
+	if (typeof toolCallFunction !== "object" || toolCallFunction === null) return undefined;
+	const thoughtSignature = Reflect.get(toolCallFunction, "thought_signature");
+	return typeof thoughtSignature === "string" && thoughtSignature.length > 0 ? thoughtSignature : undefined;
 }
 
 function getGeminiMessageThoughtSignature(value: unknown): GeminiMessageThoughtSignature | undefined {
@@ -260,16 +280,19 @@ function accumulateReasoningDetail(details: ReasoningDetail[], detail: Reasoning
 	}
 }
 
-// A single tool-call turn on an OpenAI-compatible Gemini wire can carry two
+// A single tool-call turn on an OpenAI-compatible Gemini wire can carry
 // independent signatures: a per-call one (`extra_content.google|vertex` or an
-// encrypted `reasoning_details` entry) and a message-level signature
-// (`thinking_signature`, `thought_signature`, or `reasoning_signature`).
-// Both are stashed together on the originating tool call's `thoughtSignature`
+// encrypted `reasoning_details` entry), a `function.thought_signature` on the
+// call, and a message-level signature (`thinking_signature`, `thought_signature`,
+// or `reasoning_signature`).
+// All are stashed together on the originating tool call's `thoughtSignature`
 // so persistence and replay preserve each field.
-// `perCall` holds the raw extra_content object or reasoning detail; `message`
-// holds the message-level signature in its wire shape.
+// `perCall` holds the raw extra_content object or reasoning detail; `function`
+// holds the `function.thought_signature` string; `message` holds the
+// message-level signature in its wire shape.
 type StoredGeminiSignature = {
 	perCall?: unknown;
+	function?: string;
 	message?: Partial<Record<GeminiMessageThoughtSignatureField, string>>;
 };
 
@@ -279,10 +302,14 @@ type StoredGeminiSignature = {
 function normalizeStoredGeminiSignature(value: unknown): StoredGeminiSignature | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
 	const perCall = Reflect.get(value, "perCall");
+	const functionSignature = Reflect.get(value, "function");
+	const envelopeFunction =
+		typeof functionSignature === "string" && functionSignature.length > 0 ? functionSignature : undefined;
 	const envelopeMessage = getGeminiMessageThoughtSignature(Reflect.get(value, "message"));
-	if (perCall !== undefined || envelopeMessage) {
+	if (perCall !== undefined || envelopeFunction || envelopeMessage) {
 		const normalized: StoredGeminiSignature = {};
 		if (perCall !== undefined) normalized.perCall = perCall;
+		if (envelopeFunction) normalized.function = envelopeFunction;
 		if (envelopeMessage) normalized.message = { [envelopeMessage.field]: envelopeMessage.signature };
 		return normalized;
 	}
@@ -291,20 +318,31 @@ function normalizeStoredGeminiSignature(value: unknown): StoredGeminiSignature |
 	return { perCall: value };
 }
 
-// Merges a new per-call or message-level signature into whatever is already
-// stored, so a later message-level signature never clobbers an earlier per-call
-// one (and vice versa).
+// Merges a new per-call, function, or message-level signature into whatever is
+// already stored, so a later signature of one kind never clobbers an earlier one
+// of another kind.
 function mergeStoredGeminiSignature(existing: string | undefined, update: StoredGeminiSignature): string {
 	const merged = normalizeStoredGeminiSignature(parseStoredThoughtSignature(existing)) ?? {};
 	if (update.perCall !== undefined) merged.perCall = update.perCall;
+	if (update.function) merged.function = update.function;
 	if (update.message) merged.message = update.message;
 	return JSON.stringify(merged);
 }
 
-/** The stored signature envelope for a client-replayed `extra_content` (`google` or `vertex`), as this provider writes it. */
-export function storeGeminiToolCallSignature(extraContent: unknown): string | undefined {
+/**
+ * The stored signature envelope for a client-replayed tool call's `extra_content` (`google` or `vertex`) and
+ * `function.thought_signature`, as this provider writes it.
+ */
+export function storeGeminiToolCallSignature(toolCall: unknown): string | undefined {
+	const extraContent =
+		typeof toolCall === "object" && toolCall !== null ? Reflect.get(toolCall, "extra_content") : undefined;
 	const perCall = getGeminiThoughtSignatureExtraContent(extraContent);
-	return perCall ? JSON.stringify({ perCall } satisfies StoredGeminiSignature) : undefined;
+	const functionSignature = getGeminiFunctionThoughtSignature(toolCall);
+	if (!perCall && !functionSignature) return undefined;
+	const stored: StoredGeminiSignature = {};
+	if (perCall) stored.perCall = perCall;
+	if (functionSignature) stored.function = functionSignature;
+	return JSON.stringify(stored);
 }
 
 /** A tool call's `thoughtSignature` without the encrypted `reasoning_details` entry this provider may store on it. */
@@ -312,7 +350,11 @@ export function dropToolCallReasoningDetail(thoughtSignature: string | undefined
 	const stored = normalizeStoredGeminiSignature(parseStoredThoughtSignature(thoughtSignature));
 	const perCall = stored?.perCall;
 	if (!isRecord(perCall) || perCall.type !== "reasoning.encrypted") return thoughtSignature;
-	return stored?.message ? JSON.stringify({ message: stored.message } satisfies StoredGeminiSignature) : undefined;
+	if (!stored?.function && !stored?.message) return undefined;
+	const kept: StoredGeminiSignature = {};
+	if (stored.function) kept.function = stored.function;
+	if (stored.message) kept.message = stored.message;
+	return JSON.stringify(kept);
 }
 
 /**
@@ -328,10 +370,19 @@ export function geminiToolCallExtraContent(
 	return getGeminiThoughtSignatureExtraContent(normalizeStoredGeminiSignature(stored)?.perCall);
 }
 
+/** The `function.thought_signature` that replays a tool call's Gemini signature, read from the stored envelope. */
+export function geminiToolCallFunctionSignature(thoughtSignature: string | undefined): string | undefined {
+	return normalizeStoredGeminiSignature(parseStoredThoughtSignature(thoughtSignature))?.function;
+}
+
 /** The raw Gemini signature behind a tool call's `thoughtSignature`, as native Gemini parts carry it. */
 export function rawGeminiToolCallSignature(thoughtSignature: string | undefined): string | undefined {
 	const extraContent = geminiToolCallExtraContent(thoughtSignature);
-	return extraContent?.google?.thought_signature ?? extraContent?.vertex?.thought_signature;
+	return (
+		extraContent?.google?.thought_signature ??
+		extraContent?.vertex?.thought_signature ??
+		geminiToolCallFunctionSignature(thoughtSignature)
+	);
 }
 
 /**
@@ -746,7 +797,7 @@ export interface OpenAICompletionsOptions extends StreamOptions {
 	 * with the variant baked in).
 	 */
 	openrouterVariant?: string;
-	/** Opt-in GPT-5.6+ prompt-cache policy. Unsupported explicit mode fails locally. */
+	/** Prompt-cache policy. Explicit caching is opt-in. */
 	promptCache?: OpenAIPromptCacheOptions;
 	/**
 	 * Send no `X-Stainless-Timeout` for the first-event budget. For adapter
@@ -819,6 +870,57 @@ function stripDeepseekSpecialTokens(text: string): string {
 	if (DEEPSEEK_SPECIAL_TOKEN_AT_START_REGEX.test(text)) normalized = normalized.replace(/^\s+/u, "");
 	if (DEEPSEEK_SPECIAL_TOKEN_AT_END_REGEX.test(text)) normalized = normalized.replace(/\s+$/u, "");
 	return normalized;
+}
+
+// Outbound counterpart: the DeepSeek encoder parses `<｜…｜>` in message text as special
+// tokens, and V4.1's rejects its image placeholder outright, so a tool result quoting the
+// chat template fails every later request. A zero-width space breaks each token without
+// changing the visible text. Covers the fullwidth-pipe `<｜…｜>` tokens and the bare
+// `｜DSML｜` tool-call token; ASCII spellings (`<|EOT|>`, `<think>`) are common in ordinary
+// text and stay untouched.
+const DEEPSEEK_RESERVED_TOKEN_START_REGEX = /<(?=｜[A-Za-z0-9_.｜▁]{1,64}｜>)/g;
+const DEEPSEEK_DSML_TOKEN = "｜DSML｜";
+const DEEPSEEK_DSML_TOKEN_NEUTRALIZED = "｜\u200bDSML｜";
+// Reasoning can replay under the configured field or a signature-derived one.
+const DEEPSEEK_REASONING_FIELDS: readonly OpenAICompletionsReasoningField[] = [
+	"reasoning_content",
+	"reasoning",
+	"reasoning_text",
+];
+
+function neutralizeDeepseekSpecialTokens(text: string): string {
+	if (!text.includes("｜")) return text;
+	return text
+		.replace(DEEPSEEK_RESERVED_TOKEN_START_REGEX, "<\u200b")
+		.replaceAll(DEEPSEEK_DSML_TOKEN, DEEPSEEK_DSML_TOKEN_NEUTRALIZED);
+}
+
+/** Neutralize DeepSeek special tokens in every text field of the wire messages, in place. */
+function neutralizeDeepseekSpecialTokensInParams(params: ChatCompletionMessageParam[]): void {
+	for (const param of params) {
+		if (typeof param.content === "string") {
+			param.content = neutralizeDeepseekSpecialTokens(param.content);
+		} else if (Array.isArray(param.content)) {
+			for (const part of param.content) {
+				if (part.type === "text") {
+					part.text = neutralizeDeepseekSpecialTokens(part.text);
+				} else if (part.type === "thinking") {
+					for (const inner of part.thinking) inner.text = neutralizeDeepseekSpecialTokens(inner.text);
+				}
+			}
+		}
+		if (param.role !== "assistant") continue;
+		const assistant: OpenAICompletionsAssistantMessageParam = param;
+		for (const field of DEEPSEEK_REASONING_FIELDS) {
+			const reasoning = assistant[field];
+			if (reasoning !== undefined) assistant[field] = neutralizeDeepseekSpecialTokens(reasoning);
+		}
+		for (const toolCall of assistant.tool_calls ?? []) {
+			if (toolCall.type === "function") {
+				toolCall.function.arguments = neutralizeDeepseekSpecialTokens(toolCall.function.arguments);
+			}
+		}
+	}
 }
 
 // Find a trailing partial `<｜...` (or `<|...`) that has not yet been closed by a
@@ -970,6 +1072,7 @@ const streamOpenAICompletionsOnce = (
 				// The family affinity key rides only an explicit prompt-cache
 				// identity; the sessionId-derived cache-id fallback never does.
 				options?.promptCacheKey ? promptCacheSessionId : undefined,
+				options?.parentSessionId,
 			);
 			const premiumRequestsTotal = copilotPremiumRequests;
 			let appliedStrictTools = false;
@@ -1754,6 +1857,12 @@ const streamOpenAICompletionsOnce = (
 									perCall: extraContent,
 								});
 							}
+							const functionSignature = getGeminiFunctionThoughtSignature(toolCall);
+							if (functionSignature) {
+								block.thoughtSignature = mergeStoredGeminiSignature(block.thoughtSignature, {
+									function: functionSignature,
+								});
+							}
 							let delta = "";
 							// The OpenAI SDK types `function.arguments` as a JSON string, but MiniMax-compatible
 							// hosts stream a fully-formed object instead. Model both shapes so the branches below
@@ -1991,6 +2100,9 @@ const streamOpenAICompletionsOnce = (
 			});
 			output.stopReason = result.stopReason;
 			output.errorStatus = result.status;
+			if (error instanceof OpenAIHttpError && AIError.isTransientStatus(result.status)) {
+				transportExhaustedMessages.add(output);
+			}
 			output.errorId = result.id;
 			output.errorMessage = result.message;
 			// Some providers via OpenRouter include extra details here.
@@ -2043,6 +2155,7 @@ function createRequestSetup(
 	promptCacheSessionId?: string,
 	sessionId?: string,
 	promptCacheAffinityKey?: string,
+	parentSessionId?: string,
 ): OpenAIRequestSetup & { baseUrl: string } {
 	const apiVersion = $env.AZURE_OPENAI_API_VERSION || "2024-10-21";
 	const deploymentName = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(model.id) ?? model.id;
@@ -2053,18 +2166,19 @@ function createRequestSetup(
 		promptCacheSessionId,
 		sessionId,
 		promptCacheAffinityKey,
+		parentSessionId,
 		messages: context.messages,
 		defaultBaseUrl: "https://api.openai.com/v1",
-		// Provider auth/header overlay: Kimi-code hosts require shared client
-		// attribution headers prepended before caller headers. Kept here (not in
-		// the shared helper) because it is provider-specific request setup.
+		// Provider auth/header overlay: Kimi Code managed endpoints (`kimi-code-endpoint`
+		// axis) require shared client attribution headers prepended before caller
+		// headers. Kept here (not in the shared helper) because it is
+		// provider-specific request setup.
 		// ClinePass sends the mirrored Cline CLI identity; documented in wire/cline-pass.ts.
-		prependHeaders:
-			model.provider === "kimi-code"
-				? getKimiCommonHeaders
-				: model.provider === "cline-pass"
-					? () => clinePassClientHeaders(promptCacheSessionId)
-					: undefined,
+		prependHeaders: isKimiCodeEndpoint(model)
+			? getKimiCommonHeaders
+			: model.provider === "cline-pass"
+				? () => clinePassClientHeaders(promptCacheSessionId)
+				: undefined,
 		alibabaCodingPlanAuth: true,
 		azureChatCompletions: { apiVersion, deploymentName },
 	});
@@ -2117,35 +2231,42 @@ function isChatCompletionsPromptCacheableContentBlock(
 	return block.type === "text" || block.type === "image_url" || block.type === "input_audio" || block.type === "file";
 }
 
-function markLatestStableChatCompletionsCacheBreakpoint(messages: ChatCompletionMessageParam[]): boolean {
-	let latestInputMessage = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role === "user" || message.role === "developer") {
-			latestInputMessage = i;
-			break;
-		}
-	}
-	if (latestInputMessage <= 0) return false;
+function chatCompletionsPromptCacheBoundary(
+	message: ChatCompletionMessageParam,
+): OpenAIPromptCacheBoundary | undefined {
+	if (message.role === "system" || message.role === "developer") return "instructions";
+	if (message.role === "user") return "user";
+	return message.role === "tool" ? "output" : undefined;
+}
 
-	for (let i = latestInputMessage - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role !== "user" && message.role !== "developer" && message.role !== "system") continue;
-		if (typeof message.content === "string") {
-			messages[i] = {
-				...message,
-				content: [{ type: "text", text: message.content, prompt_cache_breakpoint: { mode: "explicit" } }],
-			};
-			return true;
+function markedChatCompletionsText(text: string): ChatCompletionContentPartText[] | undefined {
+	return text ? [{ type: "text", text, prompt_cache_breakpoint: { mode: "explicit" } }] : undefined;
+}
+
+/** A copy of `message` with its last cacheable block marked; undefined when nothing in it can carry a breakpoint. */
+function withChatCompletionsMessageBreakpoint(
+	message: ChatCompletionMessageParam,
+): ChatCompletionMessageParam | undefined {
+	switch (message.role) {
+		case "user": {
+			const content =
+				typeof message.content === "string"
+					? markedChatCompletionsText(message.content)
+					: withOpenAIPromptCacheBreakpoint(message.content, isChatCompletionsPromptCacheableContentBlock);
+			return content && { ...message, content };
 		}
-		for (let j = message.content.length - 1; j >= 0; j--) {
-			const block = message.content[j];
-			if (!isChatCompletionsPromptCacheableContentBlock(block)) continue;
-			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
-			return true;
+		case "system":
+		case "developer":
+		case "tool": {
+			const content =
+				typeof message.content === "string"
+					? markedChatCompletionsText(message.content)
+					: withOpenAIPromptCacheBreakpoint(message.content, isChatCompletionsPromptCacheableContentBlock);
+			return content && { ...message, content };
 		}
+		default:
+			return undefined;
 	}
-	return false;
 }
 
 function applyOpenAIChatCompletionsPromptCachePolicy(
@@ -2181,7 +2302,11 @@ function applyOpenAIChatCompletionsPromptCachePolicy(
 		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
 	};
 	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
-		markLatestStableChatCompletionsCacheBreakpoint(params.messages);
+		markOpenAIPromptCacheBoundaries(
+			params.messages,
+			chatCompletionsPromptCacheBoundary,
+			withChatCompletionsMessageBreakpoint,
+		);
 }
 
 function buildParams(
@@ -2901,6 +3026,7 @@ export function convertMessages(
 					const stored = normalizeStoredGeminiSignature(parseStoredThoughtSignature(tc.thoughtSignature));
 					const extraContent = getGeminiThoughtSignatureExtraContent(stored?.perCall);
 					if (extraContent) replayedToolCall.extra_content = extraContent;
+					if (stored?.function) replayedToolCall.function.thought_signature = stored.function;
 					return replayedToolCall;
 				});
 				for (const toolCall of toolCalls) {
@@ -3045,7 +3171,44 @@ export function convertMessages(
 				: msg.role;
 	}
 
+	if (compat.neutralizeDeepseekSpecialTokens) {
+		neutralizeDeepseekSpecialTokensInParams(params);
+	}
+
 	return params;
+}
+
+/**
+ * Rewrites tool parameters into the schema dialect `flavor` names; see
+ * {@link ResolvedOpenAICompat.toolSchemaFlavor}. Called once per tool by
+ * {@link convertTools} after strict adaptation.
+ */
+function applyToolSchemaFlavor(
+	flavor: ResolvedOpenAICompat["toolSchemaFlavor"],
+	parameters: Record<string, unknown>,
+): Record<string, unknown> {
+	switch (flavor) {
+		// Moonshot/Kimi native hosts validate against the stricter MFJS subset
+		// (const→enum, typed enums, no validators) and 400 otherwise.
+		case "moonshot-mfjs": {
+			const normalized = normalizeSchemaForMoonshot(parameters);
+			return isRecord(normalized) ? normalized : parameters;
+		}
+		// Gemini behind an OpenAI-compatible host (GitHub Copilot) takes Google's
+		// dialect: a JSON Schema `type` array 400s the whole request.
+		case "google": {
+			const normalized = normalizeSchemaForGoogle(parameters);
+			return isRecord(normalized) ? normalized : parameters;
+		}
+		// Grammar-constrained local backends (llama.cpp, LM Studio, vLLM)
+		// build a GBNF grammar from the schema and 400 with
+		// `Unrecognized schema: true` on the bare boolean subschema
+		// `toolWireSchema` emits for open fields (issue #5914).
+		case "grammar":
+			return sanitizeSchemaForGrammar(parameters);
+		default:
+			return parameters;
+	}
 }
 
 function convertTools(
@@ -3091,18 +3254,7 @@ function convertTools(
 		const includeExplicitFalse =
 			!includeStrict && tool.strict === false && toolStrictMode === "mixed" && compat.supportsStrictMode !== false;
 		const wireParameters = includeStrict ? parameters : baseParameters;
-		// Moonshot/Kimi native hosts validate against the stricter MFJS subset
-		// (const→enum, typed enums, no validators) and 400 otherwise.
-		// Grammar-constrained local backends (llama.cpp, LM Studio, vLLM)
-		// build a GBNF grammar from the schema and 400 with
-		// `Unrecognized schema: true` on the bare boolean subschema
-		// `toolWireSchema` emits for open fields (issue #5914).
-		const emittedParameters =
-			compat.toolSchemaFlavor === "moonshot-mfjs"
-				? (normalizeSchemaForMoonshot(wireParameters) as Record<string, unknown>)
-				: compat.toolSchemaFlavor === "grammar"
-					? sanitizeSchemaForGrammar(wireParameters)
-					: wireParameters;
+		const emittedParameters = applyToolSchemaFlavor(compat.toolSchemaFlavor, wireParameters);
 		const violation = findStrictToolSchemaViolation(emittedParameters, "#", { rejectRootObjectUnion });
 		if (violation) {
 			logger.warn(

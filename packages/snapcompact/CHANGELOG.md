@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Snapcompact uses one installed font for the entire transcript and falls back to text when no single font covers it. The `silver16-bw` shape is now `cjk16-bw`.
+
+### Changed
+
+- Increased row spacing in CJK frames so vision models can distinguish horizontal lines.
+- Switched Claude Opus 5.5 and GPT-6.1 Terra to the denser `8on16-bw` layout for English text.
+
+## [19.1.1] - 2026-11-23
+
+### Fixed
+
+- Fixed snapcompact archive summaries so they accurately report the grid layout of dense middle frames.
+
 ## [19.0.1] - 2026-11-19
 
 ### Added

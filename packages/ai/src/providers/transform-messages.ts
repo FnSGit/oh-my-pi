@@ -563,8 +563,8 @@ const DIRECT_REPLAY_APIS: Record<KnownApi, boolean> = {
 	"anthropic-messages": true,
 	"bedrock-converse-stream": true,
 	"google-generative-ai": true,
-	"google-gemini-cli": true,
 	"google-vertex": true,
+	"google-interactions": true,
 	"ollama-chat": true,
 	"apple-foundation-models": true,
 	"cursor-agent": false,
@@ -1105,7 +1105,9 @@ export function transformMessages<TApi extends Api>(
 			): boolean => {
 				if (candidate.type !== "thinking") return false;
 				if (!isAnthropicReplay) return false;
-				if (isLatestSurvivingAssistant && abandonedToolUse) return true;
+				if (isLatestSurvivingAssistant && abandonedToolUse) {
+					return !(isSameModel && isSigningAnthropicTarget && !candidate.thinkingSignature?.trim());
+				}
 				const candidateSignatureUntrustworthy =
 					abandonedToolUse || (invalidStopReason && candidateIndex === lastBlockIndex);
 				const replaySignature =
@@ -1156,7 +1158,13 @@ export function transformMessages<TApi extends Api>(
 						// Latest abandoned turn: Anthropic's byte-for-byte rule forbids
 						// even stripping a signature on the latest message — but only
 						// for turns the target's own provider issued.
-						if (isLatestSurvivingAssistant && abandonedToolUse && !crossProviderSource) return block;
+						// The rule binds signed blocks only: an unsigned same-model block
+						// cannot replay natively on a signing target, so it is dropped
+						// like on every other turn (see below), never demoted to text.
+						if (isLatestSurvivingAssistant && abandonedToolUse && !crossProviderSource) {
+							if (isSameModel && isSigningAnthropicTarget && !block.thinkingSignature?.trim()) return [];
+							return block;
+						}
 						// Preserve same-deployment signatures and let Anthropic perform
 						// its one-way model compatibility check. Across deployments,
 						// strip stale signatures so the encoder applies the target's
@@ -1617,9 +1625,46 @@ export function transformMessages<TApi extends Api>(
 	flushPendingToolCalls(Date.now());
 	flushPendingAbortedToolCalls();
 
+	const splitsToolCalls =
+		targetCompat !== undefined && "splitToolCalls" in targetCompat && targetCompat.splitToolCalls;
+	const replay = splitsToolCalls ? splitAssistantToolCalls(result) : result;
 	const foldsUserText =
 		targetCompat !== undefined && "foldUserAfterToolResult" in targetCompat && targetCompat.foldUserAfterToolResult;
-	return foldsUserText ? foldUserMessagesIntoToolResults(result) : result;
+	return foldsUserText ? foldUserMessagesIntoToolResults(replay) : replay;
+}
+
+/**
+ * Replay each call of a multi-call assistant turn as its own assistant
+ * message, directly followed by that call's result (`splitToolCalls`): Llama 3
+ * chat templates served by vLLM reject an assistant message holding more than
+ * one tool call. The turn's text and thinking stay with its first call. The
+ * pieces drop the turn's native Responses items, which would replay the calls
+ * side by side again.
+ */
+function splitAssistantToolCalls(messages: Message[]): Message[] {
+	const split: Message[] = [];
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i];
+		const calls = msg.role === "assistant" ? msg.content.filter(block => block.type === "toolCall") : [];
+		if (msg.role !== "assistant" || calls.length < 2) {
+			split.push(msg);
+			continue;
+		}
+		const results: ToolResultMessage[] = [];
+		for (let next = messages[i + 1]; next?.role === "toolResult"; next = messages[i + 1]) {
+			results.push(next);
+			i++;
+		}
+		const { providerPayload: _native, ...turn } = msg;
+		const rest = msg.content.filter(block => block.type !== "toolCall");
+		for (const [n, call] of calls.entries()) {
+			split.push({ ...turn, content: n === 0 ? [...rest, call] : [call] });
+			const at = results.findIndex(result => result.toolCallId === call.id);
+			if (at >= 0) split.push(...results.splice(at, 1));
+		}
+		split.push(...results);
+	}
+	return split;
 }
 
 /**

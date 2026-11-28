@@ -6,15 +6,21 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use ashpd::desktop::{
-	PersistMode, Session,
-	screencast::{CursorMode, Screencast, SourceType},
+use ashpd::{
+	desktop::{
+		CreateSessionOptions, PersistMode, Session,
+		screencast::{
+			CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
+			StartCastOptions,
+		},
+	},
+	enumflags2::BitFlags,
 };
 use image::RgbaImage;
 
 use super::{
-	pipewire::{self, PipeWire, PixelFormat, Plane, SpaHook, SpaPod, StreamEvents, VideoFormat},
-	portal::{read_token, store_token},
+	pipewire::{self, PipeWire, PixelFormat, SpaChunk, SpaHook, SpaPod, StreamEvents, VideoFormat},
+	portal::{read_token, store_token, until_deadline},
 };
 use crate::desktop::{
 	control,
@@ -22,15 +28,23 @@ use crate::desktop::{
 };
 
 const SCREENCAST_TOKEN: &str = "screencast-token";
+/// Bounds each `ScreenCast` portal step that does not wait on the user.
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// The `Timeout` a `ScreenCast` step waiting on the share picker ends with.
+/// The step may also have been waiting on the portal itself, so it does not
+/// claim a picker was shown.
+const PICKER_UNANSWERED: &str = "the screen-share portal did not answer before the call's \
+                                 deadline, so nothing was captured; if it showed a screen-share \
+                                 picker, which can open behind other windows, ask the user to \
+                                 answer it, then retry";
 
 struct ScreenCast {
 	node:     u32,
 	fd:       OwnedFd,
 	position: Option<(i32, i32)>,
 	size:     Option<(i32, i32)>,
-	session:  Session<'static, Screencast<'static>>,
+	session:  Session<Screencast>,
 }
 
 struct CapturedFrame {
@@ -46,6 +60,24 @@ async fn portal_request<T>(request: impl Future<Output = Result<T, String>>) -> 
 		.map_err(DesktopError::capture_failed)
 }
 
+/// Runs a `ScreenCast` step that can wait on the share picker, until the
+/// call's deadline as the `RemoteDesktop` dialog does, rather than failing
+/// each call after `PORTAL_TIMEOUT` while the picker stays open. GNOME and
+/// KDE open the picker in `Start`; xdg-desktop-portal-hyprland opens it in
+/// `SelectSources` and serves one request at a time, so while its picker is
+/// open a later `CreateSession` waits for it too. The step is boxed so the
+/// futures awaiting it stay small.
+fn picker_request<'a, T: 'a>(
+	request: impl Future<Output = Result<T, String>> + 'a,
+) -> impl Future<Output = CoreResult<T>> + 'a {
+	let request = Box::pin(request);
+	async move {
+		control::cancellable(until_deadline(request, PICKER_UNANSWERED))
+			.await??
+			.map_err(DesktopError::capture_failed)
+	}
+}
+
 async fn open_screencast() -> CoreResult<ScreenCast> {
 	let portal = portal_request(async {
 		Screencast::new()
@@ -53,46 +85,56 @@ async fn open_screencast() -> CoreResult<ScreenCast> {
 			.map_err(|err| format!("ScreenCast portal: {err}"))
 	})
 	.await?;
-	let session = portal_request(async {
+	let session = picker_request(async {
 		portal
-			.create_session()
+			.create_session(CreateSessionOptions::default())
 			.await
 			.map_err(|err| format!("ScreenCast CreateSession: {err}"))
 	})
 	.await?;
-	let opened = portal_request(async {
+	let opened = async {
 		let restore_token = read_token(SCREENCAST_TOKEN);
-		portal
-			.select_sources(
-				&session,
-				CursorMode::Embedded,
-				SourceType::Monitor.into(),
-				true,
-				restore_token.as_deref(),
-				PersistMode::ExplicitlyRevoked,
-			)
-			.await
-			.map_err(|err| format!("ScreenCast SelectSources: {err}"))?;
-		let response = portal
-			.start(&session, None)
-			.await
-			.map_err(|err| format!("ScreenCast Start: {err}"))?
-			.response()
-			.map_err(|err| format!("ScreenCast permission: {err}"))?;
+		picker_request(async {
+			portal
+				.select_sources(
+					&session,
+					SelectSourcesOptions::default()
+						.set_cursor_mode(CursorMode::Embedded)
+						.set_sources(BitFlags::from(SourceType::Monitor))
+						.set_multiple(true)
+						.set_restore_token(restore_token.as_deref())
+						.set_persist_mode(PersistMode::ExplicitlyRevoked),
+				)
+				.await
+				.map_err(|err| format!("ScreenCast SelectSources: {err}"))
+		})
+		.await?;
+		let response = picker_request(async {
+			portal
+				.start(&session, None, StartCastOptions::default())
+				.await
+				.map_err(|err| format!("ScreenCast Start: {err}"))
+		})
+		.await?
+		.response()
+		.map_err(|err| DesktopError::capture_failed(format!("ScreenCast permission: {err}")))?;
 		store_token(SCREENCAST_TOKEN, response.restore_token());
 		let stream = response
 			.streams()
 			.first()
-			.ok_or_else(|| "ScreenCast returned no monitor stream".to_string())?;
+			.ok_or_else(|| DesktopError::capture_failed("ScreenCast returned no monitor stream"))?;
 		let node = stream.pipe_wire_node_id();
 		let position = stream.position();
 		let size = stream.size();
-		let fd = portal
-			.open_pipe_wire_remote(&session)
-			.await
-			.map_err(|err| format!("ScreenCast OpenPipeWireRemote: {err}"))?;
-		Ok((node, fd, position, size))
-	})
+		let fd = portal_request(async {
+			portal
+				.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
+				.await
+				.map_err(|err| format!("ScreenCast OpenPipeWireRemote: {err}"))
+		})
+		.await?;
+		Ok::<_, DesktopError>((node, fd, position, size))
+	}
 	.await;
 	match opened {
 		Ok((node, fd, position, size)) => Ok(ScreenCast { node, fd, position, size, session }),
@@ -103,21 +145,22 @@ async fn open_screencast() -> CoreResult<ScreenCast> {
 	}
 }
 
-fn rgba_from_buffer(format: VideoFormat, plane: &Plane<'_>) -> Result<RgbaImage, String> {
+fn rgba_from_buffer(
+	format: VideoFormat,
+	chunk: SpaChunk,
+	source: &[u8],
+) -> Result<RgbaImage, String> {
 	let VideoFormat { width, height, .. } = format;
 	if width == 0 || height == 0 {
 		return Err("PipeWire negotiated an empty frame".to_string());
 	}
-	let offset = plane.chunk.offset as usize;
-	let bytes = plane.chunk.size as usize;
-	let stride = plane.chunk.stride;
+	let offset = chunk.offset as usize;
+	let bytes = chunk.size as usize;
+	let stride = chunk.stride;
 	if stride <= 0 {
 		return Err(format!("PipeWire returned unsupported frame stride {stride}"));
 	}
 	let stride = stride as usize;
-	let source = plane
-		.memory
-		.ok_or_else(|| "PipeWire frame buffer is not memory-mapped".to_string())?;
 	let end = offset
 		.checked_add(bytes)
 		.ok_or_else(|| "PipeWire frame size overflow".to_string())?
@@ -228,7 +271,11 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
 		listener.frame = Some(if format.width == 0 || format.height == 0 {
 			Err(DesktopError::capture_failed("PipeWire negotiated an empty frame"))
 		} else if listener.pixels {
-			rgba_from_buffer(format, &plane)
+			plane
+				.with_memory(|bytes| rgba_from_buffer(format, plane.chunk, bytes))
+				.unwrap_or_else(|| {
+					Err("PipeWire frame buffer is not memory-mapped readable".to_string())
+				})
 				.map(|image| CapturedFrame {
 					image:  Some(image),
 					width:  format.width,
@@ -427,7 +474,40 @@ pub(super) fn geometry(pw: pipewire::Loaded) -> CoreResult<super::PortalGeometry
 
 #[cfg(test)]
 mod tests {
+	use futures::FutureExt;
+
 	use super::*;
+
+	/// A `ScreenCast` step that can show the picker waits until the call's
+	/// deadline and then names the picker, and passes a portal error through
+	/// as it is.
+	#[test]
+	fn a_picker_step_waits_until_the_deadline_and_passes_portal_errors_through() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		// The run leaves only the session-close budget, so the step gives up on
+		// its first poll; one bounded by `PORTAL_TIMEOUT` would still be pending.
+		let ending = control::CancellationSource::default();
+		ending.set_deadline(Some(std::time::Instant::now() + crate::desktop::CLOSE_TIMEOUT));
+		let (unanswered, failed) = control::with_token_for_test(&ending.token(), || {
+			runtime.block_on(async {
+				(
+					picker_request(std::future::pending::<Result<(), String>>()).now_or_never(),
+					picker_request(async { Err::<(), _>("x".to_owned()) }).now_or_never(),
+				)
+			})
+		});
+		let error = unanswered.expect("the wait must end at once").unwrap_err();
+		assert_eq!(error.code.as_str(), "Timeout");
+		assert_eq!(error.message, PICKER_UNANSWERED);
+		let error = failed
+			.expect("a portal error ends the step at once")
+			.unwrap_err();
+		assert_eq!(error.code.as_str(), "CaptureFailed");
+		assert_eq!(error.message, "x");
+	}
 
 	#[test]
 	fn cancelled_geometry_refresh_never_opens_a_portal_session() {

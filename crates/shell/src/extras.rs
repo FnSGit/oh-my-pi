@@ -3,9 +3,13 @@
 //! [`PiHost::resolve`](crate::host::PiHost) looks a name up in pi's order:
 //! the engine's intrinsics (bash's builtins: `echo`, `printf`, `test`, `kill`,
 //! `read`, `cd`, …), then pi's tools ([`crate::tools`]: `timeout`, `nohup`,
-//! `git`, and the extras that run command lines), then pi's other extras, then
-//! `PATH`. A name with a slash is never an extra. `type` and `command -v`
-//! report an extra as a shell builtin, as pi does.
+//! `git`, and the extras that run command lines), then pi's other extras,
+//! then the shells the engine runs itself (`sh`, `bash`, `zsh`), then the
+//! session commands of the run ([`crate::commands`]), then `PATH`. Shell
+//! functions and aliases come before all of these except the session
+//! commands, which come before them too. A name with a slash is never an
+//! extra or a session command. `type` and `command -v` report an extra or a
+//! session command as a shell builtin, as pi does.
 //!
 //! - Most extras (`cat`, `sort`, `grep`, `sed`, `ps`, `sleep`, …) are
 //!   [`Resolved::Native`](crate::bash::Resolved::Native): [`ExtraTask`] runs
@@ -56,7 +60,7 @@ use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-	bash::{EnvView, FdRef, FileKind, NativeRef, OsHandle, Signal, Task},
+	bash::{EnvView, FdRef, FileKind, NativeRef, OsHandle, Resolved, Signal, Task},
 	tools::ToolConfig,
 };
 
@@ -157,6 +161,45 @@ impl ExtrasGate {
 			.offered(name)
 			.is_some_and(|(_, kind)| kind == ExtraKind::Utility { runs_commands: true })
 	}
+}
+
+/// Whether pi's command `name` gives way to `PATH`'s program of that name
+/// for `argv` ([`Host::defers_to_path`](crate::bash::Host::defers_to_path)).
+/// On Windows: `argv` written in the syntax of the System32 program it
+/// shadows (`find /c /v ""`, `sort /r`, `timeout /t 5`, `whoami /all`:
+/// [`crate::cmd_dialect`]). Elsewhere: an extra given an option it does not
+/// implement (`ps --forest`, `tar --hard-dereference`), which `PATH`'s
+/// program may have; with none there the builtin runs and reports the
+/// option. Windows' `PATH` programs of those names are System32's, a
+/// different command language.
+pub(crate) fn defers_to_path(name: &BStr, argv: &[BString]) -> bool {
+	if cfg!(windows) {
+		return crate::cmd_dialect::speaks_shadowed_program(name, argv.get(1..).unwrap_or_default());
+	}
+	omp_builtins::extras::lacks_option(
+		&name.to_str_lossy(),
+		argv
+			.iter()
+			.map(|arg| arg.to_str_lossy().into_owned())
+			.collect(),
+	)
+}
+
+/// Whether pi's command `name`, resolved to `resolved`, gives way to
+/// `PATH`'s program as the sole command of a background job
+/// ([`Host::prefers_background_program`](crate::bash::Host::prefers_background_program)):
+/// only those whose whole effect is a process lifetime (`sleep`, `yes`,
+/// `timeout`), so `$!` names a pid OS tools see. Any other extra keeps its
+/// own dialect and the `scheme://` paths only builtins open.
+pub(crate) fn prefers_background_program(name: &BStr, resolved: &Resolved) -> bool {
+	const PROGRAMS: [&[u8]; 3] = [b"sleep", b"timeout", b"yes"];
+	// A GNU-style invocation must not acquire System32's incompatible
+	// grammar just because it has an `&` (notably `timeout N COMMAND`).
+	if cfg!(windows) && crate::cmd_dialect::shadows_windows_program(name) {
+		return false;
+	}
+	matches!(resolved, Resolved::Native(_) | Resolved::Tool(_))
+		&& PROGRAMS.contains(&name.as_bytes())
 }
 
 /// The flag an extra raises when it reports an error yet goes on (jq), for
@@ -406,10 +449,19 @@ impl Drop for Finish {
 
 /// Run `invocation` on `runtime`; its status lands in the returned [`Done`].
 pub(crate) fn spawn(runtime: &tokio::runtime::Handle, invocation: Invocation) -> Arc<Done> {
+	spawn_status(runtime, omp_builtins::extras::run(invocation))
+}
+
+/// Run `status` on `runtime`; the status it ends with lands in the returned
+/// [`Done`] (1 when it never ends: a panic, or the runtime shut down).
+pub(crate) fn spawn_status(
+	runtime: &tokio::runtime::Handle,
+	status: impl Future<Output = i32> + Send + 'static,
+) -> Arc<Done> {
 	let done = Arc::new(Done::default());
 	let finish = Finish(Arc::clone(&done));
 	drop(runtime.spawn(async move {
-		let code = omp_builtins::extras::run(invocation).await;
+		let code = status.await;
 		finish.0.finish(code);
 	}));
 	done
@@ -417,7 +469,7 @@ pub(crate) fn spawn(runtime: &tokio::runtime::Handle, invocation: Invocation) ->
 
 /// A signal that cancels an extra: those whose default action ends a
 /// process (pi's TERM/INT/KILL, and the hangup and quit a job may get).
-const fn cancels(sig: Signal) -> bool {
+pub(crate) const fn cancels(sig: Signal) -> bool {
 	matches!(sig, Signal::Term | Signal::Int | Signal::Kill | Signal::Hup | Signal::Quit)
 }
 

@@ -6,7 +6,6 @@
 use std::os::unix::ffi::OsStrExt;
 use std::{
 	ffi::{OsStr, OsString},
-	fmt,
 	io::{self, Read, Write},
 	ops::BitOr,
 	path::{Component, MAIN_SEPARATOR, Path, PathBuf, Prefix},
@@ -17,9 +16,6 @@ use clap::{
 	builder::{PossibleValue, ValueParser},
 	parser::ValueSource,
 };
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
-use parking_lot::Mutex;
-use crate::openfile::OpenFile;
 use omp_vfs::{FileType, Metadata, child_path, is_virtual_path, normalize_lexically, parent_path};
 use thiserror::Error;
 use uucore::{display::Quotable, parser::shortcut_value_parser::ShortcutValueParser};
@@ -78,7 +74,14 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use indicatif::ProgressBar;
+#[cfg(target_os = "macos")]
+use std::{
+	io,
+	os::{darwin::fs::MetadataExt, fd::AsRawFd},
+};
+
+#[cfg(target_os = "macos")]
+use nix::{NixPath, errno::Errno};
 use uucore::{display::Quotable, safe_traversal::{DirFd, SymlinkBehavior}};
 
 use super::{
@@ -178,6 +181,78 @@ fn native_entry(host: &Host, path: &Path) -> Option<(PathBuf, OsString)> {
 	Some((parent, name))
 }
 
+#[cfg(target_os = "macos")]
+fn is_dataless(_path: &Path, flags: u32) -> bool {
+	// SF_DATALESS in sys/stat.h is not exposed by the libc crate.
+	const SF_DATALESS: u32 = 0x4000_0000;
+	#[cfg(test)]
+	if TEST_DATALESS_PATH.with(|path| path.borrow().as_deref() == Some(_path)) {
+		return true;
+	}
+	flags & SF_DATALESS != 0
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+	pub(super) static TEST_DATALESS_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn is_dataless_directory(path: &Path, metadata: &omp_vfs::Metadata) -> bool {
+	metadata.native().is_some_and(|metadata| is_dataless(path, metadata.st_flags()))
+}
+
+#[cfg(target_os = "macos")]
+fn unlink_dataless_at(parent: libc::c_int, name: &OsStr) -> io::Result<()> {
+	// Apple's rm uses this flag from XNU's sys/fcntl_private.h. The kernel
+	// validates that nonempty directories are still dataless before removing.
+	const AT_REMOVEDIR_DATALESS: libc::c_int = 0x0100;
+	name.with_nix_path(|name| {
+		let unlink = |flags| {
+			// SAFETY: name is a valid C string and parent is AT_FDCWD or a live directory fd.
+			Errno::result(unsafe { libc::unlinkat(parent, name.as_ptr(), flags) }).map(|_| ())
+		};
+		match unlink(AT_REMOVEDIR_DATALESS) {
+			Err(Errno::EINVAL) => unlink(libc::AT_REMOVEDIR),
+			result => result,
+		}
+	})?
+	.map_err(io::Error::from)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_dataless_dir(
+	host: &mut Host,
+	parent_fd: libc::c_int,
+	name: &OsStr,
+	path: &Path,
+	options: &Options,
+) -> bool {
+	match unlink_dataless_at(parent_fd, name) {
+		Ok(()) => {
+			verbose_removed_directory(host, path, options);
+			false
+		},
+		Err(error) if is_missing_under_force(&error, options) => false,
+		Err(error) => show_removal_error(host, error, path),
+	}
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn remove_dataless_operand(
+	host: &mut Host,
+	resolved: &Path,
+	path: &Path,
+	metadata: &omp_vfs::Metadata,
+	options: &Options,
+) -> bool {
+	if !prompt_dir_with_mode(host, path, metadata.permissions().mode() as libc::mode_t, options) {
+		return false;
+	}
+	host.fs().note_change(resolved);
+	remove_dataless_dir(host, libc::AT_FDCWD, resolved.as_os_str(), path, options)
+}
+
 /// Remove a single file using safe traversal.
 ///
 /// Returns `None` when `path` is not a native host path, so the caller
@@ -185,7 +260,6 @@ fn native_entry(host: &Host, path: &Path) -> Option<(PathBuf, OsString)> {
 pub fn safe_remove_file(host: &mut Host, 
 	path: &Path,
 	options: &Options,
-	progress_bar: Option<&ProgressBar>,
 ) -> Option<bool> {
 	let (parent, file_name) = native_entry(host, path)?;
 	let dir_fd = DirFd::open(&parent, SymlinkBehavior::Follow).ok()?;
@@ -194,10 +268,6 @@ pub fn safe_remove_file(host: &mut Host,
 
 	match dir_fd.unlink_at(&file_name, false) {
 		Ok(_) => {
-			// Update progress bar for file removal
-			if let Some(pb) = progress_bar {
-				pb.inc(1);
-			}
 			verbose_removed_file(host, path, options);
 			Some(false)
 		},
@@ -220,17 +290,12 @@ pub fn safe_remove_file(host: &mut Host,
 pub fn safe_remove_empty_dir(host: &mut Host, 
 	path: &Path,
 	options: &Options,
-	progress_bar: Option<&ProgressBar>,
 ) -> Option<bool> {
 	let (parent, dir_name) = native_entry(host, path)?;
 	let dir_fd = DirFd::open(&parent, SymlinkBehavior::Follow).ok()?;
 
 	match dir_fd.unlink_at(&dir_name, true) {
 		Ok(_) => {
-			// Update progress bar for directory removal
-			if let Some(pb) = progress_bar {
-				pb.inc(1);
-			}
 			verbose_removed_directory(host, path, options);
 			Some(false)
 		},
@@ -298,7 +363,6 @@ fn handle_unlink(host: &mut Host,
 pub fn safe_remove_dir_recursive(host: &mut Host, 
 	path: &Path,
 	options: &Options,
-	progress_bar: Option<&ProgressBar>,
 ) -> bool {
 	if host.is_cancelled() {
 		return true;
@@ -309,7 +373,7 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 	// Use lstat to avoid race condition between check and use
 	let initial_mode = match host.fs().symlink_metadata(&path_fs) {
 		Ok(metadata) if !metadata.is_dir() => {
-			return remove_file(host, path, options, progress_bar);
+			return remove_file(host, path, options);
 		},
 		Ok(metadata) => metadata.permissions().mode(),
 		Err(e) if is_missing_under_force(&e, options) => return false,
@@ -375,7 +439,7 @@ pub fn safe_remove_dir_recursive(host: &mut Host,
 		}
 
 		// Directory is empty and user approved removal
-		if let Some(result) = safe_remove_empty_dir(host, path, options, progress_bar) {
+		if let Some(result) = safe_remove_empty_dir(host, path, options) {
 			result
 		} else {
 			remove_dir_with_special_cases(host, path, options, error)
@@ -560,6 +624,15 @@ pub fn safe_remove_dir_recursive_impl(host: &mut Host, path: &Path, mut cur_fd: 
 			if ancestors.contains(&entry_id) {
 				show_cycle_error(host, path_of(&path_buf));
 				error = true;
+				break 'entry false;
+			}
+
+			#[cfg(target_os = "macos")]
+			if is_dataless(path_of(&path_buf), entry_stat.st_flags) {
+				let path = path_of(&path_buf);
+				if prompt_dir_with_mode(host, path, entry_stat.st_mode, options) {
+					error |= remove_dataless_dir(host, cur_fd.as_raw_fd(), &entry_name, path, options);
+				}
 				break 'entry false;
 			}
 
@@ -863,8 +936,6 @@ pub struct Options {
 	pub dir:                 bool,
 	/// `-v`, `--verbose`
 	pub verbose:             bool,
-	/// `-g`, `--progress`
-	pub progress:            bool,
 	#[doc(hidden)]
 	/// `---presume-input-tty`
 	/// Always use `None`; GNU flag for testing use only
@@ -881,7 +952,6 @@ impl Default for Options {
 			recursive:           false,
 			dir:                 false,
 			verbose:             false,
-			progress:            false,
 			__presume_input_tty: None,
 		}
 	}
@@ -897,7 +967,6 @@ static OPT_PROMPT_ALWAYS: &str = "prompt-always";
 static OPT_PROMPT_ONCE: &str = "prompt-once";
 static OPT_RECURSIVE: &str = "recursive";
 static OPT_VERBOSE: &str = "verbose";
-static OPT_PROGRESS: &str = "progress";
 static PRESUME_INPUT_TTY: &str = "-presume-input-tty";
 
 static ARG_FILES: &str = "files";
@@ -976,7 +1045,6 @@ fn run_matches(host: &mut Host, matches: &ArgMatches) -> i32 {
 		recursive: matches.get_flag(OPT_RECURSIVE),
 		dir: matches.get_flag(OPT_DIR),
 		verbose: matches.get_flag(OPT_VERBOSE),
-		progress: matches.get_flag(OPT_PROGRESS),
 		__presume_input_tty: Some(
 			matches.get_flag(PRESUME_INPUT_TTY) || host.stdin.file().is_terminal(),
 		),
@@ -1102,13 +1170,6 @@ pub fn uu_app() -> Command {
 				.help("explain what is being done")
 				.action(ArgAction::SetTrue),
 		)
-		.arg(
-			Arg::new(OPT_PROGRESS)
-				.short('g')
-				.long(OPT_PROGRESS)
-				.help("display a progress bar. Note: this feature is not supported by GNU coreutils.")
-				.action(ArgAction::SetTrue),
-		)
 		// From the GNU source code:
 		// This is solely for testing.
 		// Do not document.
@@ -1133,133 +1194,6 @@ pub fn uu_app() -> Command {
 		)
 }
 
-/// Terminal adapter that directs progress rendering to the builtin's stderr.
-struct HostTerm(Mutex<OpenFile>);
-
-impl fmt::Debug for HostTerm {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str("HostTerm")
-	}
-}
-
-impl TermLike for HostTerm {
-	fn width(&self) -> u16 {
-		80
-	}
-
-	fn move_cursor_up(&self, n: usize) -> io::Result<()> {
-		write!(self.0.lock(), "\x1b[{n}A")
-	}
-
-	fn move_cursor_down(&self, n: usize) -> io::Result<()> {
-		write!(self.0.lock(), "\x1b[{n}B")
-	}
-
-	fn move_cursor_right(&self, n: usize) -> io::Result<()> {
-		write!(self.0.lock(), "\x1b[{n}C")
-	}
-
-	fn move_cursor_left(&self, n: usize) -> io::Result<()> {
-		write!(self.0.lock(), "\x1b[{n}D")
-	}
-
-	fn write_line(&self, s: &str) -> io::Result<()> {
-		writeln!(self.0.lock(), "{s}")
-	}
-
-	fn write_str(&self, s: &str) -> io::Result<()> {
-		write!(self.0.lock(), "{s}")
-	}
-
-	fn clear_line(&self) -> io::Result<()> {
-		write!(self.0.lock(), "\r\x1b[2K")
-	}
-
-	fn flush(&self) -> io::Result<()> {
-		self.0.lock().flush()
-	}
-}
-
-/// Returns Some(ProgressBar) if `total_files` > 0, None otherwise.
-fn create_progress_bar(host: &mut Host, files: &[&OsStr], recursive: bool) -> Option<ProgressBar> {
-	if !host.stderr.is_terminal() {
-		return None;
-	}
-	let total_files = count_files(host, files, recursive);
-	if total_files == 0 {
-		return None;
-	}
-
-	let progress = ProgressBar::with_draw_target(
-		Some(total_files),
-		ProgressDrawTarget::term_like(Box::new(HostTerm(Mutex::new(host.stderr_clone())))),
-	)
-	.with_style(
-		ProgressStyle::with_template(
-			"{msg}: [{elapsed_precise}] {wide_bar} {pos:>7}/{len:7} files",
-		)
-		.unwrap(),
-	)
-	.with_message("Removing");
-	Some(progress)
-}
-
-/// Count the total number of files and directories to be deleted.
-/// This function recursively counts all files and directories that will be
-/// processed. Files are not deduplicated when appearing in multiple sources. If
-/// `recursive` is set to `false`, the directories in `paths` will be ignored.
-fn count_files(host: &mut Host, paths: &[&OsStr], recursive: bool) -> u64 {
-	let mut total = 0;
-	for p in paths {
-		if host.is_cancelled() {
-			break;
-		}
-
-		// Empty operands are rejected by `remove(host, )` before deletion; skip them
-		// here too so the progress pre-count doesn't resolve "" to the cwd and
-		// walk the entire working directory into the total.
-		if p.is_empty() {
-			continue;
-		}
-		let path = Path::new(p);
-		if let Ok(md) = host.fs().symlink_metadata(&host.resolve(path)) {
-			if md.is_dir() && !is_symlink_dir(&md.file_type()) {
-				if recursive {
-					total += count_files_in_directory(host, path);
-				}
-			} else {
-				total += 1;
-			}
-		}
-		// If we can't access the file, skip it for counting
-		// This matches the behavior where -f suppresses errors for missing files
-	}
-	total
-}
-
-/// A helper for `count_files` specialized for directories.
-fn count_files_in_directory(host: &mut Host, p: &Path) -> u64 {
-	if host.is_cancelled() {
-		return 0;
-	}
-	let mut entries_count = 0;
-	let Ok(entries) = host.fs().read_dir(&host.resolve(p)) else {
-		return 1;
-	};
-	for entry in entries.flatten() {
-		if host.is_cancelled() {
-			break;
-		}
-		entries_count += match entry.file_type() {
-			Ok(ft) if ft.is_dir() => count_files_in_directory(host, &entry.path()),
-			Ok(_) => 1,
-			Err(_) => 0,
-		};
-	}
-	1 + entries_count
-}
-
-
 // TODO: implement one-file-system (this may get partially implemented in
 // walkdir)
 /// Remove (or unlink) the given files
@@ -1270,10 +1204,6 @@ fn count_files_in_directory(host: &mut Host, p: &Path) -> u64 {
 /// details.
 pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 	let mut had_err = false;
-
-	// Check if any files actually exist before creating progress bar
-	let mut progress_bar: Option<ProgressBar> = None;
-	let mut any_files_processed = false;
 
 	for filename in files {
 		if host.is_cancelled() {
@@ -1310,18 +1240,12 @@ pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 
 		had_err = match host.fs().symlink_metadata(&host.resolve(file)) {
 			Ok(metadata) => {
-				// Create progress bar on first successful file metadata read
-				if options.progress && progress_bar.is_none() {
-					progress_bar = create_progress_bar(host, files, options.recursive);
-				}
-
-				any_files_processed = true;
 				if metadata.is_dir() {
-					handle_dir(host, file, options, progress_bar.as_ref())
+					handle_dir(host, file, options)
 				} else if is_symlink_dir(&metadata.file_type()) {
-					remove_dir(host, file, options, progress_bar.as_ref())
+					remove_dir(host, file, options)
 				} else {
-					remove_file(host, file, options, progress_bar.as_ref())
+					remove_file(host, file, options)
 				}
 			},
 
@@ -1339,13 +1263,6 @@ pub fn remove(host: &mut Host, files: &[&OsStr], options: &Options) -> bool {
 			},
 		}
 		.bitor(had_err);
-	}
-
-	// Only finish progress bar if it was created and files were processed
-	if let Some(pb) = progress_bar
-		&& any_files_processed
-	{
-		pb.finish();
 	}
 
 	had_err
@@ -1401,7 +1318,6 @@ fn is_writable_metadata(_metadata: &Metadata) -> bool {
 fn remove_dir_recursive(host: &mut Host, 
 	path: &Path,
 	options: &Options,
-	progress_bar: Option<&ProgressBar>,
 ) -> bool {
 	if host.is_cancelled() {
 		return true;
@@ -1414,20 +1330,22 @@ fn remove_dir_recursive(host: &mut Host,
 	// avoids an infinite recursion in the case of a link to the current
 	// directory, like `ln -s . link`.
 	let fs_path = host.resolve(path);
-	if !host
-		.fs()
-		.symlink_metadata(&fs_path)
-		.is_ok_and(|metadata| metadata.is_dir())
+	if let Ok(metadata) = host.fs().symlink_metadata(&fs_path)
+		&& metadata.is_dir()
 	{
-		return remove_file(host, path, options, progress_bar);
+		#[cfg(target_os = "macos")]
+		if platform::is_dataless_directory(path, &metadata) && host.fs().is_native_local(&fs_path) {
+			return platform::remove_dataless_operand(host, &fs_path, path, &metadata, options);
+		}
+		remove_dir_tree(host, path, options)
+	} else {
+		remove_file(host, path, options)
 	}
-
-	remove_dir_tree(host, path, options, progress_bar)
 }
 
 /// Removes the directory `path`, known not to be a symlink to one, and
 /// everything in it.
-fn remove_dir_tree(host: &mut Host, path: &Path, options: &Options, progress_bar: Option<&ProgressBar>) -> bool {
+fn remove_dir_tree(host: &mut Host, path: &Path, options: &Options) -> bool {
 	// Base case 2: this is a non-empty directory, but the user
 	// doesn't want to descend into it.
 	if options.interactive == InteractiveMode::Always && !is_dir_empty(host, path) && !prompt_descend(host, path)
@@ -1439,22 +1357,21 @@ fn remove_dir_tree(host: &mut Host, path: &Path, options: &Options, progress_bar
 	// Redox); every other filesystem is walked through its provider.
 	#[cfg(all(unix, not(target_os = "redox")))]
 	if host.fs().is_native_local(&host.resolve(path)) {
-		return safe_remove_dir_recursive(host, path, options, progress_bar);
+		return safe_remove_dir_recursive(host, path, options);
 	}
 
-	remove_dir_recursive_with_provider(host, path, options, progress_bar)
+	remove_dir_recursive_with_provider(host, path, options)
 }
 
 /// Removes the directory tree at `path` through the injected filesystem.
 ///
 /// `path` must name a directory (not a symlink to one). Children are removed
-/// by the type their listing reports, so prompts, verbose output and
-/// progress apply per entry exactly as for top-level operands.
+/// by the type their listing reports, so prompts and verbose output apply per
+/// entry exactly as for top-level operands.
 fn remove_dir_recursive_with_provider(
 	host: &mut Host,
 	path: &Path,
 	options: &Options,
-	progress_bar: Option<&ProgressBar>,
 ) -> bool {
 	let filesystem = host.fs().clone();
 	let fs_path = host.resolve(path);
@@ -1502,10 +1419,10 @@ fn remove_dir_recursive_with_provider(
 				// Only a real directory is descended into, never a symlink
 				// or junction to one; an entry of unknown type is looked up.
 				error |= match entry.file_type() {
-					Ok(file_type) if file_type.is_dir() => remove_dir_tree(host, &child, options, progress_bar),
-					Ok(file_type) if is_symlink_dir(&file_type) => remove_dir(host, &child, options, progress_bar),
-					Ok(_) => remove_file(host, &child, options, progress_bar),
-					Err(_) => remove_dir_recursive(host, &child, options, progress_bar),
+					Ok(file_type) if file_type.is_dir() => remove_dir_tree(host, &child, options),
+					Ok(file_type) if is_symlink_dir(&file_type) => remove_dir(host, &child, options),
+					Ok(_) => remove_file(host, &child, options),
+					Err(_) => remove_dir_recursive(host, &child, options),
 				};
 			},
 			Err(e) => {
@@ -1531,9 +1448,6 @@ fn remove_dir_recursive_with_provider(
 		}
 	}
 
-	if let Some(pb) = progress_bar {
-		pb.inc(1);
-	}
 	remove_dir_with_special_cases(host, path, options, false)
 }
 
@@ -1585,7 +1499,7 @@ fn show_preserve_root_error(host: &mut Host, path: &Path, root: &Path) {
 	show_error!(host, "{}", RmError::UseNoPreserveRoot);
 }
 
-fn handle_dir(host: &mut Host, path: &Path, options: &Options, progress_bar: Option<&ProgressBar>) -> bool {
+fn handle_dir(host: &mut Host, path: &Path, options: &Options) -> bool {
 	let mut had_err = false;
 
 	let path = clean_trailing_slashes(path);
@@ -1597,9 +1511,9 @@ fn handle_dir(host: &mut Host, path: &Path, options: &Options, progress_bar: Opt
 	let root = is_root_path(host, path);
 	let is_root = root.is_some();
 	if options.recursive && (!is_root || !options.preserve_root) {
-		had_err = remove_dir_recursive(host, path, options, progress_bar);
+		had_err = remove_dir_recursive(host, path, options);
 	} else if options.dir && (!is_root || !options.preserve_root) {
-		had_err = remove_dir(host, path, options, progress_bar).bitor(had_err);
+		had_err = remove_dir(host, path, options).bitor(had_err);
 	} else if let Some(root) = root.filter(|_| options.recursive) {
 		show_preserve_root_error(host, path, &root);
 		had_err = true;
@@ -1614,7 +1528,7 @@ fn handle_dir(host: &mut Host, path: &Path, options: &Options, progress_bar: Opt
 /// Remove the given directory, asking the user for permission if necessary.
 ///
 /// Returns true if it has encountered an error.
-fn remove_dir(host: &mut Host, path: &Path, options: &Options, progress_bar: Option<&ProgressBar>) -> bool {
+fn remove_dir(host: &mut Host, path: &Path, options: &Options) -> bool {
 	// Ask the user for permission.
 	if !prompt_dir(host, path, options) {
 		return false;
@@ -1629,31 +1543,21 @@ fn remove_dir(host: &mut Host, path: &Path, options: &Options, progress_bar: Opt
 	// Use safe traversal on Unix (except Redox) for empty directory removal
 	#[cfg(all(unix, not(target_os = "redox")))]
 	{
-		if let Some(result) = safe_remove_empty_dir(host, path, options, progress_bar) {
+		if let Some(result) = safe_remove_empty_dir(host, path, options) {
 			return result;
 		}
-	}
-
-	// Update progress bar for directory removal
-	if let Some(pb) = progress_bar {
-		pb.inc(1);
 	}
 
 	// Fallback method for non-Linux or when safe traversal is unavailable
 	remove_dir_with_feedback(host, path, options)
 }
 
-fn remove_file(host: &mut Host, path: &Path, options: &Options, progress_bar: Option<&ProgressBar>) -> bool {
+fn remove_file(host: &mut Host, path: &Path, options: &Options) -> bool {
 	if prompt_file(host, path, options) {
-		// Update progress bar before removing the file
-		if let Some(pb) = progress_bar {
-			pb.inc(1);
-		}
-
 		// Use safe traversal on Unix (except Redox) for individual file removal
 		#[cfg(all(unix, not(target_os = "redox")))]
 		{
-			if let Some(result) = safe_remove_file(host, path, options, progress_bar) {
+			if let Some(result) = safe_remove_file(host, path, options) {
 				return result;
 			}
 		}
@@ -1958,6 +1862,49 @@ mod tests {
 
 		assert_eq!(code, 0, "{}", capture.err());
 		assert!(!cwd.path().join("tree").exists());
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn recursive_remove_unlinks_dataless_operand_and_child() {
+		let cwd = tempdir().unwrap();
+		std::fs::create_dir(cwd.path().join("operand")).unwrap();
+		std::fs::create_dir_all(cwd.path().join("tree/placeholder")).unwrap();
+
+		for (operand, placeholder, expected) in [
+			("operand", "operand", "removed directory 'operand'\n"),
+			("tree", "tree/placeholder", "removed directory 'tree/placeholder'\nremoved directory 'tree'\n"),
+		] {
+			super::platform::TEST_DATALESS_PATH.set(Some(placeholder.into()));
+			let (code, capture) = run_util::<Rm>(&["-rfv", operand], "", cwd.path());
+			super::platform::TEST_DATALESS_PATH.set(None);
+			assert_eq!(code, 0, "{}", capture.err());
+			assert_eq!(capture.out(), expected);
+			assert!(!cwd.path().join(operand).exists());
+		}
+	}
+
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn recursive_remove_does_not_descend_into_dataless_directory() {
+		let cwd = tempdir().unwrap();
+		let placeholder = cwd.path().join("tree/placeholder");
+		std::fs::create_dir_all(&placeholder).unwrap();
+		let child = placeholder.join("child");
+		std::fs::write(&child, "data").unwrap();
+
+		// Simulate a directory that materialized after stat: unlinkat must
+		// fail rather than traverse the children of what was a placeholder.
+		for operand in ["tree/placeholder", "tree"] {
+			super::platform::TEST_DATALESS_PATH.set(Some("tree/placeholder".into()));
+			let (code, capture) = run_util::<Rm>(&["-rfv", operand], "", cwd.path());
+			super::platform::TEST_DATALESS_PATH.set(None);
+
+			assert_eq!(code, 1);
+			assert!(capture.err().contains("Directory not empty"), "{}", capture.err());
+			assert_eq!(capture.out(), "");
+			assert!(child.is_file());
+		}
 	}
 
 	#[test]

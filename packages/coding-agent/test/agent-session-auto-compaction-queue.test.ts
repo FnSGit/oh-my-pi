@@ -264,7 +264,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		// listener before `await abort()`, so the abort-finally stranded-message
 		// drain is suppressed while disconnected. Unlike /new (which resets the
 		// queue), compaction preserves the agent queues, so a steer/follow-up that
-		// arrives mid-compaction (async IRC, an xd:// mount notice, an SDK steer)
+		// arrives mid-compaction (async IRC, a tool-command mount notice, an SDK steer)
 		// would hang until the next explicit prompt unless compact() re-drains
 		// after reconnecting.
 		cfgCompactionKeepRecentTokens.set(session.settings, 1);
@@ -1253,12 +1253,12 @@ describe("AgentSession auto-compaction queue resume", () => {
 		// Observe entry into admission, then yield an event-loop turn without guessing a wall-clock duration.
 		const admissionEntered = Promise.withResolvers<void>();
 		const waitForCleanup = SessionMaintenance.prototype.waitForMaintenanceCleanup;
-		vi.spyOn(SessionMaintenance.prototype, "waitForMaintenanceCleanup").mockImplementation(
-			function (this: SessionMaintenance) {
-				admissionEntered.resolve();
-				return waitForCleanup.call(this);
-			},
-		);
+		vi.spyOn(SessionMaintenance.prototype, "waitForMaintenanceCleanup").mockImplementation(function (
+			this: SessionMaintenance,
+		) {
+			admissionEntered.resolve();
+			return waitForCleanup.call(this);
+		});
 		const prompted = session.prompt("after idle compaction", {
 			onPromptAdmitted: () => order.push("prompt admitted"),
 			images: [

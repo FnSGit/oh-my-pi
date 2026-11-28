@@ -11,17 +11,18 @@
  * behind Bun's `fs.watch` drops most changes of a burst there and costs a
  * core). Linux watches a tree one directory at a time: a recursive `fs.watch`
  * there puts an inotify watch on every directory below, package contents and
- * VCS object stores included, and can use up the user's inotify watch limit.
+ * VCS object stores included, and can use up the user's inotify watch limit;
+ * an {@link InotifyBudget} bounds what the trees of a process hold.
  * Elsewhere a recursive `fs.watch` is lossless and cheap.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { DirectoryChangeAction, type DirectoryChanges, DirectoryWatcher } from "@oh-my-pi/pi-natives";
-import { logger } from "@oh-my-pi/pi-utils";
-import { mapWithConcurrencyLimit } from "../task/parallel";
+import { hasFsCode, logger, relativePathWithinNormalizedRoot } from "@oh-my-pi/pi-utils";
+import { mapWithConcurrencyLimit, Semaphore } from "../task/parallel";
 import { FileChangeType, type FileEvent } from "./types";
-import { fileToUri, uriToFile } from "./utils";
+import { fileToUri, uriToFile } from "./uri";
 
 /** Method a server registers to have the client watch files for it. */
 export const WATCHED_FILES_METHOD = "workspace/didChangeWatchedFiles";
@@ -47,6 +48,10 @@ const REPORTED_TTL_MS = 10_000;
 const CLOCK_LAG_MAX_MS = 10 * 60_000;
 /** Directories read at once while walking a tree (each is a round trip on network drives). */
 const WALK_CONCURRENCY = 16;
+/** Share of the user's inotify watch limit one process's directory trees may hold; other programs keep the rest. */
+const INOTIFY_SHARE = 0.25;
+/** `fs.inotify.max_user_watches` when it cannot be read: the kernel default before Linux 5.11. */
+const DEFAULT_MAX_USER_WATCHES = 8192;
 
 /** Matches the servers' view: tsgo and friends treat Windows and macOS file names case-insensitively. */
 const caseInsensitive = process.platform === "win32" || process.platform === "darwin";
@@ -120,6 +125,8 @@ export interface WatchedFilesForwarderOptions {
 	roots: () => readonly string[];
 	/** Delivers one `workspace/didChangeWatchedFiles` batch to the server. */
 	send: (changes: FileEvent[]) => Promise<void> | void;
+	/** Bounds the Linux per-directory watches; defaults to the budget every forwarder of the process shares. */
+	inotifyBudget?: InotifyBudget;
 }
 
 /**
@@ -181,9 +188,7 @@ function foldCase(p: string): string {
 
 /** `target` relative to `dir` with `/` separators, or undefined when it lies outside `dir`. */
 function relativeWithin(dir: string, target: string): string | undefined {
-	const rel = path.relative(foldCase(dir), foldCase(target));
-	if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return undefined;
-	return rel.replaceAll("\\", "/");
+	return relativePathWithinNormalizedRoot(foldCase(dir), foldCase(target))?.replaceAll("\\", "/");
 }
 
 /**
@@ -226,12 +231,12 @@ class PathMap<V> {
 		if (this.#values.delete(key) && !this.#children.has(key)) this.#unlink(key);
 	}
 
-	/** Remove `dir` and every key below it, passing each removed value to `removed`. */
-	deleteWithin(dir: string, removed?: (value: V) => void): void {
+	/** Remove `dir` and every key below it, passing each removed value and its key to `removed`. */
+	deleteWithin(dir: string, removed?: (value: V, key: string) => void): void {
 		const stack = [dir];
 		for (let key = stack.pop(); key !== undefined; key = stack.pop()) {
 			const value = this.#values.get(key);
-			if (value !== undefined && this.#values.delete(key)) removed?.(value);
+			if (value !== undefined && this.#values.delete(key)) removed?.(value, key);
 			const entries = this.#children.get(key);
 			if (!entries) continue;
 			this.#children.delete(key);
@@ -267,6 +272,94 @@ class PathMap<V> {
 			if (this.#values.has(parent)) return;
 		}
 	}
+}
+
+/** A directory tree's claim on its directory watches, which an {@link InotifyBudget} can take back. */
+interface WatchHolder {
+	/** Stop watching `key` because the budget sheds it; false keeps it (a tree root). */
+	shed(key: string): boolean;
+}
+
+/**
+ * The inotify watches of the Linux directory trees of a process, across all
+ * its forwarders. The kernel's watch limit is per user, so a process that used
+ * it up would break unrelated programs (`tail -f`, systemd, CI containers):
+ * trees stop adding watches once the budget is spent, and when the kernel
+ * refuses a watch anyway (other processes hold the rest), the budget halves and
+ * gives back its newest, deepest directories. Bun shares one inotify watch per
+ * path, so a directory counts once however many trees watch it.
+ */
+export class InotifyBudget {
+	/** Holders by watched directory, oldest first. */
+	readonly #held = new Map<string, Set<WatchHolder>>();
+	#limit: number;
+
+	/** At most `limit` directories are watched, tree roots aside. */
+	constructor(limit: number) {
+		this.#limit = limit;
+	}
+
+	/** Directories the budget allows. */
+	get limit(): number {
+		return this.#limit;
+	}
+
+	/** Claim a watch of `key` for `holder`; false when the budget is spent, unless `force` (a tree root). */
+	claim(key: string, holder: WatchHolder, options: { force: boolean }): boolean {
+		const holders = this.#held.get(key);
+		if (holders) {
+			holders.add(holder);
+			return true;
+		}
+		if (!options.force && this.#held.size >= this.#limit) return false;
+		this.#held.set(key, new Set([holder]));
+		return true;
+	}
+
+	/** Drop `holder`'s claim on `key`; the directory frees up once no tree watches it. */
+	release(key: string, holder: WatchHolder): void {
+		const holders = this.#held.get(key);
+		if (holders?.delete(holder) && holders.size === 0) this.#held.delete(key);
+	}
+
+	/**
+	 * The kernel refused a watch (`ENOSPC`): the user's limit is reached. Halve
+	 * what is held and shed the newest directories down to that, for good, so
+	 * other programs get watches again and the trees do not re-add them.
+	 */
+	exhausted(): void {
+		const held = this.#held.size;
+		this.#limit = Math.min(this.#limit, Math.floor(held / 2));
+		const keys = [...this.#held.keys()];
+		for (let i = keys.length - 1; i >= 0 && this.#held.size > this.#limit; i--) {
+			const holders = this.#held.get(keys[i]);
+			if (!holders) continue;
+			for (const holder of holders) if (holder.shed(keys[i])) holders.delete(holder);
+			if (holders.size === 0) this.#held.delete(keys[i]);
+		}
+		logger.warn("LSP watched-files hit the user's inotify watch limit; released watches", {
+			held,
+			released: held - this.#held.size,
+			limit: this.#limit,
+		});
+	}
+}
+
+let processBudget: InotifyBudget | undefined;
+
+/** The budget forwarders share by default: a share of `fs.inotify.max_user_watches`, read once. */
+function sharedInotifyBudget(): InotifyBudget {
+	if (processBudget) return processBudget;
+	let maxUserWatches = DEFAULT_MAX_USER_WATCHES;
+	try {
+		// Read synchronously: trees claim watches from synchronous callbacks, and only once per process.
+		const read = Number.parseInt(fs.readFileSync("/proc/sys/fs/inotify/max_user_watches", "utf8"), 10);
+		if (read > 0) maxUserWatches = read;
+	} catch {
+		// No procfs (some containers): assume the old kernel default.
+	}
+	processBudget = new InotifyBudget(Math.floor(maxUserWatches * INOTIFY_SHARE));
+	return processBudget;
 }
 
 function spec(base: string, pattern: string, kind: number): WatchSpec {
@@ -334,6 +427,7 @@ async function nearestDirectory(base: string, isDir: (target: string) => Promise
 export class WatchedFilesForwarder {
 	readonly #roots: () => readonly string[];
 	readonly #send: WatchedFilesForwarderOptions["send"];
+	readonly #inotifyBudget?: InotifyBudget;
 	/** Raw registerOptions by registration id, recompiled when roots change. */
 	readonly #registrations = new Map<string, unknown>();
 	#specs: WatchSpec[] = [];
@@ -372,6 +466,7 @@ export class WatchedFilesForwarder {
 	constructor(options: WatchedFilesForwarderOptions) {
 		this.#roots = options.roots;
 		this.#send = options.send;
+		this.#inotifyBudget = options.inotifyBudget;
 	}
 
 	/** Start watching for one `workspace/didChangeWatchedFiles` registration; settles once watched. */
@@ -638,47 +733,69 @@ export class WatchedFilesForwarder {
 	/**
 	 * Watch `root` and the directories below it one by one, skipping those no
 	 * spec wants anything below (Linux). Throws when `root` itself cannot be
-	 * watched; a subdirectory that cannot (the inotify watch limit) is skipped.
+	 * watched; a subdirectory that cannot (the inotify watch limit, or the
+	 * process's {@link InotifyBudget} is spent) is skipped. Directories are
+	 * claimed breadth first, so a spent budget leaves the deepest unwatched.
 	 * `armed` settles once the existing tree is watched.
 	 */
 	#openTree(root: string, ended: (error: unknown) => void): { watch: Watch; armed: Promise<void> } {
+		const budget = this.#inotifyBudget ?? sharedInotifyBudget();
+		const rootKey = foldCase(root);
 		const watchers = new PathMap<fs.FSWatcher>();
+		const holder: WatchHolder = {
+			shed: key => {
+				if (key === rootKey) return false;
+				watchers.get(key)?.close();
+				watchers.delete(key);
+				return true;
+			},
+		};
+		const drop = (watcher: fs.FSWatcher, key: string) => {
+			watcher.close();
+			budget.release(key, holder);
+		};
 		let skipped = false;
+		const skip = (dir: string, error: unknown) => {
+			if (skipped) return;
+			skipped = true;
+			logger.warn("LSP watched-files could not watch every directory; changes below them go unreported", {
+				dir,
+				error: String(error),
+			});
+		};
 		const watch = newWatch(() => {
-			for (const watcher of watchers.values()) watcher.close();
+			for (const [key, watcher] of watchers) drop(watcher, key);
 			watchers.clear();
 		});
 		const watchOne = (dir: string) => {
 			const key = foldCase(dir);
 			if (watch.closed || watchers.has(key)) return;
+			if (!budget.claim(key, holder, { force: key === rootKey })) {
+				return skip(dir, `the process's budget of ${budget.limit} inotify watches is spent`);
+			}
 			let watcher: fs.FSWatcher;
 			try {
 				watcher = fs.watch(dir, { persistent: false }, (eventType, filename) => {
-					const known = filename !== null && watchers.has(foldCase(path.join(dir, filename.toString())));
+					const known = filename != null && watchers.has(foldCase(path.join(dir, filename.toString())));
 					this.#fsEvent(watch, root, true, dir, eventType, filename, known);
 				});
 			} catch (error) {
-				if (dir === root) throw error;
-				if (!skipped) {
-					skipped = true;
-					logger.warn("LSP watched-files could not watch every directory; changes below them go unreported", {
-						dir,
-						error: String(error),
-					});
-				}
-				return;
+				budget.release(key, holder);
+				if (hasFsCode(error, "ENOSPC")) budget.exhausted();
+				if (key === rootKey) throw error;
+				return skip(dir, error);
 			}
 			watcher.on("error", error => {
-				watcher.close();
 				watchers.delete(key);
-				if (dir === root) ended(error);
+				drop(watcher, key);
+				if (key === rootKey) ended(error);
 			});
 			watchers.set(key, watcher);
 		};
 		watch.tree = {
 			watch: watchOne,
 			covers: dir => watchers.has(foldCase(path.dirname(dir))),
-			remove: dir => watchers.deleteWithin(foldCase(path.resolve(dir)), watcher => watcher.close()),
+			remove: dir => watchers.deleteWithin(foldCase(path.resolve(dir)), drop),
 			layout: treeLayout(this.#specs),
 			refresh: async () => {
 				const wanted = new Set<string>();
@@ -687,17 +804,16 @@ export class WatchedFilesForwarder {
 						wanted.add(foldCase(dir));
 						watchOne(dir);
 					},
-					files: false,
 				});
 				for (const [key, watcher] of watchers) {
 					if (wanted.has(key)) continue;
-					watcher.close();
 					watchers.delete(key);
+					drop(watcher, key);
 				}
 			},
 		};
 		watchOne(root);
-		return { watch, armed: this.#walk(root, true, { onDirectory: watchOne, files: false }).then(() => {}) };
+		return { watch, armed: this.#walk(root, true, { onDirectory: watchOne }) };
 	}
 
 	/** One `fs.watch` event of `dir`, part of the watch of `root`; `known`: the entry is a watched directory. */
@@ -712,7 +828,7 @@ export class WatchedFilesForwarder {
 	): void {
 		if (this.#closed || watch.closed) return;
 		// A missing name means the watcher lost changes.
-		if (filename === null) return this.#lost(watch, root, recursive);
+		if (filename == null) return this.#lost(watch, root, recursive);
 		watch.seenAt = Date.now();
 		const target = path.join(dir, filename.toString());
 		if (eventType === "change") return this.#record(target, true, true);
@@ -741,9 +857,17 @@ export class WatchedFilesForwarder {
 			while (watch.lostSince !== undefined && !this.#closed) {
 				const from = watch.lostSince;
 				watch.lostSince = undefined;
-				await this.#rescan(dir, recursive, from).catch(error => {
-					logger.debug("LSP watched-files rescan failed", { dir, error: String(error) });
-				});
+				const started = Date.now();
+				await this.#rescan(dir, recursive, from).then(
+					({ walked, reported }) =>
+						logger.debug("LSP watched-files rescan finished", {
+							dir,
+							walked,
+							reported,
+							ms: Date.now() - started,
+						}),
+					error => logger.debug("LSP watched-files rescan failed", { dir, error: String(error) }),
+				);
 			}
 			watch.rescanning = false;
 		})();
@@ -753,69 +877,89 @@ export class WatchedFilesForwarder {
 	 * Report the files below `dir` modified since `since` (0: every file, as
 	 * created, without a stat). `renamedFrom`: `dir` was moved from there, so
 	 * each file's old path is reported deleted. `onDirectory` sees every
-	 * directory walked, before it is read.
+	 * directory walked, before it is read. Files are checked directory by
+	 * directory as the walk reads them: a base holding millions of files never
+	 * has their paths or stats in memory at once (#20853). Settles with how
+	 * many files were walked and how many of them were recorded as changed.
 	 */
 	async #rescan(
 		dir: string,
 		recursive: boolean,
 		since: number,
 		options: { renamedFrom?: string; onDirectory?: (dir: string) => void } = {},
-	): Promise<void> {
-		const files = await this.#walk(dir, recursive, { onDirectory: options.onDirectory });
-		if (this.#closed) return;
-		const { renamedFrom } = options;
-		if (since === 0) {
-			for (const target of files) {
-				if (renamedFrom) this.#record(path.join(renamedFrom, path.relative(dir, target)), true, false);
-				if (this.#wantedKinds(target) !== 0) this.#record(target, false, true, undefined, true);
+	): Promise<{ walked: number; reported: number }> {
+		const { renamedFrom, onDirectory } = options;
+		const stats = new Semaphore(RESCAN_STAT_CONCURRENCY);
+		let walked = 0;
+		let reported = 0;
+		const statChanged = async (target: string): Promise<void> => {
+			await stats.acquire();
+			let stat: fs.Stats | undefined;
+			try {
+				stat = await fs.promises.lstat(target);
+			} catch {
+				return;
+			} finally {
+				stats.release();
 			}
-			return;
-		}
-		const targets = files.filter(target => this.#wantedKinds(target) !== 0);
-		const { results: stats } = await mapWithConcurrencyLimit(targets, RESCAN_STAT_CONCURRENCY, target =>
-			fs.promises.lstat(target).catch(() => undefined),
-		);
-		if (this.#closed) return;
-		for (const [index, target] of targets.entries()) {
-			const stat = stats[index];
-			if (!stat || stat.mtimeMs < since) continue;
+			if (this.#closed || stat.mtimeMs < since) return;
 			// Without a birth time (some Linux file systems) the file may be new: report it as created,
 			// which a server handles for a file it already knew, unlike a change to one it never saw.
 			this.#record(target, stat.birthtimeMs > 0 ? stat.birthtimeMs < since : undefined, true, undefined, true);
-		}
+			reported++;
+		};
+		await this.#walk(dir, recursive, {
+			onDirectory,
+			onFiles: async files => {
+				walked += files.length;
+				if (since !== 0) {
+					await Promise.all(files.filter(target => this.#wantedKinds(target) !== 0).map(statChanged));
+					return;
+				}
+				for (const target of files) {
+					if (renamedFrom) this.#record(path.join(renamedFrom, path.relative(dir, target)), true, false);
+					if (this.#wantedKinds(target) === 0) continue;
+					this.#record(target, false, true, undefined, true);
+					reported++;
+				}
+			},
+		});
+		return { walked, reported };
 	}
 
 	/**
-	 * The files below `dir` (directly, unless `recursive`), skipping directories
-	 * no spec wants anything below. `onDirectory` sees each directory before it
-	 * is read. With `files: false` only directories are visited and nothing is
-	 * collected, as a tree walk needs on a large repository.
+	 * Walk the directories below `dir` (only `dir` itself, unless `recursive`),
+	 * skipping directories no spec wants anything below. `onDirectory` sees
+	 * each directory before it is read; `onFiles` gets each directory's files
+	 * as it is read, and the walk waits for it, so only the directories in
+	 * flight are held, however large the tree.
 	 */
 	async #walk(
 		dir: string,
 		recursive: boolean,
-		options: { onDirectory?: (dir: string) => void; files?: boolean } = {},
-	): Promise<string[]> {
-		const { onDirectory, files: collect = true } = options;
-		const files: string[] = [];
+		options: { onDirectory?: (dir: string) => void; onFiles?: (files: string[]) => Promise<void> } = {},
+	): Promise<void> {
+		const { onDirectory, onFiles } = options;
 		let level = [dir];
 		while (level.length > 0 && !this.#closed) {
 			if (onDirectory) for (const entry of level) onDirectory(entry);
-			const { results } = await mapWithConcurrencyLimit(level, WALK_CONCURRENCY, entry =>
-				fs.promises.readdir(entry, { withFileTypes: true }).catch(() => []),
-			);
-			const next: string[] = [];
-			for (const [index, entries] of results.entries()) {
-				for (const entry of entries ?? []) {
-					const target = path.join(level[index], entry.name);
+			const { results } = await mapWithConcurrencyLimit(level, WALK_CONCURRENCY, async parent => {
+				const entries = await fs.promises.readdir(parent, { withFileTypes: true }).catch(() => []);
+				const files: string[] = [];
+				const subdirectories: string[] = [];
+				for (const entry of entries) {
 					if (!entry.isDirectory()) {
-						if (collect) files.push(target);
-					} else if (recursive && this.#wantsBeneath(target)) next.push(target);
+						if (onFiles) files.push(path.join(parent, entry.name));
+						continue;
+					}
+					const target = path.join(parent, entry.name);
+					if (recursive && this.#wantsBeneath(target)) subdirectories.push(target);
 				}
-			}
-			level = next;
+				if (onFiles && files.length > 0 && !this.#closed) await onFiles(files);
+				return subdirectories;
+			});
+			level = results.flatMap(subdirectories => subdirectories ?? []);
 		}
-		return files;
 	}
 
 	/** Whether some spec watches paths below `dir`. */

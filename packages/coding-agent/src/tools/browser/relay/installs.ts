@@ -13,15 +13,20 @@ import {
 	defaultRelayExtensionDir,
 	extensionIdForPath,
 	loadRelayExtension,
+	type RelayExtensionBundle,
 	writeRelayExtension,
 } from "./extension-files";
 import { discoverRelayEndpoints } from "./discovery";
+import { embeddedRelayExtensionBuild } from "./embedded-extension";
 import { refreshRelayNativeHost } from "./native-host-manifest";
 import { isOlderOmpVersion, type PanelInstall, RELAY_RECHECK_PATH } from "./protocol";
 
-/** The files this omp writes: its version and extension build. A source checkout changes the build, not the version. */
-async function installStamp(): Promise<string> {
-	return `${VERSION}+${(await loadRelayExtension()).build}`;
+/**
+ * The files this omp writes: its version and extension build. A source checkout changes the build, not the version.
+ * Builds carry the build id beside the embedded asset, so only a source checkout calls `load` here.
+ */
+async function installStamp(load: () => Promise<RelayExtensionBundle>): Promise<string> {
+	return `${VERSION}+${embeddedRelayExtensionBuild ?? (await load()).build}`;
 }
 
 /** Managed extension directory and the last asset version omp wrote there. */
@@ -60,7 +65,7 @@ function installKey(dir: string): string {
 	return process.platform === "win32" ? dir.toLowerCase() : dir;
 }
 
-function resolveLocations(options: RelayInstallLocations): Required<RelayInstallLocations> {
+function resolveLocations(options: RelayInstallLocations) {
 	return {
 		registryFile: options.registryFile ?? getBrowserRelayInstallRegistryFile(),
 		defaultDir:
@@ -68,12 +73,6 @@ function resolveLocations(options: RelayInstallLocations): Required<RelayInstall
 			(options.registryFile
 				? path.join(path.dirname(options.registryFile), "extension")
 				: defaultRelayExtensionDir()),
-		relayUrl:
-			options.relayUrl !== undefined
-				? options.relayUrl
-				: options.registryFile
-					? null
-					: (discoverRelayEndpoints()[0] ?? null),
 	};
 }
 
@@ -82,8 +81,10 @@ function resolveLocations(options: RelayInstallLocations): Required<RelayInstall
  * (see `RelayBridge.recheckExtensions`). No relay listening, or one too old for the endpoint, is fine: the next
  * extension hello runs the same check.
  */
-async function recheckRelay(relayUrl: string | null): Promise<void> {
-	if (relayUrl === null) return;
+async function recheckRelay(options: RelayInstallLocations): Promise<void> {
+	let { relayUrl } = options;
+	if (relayUrl === undefined && !options.registryFile) relayUrl = (await discoverRelayEndpoints())[0];
+	if (relayUrl == null) return;
 	await fetch(`${relayUrl.replace(/\/+$/, "")}${RELAY_RECHECK_PATH}`, {
 		method: "POST",
 		signal: AbortSignal.timeout(1_000),
@@ -189,7 +190,7 @@ export async function registeredRelayExtensionIds(options: RelayInstallLocations
 
 /** Install the requested copy, recording its real directory and preserving any existing default installation. */
 export async function installRelayExtension(dir: string, options: RelayInstallLocations = {}): Promise<string> {
-	const { registryFile, defaultDir, relayUrl } = resolveLocations(options);
+	const { registryFile, defaultDir } = resolveLocations(options);
 	await fs.mkdir(path.dirname(registryFile), { recursive: true });
 	let written = false;
 	const canonical = await withFileLock(registryFile, async () => {
@@ -213,7 +214,7 @@ export async function installRelayExtension(dir: string, options: RelayInstallLo
 		if (updated || adopted) await writeFileAtomically(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
 		return canonical;
 	});
-	if (written) await recheckRelay(relayUrl);
+	if (written) await recheckRelay(options);
 	return canonical;
 }
 
@@ -224,11 +225,14 @@ export interface RelayInstallSyncOptions extends RelayInstallLocations {
 
 /** Reconcile every known install with this omp's assets without recreating missing directories. */
 export async function syncRelayInstalls(options: RelayInstallSyncOptions = {}): Promise<RelayInstallSyncResult[]> {
-	const { registryFile, defaultDir, relayUrl } = resolveLocations(options);
+	const { registryFile, defaultDir } = resolveLocations(options);
 	const initial = await readRelayInstallRegistry(registryFile);
 	if (initial.installs.length === 0 && !(await Bun.file(path.join(defaultDir, "manifest.json")).exists())) return [];
+	// Loaded at most once per sync, on the first folder written, and released when the sync returns.
+	let bundle: Promise<RelayExtensionBundle> | undefined;
+	const load = (): Promise<RelayExtensionBundle> => (bundle ??= loadRelayExtension());
 	// Nothing to write without the extension: a source checkout that never generated it fails here, not per folder.
-	const stamp = await installStamp();
+	const stamp = await installStamp(load);
 	if (options.mode === "startup" && initial.lastSynced === stamp) return [];
 	await fs.mkdir(path.dirname(registryFile), { recursive: true });
 	const synced = await withFileLock(registryFile, async () => {
@@ -248,7 +252,7 @@ export async function syncRelayInstalls(options: RelayInstallSyncOptions = {}): 
 					results.push({ dir, status: "up to date", ompVersion: installed });
 					continue;
 				}
-				const written = await writeRelayExtension(dir, VERSION);
+				const written = await writeRelayExtension(dir, VERSION, load());
 				if (written || row.ompVersion !== VERSION) {
 					row.ompVersion = VERSION;
 					row.writtenAt = Date.now();
@@ -291,7 +295,7 @@ export async function syncRelayInstalls(options: RelayInstallSyncOptions = {}): 
 		return results;
 	});
 	// The relay's own sync already reloads the extension it ran for.
-	if (options.mode !== "relay" && synced.some(result => result.status === "written")) await recheckRelay(relayUrl);
+	if (options.mode !== "relay" && synced.some(result => result.status === "written")) await recheckRelay(options);
 	return synced;
 }
 

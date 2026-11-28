@@ -28,7 +28,7 @@ import {
 	setMnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { MemoryEditTool } from "@oh-my-pi/pi-coding-agent/tools/memory-edit";
 import { MemoryRecallTool } from "@oh-my-pi/pi-coding-agent/tools/memory-recall";
@@ -281,34 +281,6 @@ describe("Mnemopi tool factories", () => {
 		expect(MemoryReflectTool.createIf(session)).toBeInstanceOf(MemoryReflectTool);
 		expect(MemoryEditTool.createIf(session)).toBeInstanceOf(MemoryEditTool);
 	});
-
-	it("names sibling memory tools by their xd:// URL only when they are mounted as devices", () => {
-		const session = makeSession(Settings.isolated({ "memory.backend": "mnemopi" }));
-		const recall = new MemoryRecallTool(session);
-		const reflect = new MemoryReflectTool(session);
-		const edit = new MemoryEditTool(session);
-		const tools = new Map<string, Tool>([
-			["recall", recall],
-			["reflect", reflect],
-			["memory_edit", edit],
-		]);
-		session.xdev = {
-			tools,
-			mountedNames: new Set(["recall", "memory_edit"]),
-			builtInNames: new Set(tools.keys()),
-			isActive: name => name === "reflect",
-		};
-
-		expect(reflect.description).toContain("unlike `xd://recall`, blends them");
-		expect(recall.description).toContain("`reflect`: synthesized answer");
-		expect(recall.description).toContain("Before any `xd://memory_edit update`");
-		expect(edit.description).toContain("Only ids returned by `xd://recall`.");
-
-		// A mounted device without a summary makes catalog summaries read its description;
-		// rendering refs must not depend on them, or this recurses without bound.
-		Object.assign(recall, { summary: undefined });
-		expect(recall.description).toContain("`reflect`: synthesized answer");
-	});
 });
 
 describe("retain.execute", () => {
@@ -381,18 +353,17 @@ describe("retain.execute", () => {
 		await registeredState?.flushRetainQueue();
 
 		expect(retainBatchSpy).toHaveBeenCalledTimes(2);
+		// One request per tag set, in the order of each set's first item; items keep the call's order.
 		const requests = retainBatchSpy.mock.calls.map(([, items]) =>
 			items.map(item => ({ content: item.content, tags: item.tags })),
 		);
-		expect(requests).toEqual(
-			expect.arrayContaining([
-				[
-					{ content: "pi uses tabs", tags: ["project:pi"] },
-					{ content: "pi builds with bun", tags: ["project:pi"] },
-				],
-				[{ content: "the user prefers zsh across projects", tags: undefined }],
-			]),
-		);
+		expect(requests).toEqual([
+			[
+				{ content: "pi uses tabs", tags: ["project:pi"] },
+				{ content: "pi builds with bun", tags: ["project:pi"] },
+			],
+			[{ content: "the user prefers zsh across projects", tags: undefined }],
+		]);
 	});
 
 	it("sends global and project items in one untagged request when the scope has no project tags", async () => {
@@ -507,23 +478,19 @@ describe("retain.execute", () => {
 		const [bankId, items, options] = retainBatchSpy.mock.calls[0];
 		expect(bankId).toBe("test-bank");
 		expect(options).toEqual(expect.objectContaining({ async: true }));
-		// Same-call items share a publication mtime, so their order within the batch is unspecified.
-		expect(items).toHaveLength(2);
-		expect(items).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({
-					content: "fact one",
-					metadata: { session_id: TEST_SESSION_ID },
-					tags: ["project:pi"],
-				}),
-				expect.objectContaining({
-					content: "fact two",
-					context: "user override",
-					metadata: { session_id: TEST_SESSION_ID },
-					tags: ["project:pi"],
-				}),
-			]),
-		);
+		expect(items).toEqual([
+			expect.objectContaining({
+				content: "fact one",
+				metadata: { session_id: TEST_SESSION_ID },
+				tags: ["project:pi"],
+			}),
+			expect.objectContaining({
+				content: "fact two",
+				context: "user override",
+				metadata: { session_id: TEST_SESSION_ID },
+				tags: ["project:pi"],
+			}),
+		]);
 		expect(await outboxEvents()).toEqual([]);
 	});
 

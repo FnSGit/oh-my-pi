@@ -45,7 +45,7 @@ omp-vcs.workspace = true
 omp-vfs.workspace = true
 postcard.workspace = true
 regex.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 smallvec.workspace = true
 strum.workspace = true

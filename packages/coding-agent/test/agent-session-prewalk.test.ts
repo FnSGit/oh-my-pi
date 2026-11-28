@@ -1,15 +1,20 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { CustomToolAdapter } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/wrapper";
 import { MCPTool } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import type { MCPServerConnection } from "@oh-my-pi/pi-coding-agent/mcp/types";
-import { dispatchXdevTool, type XdevDispatch, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import {
+	dispatchToolCommand,
+	type ToolCommandDispatch,
+	type ToolCommandState,
+} from "@oh-my-pi/pi-coding-agent/tools/tool-commands";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -31,7 +36,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import type { TuiSlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
-import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
+import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking/levels";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import { mockSchedulerWaitWithClock } from "./helpers/mock-scheduler-clock";
@@ -135,13 +140,14 @@ describe("AgentSession prewalk", () => {
 			agentKind?: "main" | "sub";
 			sessionManager?: SessionManager;
 			extendedContext?: boolean;
+			primary?: Model;
 			target?: Model;
 			startupTarget?: Model;
 			tools?: AgentTool[];
 			registry?: Map<string, AgentTool>;
 		} = {},
 	) {
-		const primary = modelOrThrow("claude-sonnet-4-5");
+		const primary = options.primary ?? modelOrThrow("claude-sonnet-4-5");
 		const target = options.target ?? modelOrThrow("claude-sonnet-4-6");
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
@@ -152,6 +158,7 @@ describe("AgentSession prewalk", () => {
 		settings.setModelRole("smol", `anthropic/missing-model,${target.provider}/${target.id}:low`);
 		const mock = createMockModel({ responses });
 		const requested: string[] = [];
+		const requestedModels: Model[] = [];
 		const nudges: string[][] = [];
 		let requestNudges: string[] = [];
 		const agent = new Agent({
@@ -171,6 +178,7 @@ describe("AgentSession prewalk", () => {
 			},
 			streamFn: (model, context, streamOptions) => {
 				requested.push(model.id);
+				requestedModels.push(model);
 				nudges.push(requestNudges);
 				return mock.stream(model, context, streamOptions);
 			},
@@ -189,8 +197,62 @@ describe("AgentSession prewalk", () => {
 			agentKind: options.agentKind,
 		});
 		session = created;
-		return { session: created, primary, target, settings, requested, nudges };
+		return { session: created, primary, target, settings, requested, requestedModels, nudges };
 	}
+
+	it.each(["main", "sub"] as const)(
+		"hands off a route-only %s prewalk and journals the selected route",
+		async agentKind => {
+			const row = getBundledModel("openrouter", "z-ai/glm-4.7");
+			if (!row) throw new Error("Expected bundled OpenRouter model");
+			const source = parseModelPattern("openrouter/z-ai/glm-4.7@cerebras", [row]).model;
+			const target = parseModelPattern("openrouter/z-ai/glm-4.7@sambanova", [row]).model;
+			if (!source || !target) throw new Error("Expected routed prewalk models");
+			authStorage.keys.setRuntime("openrouter", "test-key");
+			const created = createLifecycleSession(
+				[toolCall("todo", "todo"), toolCall("write", "write"), { content: ["done"] }],
+				{ primary: source, target, agentKind },
+			);
+			created.session.setThinkingLevel(Effort.Low);
+
+			await created.session.prompt("implement the plan");
+
+			expect(created.requestedModels.map(model => model.compat)).toEqual([
+				source.compat,
+				source.compat,
+				target.compat,
+			]);
+			expect(created.session.model?.compat).toMatchObject({ openRouterRouting: { only: ["sambanova"] } });
+			expect(created.session.sessionManager.getSessionLocalModelChange()).toMatchObject({
+				model: "openrouter/z-ai/glm-4.7@sambanova",
+				role: "prewalk",
+			});
+			expect(created.session.getPrewalkState()).toBeUndefined();
+			expect(created.nudges.at(-1)).toContain("prewalk-checklist");
+		},
+	);
+
+	it("rejects a different upstream for an existing arm without partially restarting", async () => {
+		const row = getBundledModel("openrouter", "z-ai/glm-4.7");
+		if (!row) throw new Error("Expected bundled OpenRouter model");
+		const target = parseModelPattern("openrouter/z-ai/glm-4.7@cerebras", [row]).model;
+		const other = parseModelPattern("openrouter/z-ai/glm-4.7@sambanova", [row]).model;
+		if (!target || !other) throw new Error("Expected routed prewalk models");
+		const created = createLifecycleSession([], { target });
+		const active = created.session.getPrewalkState();
+		const notices: string[] = [];
+		created.session.subscribe(event => {
+			if (event.type === "notice" && event.source === "prewalk") notices.push(event.message);
+		});
+
+		expect(created.session.armPrewalk({ ...target }, Effort.Low)).toBe(true);
+		expect(created.session.armPrewalk(other, Effort.Low)).toBe(false);
+		expect(notices.at(-1)).toContain("@cerebras");
+		expect(await created.session.restartPrewalk(other, Effort.Medium, other, Effort.Low)).toBe("rejected");
+		expect(created.session.getPrewalkState()).toBe(active);
+		expect(created.session.model).toBe(created.primary);
+		expect(created.session.configuredThinkingLevel()).toBe(Effort.High);
+	});
 
 	it("/new restores the previous prewalk source and effort, then requires a fresh todo before handoff", async () => {
 		const created = createLifecycleSession([
@@ -379,14 +441,37 @@ describe("AgentSession prewalk", () => {
 		expect(manager.getLastModelChangeRole({ skipEphemeral: true })).toBe("slow");
 	});
 
-	it("keeps the arm when a session with a recorded handoff resumes on a different model", () => {
-		const target = modelOrThrow("claude-sonnet-4-6");
+	it("keeps the arm when a literal model ID looks like the recorded pin", () => {
+		const row = getBundledModel("openrouter", "z-ai/glm-4.7")!;
+		const selector = "openrouter/z-ai/glm-4.7@sambanova";
+		const target = parseModelPattern(selector, [row]).model!;
+		const literal = { ...row, id: `${row.id}@sambanova` };
 		const manager = SessionManager.inMemory(tempDir.path());
-		manager.appendModelChange(`${target.provider}/${target.id}`, "prewalk");
-		const created = createLifecycleSession([], { sessionManager: manager, target });
+		manager.appendModelChange(selector, "prewalk");
+		const created = createLifecycleSession([], { sessionManager: manager, primary: literal, target });
 
 		expect(created.session.model?.id).toBe(created.primary.id);
 		expect(created.session.getPrewalkState()?.target.id).toBe(target.id);
+	});
+
+	it.each([
+		["the bare model", "", false],
+		["a different pinned upstream", "@cerebras", true],
+	] as const)("handles a legacy bare prewalk journal restored on %s", (_case, restoredRoute, armed) => {
+		const row = getBundledModel("openrouter", "z-ai/glm-4.7");
+		if (!row) throw new Error("Expected bundled OpenRouter model");
+		const source = parseModelPattern(`openrouter/z-ai/glm-4.7${restoredRoute}`, [row]).model;
+		const target = parseModelPattern("openrouter/z-ai/glm-4.7@sambanova", [row]).model;
+		if (!source || !target) throw new Error("Expected routed prewalk models");
+		const manager = SessionManager.inMemory(tempDir.path());
+		manager.appendModelChange("openrouter/z-ai/glm-4.7", "prewalk");
+		const created = createLifecycleSession([], { sessionManager: manager, primary: source, target });
+
+		if (armed) {
+			expect(created.session.getPrewalkState()?.target.compat).toEqual(target.compat);
+		} else {
+			expect(created.session.getPrewalkState()).toBeUndefined();
+		}
 	});
 
 	it("/new restores the prewalk source and effort after automatic fallback and primary restoration", async () => {
@@ -549,7 +634,7 @@ describe("AgentSession prewalk", () => {
 			settings: created.settings,
 			collabGuest: false,
 			showStatus: vi.fn(),
-			editor: { setText: vi.fn() },
+			composer: { setText: vi.fn() },
 			refreshSlashCommandState: vi.fn(),
 		} as unknown as InteractiveModeContext;
 		expect(await executeBuiltinSlashCommand("/prewalk off", { ctx })).toBe(true);
@@ -1011,73 +1096,72 @@ describe("AgentSession prewalk", () => {
 	it.each([
 		{ tier: "read", tool: "lsp" },
 		{ tier: "exec", tool: "bun-test" },
-	])(
-		"does not switch on a $tier-tier xd:// device dispatched through write (issues #7312, #19002)",
-		async ({ tier, tool }) => {
-			const primary = modelOrThrow("claude-sonnet-4-5");
-			const target = modelOrThrow("claude-sonnet-4-6");
+	])("does not switch on a $tier-tier tool command (issues #7312, #19002)", async ({ tier, tool }) => {
+		const primary = modelOrThrow("claude-sonnet-4-5");
+		const target = modelOrThrow("claude-sonnet-4-6");
 
-			// A read-only lsp navigation or an exec-tier test run is dispatched as
-			// `write xd://<device>`; the write result carries the wrapped tool's tier.
-			// Like a direct bash step, neither mutates the workspace through `write`,
-			// so neither may arm the hand-off — the model keeps investigating on the
-			// strong model. Mirrors the bounded-continuation flow: one continuation,
-			// four turns, all primary, then a clean stop.
-			const deviceWrite: AgentTool<typeof writeToolSchema, { xdev: { tool: string; mode: string; tier: string } }> =
-				{
-					name: "write",
-					label: "Write",
-					description: "Dispatch a non-mutating device",
-					parameters: writeToolSchema,
-					async execute() {
-						return {
-							content: [{ type: "text", text: "device output" }],
-							details: { xdev: { tool, mode: "execute", tier } },
-						};
-					},
+		// A read-only lsp navigation or an exec-tier test run runs as a `bash`
+		// tool command; the dispatch record carries the wrapped tool's tier.
+		// Like a plain shell step, neither mutates the workspace, so neither may
+		// arm the hand-off — the model keeps investigating on the strong model.
+		// Mirrors the bounded-continuation flow: one continuation, four turns,
+		// all primary, then a clean stop.
+		const dispatchBash: AgentTool<
+			typeof writeToolSchema,
+			{ toolCommands: Array<{ tool: string; mode: string; exitCode: number; tier: string }> }
+		> = {
+			name: "bash",
+			label: "Bash",
+			description: "Run a session tool command",
+			parameters: writeToolSchema,
+			async execute() {
+				return {
+					content: [{ type: "text", text: "command output" }],
+					details: { toolCommands: [{ tool, mode: "execute", exitCode: 0, tier }] },
 				};
-			const mock = createMockModel({
-				responses: [
-					toolCall("t1", "record"),
-					toolCall("t2", "write"),
-					{ content: [{ type: "text", text: "Still planning." }], stopReason: "stop" },
-					{ content: [{ type: "text", text: "Done planning." }], stopReason: "stop" },
-				],
-			});
-			const requested: string[] = [];
-			const agent = new Agent({
-				getApiKey: () => "test-key",
-				initialState: {
-					model: primary,
-					systemPrompt: ["Test"],
-					tools: [recordTool as AgentTool, deviceWrite as AgentTool],
-					messages: [],
-					thinkingLevel: Effort.Medium,
-				},
-				convertToLlm,
-				streamFn: (model, context, options) => {
-					requested.push(`${model.provider}/${model.id}`);
-					return mock.stream(model, context, options);
-				},
-			});
-			session = new AgentSession({
-				agent,
-				sessionManager: SessionManager.inMemory(),
-				settings: Settings.isolated({ "compaction.enabled": false }),
-				modelRegistry,
-				toolRegistry: new Map([
-					[recordTool.name, recordTool as AgentTool],
-					[deviceWrite.name, deviceWrite as AgentTool],
-				]),
-				prewalk: { target },
-			});
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				toolCall("t1", "record"),
+				toolCall("t2", "bash"),
+				{ content: [{ type: "text", text: "Still planning." }], stopReason: "stop" },
+				{ content: [{ type: "text", text: "Done planning." }], stopReason: "stop" },
+			],
+		});
+		const requested: string[] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model: primary,
+				systemPrompt: ["Test"],
+				tools: [recordTool as AgentTool, dispatchBash as AgentTool],
+				messages: [],
+				thinkingLevel: Effort.Medium,
+			},
+			convertToLlm,
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				return mock.stream(model, context, options);
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+			toolRegistry: new Map([
+				[recordTool.name, recordTool as AgentTool],
+				[dispatchBash.name, dispatchBash as AgentTool],
+			]),
+			prewalk: { target },
+		});
 
-			await session.prompt("investigate the code shape");
+		await session.prompt("investigate the code shape");
 
-			expect(requested).toEqual(Array(4).fill(`${primary.provider}/${primary.id}`));
-			expect(session.model?.id).toBe(primary.id);
-		},
-	);
+		expect(requested).toEqual(Array(4).fill(`${primary.provider}/${primary.id}`));
+		expect(session.model?.id).toBe(primary.id);
+	});
 
 	it.each([
 		{ readOnlyHint: true, thirdTurnModel: "claude-sonnet-4-5" },
@@ -1100,7 +1184,7 @@ describe("AgentSession prewalk", () => {
 				inputSchema: { type: "object" },
 				annotations: { readOnlyHint },
 			});
-			const xdevState: XdevState = {
+			const toolCommandState: ToolCommandState = {
 				tools: new Map([
 					[
 						mcp.name,
@@ -1113,35 +1197,32 @@ describe("AgentSession prewalk", () => {
 				builtInNames: new Set(),
 				isActive: () => false,
 			};
-			let writes = 0;
-			const dispatchedWrite: AgentTool<typeof writeToolSchema, { xdev: XdevDispatch } | undefined> = {
-				name: "write",
-				label: "Write",
-				description: "MCP lookup then workspace write",
+			const dispatchedBash: AgentTool<typeof writeToolSchema, { toolCommands: ToolCommandDispatch[] }> = {
+				name: "bash",
+				label: "Bash",
+				description: "MCP lookup",
 				parameters: writeToolSchema,
 				async execute(toolCallId) {
-					if (writes++ === 0) {
-						const { result, xdev } = await dispatchXdevTool(xdevState, mcp.name, "{}", toolCallId);
-						// A tools/list_changed refresh drops the definition before the turn ends; the
-						// gate must classify the tool that ran.
-						xdevState.tools.delete(mcp.name);
-						return { content: result.content, details: { xdev } };
-					}
-					return { content: [{ type: "text", text: "implementation written" }], details: undefined };
+					const { result, dispatch } = await dispatchToolCommand(toolCommandState, mcp.name, {}, toolCallId);
+					// A tools/list_changed refresh drops the definition before the turn ends; the
+					// gate must classify the tool that ran.
+					toolCommandState.tools.delete(mcp.name);
+					return { content: result.content, details: { toolCommands: [dispatch] } };
 				},
 			};
 			const created = createLifecycleSession(
 				[
 					toolCall("todo", "todo"),
-					toolCall("lookup", "write"),
+					toolCall("lookup", "bash"),
 					toolCall("implementation", "write"),
 					{ content: ["done"] },
 				],
 				{
-					tools: [todoTool, dispatchedWrite],
+					tools: [todoTool, writeTool, dispatchedBash],
 					registry: new Map<string, AgentTool>([
 						[todoTool.name, todoTool],
-						[dispatchedWrite.name, dispatchedWrite],
+						[writeTool.name, writeTool],
+						[dispatchedBash.name, dispatchedBash],
 					]),
 				},
 			);
@@ -1206,30 +1287,30 @@ describe("AgentSession prewalk", () => {
 		expect(worker.session.model?.id).toBe(worker.target.id);
 	});
 
-	it("switches on a write-tier xd:// device dispatched through write (issue #7312)", async () => {
+	it("switches on a write-tier tool command (issue #7312)", async () => {
 		const primary = modelOrThrow("claude-sonnet-4-5");
 		const target = modelOrThrow("claude-sonnet-4-6");
 
-		// An lsp rename is a write-tier device call — it must arm the hand-off
+		// An lsp rename is a write-tier tool command — it must arm the hand-off
 		// just like a direct edit/write: the write turn stays on the strong model,
 		// the next turn runs on the target.
-		const writeDeviceWrite: AgentTool<
+		const dispatchBash: AgentTool<
 			typeof writeToolSchema,
-			{ xdev: { tool: string; mode: string; tier: string } }
+			{ toolCommands: Array<{ tool: string; mode: string; exitCode: number; tier: string }> }
 		> = {
-			name: "write",
-			label: "Write",
-			description: "Dispatch a write-tier device",
+			name: "bash",
+			label: "Bash",
+			description: "Run a write-tier tool command",
 			parameters: writeToolSchema,
 			async execute() {
 				return {
 					content: [{ type: "text", text: "renamed" }],
-					details: { xdev: { tool: "lsp", mode: "execute", tier: "write" } },
+					details: { toolCommands: [{ tool: "lsp", mode: "execute", exitCode: 0, tier: "write" }] },
 				};
 			},
 		};
 		const mock = createMockModel({
-			responses: [toolCall("t1", "record"), toolCall("t2", "write"), { content: ["done"] }],
+			responses: [toolCall("t1", "record"), toolCall("t2", "bash"), { content: ["done"] }],
 		});
 		const requested: string[] = [];
 		const agent = new Agent({
@@ -1237,7 +1318,7 @@ describe("AgentSession prewalk", () => {
 			initialState: {
 				model: primary,
 				systemPrompt: ["Test"],
-				tools: [recordTool as AgentTool, writeDeviceWrite as AgentTool],
+				tools: [recordTool as AgentTool, dispatchBash as AgentTool],
 				messages: [],
 				thinkingLevel: Effort.Medium,
 			},
@@ -1254,7 +1335,7 @@ describe("AgentSession prewalk", () => {
 			modelRegistry,
 			toolRegistry: new Map([
 				[recordTool.name, recordTool as AgentTool],
-				[writeDeviceWrite.name, writeDeviceWrite as AgentTool],
+				[dispatchBash.name, dispatchBash as AgentTool],
 			]),
 			prewalk: { target },
 		});
@@ -1508,7 +1589,7 @@ describe("AgentSession prewalk", () => {
 			settings,
 			collabGuest: false,
 			showStatus,
-			editor: { setText: vi.fn() },
+			composer: { setText: vi.fn() },
 			refreshSlashCommandState: vi.fn(),
 		} as unknown as InteractiveModeContext;
 		const runtime = { ctx } satisfies TuiSlashCommandRuntime;
@@ -1611,7 +1692,7 @@ describe("AgentSession prewalk", () => {
 			settings,
 			collabGuest: false,
 			showStatus,
-			editor: { setText: vi.fn() },
+			composer: { setText: vi.fn() },
 			refreshSlashCommandState: vi.fn(),
 		} as unknown as InteractiveModeContext;
 		const runtime = { ctx } satisfies TuiSlashCommandRuntime;
@@ -1676,7 +1757,7 @@ describe("AgentSession prewalk", () => {
 			settings,
 			collabGuest: false,
 			showStatus,
-			editor: { setText: vi.fn() },
+			composer: { setText: vi.fn() },
 			refreshSlashCommandState: vi.fn(),
 		} as unknown as InteractiveModeContext;
 		return { session: created, settings, showStatus, runtime: { ctx } satisfies TuiSlashCommandRuntime };
@@ -1735,6 +1816,24 @@ describe("AgentSession prewalk", () => {
 		expect(session.getPrewalkState()?.target.id).toBe(target.id);
 		expect(showStatus.mock.calls.length).toBe(calls + 1);
 		expect(showStatus).toHaveBeenLastCalledWith(expect.stringContaining("Usage: /prewalk"));
+	});
+
+	it("/prewalk accepts ^ model references for into and from", async () => {
+		const primary = modelOrThrow("claude-sonnet-4-5");
+		const target = modelOrThrow("claude-sonnet-4-6");
+		const { session, showStatus, runtime } = createSelectorFixture(primary, { default: primary, smol: primary });
+		const from = `^${primary.provider}/${primary.id}:medium`;
+		const into = `^${target.provider}/${target.id}:high`;
+
+		expect(await executeBuiltinSlashCommand(`/prewalk ${into}`, runtime)).toBe(true);
+		expect(showStatus).toHaveBeenLastCalledWith(expect.stringContaining("Prewalk on"));
+		expect(session.getPrewalkState()?.target.id).toBe(target.id);
+		expect(session.getPrewalkState()?.thinkingLevel).toBe(Effort.High);
+
+		expect(await executeBuiltinSlashCommand(`/prewalk restart ${from} ${into}`, runtime)).toBe(true);
+		expect(showStatus).toHaveBeenLastCalledWith(expect.stringContaining("Prewalk restarted"));
+		expect(session.model?.id).toBe(primary.id);
+		expect(session.getPrewalkState()?.target.id).toBe(target.id);
 	});
 
 	it("requires a fresh todo before a later explicit prewalk can hand off", async () => {
@@ -1960,5 +2059,98 @@ describe("AgentSession prewalk", () => {
 		// The hand-off clears automatic thinking.
 		expect(session.isAutoThinking).toBe(false);
 		expect(notices.some(message => message.includes("nothing to switch"))).toBe(false);
+	});
+	// With `todo.eager=always`, an armed prewalk's plan flow owns todo creation, so
+	// the forced eager-todo prelude ("call todo first this turn") must yield to the
+	// prewalk plan nudge ("write a complete plan first, then todo") instead of
+	// sending both contradictory hidden messages.
+	describe("eager-todo prelude", () => {
+		function messageText(message: AgentMessage): string {
+			if (!("content" in message)) return "";
+			const content = message.content;
+			if (typeof content === "string") return content;
+			if (!Array.isArray(content)) return "";
+			const parts: string[] = [];
+			for (const block of content) {
+				if (block && typeof block === "object" && "type" in block && block.type === "text" && "text" in block) {
+					if (typeof block.text === "string") parts.push(block.text);
+				}
+			}
+			return parts.join("\n");
+		}
+
+		/** Runs a first-turn prompt and returns every hidden/visible text sent to the model. */
+		async function collectInjectedText(options: { prewalk: "handoff" | "noop" | "off" }): Promise<string> {
+			const primary = modelOrThrow("claude-sonnet-4-5");
+			const handoffTarget = modelOrThrow("claude-sonnet-4-6");
+			const prewalkTarget =
+				options.prewalk === "handoff" ? handoffTarget : options.prewalk === "noop" ? primary : undefined;
+			const eagerRegistry = new Map<string, AgentTool>([
+				[recordTool.name, recordTool as AgentTool],
+				[writeTool.name, writeTool as AgentTool],
+				[todoTool.name, todoTool as AgentTool],
+			]);
+			const mock = createMockModel({
+				responses: [
+					toolCall("t1", "todo"),
+					toolCall("t2", "record"),
+					toolCall("t3", "write"),
+					{ content: ["done"] },
+				],
+			});
+
+			const injected: string[] = [];
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				initialState: {
+					model: primary,
+					systemPrompt: ["Test"],
+					tools: [...eagerRegistry.values()],
+					messages: [],
+					thinkingLevel: Effort.Medium,
+				},
+				convertToLlm,
+				getToolChoice: () => eagerSession.nextToolChoiceDirective(),
+				streamFn: (model, context, streamOptions) => {
+					for (const message of context.messages) injected.push(messageText(message));
+					return mock.stream(model, context, streamOptions);
+				},
+			});
+			const eagerSession = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(tempDir.path()),
+				settings: Settings.isolated({
+					"compaction.enabled": false,
+					"todo.enabled": true,
+					"todo.eager": "always",
+					"todo.reminders": false,
+				}),
+				modelRegistry,
+				toolRegistry: eagerRegistry,
+				...(prewalkTarget ? { prewalk: { target: prewalkTarget } } : {}),
+			});
+
+			await eagerSession.prompt("do the task");
+			await eagerSession.dispose();
+			return injected.join("\n---\n");
+		}
+
+		it("suppresses the forced eager-todo prelude while prewalk is armed", async () => {
+			const text = await collectInjectedText({ prewalk: "handoff" });
+			expect(text.includes("write complete plan")).toBe(true);
+			expect(text.includes("You MUST call") && text.includes("first in this turn")).toBe(false);
+		});
+
+		it("still injects the forced eager-todo prelude when prewalk is not armed", async () => {
+			const text = await collectInjectedText({ prewalk: "off" });
+			expect(text.includes("write complete plan")).toBe(false);
+			expect(text.includes("You MUST call") && text.includes("first in this turn")).toBe(true);
+		});
+
+		it("keeps the forced eager-todo prelude when the armed prewalk is a no-op", async () => {
+			const text = await collectInjectedText({ prewalk: "noop" });
+			expect(text.includes("write complete plan")).toBe(false);
+			expect(text.includes("You MUST call") && text.includes("first in this turn")).toBe(true);
+		});
 	});
 });

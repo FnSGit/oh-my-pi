@@ -1,6 +1,10 @@
 //! `sed` builtin stream editor.
 //!
 //! Ported from uutils sed 0.1.1.
+//!
+//! Pattern and hold spaces preserve raw bytes. Regular expressions retain
+//! Unicode character semantics on valid UTF-8 and use single-byte C-locale
+//! matching on lines that are not valid UTF-8.
 
 // Program entry point and CLI processing
 //
@@ -24,12 +28,21 @@ pub mod command {
 // file that was distributed with this source code.
 
 use std::path::PathBuf; // For file descriptors and equivalent
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+	cell::RefCell,
+	collections::HashMap,
+	fmt,
+	io::{BufRead, BufReader},
+	rc::Rc,
+};
 
-use crate::{host::ShellPaths, sed::error_handling::SedResult};
+use crate::{
+	host::{Host, ShellPaths},
+	sed::error_handling::SedResult,
+};
 
 use crate::sed::{
-	error_handling::{ScriptLocation, runtime_error},
+	error_handling::{ScriptLocation, read_error},
 	fast_regex::{Captures, Match, Regex},
 	named_writer::NamedWriter,
 	script_char_provider::ScriptCharProvider,
@@ -61,8 +74,10 @@ pub struct ProcessingContext {
 	pub paths:            ShellPaths,
 
 	// Other context
-	/// Currently processed input file name (not script) in quoted form
-	pub input_name:           String,
+	/// Where GNU locates script errors found at run time: the end of the script.
+	pub script_end:           String,
+	/// Currently processed input file operand, `-` for standard input
+	pub input_name:           PathBuf,
 	/// Current input line number
 	pub line_number:          usize,
 	/// True if this is the last address of a range
@@ -76,12 +91,17 @@ pub struct ProcessingContext {
 	/// Previously compiled RE, saved for reuse when specifying an empty RE.
 	/// Shared, never cloned: a cloned `Regex` starts with an empty match cache.
 	pub saved_regex:          Option<Rc<Regex>>,
+	/// True while the saved RE is one an address supplied and no `s//` has reused.
+	pub saved_regex_from_address: bool,
+	/// True once a `$` address was checked on the current input's last line,
+	/// where GNU reads ahead through the following operands.
+	pub looked_past_input:    bool,
 	/// Modification of input processing action
 	// This is required to avoid doubly borrowing the reader in the 'N'
 	// command.
 	pub input_action: Option<InputAction>,
 	/// Hold space
-	pub hold:                 StringSpace,
+	pub hold:                 ByteSpace,
 	/// Nesting of { } at compile time
 	pub parsed_block_nesting: usize,
 	/// Command associated with each label
@@ -92,6 +112,15 @@ pub struct ProcessingContext {
 	pub substitution_made:    bool,
 	/// Elements to append at the end of each command processing cycle
 	pub append_elements:      Vec<AppendElement>,
+	/// `R` inputs by file name as written, so commands naming the same file share one handle (GNU).
+	pub line_sources:         HashMap<PathBuf, Rc<RefCell<LineSource>>>,
+}
+
+impl ProcessingContext {
+	/// Return the record separator for this invocation.
+	pub(super) fn separator(&self) -> u8 {
+		if self.null_data { 0 } else { b'\n' }
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -99,13 +128,64 @@ pub struct ProcessingContext {
 pub enum AppendElement {
 	Text(Rc<str>), // The specified text string
 	Path(PathBuf), // The contents of the specified file path
+	Line(Vec<u8>), // A line read by `R`, written exactly as read
+}
+
+/// The file an `R` command reads one line from per execution; it stays open across cycles.
+pub struct LineSource {
+	path:   PathBuf,
+	stdin:  bool,
+	reader: LineSourceState,
+}
+
+/// Progress of an `R` input: opened on first use, closed at end of file or when unreadable.
+enum LineSourceState {
+	Unopened,
+	Open(Box<dyn BufRead>),
+	Closed,
+}
+
+impl LineSource {
+	/// Creates the input for `path` as the script names it; `stdin` reads the builtin's standard input.
+	pub fn new(path: PathBuf, stdin: bool) -> Self {
+		Self { path, stdin, reader: LineSourceState::Unopened }
+	}
+
+	/// Returns the next line with its terminator, or `None` at end of file or if the file can't be opened.
+	pub fn next_line(&mut self, host: &Host, separator: u8) -> SedResult<Option<Vec<u8>>> {
+		if matches!(self.reader, LineSourceState::Unopened) {
+			self.reader = if self.stdin {
+				LineSourceState::Open(Box::new(BufReader::new(host.stdin.file().clone())))
+			} else {
+				match host.fs().open(host.resolve(&self.path)) {
+					Ok(file) => LineSourceState::Open(Box::new(BufReader::new(file))),
+					Err(_) => LineSourceState::Closed,
+				}
+			};
+		}
+		let LineSourceState::Open(reader) = &mut self.reader else {
+			return Ok(None);
+		};
+		let mut line = Vec::new();
+		if reader.read_until(separator, &mut line).map_err(|e| read_error(&self.path, &e))? == 0 {
+			self.reader = LineSourceState::Closed;
+			return Ok(None);
+		}
+		Ok(Some(line))
+	}
+}
+
+impl fmt::Debug for LineSource {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("LineSource").field("path", &self.path).finish_non_exhaustive()
+	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-/// A space mirroring IOChunk, but only with a String
-pub struct StringSpace {
-	pub content:     String, // Line content without newline
-	pub has_newline: bool,   // True if \n-terminated
+/// Owned hold space, with the line terminator stored separately.
+pub struct ByteSpace {
+	pub content:    Vec<u8>, // Content without the record separator
+	pub terminated: bool,    // True if a separator followed the content
 }
 
 #[derive(Debug)]
@@ -166,58 +246,31 @@ impl ReplacementTemplate {
 		Self { parts, max_group_number: max_group_number.try_into().unwrap() }
 	}
 
-	/// Apply the template to the given RE captures.
-	/// Example:
-	/// let result = regex.replace_all(input, |caps: &Captures| {
-	///    template.apply_captures(&command, caps) });
-	/// Returns an error if a backreference in the template was not matched by
-	/// the RE.
-	pub fn apply_captures(&self, command: &Command, caps: &Captures) -> SedResult<String> {
-		let mut result = String::new();
-
-		// Invalid group numbers may end here through (unkown at compile time)
-		// reused REs.
-		if self.max_group_number > caps.len() - 1 {
-			return runtime_error(
-				&command.location,
-				format!("invalid reference \\{} on command's RHS", self.max_group_number),
-			);
-		}
-
+	/// Append the replacement for a match, using original bytes from its captures;
+	/// a group the regex lacks expands to nothing, as in GNU.
+	pub fn apply_captures(&self, caps: &Captures, result: &mut Vec<u8>) {
 		for part in &self.parts {
 			match part {
-				ReplacementPart::Literal(s) => result.push_str(s),
-
-				ReplacementPart::WholeMatch => {
-					result.push_str(caps.get(0)?.map_or_default(|m| m.as_str()));
-				},
-
+				ReplacementPart::Literal(s) => result.extend_from_slice(s.as_bytes()),
+				ReplacementPart::WholeMatch => result.extend_from_slice(caps.get(0).unwrap().as_bytes()),
 				ReplacementPart::Group(n) => {
-					let i: usize = (*n).try_into().unwrap();
-					result.push_str(caps.get(i)?.map_or_default(|m| m.as_str()));
+					if let Some(m) = caps.get(*n as usize) {
+						result.extend_from_slice(m.as_bytes());
+					}
 				},
 			}
 		}
-
-		Ok(result)
 	}
 
 	/// Apply the template to the given RE single match.
-	pub fn apply_match(&self, m: &Match) -> String {
-		let mut result = String::new();
-
+	pub fn apply_match(&self, m: &Match, result: &mut Vec<u8>) {
 		for part in &self.parts {
 			match part {
-				ReplacementPart::Literal(s) => result.push_str(s),
-
-				ReplacementPart::WholeMatch => result.push_str(m.as_str()),
-
-				ReplacementPart::Group(_) => {
-					panic!("unexpected Regex group replacement")
-				},
+				ReplacementPart::Literal(s) => result.extend_from_slice(s.as_bytes()),
+				ReplacementPart::WholeMatch => result.extend_from_slice(m.as_bytes()),
+				ReplacementPart::Group(_) => panic!("unexpected Regex group replacement"),
 			}
 		}
-		result
 	}
 }
 
@@ -227,6 +280,7 @@ pub struct Substitution {
 	pub regex:       Option<Rc<Regex>>,   // Regular expression
 	pub replacement: ReplacementTemplate, // Specified broken-down replacement
 	pub occurrence:  usize,               // Which occurrence to substitute
+	pub global:      bool,                // True if 'g' flag: also replace every later occurrence
 	pub print_flag:  bool,                // True if 'p' flag
 	pub ignore_case: bool,                // True if 'I' flag
 	pub execute:     bool,                // True if 'e' flag (GNU extension)
@@ -331,10 +385,11 @@ pub enum CommandData {
 	BranchTarget(Option<Rc<RefCell<Command>>>), // Commands for 'b', 't', '{'
 	Label(Option<String>),                      // Label name for 'b', 't', ':'
 	Path(PathBuf),                              // File path for 'r'
+	LineSource(Rc<RefCell<LineSource>>),        // Line-at-a-time input for 'R' (GNU)
 	NamedWriter(Rc<RefCell<NamedWriter>>),      // File output for 'w'
 	Number(usize),                              // Number for 'l', 'q', 'Q' (GNU)
 	Substitution(Box<Substitution>),            // Substitute command 's'
-	Text(Rc<str>),                              // Text for 'a', 'c', 'i'
+	Text(Rc<str>),                              // Text for 'a', 'c', 'i'; command for 'e' (GNU)
 	Transliteration(Box<Transliteration>),      // Transliteration command 'y'
 }
 
@@ -344,7 +399,9 @@ pub struct InputAction {
 	/// Next command to execute (rather than commands from start)
 	pub next_command: Option<Rc<RefCell<Command>>>,
 	/// Data to prepend to the read contents
-	pub prepend:      String,
+	pub prepend:      Vec<u8>,
+	/// Whether the pending pattern space had a trailing separator.
+	pub terminated:   bool,
 }
 
 #[cfg(test)]
@@ -367,10 +424,10 @@ mod tests {
 		let template = ReplacementTemplate::default();
 		let input = &mut IOChunk::new_from_str("foo");
 		let caps = caps_for("foo", input);
-		let cmd = Command::default();
 
-		let result = template.apply_captures(&cmd, &caps).unwrap();
-		assert_eq!(result, "");
+		let mut result = Vec::new();
+		template.apply_captures(&caps, &mut result);
+		assert!(result.is_empty());
 	}
 
 	#[test]
@@ -379,10 +436,10 @@ mod tests {
 		let template = ReplacementTemplate::new(vec![ReplacementPart::Literal("hello".into())]);
 		let input = &mut IOChunk::new_from_str("abc");
 		let caps = caps_for("abc", input);
-		let cmd = Command::default();
 
-		let result = template.apply_captures(&cmd, &caps).unwrap();
-		assert_eq!(result, "hello");
+		let mut result = Vec::new();
+		template.apply_captures(&caps, &mut result);
+		assert_eq!(result, b"hello");
 	}
 
 	#[test]
@@ -394,10 +451,10 @@ mod tests {
 		]);
 		let input = &mut IOChunk::new_from_str("foo42");
 		let caps = caps_for(r"foo\d+", input);
-		let cmd = Command::default();
 
-		let result = template.apply_captures(&cmd, &caps).unwrap();
-		assert_eq!(result, "got: foo42");
+		let mut result = Vec::new();
+		template.apply_captures(&caps, &mut result);
+		assert_eq!(result, b"got: foo42");
 	}
 
 	#[test]
@@ -409,10 +466,10 @@ mod tests {
 		]);
 		let input = &mut IOChunk::new_from_str("foo42");
 		let caps = caps_for(r"foo(\d+)", input);
-		let cmd = Command::default();
 
-		let result = template.apply_captures(&cmd, &caps).unwrap();
-		assert_eq!(result, "number: 42");
+		let mut result = Vec::new();
+		template.apply_captures(&caps, &mut result);
+		assert_eq!(result, b"number: 42");
 	}
 
 	#[test]
@@ -426,15 +483,15 @@ mod tests {
 		]);
 		let input = &mut IOChunk::new_from_str("x:123");
 		let caps = caps_for(r"(\w+):(\d+)", input);
-		let cmd = Command::default();
 
-		let result = template.apply_captures(&cmd, &caps).unwrap();
-		assert_eq!(result, "key: x, value: 123");
+		let mut result = Vec::new();
+		template.apply_captures(&caps, &mut result);
+		assert_eq!(result, b"key: x, value: 123");
 	}
 
 	#[test]
 	// s/(\w+):(\d+)/key: \1, value: \3/
-	fn test_invalid_group() {
+	fn test_missing_group_expands_to_nothing() {
 		let template = ReplacementTemplate::new(vec![
 			ReplacementPart::Literal("key: ".into()),
 			ReplacementPart::Group(1),
@@ -443,13 +500,11 @@ mod tests {
 		]);
 		let input = &mut IOChunk::new_from_str("x:123");
 		let caps = caps_for(r"(\w+):(\d+)", input);
-		let cmd = Command::default();
 
-		let result = template.apply_captures(&cmd, &caps);
-		assert!(result.is_err());
-
-		let msg = result.unwrap_err().to_string();
-		assert!(msg.contains("invalid reference \\3"));
+		// A group the reused regex lacks expands to nothing, as in GNU.
+		let mut result = Vec::new();
+		template.apply_captures(&caps, &mut result);
+		assert_eq!(result, b"key: x, value: ");
 	}
 
 	// max_group_number
@@ -582,11 +637,14 @@ use crate::openfile::OpenFile;
 use crate::host::ShellPaths;
 use crate::sed::{
 	command::{
-		Address, Command, CommandData, ProcessingContext, RegexMode, ReplacementPart,
+		Address, Command, CommandData, LineSource, ProcessingContext, RegexMode, ReplacementPart,
 		ReplacementTemplate, Substitution, Transliteration,
 	},
-	delimited_parser::{parse_char_escape, parse_regex, parse_transliteration},
-	error_handling::{ScriptLocation, compilation_error, semantic_error},
+	delimited_parser::{ERR_UNTERMINATED_Y, parse_char_escape, parse_regex, parse_transliteration},
+	error_handling::{
+		ScriptLocation, compilation_error, compilation_error_before, compilation_error_through_newline,
+		invalid_reference, newline_delimiter_error, semantic_error,
+	},
 	fast_regex::Regex,
 	named_writer::NamedWriter,
 	script_char_provider::ScriptCharProvider,
@@ -595,11 +653,14 @@ use crate::sed::{
 
 const DEFAULT_OUTPUT_WIDTH: usize = 60;
 
-const ERR_ADDRESS_0_USAGE: &str =
-	"address 0 can only be used with ~step, a second regular expression, or a read command";
-const ERR_SANDBOX: &str = "command not allowed with --sandbox";
-
-const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to 's'";
+// Diagnostics worded as GNU sed 4.9 (sed/compile.c).
+const ERR_ADDRESS_0_USAGE: &str = "invalid usage of line address 0";
+const ERR_SANDBOX: &str = "e/r/w commands disabled in sandbox mode";
+const ERR_UNKNOWN_OPTION_TO_S: &str = "unknown option to `s'";
+const ERR_UNTERMINATED_S: &str = "unterminated `s' command";
+const ERR_UNTERMINATED_ADDRESS: &str = "unterminated address regex";
+const ERR_MISSING_FILENAME: &str = "missing filename in r/R/w/W commands";
+const ERR_EXPECTED_TEXT: &str = "expected \\ after `a', `c' or `i'";
 
 // Handling required after processing a command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,22 +711,20 @@ fn compile_with_provider(
 
 	let mut empty_line = ScriptCharProvider::new("");
 	let result = compile_sequence(&mut make_providers, &mut empty_line, context)?;
+	context.script_end = make_providers.end_origin();
 
 	// Comment-out the following to show the compiled script.
 	#[cfg(any())]
 	dbg!(&result);
 
 	// Link branch commands to the target label commands.
-	populate_label_map(result.clone(), context)?;
+	populate_label_map(result.clone(), context);
 	populate_range_commands(result.clone(), context);
 	resolve_branch_targets(result.clone(), context)?;
 
 	// Link the ends of command blocks to their following commands.
 	// This converts the tree into a graph, so it must be the last
 	// conversion that traverses the structure as a tree.
-	if context.parsed_block_nesting > 0 {
-		return Err(SedError::new(1, "unmatched `{'"));
-	}
 	patch_block_endings(result.clone());
 
 	Ok(result)
@@ -725,10 +784,8 @@ fn patch_block_endings(head: Option<Rc<RefCell<Command>>>) {
 }
 
 /// Populate the context's label map with references to associated commands.
-fn populate_label_map(
-	mut cur: Option<Rc<RefCell<Command>>>,
-	context: &mut ProcessingContext,
-) -> SedResult<()> {
+/// Like GNU sed, a label defined twice resolves to its last definition.
+fn populate_label_map(mut cur: Option<Rc<RefCell<Command>>>, context: &mut ProcessingContext) {
 	while let Some(rc_cmd) = cur.take() {
 		// Borrow mutably just long enough to inspect/rewire this node
 		let cmd = rc_cmd.borrow_mut();
@@ -736,7 +793,7 @@ fn populate_label_map(
 		// Extract any label to insert after borrow ends
 		let maybe_label = match &cmd.data {
 			CommandData::BranchTarget(Some(sub_head)) => {
-				populate_label_map(Some(sub_head.clone()), context)?;
+				populate_label_map(Some(sub_head.clone()), context);
 				None
 			},
 			CommandData::Label(Some(label)) => Some(label.clone()),
@@ -746,15 +803,11 @@ fn populate_label_map(
 		if let Some(label) = maybe_label
 			&& cmd.code == ':'
 		{
-			if context.label_to_command_map.contains_key(&label) {
-				return semantic_error(&cmd.location, format!("duplicate label `{label}'"));
-			}
 			context.label_to_command_map.insert(label, rc_cmd.clone());
 		}
 
 		cur.clone_from(&cmd.next);
 	}
-	Ok(())
 }
 
 /// Populate the context's address range command list with references to
@@ -801,13 +854,13 @@ fn resolve_branch_targets(
 			// Build the replacement
 			let new_data = match old_data {
 				CommandData::Label(Some(label)) => {
+					// GNU reports this without a location and with its panic status, 4.
 					let target = context
 						.label_to_command_map
 						.get(&label)
 						.cloned()
 						.ok_or_else(|| {
-							semantic_error::<()>(&cmd.location, format!("undefined label `{label}'"))
-								.unwrap_err()
+							SedError::new(4, format!("can't find label for jump to `{label}'"))
 						})?;
 					CommandData::BranchTarget(Some(target))
 				},
@@ -918,66 +971,43 @@ fn compile_address_range(
 		let addr1 = compile_address(lines, line, context)?;
 		is_line0 = matches!(addr1, Address::Line(0));
 		cmd.addr1 = Some(addr1);
-		if is_line0 && context.posix {
-			// 0 starting address is a GNU extension.
-			return compilation_error(lines, line, "address 0 is invalid in POSIX mode");
-		}
 		n_addr += 1;
 	}
 
 	line.eat_spaces();
-	if n_addr == 1 && !line.eol() && matches!(line.current(), ',' | '~') {
+	// ~ steps are a GNU extension; under --posix a `~` is an unknown command.
+	if n_addr == 1 && !line.eol() && (line.current() == ',' || (line.current() == '~' && !context.posix))
+	{
 		let is_step_match = line.current() == '~'; // E.g. 0~2: Pick even-numbered lines
 		line.advance();
 		line.eat_spaces();
-		let is_step_end = if line.current() == '~' {
-			// E.g. /foo/,~10: Start at foo, include all lines until multiple of 10 is
-			// reached.
+		// E.g. /foo/,~10: Start at foo, include all lines until multiple of 10 is reached.
+		let is_step_end = !is_step_match && !context.posix && !line.eol() && line.current() == '~';
+		if is_step_end {
 			line.advance();
 			line.eat_spaces();
-			true
-		} else {
-			false
-		};
-
-		if (is_step_match || is_step_end) && context.posix {
-			// ~ steps are a GNU extension.
-			return compilation_error(lines, line, "~step is invalid in POSIX mode");
 		}
 
-		// Look for second address.
-		if !line.eol() {
-			let addr2 = compile_address(lines, line, context)?;
-			// Set step_n to the number specified in the (required numeric) address.
-			let step_n = if is_step_match || is_step_end {
-				match addr2 {
-					Address::Line(n) => n,
-					_ => {
-						return compilation_error(
-							lines,
-							line,
-							"~step can only be specified on numeric addresses",
-						);
-					},
-				}
-			} else {
-				0 // dummy, not used
-			};
-
-			if is_line0 && !matches!(addr2, Address::Re(_)) && !is_step_match {
+		if is_step_match || is_step_end {
+			// GNU reads a missing step as 0.
+			let step = parse_number(lines, line, false)?.unwrap_or(0);
+			if is_line0 && is_step_end {
 				return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
 			}
-
-			// If needed, transform Address::Line into Address::Step*.
-			cmd.addr2 = if is_step_match {
-				Some(Address::StepMatch(step_n))
-			} else if is_step_end {
-				Some(Address::StepEnd(step_n))
-			} else {
-				Some(addr2)
-			};
-			n_addr += 1;
+			cmd.addr2 =
+				Some(if is_step_match { Address::StepMatch(step) } else { Address::StepEnd(step) });
+		} else {
+			if line.eol() || !(is_address_char(line.current()) || line.current() == '+') {
+				return compilation_error(lines, line, "unexpected `,'");
+			}
+			let addr2 = compile_address(lines, line, context)?;
+			// Address 0 is a GNU extension that only pairs with a closing regex.
+			if is_line0 && (context.posix || !matches!(addr2, Address::Re(_))) {
+				return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
+			}
+			cmd.addr2 = Some(addr2);
 		}
+		n_addr += 1;
 	}
 
 	// Zero-address read command check
@@ -985,7 +1015,7 @@ fn compile_address_range(
 		// After retrieval of first address, subsequent spaces
 		// are consumed unconditionally. By now, the position
 		// must be in non-whitespace character or EOL.
-		if line.eol() || line.current() != 'r' {
+		if context.posix || line.eol() || line.current() != 'r' {
 			return compilation_error(lines, line, ERR_ADDRESS_0_USAGE);
 		}
 	}
@@ -995,22 +1025,27 @@ fn compile_address_range(
 
 /// Read the line's remaining characters as a file path and return it.
 fn read_file_path(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> SedResult<PathBuf> {
-	line.advance(); // Skip the command/w character
-	line.eat_spaces(); // Skip any leading whitespace
-
-	let mut path = String::new();
-	while !line.eol() {
-		path.push(line.current());
-		line.advance();
-	}
-
+	let path = read_argument(line);
 	if path.is_empty() {
-		compilation_error(lines, line, "missing file path")
+		compilation_error(lines, line, ERR_MISSING_FILENAME)
 	} else {
 		// resolve `r`/`w`/`s///w` file
 		// operands against the shell working directory.
 		Ok(PathBuf::from(path))
 	}
+}
+
+/// Skip the command character and leading whitespace, and return the rest of the line.
+fn read_argument(line: &mut ScriptCharProvider) -> String {
+	line.advance(); // Skip the command/w character
+	line.eat_spaces(); // Skip any leading whitespace
+
+	let mut argument = String::new();
+	while !line.eol() {
+		argument.push(line.current());
+		line.advance();
+	}
+	argument
 }
 
 /// Compile and return a single range address specification.
@@ -1039,25 +1074,41 @@ fn compile_address(
 			} else {
 				RegexMode::Basic
 			};
-			let re = parse_regex(lines, line, regex_mode)?;
+			let re = parse_regex(lines, line, regex_mode, ERR_UNTERMINATED_ADDRESS)?;
 			// Skip over delimiter
 			line.advance();
 
-			line.eat_spaces();
-			if !line.eol() && line.current() == 'I' {
-				icase = true;
+			// GNU's `I` and `M` address flags, in any order and spacing; --posix has neither.
+			let mut multiline = false;
+			loop {
+				line.eat_spaces();
+				if context.posix || line.eol() {
+					break;
+				}
+				match line.current() {
+					'I' => icase = true,
+					'M' => multiline = true,
+					_ => break,
+				}
 				line.advance();
 			}
 
-			Ok(Address::Re(compile_regex(lines, line, &re, context, icase, false)?.map(Rc::new)))
+			// GNU compiles an address regex before reading the command after it.
+			if let Some(msg) = re.error {
+				return compilation_error_before(lines, line, msg);
+			}
+			let regex = compile_regex(&re.pattern, context, icase, multiline)
+				.or_else(|msg| compilation_error_before(lines, line, msg))?;
+			Ok(Address::Re(regex.map(Rc::new)))
 		},
 		'$' => {
 			line.advance();
 			Ok(Address::Last)
 		},
 		'+' => {
+			// GNU reads a missing offset as 0.
 			line.advance();
-			let number = parse_number(lines, line, true)?.unwrap();
+			let number = parse_number(lines, line, false)?.unwrap_or(0);
 			Ok(Address::RelLine(number))
 		},
 		c if c.is_ascii_digit() => {
@@ -1098,15 +1149,12 @@ fn parse_number(
 }
 
 /// Parse the end of a command, failing with an error on extra characters.
-fn parse_command_ending(
-	lines: &ScriptLineProvider,
-	line: &mut ScriptCharProvider,
-	cmd: &mut Command,
-) -> SedResult<()> {
+fn parse_command_ending(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> SedResult<()> {
 	line.eat_spaces();
-	// Leave a closing brace for compile_sequence to validate and close the group.
-	// GNU sed recognizes it at a command boundary even under --posix.
-	if !line.eol() && line.current() == '}' {
+	// Leave a closing brace for compile_sequence to validate and close the group,
+	// and a comment for it to skip. GNU sed recognizes both at a command boundary
+	// even under --posix.
+	if !line.eol() && matches!(line.current(), '}' | '#') {
 		return Ok(());
 	}
 	if !line.eol() && line.current() == ';' {
@@ -1115,11 +1163,7 @@ fn parse_command_ending(
 	}
 
 	if !line.eol() {
-		return compilation_error(
-			lines,
-			line,
-			format!("extra characters at the end of the {} command", cmd.code),
-		);
+		return compilation_error(lines, line, "extra characters after command");
 	}
 
 	Ok(())
@@ -1131,31 +1175,28 @@ fn parse_command_ending(
 /// An empty pattern results in None, which means that the last RE employed
 /// at runtime will be used.
 fn compile_regex(
-	lines: &ScriptLineProvider,
-	line: &ScriptCharProvider,
 	pattern: &str,
 	context: &ProcessingContext,
 	icase: bool,
 	multiline: bool,
-) -> SedResult<Option<Regex>> {
+) -> Result<Option<Regex>, String> {
 	if pattern.is_empty() {
 		return Ok(None);
 	}
 
-	// Convert basic to extended regular expression if needed. A BRE the
-	// dialect cannot express is a compilation error, matching real sed:
-	// `sed 's/\{1,3\}/X/'` reports an invalid RE rather than substituting.
 	let translated = if context.regex_extended {
-		None
+		crate::bre::ere_to_rust(pattern, false)
 	} else {
-		Some(
-			crate::bre::bre_to_ere(pattern, crate::bre::Backrefs::Supported).map_err(|e| {
-				compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {}", e.message()))
-					.unwrap_err()
-			})?,
-		)
+		crate::bre::bre_to_ere(pattern, crate::bre::Backrefs::Supported, crate::bre::StackedRepeats::Refused).map(std::borrow::Cow::Owned)
+	}
+	.map_err(|e| e.gnu_message().to_string())?;
+	let multiline_classes;
+	let pattern = if multiline {
+		multiline_classes = exclude_newline_from_negated_classes(translated.as_ref());
+		&multiline_classes
+	} else {
+		translated.as_ref()
 	};
-	let pattern = translated.as_deref().unwrap_or(pattern);
 
 	let mut modifiers = String::new();
 	if icase {
@@ -1164,19 +1205,54 @@ fn compile_regex(
 	if multiline {
 		modifiers.push('m');
 	}
+	let with_modifiers;
 	let pattern = if modifiers.is_empty() {
-		pattern.to_string()
+		pattern
 	} else {
-		format!("(?{modifiers}){pattern}")
+		with_modifiers = format!("(?{modifiers}){pattern}");
+		&with_modifiers
 	};
 
-	// Compile into engine.
-	let compiled = Regex::new(&pattern).map_err(|e| {
-		compilation_error::<Regex>(lines, line, format!("invalid regex '{pattern}': {e}"))
-			.unwrap_err()
+	// Compile into engine; the translation has already refused what glibc refuses.
+	let compiled = Regex::new(pattern).map_err(|e| match e.downcast_ref::<::regex::Error>() {
+		Some(::regex::Error::CompiledTooBig(_)) => crate::bre::BreError::IntervalTooBig.gnu_message().to_string(),
+		_ => e.to_string(),
 	})?;
 
 	Ok(Some(compiled))
+}
+
+/// Adds `\n` to every negated bracket class of a translated pattern: under
+/// `M`, GNU sed's `[^x]` stops at the newlines that separate lines, as `.`
+/// does, while the Rust engine's matches them.
+fn exclude_newline_from_negated_classes(pattern: &str) -> String {
+	let mut result = String::with_capacity(pattern.len() + 8);
+	let mut chars = pattern.chars().peekable();
+	// Nesting depth inside a bracket class (Rust classes nest).
+	let mut depth = 0usize;
+	while let Some(c) = chars.next() {
+		result.push(c);
+		match c {
+			'\\' => result.extend(chars.next()),
+			'[' => {
+				if depth == 0 && chars.next_if_eq(&'^').is_some() {
+					result.push_str(r"^\n");
+				} else if depth > 0
+					&& let Some(caret) = chars.next_if_eq(&'^')
+				{
+					result.push(caret);
+				}
+				depth += 1;
+				// A `]` right after the opening is a literal member.
+				if let Some(close) = chars.next_if_eq(&']') {
+					result.push(close);
+				}
+			},
+			']' if depth > 0 => depth -= 1,
+			_ => {},
+		}
+	}
+	result
 }
 
 /// Compile a regular expression replacement string.
@@ -1190,105 +1266,87 @@ pub fn compile_replacement(
 	let delimiter = line.current();
 	line.advance();
 
-	loop {
-		while !line.eol() {
-			match line.current() {
-				'\\' => {
-					line.advance();
+	while !line.eol() {
+		match line.current() {
+			c if c == delimiter => {
+				line.advance(); // skip closing delimiter
+				if !literal.is_empty() {
+					parts.push(ReplacementPart::Literal(literal));
+				}
+				return Ok(ReplacementTemplate::new(parts));
+			},
 
-					// Line input_action
-					if line.eol() {
-						if let Some(next_line_string) = lines.next_line()? {
-							literal.push('\n');
-							*line = ScriptCharProvider::new(&next_line_string);
-							continue;
+			'\\' => {
+				line.advance();
+
+				// An escaped newline continues the replacement on the next line.
+				if line.eol() {
+					if let Some(next_line_string) = lines.next_line()? {
+						literal.push('\n');
+						*line = ScriptCharProvider::new(&next_line_string);
+						continue;
+					}
+					return compilation_error(lines, line, ERR_UNTERMINATED_S);
+				}
+
+				match line.current() {
+					// \0 - \9
+					c @ '0'..='9' => {
+						let ref_num = c.to_digit(10).unwrap();
+
+						if !literal.is_empty() {
+							parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
 						}
-						return compilation_error(
-							lines,
-							line,
-							"unterminated substitute replacement (unexpected EOF)",
-						);
-					}
+						if ref_num == 0 {
+							parts.push(ReplacementPart::WholeMatch);
+						} else {
+							parts.push(ReplacementPart::Group(ref_num));
+						}
+						line.advance();
+					},
 
-					match line.current() {
-						// \0 - \9
-						c @ '0'..='9' => {
-							let ref_num = c.to_digit(10).unwrap();
+					// Literal \ and &
+					'\\' | '&' => {
+						literal.push(line.current());
+						line.advance();
+					},
 
-							if !literal.is_empty() {
-								parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
-							}
-							if ref_num == 0 {
-								parts.push(ReplacementPart::WholeMatch);
-							} else {
-								parts.push(ReplacementPart::Group(ref_num));
-							}
-							line.advance();
-						},
+					// Literal delimiter
+					v if v == delimiter => {
+						literal.push(line.current());
+						line.advance();
+					},
 
-						// Literal \ and &
-						'\\' | '&' => {
+					// other escape sequences
+					_ => {
+						if let Some(decoded) = parse_char_escape(line) {
+							literal.push(decoded);
+						} else {
+							literal.push('\\');
 							literal.push(line.current());
 							line.advance();
-						},
+						}
+					},
+				}
+			},
 
-						// Literal delimiter
-						v if v == delimiter => {
-							literal.push(line.current());
-							line.advance();
-						},
+			'&' => {
+				if !literal.is_empty() {
+					parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
+				}
+				parts.push(ReplacementPart::WholeMatch);
+				line.advance();
+			},
 
-						// other escape sequences
-						_ => {
-							if let Some(decoded) = parse_char_escape(line) {
-								literal.push(decoded);
-							} else {
-								literal.push('\\');
-								literal.push(line.current());
-								line.advance();
-							}
-						},
-					}
-				},
-
-				'&' => {
-					if !literal.is_empty() {
-						parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
-					}
-					parts.push(ReplacementPart::WholeMatch);
-					line.advance();
-				},
-
-				'\n' => {
-					return compilation_error(
-						lines,
-						line,
-						"unescaped newline inside substitute replacement",
-					);
-				},
-
-				c if c == delimiter => {
-					line.advance(); // skip closing delimiter
-					if !literal.is_empty() {
-						parts.push(ReplacementPart::Literal(literal));
-					}
-					return Ok(ReplacementTemplate::new(parts));
-				},
-
-				c => {
-					literal.push(c);
-					line.advance();
-				},
-			}
-		}
-
-		// Fetch next line for continued replacement string
-		if let Some(next_line_string) = lines.next_line()? {
-			*line = ScriptCharProvider::new(&next_line_string);
-		} else {
-			return compilation_error(lines, line, "unterminated substitute replacement");
+			c => {
+				literal.push(c);
+				line.advance();
+			},
 		}
 	}
+
+	// An unescaped newline ends the line before the closing delimiter.
+	compilation_error(lines, line, ERR_UNTERMINATED_S)
 }
 
 // Handles s
@@ -1299,14 +1357,8 @@ fn compile_subst_command(
 	context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // move past 's'
-
-	let delimiter = line.current();
-	if delimiter == '\0' || delimiter == '\\' {
-		return compilation_error(
-			lines,
-			line,
-			"substitute pattern cannot be delimited by newline or backslash",
-		);
+	if line.eol() {
+		return newline_delimiter_error(lines, line, ERR_UNTERMINATED_S);
 	}
 
 	let regex_mode = if context.regex_extended {
@@ -1314,38 +1366,44 @@ fn compile_subst_command(
 	} else {
 		RegexMode::Basic
 	};
-	let pattern = parse_regex(lines, line, regex_mode)?;
+	let parsed = parse_regex(lines, line, regex_mode, ERR_UNTERMINATED_S)?;
 	let mut subst = Box::new(Substitution::default());
 
 	subst.replacement = compile_replacement(lines, line)?;
 	compile_subst_flags(lines, line, &mut subst, context.posix, context.sandbox, &context.paths)?;
 
-	if pattern.is_empty() && (subst.ignore_case || subst.multiline) {
-		return compilation_error(
-			lines,
-			line,
-			"cannot specify modifiers on an empty regular expression",
-		);
+	if parsed.pattern.is_empty() && (subst.ignore_case || subst.multiline) {
+		return subst_flags_error(lines, line, "cannot specify modifiers on empty regexp");
 	}
 
-	// Compile regex with now known modifier flags.
-	subst.regex = compile_regex(lines, line, &pattern, context, subst.ignore_case, subst.multiline)?
+	// Compile regex with now known modifier flags; GNU reports regex errors here.
+	if let Some(msg) = parsed.error {
+		return subst_flags_error(lines, line, msg);
+	}
+	subst.regex = compile_regex(&parsed.pattern, context, subst.ignore_case, subst.multiline)
+		.or_else(|msg| subst_flags_error(lines, line, msg))?
 		.map(Rc::new);
 
 	// Catch invalid group references at compile time, if possible.
 	if let Some(regex) = &subst.regex
 		&& subst.replacement.max_group_number > regex.captures_len() - 1
 	{
-		return compilation_error(
-			lines,
-			line,
-			format!("invalid reference \\{} on `s' command's RHS", subst.replacement.max_group_number),
-		);
+		return subst_flags_error(lines, line, invalid_reference(subst.replacement.max_group_number));
 	}
 	cmd.data = CommandData::Substitution(subst);
 
-	parse_command_ending(lines, line, cmd)?;
+	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Continue)
+}
+
+/// Fails with an error GNU raises once an `s` command's flags are read: past a
+/// terminating `;` or newline, but before a `}` or `#`.
+fn subst_flags_error<T>(lines: &ScriptLineProvider, line: &ScriptCharProvider, msg: impl ToString) -> SedResult<T> {
+	if !line.eol() && matches!(line.current(), '}' | '#') {
+		compilation_error_before(lines, line, msg)
+	} else {
+		compilation_error_through_newline(lines, line, msg)
+	}
 }
 
 // Handles y
@@ -1356,27 +1414,21 @@ fn compile_trans_command(
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // move past 'y'
-
-	let delimiter = line.current();
-	if delimiter == '\0' || delimiter == '\\' {
-		return compilation_error(
-			lines,
-			line,
-			"transliteration string cannot be delimited by newline or backslash",
-		);
+	if line.eol() {
+		return newline_delimiter_error(lines, line, ERR_UNTERMINATED_Y);
 	}
 
 	let source = parse_transliteration(lines, line)?;
 	let target = parse_transliteration(lines, line)?;
 	if source.chars().count() != target.chars().count() {
-		return compilation_error(lines, line, "transliteration strings are not the same length");
+		return compilation_error(lines, line, "strings for `y' command are different lengths");
 	}
 
 	let transliteration = Box::new(Transliteration::from_strings(&source, &target));
 	cmd.data = CommandData::Transliteration(transliteration);
 
 	line.advance(); // move past last delimiter
-	parse_command_ending(lines, line, cmd)?;
+	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Continue)
 }
 
@@ -1389,9 +1441,10 @@ pub fn compile_subst_flags(
 	sandbox: bool,
 	paths: &ShellPaths,
 ) -> SedResult<()> {
-	let mut seen_g_or_n = false;
+	let mut seen_n = false;
 
 	subst.occurrence = 1; // default
+	subst.global = false;
 	subst.print_flag = false;
 	subst.ignore_case = false;
 	subst.execute = false;
@@ -1406,15 +1459,10 @@ pub fn compile_subst_flags(
 
 		match line.current() {
 			'g' => {
-				if seen_g_or_n {
-					return compilation_error(
-						lines,
-						line,
-						"multiple 'g' or numeric flags in substitute command",
-					);
+				if subst.global {
+					return compilation_error(lines, line, "multiple `g' options to `s' command");
 				}
-				seen_g_or_n = true;
-				subst.occurrence = 0;
+				subst.global = true;
 				line.advance();
 			},
 
@@ -1440,24 +1488,27 @@ pub fn compile_subst_flags(
 			},
 
 			'e' => {
-				if posix || sandbox {
-					return compilation_error(
-						lines,
-						line,
-						"the 'e' substitute flag is not allowed with --posix or --sandbox",
-					);
+				if sandbox {
+					return compilation_error(lines, line, ERR_SANDBOX);
+				}
+				if posix {
+					return compilation_error(lines, line, ERR_UNKNOWN_OPTION_TO_S);
 				}
 				subst.execute = true;
 				line.advance();
 			},
 
+			'0' => {
+				return compilation_error(
+					lines,
+					line,
+					"number option to `s' command may not be zero",
+				);
+			},
+
 			_c @ '1'..='9' => {
-				if seen_g_or_n {
-					return compilation_error(
-						lines,
-						line,
-						"multiple 'g' or numeric flags in substitute command",
-					);
+				if seen_n {
+					return compilation_error(lines, line, "multiple number options to `s' command");
 				}
 
 				let mut number = 0usize;
@@ -1473,23 +1524,22 @@ pub fn compile_subst_flags(
 				}
 
 				subst.occurrence = number;
-				seen_g_or_n = true;
+				seen_n = true;
 			},
 
 			'w' => {
 				if sandbox {
 					return compilation_error(lines, line, ERR_SANDBOX);
 				}
-				let location = ScriptLocation::at_position(lines, line);
 				let path = read_file_path(lines, line)?;
-				subst.write_file = Some(NamedWriter::new(path, paths, location)?);
+				subst.write_file = Some(NamedWriter::new(path, paths)?);
 				return Ok(()); // 'w' is the last flag allowed
 			},
 
-			';' | '\n' | '}' => break,
+			';' | '\n' | '}' | '#' => break,
 
-			other => {
-				return compilation_error(lines, line, format!("invalid substitute flag: '{other}'"));
+			_ => {
+				return compilation_error(lines, line, ERR_UNKNOWN_OPTION_TO_S);
 			},
 		}
 	}
@@ -1507,9 +1557,12 @@ fn compile_end_group_command(
 	if context.parsed_block_nesting == 0 {
 		return compilation_error(lines, line, "unexpected `}'");
 	}
+	if cmd.addr1.is_some() {
+		return compilation_error(lines, line, "`}' doesn't want any addresses");
+	}
 	context.parsed_block_nesting -= 1;
 	line.advance();
-	parse_command_ending(lines, line, cmd)?;
+	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Return)
 }
 
@@ -1520,11 +1573,11 @@ fn compile_negation_command(
 	cmd: &mut Command,
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
+	if cmd.non_select {
+		return compilation_error(lines, line, "multiple `!'s");
+	}
 	line.advance();
 	line.eat_spaces();
-	if cmd.non_select {
-		return compilation_error(lines, line, "negation already applied");
-	}
 	cmd.non_select = true;
 	Ok(CommandHandling::GetNext)
 }
@@ -1534,11 +1587,11 @@ fn compile_negation_command(
 fn compile_empty_command(
 	lines: &mut ScriptLineProvider,
 	line: &mut ScriptCharProvider,
-	cmd: &mut Command,
+	_cmd: &mut Command,
 	_context: &mut ProcessingContext,
 ) -> SedResult<CommandHandling> {
 	line.advance(); // Skip the command character
-	parse_command_ending(lines, line, cmd)?;
+	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Continue)
 }
 
@@ -1552,13 +1605,50 @@ fn compile_read_file_command(
 	if context.sandbox {
 		return compilation_error(lines, line, ERR_SANDBOX);
 	}
-	let path = context.paths.resolve(read_file_path(lines, line)?);
-	cmd.data = CommandData::Path(path);
+	cmd.data = CommandData::Path(read_file_path(lines, line)?);
+	Ok(CommandHandling::Continue)
+}
+
+// Handles R (GNU)
+fn compile_read_line_command(
+	lines: &mut ScriptLineProvider,
+	line: &mut ScriptCharProvider,
+	cmd: &mut Command,
+	context: &mut ProcessingContext,
+) -> SedResult<CommandHandling> {
+	if context.sandbox {
+		return compilation_error(lines, line, ERR_SANDBOX);
+	}
+	let path = read_file_path(lines, line)?;
+	let source = match context.line_sources.get(&path) {
+		Some(source) => Rc::clone(source),
+		None => {
+			let source =
+				Rc::new(RefCell::new(LineSource::new(path.clone(), path.as_os_str() == "/dev/stdin")));
+			context.line_sources.insert(path, Rc::clone(&source));
+			source
+		},
+	};
+	cmd.data = CommandData::LineSource(source);
+	Ok(CommandHandling::Continue)
+}
+
+// Handles e (GNU): an empty command executes the pattern space.
+fn compile_execute_command(
+	lines: &mut ScriptLineProvider,
+	line: &mut ScriptCharProvider,
+	cmd: &mut Command,
+	context: &mut ProcessingContext,
+) -> SedResult<CommandHandling> {
+	if context.sandbox {
+		return compilation_error(lines, line, ERR_SANDBOX);
+	}
+	cmd.data = CommandData::Text(Rc::from(read_argument(line)));
 	Ok(CommandHandling::Continue)
 }
 
 
-// Handles w
+// Handles w and W (GNU)
 fn compile_write_file_command(
 	lines: &mut ScriptLineProvider,
 	line: &mut ScriptCharProvider,
@@ -1568,9 +1658,8 @@ fn compile_write_file_command(
 	if context.sandbox {
 		return compilation_error(lines, line, ERR_SANDBOX);
 	}
-	let location = ScriptLocation::at_position(lines, line);
 	let path = read_file_path(lines, line)?;
-	cmd.data = CommandData::NamedWriter(NamedWriter::new(path, &context.paths, location)?);
+	cmd.data = CommandData::NamedWriter(NamedWriter::new(path, &context.paths)?);
 	Ok(CommandHandling::Continue)
 }
 
@@ -1583,7 +1672,13 @@ fn compile_block_command(
 ) -> SedResult<CommandHandling> {
 	line.advance(); // move past '{'
 	context.parsed_block_nesting += 1;
+	let depth = context.parsed_block_nesting;
 	let block_body = compile_sequence(lines, line, context)?;
+	if context.parsed_block_nesting == depth {
+		// GNU reports the innermost unclosed block where it opened, at char 0.
+		let location = ScriptLocation { offset: 0, ..cmd.location.clone() };
+		return semantic_error(&location, "unmatched `{'");
+	}
 	cmd.data = CommandData::BranchTarget(block_body);
 	Ok(CommandHandling::Continue)
 }
@@ -1612,14 +1707,14 @@ fn compile_label_command(
 
 	if label.is_empty() {
 		if cmd.code == ':' {
-			return compilation_error(lines, line, "empty label");
+			return compilation_error(lines, line, "\":\" lacks a label");
 		}
 		cmd.data = CommandData::Label(None);
 	} else {
 		cmd.data = CommandData::Label(Some(label));
 	}
 
-	parse_command_ending(lines, line, cmd)?;
+	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Continue)
 }
 
@@ -1656,15 +1751,13 @@ fn compile_number_command(
 		},
 	}
 
-	parse_command_ending(lines, line, cmd)?;
+	parse_command_ending(lines, line)?;
 	Ok(CommandHandling::Continue)
 }
 
-/// Compile commands that take text as an argument.
-// Handles a, c, i
-// According to POSIX, these commands expect \ followed by text.
-// As a GNU extension the initial \ can be ommitted, and from then on
-// character escapes are honored.
+/// Compile `a`, `c` and `i`, whose text GNU reads after an optional `\` and
+/// newline; `\` escapes and continues lines. --posix requires the `\` and text
+/// from the same script piece.
 fn compile_text_command(
 	lines: &mut ScriptLineProvider,
 	line: &mut ScriptCharProvider,
@@ -1673,52 +1766,33 @@ fn compile_text_command(
 ) -> SedResult<CommandHandling> {
 	line.advance(); // Skip the command character.
 	line.eat_spaces(); // Skip any leading whitespace.
-	if context.posix {
-		compile_text_command_posix(lines, line, cmd, context)
-	} else {
-		compile_text_command_gnu(lines, line, cmd, context)
-	}
-}
 
-/// Compile commands that take text as an argument (GNU syntax).
-// Handles a, c, i; after the command and initial whitespace have been consumed.
-// According to POSIX, these commands expect \ followed by text.
-// As a GNU extension the initial \ can be ommitted, and from then on
-// character escapes are honored.
-fn compile_text_command_gnu(
-	lines: &mut ScriptLineProvider,
-	line: &mut ScriptCharProvider,
-	cmd: &mut Command,
-	_context: &mut ProcessingContext,
-) -> SedResult<CommandHandling> {
+	if line.eol() || (context.posix && line.current() != '\\') {
+		return compilation_error(lines, line, ERR_EXPECTED_TEXT);
+	}
+
 	// True after a \ at the end of a line
 	let mut escaped_newline = false;
 
-	if line.eol() {
-		return compilation_error(
-			lines,
-			line,
-			format!("command `{}' expects \\ followed by text", cmd.code),
-		);
-	}
-
 	// Skip optional \.
-	if !line.eol() && line.current() == '\\' {
+	if line.current() == '\\' {
 		line.advance();
 		escaped_newline = line.eol();
 	}
 
 	// Gather replacement text.  Stop on a non-escaped newline.
 	let mut text = String::new();
-	'text_content: loop {
+	loop {
 		if escaped_newline {
-			match lines.next_line()? {
-				None => {
-					break 'text_content;
-				},
-				Some(line_string) => {
-					*line = ScriptCharProvider::new(&line_string);
-				},
+			let next_line = if context.posix {
+				let incomplete = compilation_error::<()>(lines, line, "incomplete command").unwrap_err();
+				Some(lines.next_line_in_source()?.ok_or(incomplete)?)
+			} else {
+				lines.next_line()?
+			};
+			match next_line {
+				None => break,
+				Some(line_string) => *line = ScriptCharProvider::new(&line_string),
 			}
 			escaped_newline = false;
 		}
@@ -1726,7 +1800,7 @@ fn compile_text_command_gnu(
 		// Non-escaped newline
 		if line.eol() {
 			text.push('\n');
-			break 'text_content;
+			break;
 		}
 
 		if line.current() == '\\' {
@@ -1735,7 +1809,7 @@ fn compile_text_command_gnu(
 			if line.eol() {
 				escaped_newline = true;
 				text.push('\n');
-				continue 'text_content;
+				continue;
 			}
 
 			if let Some(decoded) = parse_char_escape(line) {
@@ -1754,54 +1828,6 @@ fn compile_text_command_gnu(
 	Ok(CommandHandling::Continue)
 }
 
-/// Compile commands that take text as an argument (POSIX syntax).
-// Handles a, c, i; after the command and initial whitespace have been consumed.
-// According to POSIX, these commands expect \ followed by text.
-fn compile_text_command_posix(
-	lines: &mut ScriptLineProvider,
-	line: &mut ScriptCharProvider,
-	cmd: &mut Command,
-	_context: &mut ProcessingContext,
-) -> SedResult<CommandHandling> {
-	if line.eol() || line.current() != '\\' {
-		return compilation_error(
-			lines,
-			line,
-			format!("command `{}' expects \\ followed by text", cmd.code),
-		);
-	}
-
-	line.advance(); // Skip \.
-	line.eat_spaces(); // Skip any whitespace at the end of \.
-	if !line.eol() {
-		return compilation_error(
-			lines,
-			line,
-			format!("extra characters after \\ at the end of `{}' command", cmd.code),
-		);
-	}
-
-	let mut text = String::new();
-	while let Some(line) = lines.next_line()? {
-		if line.ends_with('\\') {
-			// Line ends with \ to escape \n; remove the trailing \.
-			text.push_str(&line[..line.len() - 1]);
-			text.push('\n');
-		} else {
-			text.push_str(&line);
-			text.push('\n');
-			break;
-		}
-	}
-
-	if text.is_empty() {
-		compilation_error(lines, line, "incomplete command")?;
-	}
-
-	cmd.data = CommandData::Text(Rc::from(text));
-	Ok(CommandHandling::Continue)
-}
-
 // Return the specification for the command letter at the current line position
 // checking for diverse errors.
 fn get_verified_cmd_spec(
@@ -1811,18 +1837,18 @@ fn get_verified_cmd_spec(
 	posix: bool,
 ) -> SedResult<CommandSpec> {
 	if line.eol() {
-		return compilation_error(lines, line, "command expected");
+		return compilation_error(lines, line, "missing command");
 	}
 
 	let ch = line.current();
+	if ch == '#' && n_addr > 0 {
+		return compilation_error(lines, line, "comments don't accept any addresses");
+	}
 	let cmd_spec = get_cmd_spec(lines, line, ch, posix)?;
 
 	if n_addr > cmd_spec.n_addr {
-		return compilation_error(
-			lines,
-			line,
-			format!("command {} expects up to {} address(es), found {}", ch, cmd_spec.n_addr, n_addr),
-		);
+		let msg = if ch == ':' { ": doesn't want any addresses" } else { "command only uses one address" };
+		return compilation_error(lines, line, msg);
 	}
 
 	Ok(cmd_spec)
@@ -1840,7 +1866,8 @@ fn get_cmd_spec(
 		'=' => Ok(CommandSpec { n_addr: if posix { 1 } else { 2 }, handler: compile_empty_command }),
 		':' => Ok(CommandSpec { n_addr: 0, handler: compile_label_command }),
 		'{' => Ok(CommandSpec { n_addr: 2, handler: compile_block_command }),
-		'}' => Ok(CommandSpec { n_addr: 0, handler: compile_end_group_command }),
+		// Addresses are rejected by the handler, after the unmatched-brace check (GNU order).
+		'}' => Ok(CommandSpec { n_addr: 2, handler: compile_end_group_command }),
 		'a' | 'i' => {
 			Ok(CommandSpec { n_addr: if posix { 1 } else { 2 }, handler: compile_text_command })
 		},
@@ -1849,27 +1876,27 @@ fn get_cmd_spec(
 		'd' | 'D' | 'g' | 'G' | 'h' | 'H' | 'n' | 'N' | 'p' | 'P' | 'x' => {
 			Ok(CommandSpec { n_addr: 2, handler: compile_empty_command })
 		},
-		'z' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_empty_command }),
+		'z' | 'F' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_empty_command }),
+		'e' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_execute_command }),
+		'R' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_read_line_command }),
 		'l' => Ok(CommandSpec { n_addr: 2, handler: compile_number_command }),
-		'q' => {
-			Ok(CommandSpec { n_addr: if posix { 1 } else { 2 }, handler: compile_number_command })
-		},
 		// Q is a GNU extension
-		'Q' => Ok(CommandSpec { n_addr: 1, handler: compile_number_command }),
+		'q' | 'Q' => Ok(CommandSpec { n_addr: 1, handler: compile_number_command }),
 		'r' => {
 			Ok(CommandSpec { n_addr: if posix { 1 } else { 2 }, handler: compile_read_file_command })
 		},
 		's' => Ok(CommandSpec { n_addr: 2, handler: compile_subst_command }),
 		'w' => Ok(CommandSpec { n_addr: 2, handler: compile_write_file_command }),
+		'W' if !posix => Ok(CommandSpec { n_addr: 2, handler: compile_write_file_command }),
 		'y' => Ok(CommandSpec { n_addr: 2, handler: compile_trans_command }),
-		_ => compilation_error(lines, line, format!("invalid command code `{cmd_code}'")),
+		_ => compilation_error(lines, line, format!("unknown command: `{cmd_code}'")),
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::sed::fast_io::IOChunk;
+	use crate::sed::{error_handling::ScriptOrigin, fast_io::IOChunk};
 
 	// Return an empty line provider and a char provider for the specified str.
 	fn make_providers(input: &str) -> (ScriptLineProvider, ScriptCharProvider) {
@@ -1921,7 +1948,7 @@ mod tests {
 	fn test_lookup_endgroup_command() {
 		let (lines, line) = make_providers("123abc");
 		let cmd = get_cmd_spec(&lines, &line, '}', false).unwrap();
-		assert_eq!(cmd.n_addr, 0);
+		assert_eq!(cmd.n_addr, 2);
 	}
 
 	#[test]
@@ -1954,7 +1981,7 @@ mod tests {
 		let err = result.unwrap_err();
 		let msg = err.to_string();
 
-		assert!(msg.contains("test.sed:42:5: error: unexpected token"));
+		assert_eq!(msg, "file test.sed line 42: unexpected token");
 	}
 
 	#[test]
@@ -1971,7 +1998,7 @@ mod tests {
 		let err = result.unwrap_err();
 		let msg = err.to_string();
 
-		assert_eq!(msg, "input.txt:3:1: error: invalid command 'x'");
+		assert_eq!(msg, "file input.txt line 3: invalid command 'x'");
 	}
 
 	// get_verified_cmd_spec
@@ -1983,7 +2010,7 @@ mod tests {
 
 		assert!(result.is_err());
 		let msg = result.unwrap_err().to_string();
-		assert!(msg.contains("test.sed:1:1: error: command expected"));
+		assert_eq!(msg, "file test.sed line 1: missing command");
 	}
 
 	#[test]
@@ -1994,7 +2021,7 @@ mod tests {
 
 		assert!(result.is_err());
 		let msg = result.unwrap_err().to_string();
-		assert!(msg.contains("script.sed:2:1: error: invalid command code `@'"));
+		assert_eq!(msg, "file script.sed line 2: unknown command: `@'");
 	}
 
 	#[test]
@@ -2005,7 +2032,7 @@ mod tests {
 
 		assert!(result.is_err());
 		let msg = result.unwrap_err().to_string();
-		assert!(msg.contains("input.sed:3:1: error: command q expects up to 1 address(es), found 2"));
+		assert_eq!(msg, "file input.sed line 3: command only uses one address");
 	}
 
 	#[test]
@@ -2025,7 +2052,7 @@ mod tests {
 		let result = get_verified_cmd_spec(&lines, &line, 2, true);
 		assert!(result.is_err());
 		let msg = result.unwrap_err().to_string();
-		assert!(msg.contains("input.sed:1:1: error: command i expects up to 1 address(es), found 2"));
+		assert_eq!(msg, "file input.sed line 1: command only uses one address");
 	}
 
 	// parse_number
@@ -2057,31 +2084,26 @@ mod tests {
 	}
 
 	// compile_re
-	fn dummy_providers() -> (ScriptLineProvider, ScriptCharProvider) {
-		make_providers("dummy input")
-	}
 
 	#[test]
 	fn test_compile_re_basic() {
-		let (lines, chars) = dummy_providers();
-		let regex = compile_regex(&lines, &chars, "abc", &ctx(), false, false)
+		let regex = compile_regex("abc", &ctx(), false, false)
 			.unwrap()
 			.expect("regex should be present");
-		assert!(regex.is_match(&mut IOChunk::new_from_str("abc")).unwrap());
-		assert!(!regex.is_match(&mut IOChunk::new_from_str("ABC")).unwrap());
+		assert!(regex.is_match(&IOChunk::new_from_str("abc")).unwrap());
+		assert!(!regex.is_match(&IOChunk::new_from_str("ABC")).unwrap());
 	}
 
 	#[test]
 	fn test_compile_re_extended() {
-		let (lines, chars) = make_providers("acaa\nbbb\nccc");
 		let mut ctx = ctx();
 		ctx.regex_extended = true;
-		let regex = compile_regex(&lines, &chars, "cc{0,}", &ctx, false, false)
+		let regex = compile_regex("cc{0,}", &ctx, false, false)
 			.unwrap()
 			.expect("regex should be present");
 		assert!(
 			regex
-				.is_match(&mut IOChunk::new_from_str("acaa\nccc"))
+				.is_match(&IOChunk::new_from_str("acaa\nccc"))
 				.unwrap()
 		);
 	}
@@ -2091,13 +2113,12 @@ mod tests {
 		// REGRESSION: `s/^\+/X/` used to substitute at the start of EVERY
 		// line, because `\+` became `+` unconditionally and `^+` compiles as
 		// `(?:^)+`. Real sed changes only lines that begin with a plus.
-		let (lines, chars) = dummy_providers();
-		let regex = compile_regex(&lines, &chars, r"^\+", &ctx(), false, false)
+		let regex = compile_regex(r"^\+", &ctx(), false, false)
 			.unwrap()
 			.expect("regex should be present");
-		assert!(regex.is_match(&mut IOChunk::new_from_str("+added")).unwrap());
-		assert!(!regex.is_match(&mut IOChunk::new_from_str("alpha")).unwrap());
-		assert!(!regex.is_match(&mut IOChunk::new_from_str(" context")).unwrap());
+		assert!(regex.is_match(&IOChunk::new_from_str("+added")).unwrap());
+		assert!(!regex.is_match(&IOChunk::new_from_str("alpha")).unwrap());
+		assert!(!regex.is_match(&IOChunk::new_from_str(" context")).unwrap());
 	}
 
 	#[test]
@@ -2105,68 +2126,59 @@ mod tests {
 		// Real sed refuses this rather than substituting: emitting the
 		// operator would give `{1,3}` or, after an anchor, `^{1,3}` - which
 		// fancy-regex accepts and matches at every line start.
-		let (lines, chars) = dummy_providers();
 		for pattern in [r"\{1,3\}", r"^\{1,3\}"] {
-			let err = compile_regex(&lines, &chars, pattern, &ctx(), false, false)
+			let err = compile_regex(pattern, &ctx(), false, false)
 				.expect_err("a brace quantifier with no operand must not compile");
-			assert!(
-				err.to_string().contains("repetition-operator operand invalid"),
-				"{pattern}: {err}"
-			);
+			assert_eq!(err, "Invalid preceding regular expression", "{pattern}");
 		}
 	}
 
 	#[test]
 	fn test_compile_re_basic_caret_is_an_anchor_inside_a_group() {
 		// `\(^a\)` anchors in a BRE; escaping the caret matched nothing.
-		let (lines, chars) = dummy_providers();
-		let regex = compile_regex(&lines, &chars, r"\(^alpha\)", &ctx(), false, false)
+		let regex = compile_regex(r"\(^alpha\)", &ctx(), false, false)
 			.unwrap()
 			.expect("regex should be present");
-		assert!(regex.is_match(&mut IOChunk::new_from_str("alpha")).unwrap());
-		assert!(!regex.is_match(&mut IOChunk::new_from_str("xalpha")).unwrap());
+		assert!(regex.is_match(&IOChunk::new_from_str("alpha")).unwrap());
+		assert!(!regex.is_match(&IOChunk::new_from_str("xalpha")).unwrap());
 	}
 
 	#[test]
 	fn test_compile_re_case_insensitive() {
-		let (lines, chars) = dummy_providers();
-		let regex = compile_regex(&lines, &chars, "abc", &ctx(), true, false)
+		let regex = compile_regex("abc", &ctx(), true, false)
 			.unwrap()
 			.expect("regex should be present");
-		assert!(regex.is_match(&mut IOChunk::new_from_str("abc")).unwrap());
-		assert!(regex.is_match(&mut IOChunk::new_from_str("ABC")).unwrap());
-		assert!(regex.is_match(&mut IOChunk::new_from_str("AbC")).unwrap());
+		assert!(regex.is_match(&IOChunk::new_from_str("abc")).unwrap());
+		assert!(regex.is_match(&IOChunk::new_from_str("ABC")).unwrap());
+		assert!(regex.is_match(&IOChunk::new_from_str("AbC")).unwrap());
 	}
 
 	#[test]
 	fn test_compile_re_invalid() {
-		let (lines, chars) = dummy_providers();
-		let result = compile_regex(&lines, &chars, "a[d", &ctx(), false, false);
-		assert!(result.is_err()); // Should fail due to open bracketed expression
+		let result = compile_regex("a[d", &ctx(), false, false);
+		assert_eq!(result.unwrap_err(), "Unmatched [, [^, [:, [., or [=");
 	}
 
 	#[test]
 	fn test_compile_re_multiline_start() {
-		let (lines, chars) = dummy_providers();
-		let regex = compile_regex(&lines, &chars, "^bar", &ctx(), false, true)
+		let regex = compile_regex("^bar", &ctx(), false, true)
 			.unwrap()
 			.expect("regex should be present");
 		assert!(
 			regex
-				.is_match(&mut IOChunk::new_from_str("foo\nbar"))
+				.is_match(&IOChunk::new_from_str("foo\nbar"))
 				.unwrap()
 		);
 	}
 
 	#[test]
 	fn test_compile_re_multiline_end() {
-		let (lines, chars) = dummy_providers();
-		let regex = compile_regex(&lines, &chars, "foo$", &ctx(), false, true)
+		let regex = compile_regex("foo$", &ctx(), false, true)
 			.unwrap()
 			.expect("regex should be present");
 		assert!(
 			regex
-				.is_match(&mut IOChunk::new_from_str("foo\nbar"))
+				.is_match(&IOChunk::new_from_str("foo\nbar"))
 				.unwrap()
 		);
 	}
@@ -2202,7 +2214,7 @@ mod tests {
 			panic!("expected Address::Re(Some(_))");
 		};
 
-		assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
+		assert!(re.is_match(&IOChunk::new_from_str("hello")).unwrap());
 	}
 
 	#[test]
@@ -2212,7 +2224,7 @@ mod tests {
 
 		match addr {
 			Address::Re(Some(re)) => {
-				assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("hello")).unwrap());
 			},
 			_ => panic!("expected Address::Re(Some(_))"),
 		}
@@ -2225,7 +2237,7 @@ mod tests {
 
 		match addr {
 			Address::Re(Some(re)) => {
-				assert!(!re.is_match(&mut IOChunk::new_from_str("helio")).unwrap());
+				assert!(!re.is_match(&IOChunk::new_from_str("helio")).unwrap());
 			},
 			_ => panic!("expected Address::Re(Some(_))"),
 		}
@@ -2238,7 +2250,7 @@ mod tests {
 
 		match addr {
 			Address::Re(Some(re)) => {
-				assert!(re.is_match(&mut IOChunk::new_from_str("hello")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("hello")).unwrap());
 			},
 			_ => panic!("expected Address::Re(Some(_))"),
 		}
@@ -2252,7 +2264,7 @@ mod tests {
 		match addr {
 			Address::Re(Some(re)) => {
 				// Case-insensitive
-				assert!(re.is_match(&mut IOChunk::new_from_str("HELLO")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("HELLO")).unwrap());
 			},
 			_ => panic!("expected Address::Re(Some(_))"),
 		}
@@ -2334,8 +2346,8 @@ mod tests {
 
 		match cmd.borrow().addr1.as_ref().unwrap() {
 			Address::Re(Some(re)) => {
-				assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
-				assert!(!re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("foo")).unwrap());
+				assert!(!re.is_match(&IOChunk::new_from_str("bar")).unwrap());
 			},
 			_ => panic!("expected regex address"),
 		}
@@ -2351,16 +2363,16 @@ mod tests {
 
 		match cmd.borrow().addr1.as_ref().unwrap() {
 			Address::Re(Some(re)) => {
-				assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
-				assert!(!re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("foo")).unwrap());
+				assert!(!re.is_match(&IOChunk::new_from_str("bar")).unwrap());
 			},
 			_ => panic!("expected regex address"),
 		}
 
 		match cmd.borrow().addr2.as_ref().unwrap() {
 			Address::Re(Some(re)) => {
-				assert!(re.is_match(&mut IOChunk::new_from_str("bar")).unwrap());
-				assert!(!re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("bar")).unwrap());
+				assert!(!re.is_match(&IOChunk::new_from_str("foo")).unwrap());
 			},
 			_ => panic!("expected regex address"),
 		}
@@ -2376,8 +2388,8 @@ mod tests {
 
 		match cmd.borrow().addr1.as_ref().unwrap() {
 			Address::Re(Some(re)) => {
-				assert!(re.is_match(&mut IOChunk::new_from_str("FOO")).unwrap());
-				assert!(re.is_match(&mut IOChunk::new_from_str("foo")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("FOO")).unwrap());
+				assert!(re.is_match(&IOChunk::new_from_str("foo")).unwrap());
 			},
 			_ => panic!("expected regex address"),
 		}
@@ -2391,7 +2403,7 @@ mod tests {
 
 		assert!(result.is_err());
 		let msg = result.unwrap_err().to_string();
-		assert!(msg.contains("unterminated regular expression"));
+		assert!(msg.contains(ERR_UNTERMINATED_ADDRESS));
 	}
 
 	// compile_sequence
@@ -2540,9 +2552,8 @@ mod tests {
 
 		assert!(matches!(cmd.addr1, Some(Address::Line(1))));
 
-		assert_eq!(cmd.location.line_number, 1);
-		assert_eq!(cmd.location.column_number, 1);
-		assert_eq!(cmd.location.input_name.as_ref(), "<script argument 1>");
+		assert_eq!(cmd.location.origin, ScriptOrigin::Expression(1));
+		assert_eq!(cmd.location.offset, 1);
 
 		assert!(cmd.next.is_none());
 	}
@@ -2557,16 +2568,14 @@ mod tests {
 		let cmd = binding.borrow();
 
 		assert_eq!(cmd.code, 'l');
-		assert_eq!(cmd.location.line_number, 1);
-		assert_eq!(cmd.location.column_number, 1);
-		assert_eq!(cmd.location.input_name.as_ref(), "<script argument 1>");
+		assert_eq!(cmd.location.origin, ScriptOrigin::Expression(1));
+		assert_eq!(cmd.location.offset, 1);
 
 		let binding2 = cmd.next.clone().unwrap();
 		let cmd2 = binding2.borrow();
 		assert_eq!(cmd2.code, 'q');
-		assert_eq!(cmd2.location.line_number, 1);
-		assert_eq!(cmd2.location.column_number, 3);
-		assert_eq!(cmd2.location.input_name.as_ref(), "<script argument 1>");
+		assert_eq!(cmd2.location.origin, ScriptOrigin::Expression(1));
+		assert_eq!(cmd2.location.offset, 3);
 
 		assert!(cmd2.next.is_none());
 	}
@@ -2670,7 +2679,7 @@ mod tests {
 		let mut subst = Substitution::default();
 
 		compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap();
-		assert_eq!(subst.occurrence, 0); // 'g' means all occurrences
+		assert!(subst.global);
 	}
 
 	#[test]
@@ -2728,27 +2737,29 @@ mod tests {
 	}
 
 	#[test]
-	fn test_compile_subst_flag_g_and_number_should_fail() {
-		let (lines, mut chars) = make_providers("g3");
-		let mut subst = Substitution::default();
+	fn test_compile_subst_flag_g_and_number_combine() {
+		// GNU's `Ng`: replace the Nth match and every later one.
+		for flags in ["g3", "3g"] {
+			let (lines, mut chars) = make_providers(flags);
+			let mut subst = Substitution::default();
 
-		let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("multiple 'g' or numeric flags in substitute command")
-		);
+			compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap();
+			assert_eq!((subst.occurrence, subst.global), (3, true), "{flags}");
+		}
 	}
 
 	#[test]
-	fn test_compile_subst_flag_number_and_g_should_fail() {
-		let (lines, mut chars) = make_providers("2g");
-		let mut subst = Substitution::default();
+	fn test_compile_subst_flag_repeated_should_fail() {
+		for (flags, msg) in [
+			("gg", "multiple `g' options to `s' command"),
+			("2p3", "multiple number options to `s' command"),
+		] {
+			let (lines, mut chars) = make_providers(flags);
+			let mut subst = Substitution::default();
 
-		let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("multiple 'g' or numeric flags in substitute command")
-		);
+			let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap_err();
+			assert!(err.to_string().contains(msg), "{flags}: {err}");
+		}
 	}
 
 	#[test]
@@ -2757,7 +2768,7 @@ mod tests {
 		let mut subst = Substitution::default();
 
 		let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap_err();
-		assert!(err.to_string().contains("missing file path"));
+		assert!(err.to_string().contains(ERR_MISSING_FILENAME));
 	}
 
 	#[test]
@@ -2795,10 +2806,7 @@ mod tests {
 		let mut subst = Substitution::default();
 
 		let err = compile_subst_flags(&lines, &mut chars, &mut subst, true, false, &ShellPaths::default()).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("not allowed with --posix or --sandbox")
-		);
+		assert!(err.to_string().contains(ERR_UNKNOWN_OPTION_TO_S));
 	}
 
 	#[test]
@@ -2807,10 +2815,7 @@ mod tests {
 		let mut subst = Substitution::default();
 
 		let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, true, &ShellPaths::default()).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("not allowed with --posix or --sandbox")
-		);
+		assert!(err.to_string().contains(ERR_SANDBOX));
 	}
 
 	#[test]
@@ -2819,21 +2824,20 @@ mod tests {
 		let mut subst = Substitution::default();
 
 		let err = compile_subst_flags(&lines, &mut chars, &mut subst, false, false, &ShellPaths::default()).unwrap_err();
-		assert!(err.to_string().contains("invalid substitute flag"));
+		assert!(err.to_string().contains(ERR_UNKNOWN_OPTION_TO_S));
 	}
 
 	// compile_subst_command
 	#[test]
-	fn test_compile_subst_invalid_delimiter_backslash() {
+	fn test_compile_subst_backslash_delimiter() {
+		// `sed 's\foo\bar\'` is a valid GNU substitution, not a delimiter error.
 		let (mut lines, mut chars) = make_providers("s\\foo\\bar\\");
 		let mut cmd = Command::default();
 		let mut context = ctx();
 
-		let err = compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("substitute pattern cannot be delimited")
-		);
+		compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap();
+		let CommandData::Substitution(subst) = &cmd.data else { panic!("Expected a substitution") };
+		assert!(matches!(&subst.replacement.parts[..], [ReplacementPart::Literal(text)] if text == "bar"));
 	}
 
 	#[test]
@@ -2843,7 +2847,7 @@ mod tests {
 		let mut context = ctx();
 
 		let err = compile_subst_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
-		assert!(err.to_string().contains("invalid substitute flag"));
+		assert!(err.to_string().contains(ERR_UNKNOWN_OPTION_TO_S));
 	}
 
 	#[test]
@@ -3072,7 +3076,7 @@ mod tests {
 
 		cmd.code = ':';
 		let err = compile_label_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
-		assert!(err.to_string().contains("empty label"));
+		assert!(err.to_string().contains("\":\" lacks a label"));
 	}
 
 	#[test]
@@ -3102,7 +3106,7 @@ mod tests {
 		cmd.borrow_mut().code = ':';
 		let mut context = ProcessingContext::default();
 
-		populate_label_map(Some(cmd.clone()), &mut context).unwrap();
+		populate_label_map(Some(cmd.clone()), &mut context);
 
 		assert_eq!(context.label_to_command_map.len(), 1);
 		assert!(context.label_to_command_map.contains_key("start"));
@@ -3116,7 +3120,7 @@ mod tests {
 		let block = command_with_data(CommandData::BranchTarget(Some(nested.clone())));
 		let mut context = ProcessingContext::default();
 
-		populate_label_map(Some(block), &mut context).unwrap();
+		populate_label_map(Some(block), &mut context);
 
 		assert_eq!(context.label_to_command_map.len(), 1);
 		assert!(context.label_to_command_map.contains_key("inside"));
@@ -3132,7 +3136,7 @@ mod tests {
 		let head = link_commands(vec![a, b]);
 
 		let mut context = ProcessingContext::default();
-		populate_label_map(head, &mut context).unwrap();
+		populate_label_map(head, &mut context);
 
 		assert_eq!(context.label_to_command_map.len(), 2);
 		assert!(context.label_to_command_map.contains_key("a"));
@@ -3146,7 +3150,7 @@ mod tests {
 		let head = link_commands(vec![a, b]);
 
 		let mut context = ProcessingContext::default();
-		populate_label_map(head, &mut context).unwrap();
+		populate_label_map(head, &mut context);
 
 		assert_eq!(context.label_to_command_map.len(), 0);
 	}
@@ -3156,28 +3160,27 @@ mod tests {
 		let cmd = command_with_data(CommandData::Label(None));
 		let mut context = ProcessingContext::default();
 
-		populate_label_map(Some(cmd), &mut context).unwrap();
+		populate_label_map(Some(cmd), &mut context);
 
 		// The map should remain empty since the label is None
 		assert_eq!(context.label_to_command_map.len(), 0);
 	}
 
 	#[test]
-	fn test_duplicate_label_gives_error() {
+	fn test_duplicate_label_resolves_to_last_definition() {
+		// GNU accepts a repeated label and jumps to its last definition.
 		let a1 = command_with_data(CommandData::Label(Some("dup".to_string())));
 		a1.borrow_mut().code = ':';
 
 		let a2 = command_with_data(CommandData::Label(Some("dup".to_string())));
 		a2.borrow_mut().code = ':';
 
-		let head = link_commands(vec![a1, a2]);
+		let head = link_commands(vec![a1, a2.clone()]);
 		let mut context = ProcessingContext::default();
 
-		let result = populate_label_map(head, &mut context);
+		populate_label_map(head, &mut context);
 
-		assert!(result.is_err());
-		let err = result.unwrap_err().to_string();
-		assert!(err.contains("duplicate label `dup'"));
+		assert!(Rc::ptr_eq(&context.label_to_command_map["dup"], &a2));
 	}
 
 	// populate_range_commands
@@ -3300,7 +3303,7 @@ mod tests {
 		let head = link_commands(vec![branch.clone(), target.clone()]);
 		let mut context = ProcessingContext::default();
 
-		populate_label_map(head.clone(), &mut context).unwrap();
+		populate_label_map(head.clone(), &mut context);
 		let result = resolve_branch_targets(head, &mut context);
 		assert!(result.is_ok());
 
@@ -3322,7 +3325,7 @@ mod tests {
 
 		assert!(result.is_err());
 		let err = result.unwrap_err().to_string();
-		assert!(err.contains("undefined label `nope'"));
+		assert!(err.contains("can't find label for jump to `nope'"));
 	}
 
 	#[test]
@@ -3367,7 +3370,7 @@ mod tests {
 		let head = link_commands(vec![branch.clone(), block]);
 
 		let mut context = ProcessingContext::default();
-		populate_label_map(Some(label.clone()), &mut context).unwrap();
+		populate_label_map(Some(label.clone()), &mut context);
 		let result = resolve_branch_targets(head, &mut context);
 
 		assert!(result.is_ok());
@@ -3396,6 +3399,7 @@ mod tests {
 
 	#[test]
 	fn test_compile_text_command_posix_spaces_single_line() {
+		// GNU --posix keeps the text after `a\` on the same line, a lone space included.
 		let mut chars = make_char_provider("a \\ ");
 		let mut lines = make_line_provider(&["line1", "line2"]);
 		let mut cmd = Command::default();
@@ -3404,7 +3408,7 @@ mod tests {
 		compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap();
 		match &cmd.data {
 			CommandData::Text(text) => {
-				assert_eq!(text.to_string(), "line1\n");
+				assert_eq!(text.to_string(), " \n");
 			},
 			_ => panic!("Expected CommandData::Text"),
 		}
@@ -3462,7 +3466,7 @@ mod tests {
 		let result = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context);
 		assert!(result.is_err());
 		let err = result.unwrap_err().to_string();
-		assert!(err.contains("expects \\ followed by text"));
+		assert!(err.contains(ERR_EXPECTED_TEXT));
 	}
 
 	#[test]
@@ -3539,20 +3543,36 @@ mod tests {
 		let result = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context);
 		assert!(result.is_err());
 		let err = result.unwrap_err().to_string();
-		assert!(err.contains("expects \\ followed by text"));
+		assert!(err.contains(ERR_EXPECTED_TEXT));
 	}
 
 	#[test]
 	fn test_compile_text_command_posix_with_trailing_chars() {
+		// `sed --posix 'a\ foo'` must append " foo", not fail.
 		let mut chars = make_char_provider("a \\ foo");
 		let mut lines = make_line_provider(&["line1", "line2"]);
 		let mut cmd = Command::default();
 		let mut context = ProcessingContext { posix: true, ..Default::default() };
 
-		let result = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context);
-		assert!(result.is_err());
-		let err = result.unwrap_err().to_string();
-		assert!(err.contains("extra characters after \\"));
+		compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap();
+		match &cmd.data {
+			CommandData::Text(text) => {
+				assert_eq!(text.to_string(), " foo\n");
+			},
+			_ => panic!("Expected CommandData::Text"),
+		}
+	}
+
+	#[test]
+	fn test_compile_text_command_posix_text_from_another_piece_is_incomplete() {
+		// `sed --posix -e 'a\' -e text` is GNU's "incomplete command", not an append.
+		let mut chars = make_char_provider("a\\");
+		let mut lines = make_line_provider(&["line1"]);
+		let mut cmd = Command::default();
+		let mut context = ProcessingContext { posix: true, ..Default::default() };
+
+		let err = compile_text_command(&mut lines, &mut chars, &mut cmd, &mut context).unwrap_err();
+		assert_eq!(err.to_string(), "-e expression #1, char 2: incomplete command");
 	}
 
 	// read_file_path
@@ -3569,7 +3589,7 @@ mod tests {
 		let (lines, mut chars) = make_providers("w ");
 
 		let err = read_file_path(&lines, &mut chars).unwrap_err();
-		assert!(err.to_string().contains("missing file path"));
+		assert!(err.to_string().contains(ERR_MISSING_FILENAME));
 	}
 }
 }
@@ -3594,6 +3614,9 @@ use crate::sed::{
 	script_char_provider::ScriptCharProvider,
 	script_line_provider::ScriptLineProvider,
 };
+
+/// GNU sed's message for a `y` command missing a delimiter.
+pub const ERR_UNTERMINATED_Y: &str = "unterminated `y' command";
 
 /// Return true if c is a valid octal digit
 fn is_ascii_octal_digit(c: char) -> bool {
@@ -3759,10 +3782,12 @@ pub fn parse_char_escape(line: &mut ScriptCharProvider) -> Option<char> {
 /// Parse a POSIX RE character class returning it as a string.
 /// This functionality is needed to avoid terminating delimited
 /// sequences when a delimiter appears within a character class.
-/// While at it, handle escaped characters for the sake of consistency.
+/// Also decode sed's recognized character escapes, but a POSIX bracket
+/// expression has no regex escape syntax of its own.
 fn parse_character_class(
 	lines: &ScriptLineProvider,
 	line: &mut ScriptCharProvider,
+	unterminated: &str,
 ) -> SedResult<String> {
 	let mut result = String::new();
 
@@ -3806,7 +3831,6 @@ fn parse_character_class(
 				result.push('[');
 				result.push(marker);
 
-				let mut inner = String::new();
 				let mut terminated = false;
 
 				while !line.eol() {
@@ -3815,34 +3839,28 @@ fn parse_character_class(
 						line.advance();
 						if !line.eol() && line.current() == ']' {
 							line.advance();
-							result.push_str(&inner);
 							result.push(marker);
 							result.push(']');
 							terminated = true;
 							break;
 						}
 						// False alarm, just part of the inner name
-						inner.push(marker);
+						result.push(marker);
 					} else {
-						inner.push(c);
+						result.push(c);
 						line.advance();
 					}
 				}
 
 				if !terminated {
-					return compilation_error(
-						lines,
-						line,
-						"Unterminated POSIX character class, equivalence or collating symbol",
-					);
+					return compilation_error(lines, line, unterminated);
 				}
 
 				continue;
 			}
-			// Not a POSIX construct — treat as literal
+			// The next character may itself be a closing bracket or the
+			// start of another bracket construct. Do not consume it here.
 			result.push('[');
-			result.push(marker);
-			line.advance();
 			continue;
 		}
 
@@ -3856,8 +3874,10 @@ fn parse_character_class(
 				result.push(decoded);
 			} else {
 				result.push('\\');
-				result.push(line.current());
-				line.advance();
+				if line.current() == '\\' {
+					result.push('\\');
+					line.advance();
+				}
 			}
 		} else {
 			result.push(ch);
@@ -3865,48 +3885,62 @@ fn parse_character_class(
 		}
 	}
 
-	compilation_error(lines, line, "Unterminated bracket expression")
+	compilation_error(lines, line, unterminated)
 }
 
 /// Scan and return the opening delimiter of a delimited string
 /// Advances the line past the opening delimiter
-fn scan_delimiter(lines: &ScriptLineProvider, line: &mut ScriptCharProvider) -> SedResult<char> {
-	// Sanity check
+fn scan_delimiter(
+	lines: &ScriptLineProvider,
+	line: &mut ScriptCharProvider,
+	unterminated: &str,
+) -> SedResult<char> {
 	if line.eol() {
-		return compilation_error(lines, line, "unexpected end of line".to_string());
+		return compilation_error(lines, line, unterminated);
 	}
 
 	let delimiter = line.current();
-	if delimiter == '\\' {
-		return compilation_error(lines, line, "\\ cannot be used as a string delimiter");
-	}
 	line.advance(); // skip the opening delimiter
 	Ok(delimiter)
 }
 
+/// A delimited regular expression as parsed from the script.
+#[derive(Debug)]
+pub struct RegexSource {
+	/// The pattern, with sed's character escapes decoded.
+	pub pattern: String,
+	/// An invalid interval; GNU reports it only once the whole command is read.
+	pub error:   Option<&'static str>,
+}
+
 /// Parse the regular expression delimited by the current line
-/// character and return it as a string.
+/// character and return it.
 /// On return, the line is on the closing delimiter.
 /// In Basic mode, quantifiers like {m,n} must be escaped (\{m,n\}).
 /// In Extended mode, quantifiers like {m,n} don't require escaping.
+/// A missing closing delimiter fails with `unterminated`.
 pub fn parse_regex(
 	lines: &ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 	regex_mode: RegexMode,
-) -> SedResult<String> {
-	let delimiter = scan_delimiter(lines, line)?;
+	unterminated: &str,
+) -> SedResult<RegexSource> {
+	let delimiter = scan_delimiter(lines, line, unterminated)?;
 	let mut result = String::new();
+	let mut error = None;
 	while !line.eol() {
 		match line.current() {
-			'[' if delimiter != '[' => {
-				let cc = parse_character_class(lines, line)?;
+			// A backslash delimiter ends the regex wherever it appears (GNU).
+			c if c == delimiter => return Ok(RegexSource { pattern: result, error }),
+			'[' => {
+				let cc = parse_character_class(lines, line, unterminated)?;
 				result.push_str(&cc);
 				continue;
 			},
 			'\\' => {
 				line.advance();
 				if line.eol() {
-					return compilation_error(lines, line, "unterminated regular expression");
+					return compilation_error(lines, line, unterminated);
 				}
 				if line.current() == delimiter {
 					// Push escaped delimiter
@@ -3915,11 +3949,18 @@ pub fn parse_regex(
 					continue;
 				}
 				if line.current() == '{' && matches!(regex_mode, RegexMode::Basic) {
-					validate_quantifier_structure(lines, line, delimiter, RegexMode::Basic)?;
-					let quantifier = validate_quantifier_numbers(lines, line)?;
-					result.push('\\');
-					result.push('{');
-					result.push_str(&quantifier);
+					match validate_quantifier_structure(line, delimiter, RegexMode::Basic)
+						.and_then(|()| validate_quantifier_numbers(line))
+					{
+						Ok(quantifier) => {
+							result.push('\\');
+							result.push('{');
+							result.push_str(&quantifier);
+						},
+						Err(msg) => {
+							error.get_or_insert(msg);
+						},
+					}
 					continue;
 				}
 				if line.current() == '}' {
@@ -3935,6 +3976,17 @@ pub fn parse_regex(
 					line.advance();
 					continue;
 				}
+				// GNU's buffer anchors, which match only at the very start and end
+				// of the pattern space, even in multiline mode.
+				if let Some(anchor) = match line.current() {
+					'`' => Some("\\A"),
+					'\'' => Some("\\z"),
+					_ => None,
+				} {
+					result.push_str(anchor);
+					line.advance();
+					continue;
+				}
 				if let Some(decoded) = parse_char_escape(line) {
 					result.push(decoded);
 				} else {
@@ -3945,34 +3997,40 @@ pub fn parse_regex(
 				}
 				continue;
 			},
-			'{' if delimiter != '{' && matches!(regex_mode, RegexMode::Extended) => {
-				validate_quantifier_structure(lines, line, delimiter, RegexMode::Extended)?;
-				let quantifier = validate_quantifier_numbers(lines, line)?;
-				result.push('{');
-				result.push_str(&quantifier);
+			'{' if matches!(regex_mode, RegexMode::Extended) => {
+				match validate_quantifier_structure(line, delimiter, RegexMode::Extended)
+					.and_then(|()| validate_quantifier_numbers(line))
+				{
+					Ok(quantifier) => {
+						result.push('{');
+						result.push_str(&quantifier);
+					},
+					Err(msg) => {
+						error.get_or_insert(msg);
+					},
+				}
 				continue;
 			},
-			'}' if delimiter != '}' => {
+			'}' => {
 				result.push('}');
 				line.advance();
 				continue;
 			},
 
-			c if c == delimiter => return Ok(result),
 			c => result.push(c),
 		}
 		line.advance();
 	}
-	compilation_error(lines, line, "unterminated regular expression")
+	compilation_error(lines, line, unterminated)
 }
 
 // Check for closing brace and the structure/content.
+// On failure the line is left where scanning stopped.
 fn validate_quantifier_structure(
-	lines: &ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 	delimiter: char,
 	regex_mode: RegexMode,
-) -> SedResult<()> {
+) -> Result<(), &'static str> {
 	let invalid_content_error_msg = "Invalid content of \\{\\}";
 	let mut found_closing_brace = false;
 	let mut seen_comma = false;
@@ -4035,11 +4093,11 @@ fn validate_quantifier_structure(
 	}
 
 	if !found_closing_brace {
-		return compilation_error(lines, line, "Unmatched \\{");
+		return Err("Unmatched \\{");
 	}
 
 	if invalid_content_detected {
-		return compilation_error(lines, line, invalid_content_error_msg);
+		return Err(invalid_content_error_msg);
 	}
 
 	line.set_position(initial_pos);
@@ -4050,23 +4108,16 @@ fn validate_quantifier_structure(
 // `validate_quantifier_structure` guarantees the run contains only ASCII
 // digits, so the sole failure mode is a value exceeding what fits, which sed
 // reports as "Regular expression too big" (same as exceeding RE_DUP_MAX).
-fn parse_quantifier_bound(
-	lines: &ScriptLineProvider,
-	line: &mut ScriptCharProvider,
-	digits: &str,
-) -> SedResult<usize> {
+fn parse_quantifier_bound(digits: &str) -> Result<usize, &'static str> {
 	match digits.parse::<usize>() {
 		Ok(val) if val <= RE_DUP_MAX => Ok(val),
-		_ => compilation_error(lines, line, "Regular expression too big"),
+		_ => Err("Regular expression too big"),
 	}
 }
 
 // Performs validations on m and/or n values of the quantifier
 // and returns the valid content as a string (without braces).
-fn validate_quantifier_numbers(
-	lines: &ScriptLineProvider,
-	line: &mut ScriptCharProvider,
-) -> SedResult<String> {
+fn validate_quantifier_numbers(line: &mut ScriptCharProvider) -> Result<String, &'static str> {
 	line.advance(); // Skip the opening brace.
 
 	// Collect m. It may be empty for the {,n} and {,} forms, which mean {0,n}
@@ -4089,22 +4140,14 @@ fn validate_quantifier_numbers(
 	}
 
 	// An absent m defaults to 0; both m and n are bounded by RE_DUP_MAX.
-	let m_val = if m.is_empty() {
-		0
-	} else {
-		parse_quantifier_bound(lines, line, &m)?
-	};
-	let n_val = if n.is_empty() {
-		None
-	} else {
-		Some(parse_quantifier_bound(lines, line, &n)?)
-	};
+	let m_val = if m.is_empty() { 0 } else { parse_quantifier_bound(&m)? };
+	let n_val = if n.is_empty() { None } else { Some(parse_quantifier_bound(&n)?) };
 
 	// Validate m <= n if both present.
 	if let Some(n_val) = n_val
 		&& m_val > n_val
 	{
-		return compilation_error(lines, line, "Invalid content of \\{\\}");
+		return Err("Invalid content of \\{\\}");
 	}
 
 	// Rebuild the validated content (without braces), defaulting an absent m
@@ -4125,15 +4168,17 @@ pub fn parse_transliteration(
 	lines: &ScriptLineProvider,
 	line: &mut ScriptCharProvider,
 ) -> SedResult<String> {
-	let delimiter = scan_delimiter(lines, line)?;
+	let delimiter = scan_delimiter(lines, line, ERR_UNTERMINATED_Y)?;
 	let mut result = String::new();
 
 	while !line.eol() {
 		match line.current() {
+			// A backslash delimiter ends the string wherever it appears (GNU).
+			c if c == delimiter => return Ok(result),
 			'\\' => {
 				line.advance();
 				if line.eol() {
-					return compilation_error(lines, line, "unterminated transliteration string");
+					return compilation_error(lines, line, ERR_UNTERMINATED_Y);
 				}
 				if line.current() == delimiter || line.current() == '\\' {
 					// Push only the escaped character
@@ -4151,12 +4196,11 @@ pub fn parse_transliteration(
 				}
 				continue;
 			},
-			c if c == delimiter => return Ok(result),
 			c => result.push(c),
 		}
 		line.advance();
 	}
-	compilation_error(lines, line, "unterminated transliteration string")
+	compilation_error(lines, line, ERR_UNTERMINATED_Y)
 }
 
 #[cfg(test)]
@@ -4398,7 +4442,7 @@ mod tests {
 	fn test_basic_character_class() {
 		let mut line = char_provider_from("[qr]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[qr]");
 	}
 
@@ -4406,7 +4450,7 @@ mod tests {
 	fn test_negated_class() {
 		let mut line = char_provider_from("[^abc]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[^abc]");
 	}
 
@@ -4414,7 +4458,7 @@ mod tests {
 	fn test_leading_close_bracket() {
 		let mut line = char_provider_from("[]abc]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[]abc]");
 	}
 
@@ -4422,7 +4466,7 @@ mod tests {
 	fn test_leading_negated_close_bracket() {
 		let mut line = char_provider_from("[^]abc]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[^]abc]");
 	}
 
@@ -4430,7 +4474,7 @@ mod tests {
 	fn test_escaped_character_begin() {
 		let mut line = char_provider_from("[\\nabc]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[\nabc]");
 	}
 
@@ -4438,7 +4482,7 @@ mod tests {
 	fn test_escaped_character_middle() {
 		let mut line = char_provider_from("[a\\nbc]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[a\nbc]");
 	}
 
@@ -4446,7 +4490,7 @@ mod tests {
 	fn test_escaped_character_end() {
 		let mut line = char_provider_from("[abc\\n]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[abc\n]");
 	}
 
@@ -4454,15 +4498,16 @@ mod tests {
 	fn test_escaped_delimiter() {
 		let mut line = char_provider_from("[a\\]bc]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
-		assert_eq!(result, "[a\\]bc]");
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
+		assert_eq!(result, "[a\\]");
+		assert_eq!(line.current(), 'b');
 	}
 
 	#[test]
 	fn test_posix_class() {
 		let mut line = char_provider_from("[[:digit:]]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[[:digit:]]");
 	}
 
@@ -4470,7 +4515,7 @@ mod tests {
 	fn test_equivalence_class() {
 		let mut line = char_provider_from("[[=a=]]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[[=a=]]");
 	}
 
@@ -4478,7 +4523,7 @@ mod tests {
 	fn test_collating_symbol() {
 		let mut line = char_provider_from("[[.ch.]]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[[.ch.]]");
 	}
 
@@ -4486,7 +4531,7 @@ mod tests {
 	fn test_unterminated_class_error() {
 		let mut line = char_provider_from("[abc"); // missing closing ]
 		let lines = test_lines();
-		let err = parse_character_class(&lines, &mut line);
+		let err = parse_character_class(&lines, &mut line, "unterminated");
 		assert!(err.is_err());
 	}
 
@@ -4494,7 +4539,7 @@ mod tests {
 	fn test_unterminated_posix_class_error() {
 		let mut line = char_provider_from("[[:digit:]");
 		let lines = test_lines();
-		let err = parse_character_class(&lines, &mut line);
+		let err = parse_character_class(&lines, &mut line, "unterminated");
 		assert!(err.is_err());
 	}
 
@@ -4502,7 +4547,7 @@ mod tests {
 	fn test_unterminated_escape_error() {
 		let mut line = char_provider_from("[abc\\"); // missing closing ]
 		let lines = test_lines();
-		let err = parse_character_class(&lines, &mut line);
+		let err = parse_character_class(&lines, &mut line, "unterminated");
 		assert!(err.is_err());
 	}
 
@@ -4510,7 +4555,7 @@ mod tests {
 	fn test_malformed_posix_like_pattern_treated_as_literal() {
 		let mut line = char_provider_from("[[x]yz]");
 		let lines = test_lines();
-		let result = parse_character_class(&lines, &mut line).unwrap();
+		let result = parse_character_class(&lines, &mut line, "unterminated").unwrap();
 		assert_eq!(result, "[[x]");
 	}
 
@@ -4518,176 +4563,175 @@ mod tests {
 	#[test]
 	fn test_simple_regex() {
 		let (lines, mut line) = make_providers("/abc/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "abc");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "abc");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_regex_with_escaped_delimiter() {
 		let (lines, mut line) = make_providers("/ab\\/c/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "ab/c");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "ab/c");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_regex_with_capture() {
 		let (lines, mut line) = make_providers(r"/\(.\)/c/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, r"\(.\)");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, r"\(.\)");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_regex_with_escape_sequence() {
 		let (lines, mut line) = make_providers("/ab\\n/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "ab\n");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "ab\n");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_basic_regex_quantifier() {
 		let (lines, mut line) = make_providers("/a\\{2,3\\}/p");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "a\\{2,3\\}");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "a\\{2,3\\}");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_basic_regex_with_unmatched_brace_quantifier() {
 		let (lines, mut line) = make_providers("/a\\{2,3/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Unmatched \\{"));
 	}
 
 	#[test]
 	fn test_basic_regex_with_invalid_content() {
 		let (lines, mut line) = make_providers("/a\\{2d,3\\}/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_extended_regex_quantifier() {
 		let (lines, mut line) = make_providers("/a{2,3}/p");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap();
-		assert_eq!(parsed, "a{2,3}");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Extended, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "a{2,3}");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_extended_regex_with_unmatched_brace_quantifier() {
 		let (lines, mut line) = make_providers("/a{2,3/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Extended, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Unmatched \\{"));
 	}
 
 	#[test]
 	fn test_extended_regex_with_empty_quantifier() {
 		let (lines, mut line) = make_providers("/a{}/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Extended, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_extended_regex_with_whitespace_quantifier() {
 		let (lines, mut line) = make_providers("/a{}/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Extended, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_extended_regex_with_invalid_m() {
 		let (lines, mut line) = make_providers("/a{2d,3}/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Extended, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_extended_regex_with_invalid_n() {
 		let (lines, mut line) = make_providers("/a{2,-3}/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Extended, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_extended_regex_with_m_gt_n() {
 		let (lines, mut line) = make_providers("/a{3,2}/p");
-		let err = parse_regex(&lines, &mut line, RegexMode::Extended).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Extended, "unterminated regular expression").unwrap().error.unwrap();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn errors_on_unterminated_regex() {
 		let (lines, mut line) = make_providers("/unterminated");
-		let err = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap_err();
 		assert!(err.to_string().contains("unterminated regular expression"));
 	}
 
 	#[test]
 	fn errors_on_esc_at_re_eol() {
 		let (lines, mut line) = make_providers("/foo\\");
-		let err = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap_err();
+		let err = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap_err();
 		assert!(err.to_string().contains("unterminated regular expression"));
 	}
 
 	#[test]
-	fn errors_on_backslash_delimiter() {
-		let (lines, mut line) = make_providers("\\bad");
-		let err = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap_err();
-		assert!(
-			err.to_string()
-				.contains("\\ cannot be used as a string delimiter")
-		);
+	fn backslash_delimiter_ends_the_regex_at_every_backslash() {
+		// GNU's `\\a\d` addresses "a"; a backslash cannot escape this delimiter.
+		let (lines, mut line) = make_providers("\\a\\\\");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "a");
+		assert_eq!(line.current(), '\\');
 	}
 
 	#[test]
 	fn test_regex_with_character_class() {
 		let (lines, mut line) = make_providers("/[a-z]/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "[a-z]");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "[a-z]");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_regex_with_bracket_delimiter() {
 		let (lines, mut line) = make_providers("[abc[");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "abc");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "abc");
 		assert_eq!(line.current(), '[');
 	}
 
 	#[test]
 	fn test_bracket_regex_with_bracket_delimiter() {
 		let (lines, mut line) = make_providers("[a\\[0-9]bc[");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "a[0-9]bc");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "a[0-9]bc");
 		assert_eq!(line.current(), '[');
 	}
 
 	#[test]
 	fn test_regex_with_escaped_bracket_in_character_class() {
 		let (lines, mut line) = make_providers("/[a\\]z]/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "[a\\]z]");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "[a\\]z]");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_regex_with_delimiter_inside_character_class() {
 		let (lines, mut line) = make_providers("/[a/c]/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "[a/c]");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "[a/c]");
 		assert_eq!(line.current(), '/');
 	}
 
 	#[test]
 	fn test_regex_with_escaped_paren_and_backslash() {
 		let (lines, mut line) = make_providers("/\\(\\\\/");
-		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic).unwrap();
-		assert_eq!(parsed, "\\(\\\\");
+		let parsed = parse_regex(&lines, &mut line, RegexMode::Basic, "unterminated regular expression").unwrap();
+		assert_eq!(parsed.pattern, "\\(\\\\");
 		assert_eq!(line.current(), '/');
 	}
 
@@ -4695,142 +4739,142 @@ mod tests {
 	//BRE tests
 	#[test]
 	fn test_validate_quantifier_structure_bre_valid() {
-		let (lines, mut line) = make_providers("{2,3\\}");
-		validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Basic).unwrap();
+		let mut line = ScriptCharProvider::new("{2,3\\}");
+		validate_quantifier_structure(&mut line, '/', RegexMode::Basic).unwrap();
 		assert_eq!(line.current(), '{'); // Line should be back on the opening brace
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_bre_with_unmatched_brace() {
-		let (lines, mut line) = make_providers("{2,3");
+		let mut line = ScriptCharProvider::new("{2,3");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Basic).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Basic).unwrap_err();
 		assert!(err.to_string().contains("Unmatched \\{"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_bre_with_empty_content() {
-		let (lines, mut line) = make_providers("{\\}");
+		let mut line = ScriptCharProvider::new("{\\}");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Basic).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Basic).unwrap_err();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_bre_with_invalid_char() {
-		let (lines, mut line) = make_providers("{2d,3\\}");
+		let mut line = ScriptCharProvider::new("{2d,3\\}");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Basic).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Basic).unwrap_err();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_bre_with_double_comma() {
-		let (lines, mut line) = make_providers("{2,3,\\}");
+		let mut line = ScriptCharProvider::new("{2,3,\\}");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Basic).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Basic).unwrap_err();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	// ERE tests
 	#[test]
 	fn test_validate_quantifier_structure_ere_valid() {
-		let (lines, mut line) = make_providers("{2,3}");
-		validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Extended).unwrap();
+		let mut line = ScriptCharProvider::new("{2,3}");
+		validate_quantifier_structure(&mut line, '/', RegexMode::Extended).unwrap();
 		assert_eq!(line.current(), '{'); // Line should be back on the opening brace
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_ere_with_unmatched_brace() {
-		let (lines, mut line) = make_providers("{2,3");
+		let mut line = ScriptCharProvider::new("{2,3");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Extended).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Extended).unwrap_err();
 		assert!(err.to_string().contains("Unmatched \\{"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_ere_with_empty_content() {
-		let (lines, mut line) = make_providers("{}");
+		let mut line = ScriptCharProvider::new("{}");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Extended).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Extended).unwrap_err();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_ere_with_invalid_char() {
-		let (lines, mut line) = make_providers("{2d,3}");
+		let mut line = ScriptCharProvider::new("{2d,3}");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Extended).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Extended).unwrap_err();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_structure_ere_with_double_comma() {
-		let (lines, mut line) = make_providers("{2,3,}");
+		let mut line = ScriptCharProvider::new("{2,3,}");
 		let err =
-			validate_quantifier_structure(&lines, &mut line, '/', RegexMode::Extended).unwrap_err();
+			validate_quantifier_structure(&mut line, '/', RegexMode::Extended).unwrap_err();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	// validate_quantifier_numbers
 	#[test]
 	fn test_validate_quantifier_numbers_with_m() {
-		let (lines, mut line) = make_providers("{2}");
-		let result = validate_quantifier_numbers(&lines, &mut line).unwrap();
+		let mut line = ScriptCharProvider::new("{2}");
+		let result = validate_quantifier_numbers(&mut line).unwrap();
 		assert_eq!(result, "2");
 		assert_eq!(line.current(), '}');
 	}
 
 	#[test]
 	fn test_validate_quantifier_numbers_with_single_comma() {
-		let (lines, mut line) = make_providers("{,}");
-		let result = validate_quantifier_numbers(&lines, &mut line).unwrap();
+		let mut line = ScriptCharProvider::new("{,}");
+		let result = validate_quantifier_numbers(&mut line).unwrap();
 		assert_eq!(result, "0,");
 		assert_eq!(line.current(), '}');
 	}
 
 	#[test]
 	fn test_validate_quantifier_numbers_with_comma_n() {
-		let (lines, mut line) = make_providers("{,3}");
-		let result = validate_quantifier_numbers(&lines, &mut line).unwrap();
+		let mut line = ScriptCharProvider::new("{,3}");
+		let result = validate_quantifier_numbers(&mut line).unwrap();
 		assert_eq!(result, "0,3");
 		assert_eq!(line.current(), '}');
 	}
 
 	#[test]
 	fn test_validate_quantifier_numbers_valid() {
-		let (lines, mut line) = make_providers("{2,3}");
-		let result = validate_quantifier_numbers(&lines, &mut line).unwrap();
+		let mut line = ScriptCharProvider::new("{2,3}");
+		let result = validate_quantifier_numbers(&mut line).unwrap();
 		assert_eq!(result, "2,3");
 		assert_eq!(line.current(), '}');
 	}
 
 	#[test]
 	fn test_validate_quantifier_numbers_with_m_too_big() {
-		let (lines, mut line) = make_providers("{32768}");
-		let err = validate_quantifier_numbers(&lines, &mut line).unwrap_err();
+		let mut line = ScriptCharProvider::new("{32768}");
+		let err = validate_quantifier_numbers(&mut line).unwrap_err();
 		assert!(err.to_string().contains("Regular expression too big"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_numbers_with_n_too_big() {
-		let (lines, mut line) = make_providers("{2,32768}");
-		let err = validate_quantifier_numbers(&lines, &mut line).unwrap_err();
+		let mut line = ScriptCharProvider::new("{2,32768}");
+		let err = validate_quantifier_numbers(&mut line).unwrap_err();
 		assert!(err.to_string().contains("Regular expression too big"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_numbers_with_m_gt_n() {
-		let (lines, mut line) = make_providers("{3,2}");
-		let err = validate_quantifier_numbers(&lines, &mut line).unwrap_err();
+		let mut line = ScriptCharProvider::new("{3,2}");
+		let err = validate_quantifier_numbers(&mut line).unwrap_err();
 		assert!(err.to_string().contains("Invalid content of \\{\\}"));
 	}
 
 	#[test]
 	fn test_validate_quantifier_numbers_with_leading_comma_n_too_big() {
 		// The {,n} form must bound n by RE_DUP_MAX just like {m,n}.
-		let (lines, mut line) = make_providers("{,32768}");
-		let err = validate_quantifier_numbers(&lines, &mut line).unwrap_err();
+		let mut line = ScriptCharProvider::new("{,32768}");
+		let err = validate_quantifier_numbers(&mut line).unwrap_err();
 		assert!(err.to_string().contains("Regular expression too big"));
 	}
 
@@ -4838,8 +4882,8 @@ mod tests {
 	fn test_validate_quantifier_numbers_with_overflowing_m() {
 		// A digit run too large for usize is reported as too big, not as
 		// invalid content.
-		let (lines, mut line) = make_providers("{99999999999999999999999}");
-		let err = validate_quantifier_numbers(&lines, &mut line).unwrap_err();
+		let mut line = ScriptCharProvider::new("{99999999999999999999999}");
+		let err = validate_quantifier_numbers(&mut line).unwrap_err();
 		assert!(err.to_string().contains("Regular expression too big"));
 	}
 
@@ -4882,7 +4926,7 @@ mod tests {
 		let err = parse_transliteration(&lines, &mut line).unwrap_err();
 		assert!(
 			err.to_string()
-				.contains("unterminated transliteration string")
+				.contains(ERR_UNTERMINATED_Y)
 		);
 	}
 
@@ -4892,7 +4936,7 @@ mod tests {
 		let err = parse_transliteration(&lines, &mut line).unwrap_err();
 		assert!(
 			err.to_string()
-				.contains("unterminated transliteration string")
+				.contains(ERR_UNTERMINATED_Y)
 		);
 	}
 }
@@ -4903,8 +4947,9 @@ pub mod error_handling {
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 Diomidis Spinellis
 
-use std::{fmt, io, rc::Rc};
+use std::{fmt, io, path::Path, rc::Rc};
 
+use crate::host::strip_errno;
 use crate::sed::{
 	command::ProcessingContext, script_char_provider::ScriptCharProvider,
 	script_line_provider::ScriptLineProvider,
@@ -4937,9 +4982,10 @@ impl fmt::Display for SedError {
 
 impl std::error::Error for SedError {}
 
+/// An I/O failure is GNU's panic status, 4.
 impl From<io::Error> for SedError {
 	fn from(error: io::Error) -> Self {
-		Self::new(2, error)
+		Self::new(4, strip_errno(&error))
 	}
 }
 
@@ -4961,9 +5007,10 @@ impl From<std::num::ParseIntError> for SedError {
 	}
 }
 
+/// A match the engine gives up on is a serious run-time problem, GNU's status 4.
 impl From<fancy_regex::Error> for SedError {
 	fn from(error: fancy_regex::Error) -> Self {
-		Self::new(2, error)
+		Self::new(4, error)
 	}
 }
 
@@ -4978,88 +5025,121 @@ pub trait IoContext<T> {
 
 impl<T> IoContext<T> for io::Result<T> {
 	fn map_err_context(self, context: impl FnOnce() -> String) -> SedResult<T> {
-		self.map_err(|error| SedError::new(2, format!("{}: {error}", context())))
+		self.map_err(|error| SedError::new(4, format!("{}: {}", context(), strip_errno(&error))))
 	}
 }
 
-#[derive(Clone, Debug)]
+/// Where a script piece came from, as GNU sed names it in compile diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScriptOrigin {
+	/// The Nth string expression; the script operand is #1.
+	Expression(usize),
+	/// A `-f` script file, as named on the command line, and a line in it.
+	File(Rc<str>, usize),
+}
+
+impl Default for ScriptOrigin {
+	fn default() -> Self {
+		Self::Expression(1)
+	}
+}
+
+impl ScriptOrigin {
+	/// Renders GNU's `-e expression #N, char M` or `file F line L` prefix; `offset` is M.
+	pub fn describe(&self, offset: usize) -> String {
+		match self {
+			Self::Expression(number) => format!("-e expression #{number}, char {offset}"),
+			Self::File(name, line) => format!("file {name} line {line}"),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default)]
 /// The location in a script where a command is defined.
 pub struct ScriptLocation {
-	pub input_name: Rc<str>,
-	pub line_number: usize,
-	pub column_number: usize,
-}
-
-impl Default for ScriptLocation {
-	fn default() -> Self {
-		Self { input_name: Rc::from("<unknown>"), line_number: 1, column_number: 1 }
-	}
+	/// GNU-style origin of the command.
+	pub origin: ScriptOrigin,
+	/// Bytes of the expression GNU had read at the command.
+	pub offset: usize,
 }
 
 impl ScriptLocation {
 	/// Constructs a location from the current script providers.
 	pub fn at_position(lines: &ScriptLineProvider, line: &ScriptCharProvider) -> Self {
-		Self {
-			line_number: lines.get_line_number(),
-			column_number: line.get_pos() + 1,
-			input_name: Rc::from(lines.get_input_name()),
-		}
+		Self { origin: lines.origin().clone(), offset: lines.char_offset(line, true) }
 	}
 }
 
-/// Fails with a compile error at the provider location.
+/// Fails with a compile error found after reading the current character, in GNU's format.
 pub fn compilation_error<T>(
 	lines: &ScriptLineProvider,
 	line: &ScriptCharProvider,
 	msg: impl ToString,
 ) -> SedResult<T> {
-	Err(SedError::new(
-		1,
-		format!(
-			"{}:{}:{}: error: {}",
-			lines.get_input_name(), lines.get_line_number(), line.get_pos() + 1, msg.to_string()
-		),
-	))
+	located_compilation_error(lines, lines.char_offset(line, true), msg)
 }
 
-fn location_error<T>(location: &ScriptLocation, msg: impl ToString, code: i32) -> SedResult<T> {
-	Err(SedError::new(
-		code,
-		format!(
-			"{}:{}:{}: error: {}",
-			location.input_name, location.line_number, location.column_number, msg.to_string()
-		),
-	))
-}
-
-/// Fails with a semantic error at the command location.
-pub fn semantic_error<T>(location: &ScriptLocation, msg: impl ToString) -> SedResult<T> {
-	location_error(location, msg, 1)
-}
-
-/// Fails with a runtime error at the command location.
-pub fn runtime_error<T>(location: &ScriptLocation, msg: impl ToString) -> SedResult<T> {
-	location_error(location, msg, 2)
-}
-
-/// Fails with a runtime error including command and input locations.
-pub fn input_runtime_error<T>(
-	location: &ScriptLocation,
-	context: &ProcessingContext,
+/// Fails with `msg` for a command at the end of its line, whose delimiter
+/// would be the newline: GNU locates it past that newline
+/// ([`ScriptLineProvider::newline_delimiter_offset`]).
+pub fn newline_delimiter_error<T>(
+	lines: &mut ScriptLineProvider,
+	line: &ScriptCharProvider,
 	msg: impl ToString,
 ) -> SedResult<T> {
+	match lines.newline_delimiter_offset() {
+		Some(offset) => located_compilation_error(lines, offset, msg),
+		None => compilation_error(lines, line, msg),
+	}
+}
+
+/// Fails with a compile error found before reading the current character, in GNU's format.
+pub fn compilation_error_before<T>(
+	lines: &ScriptLineProvider,
+	line: &ScriptCharProvider,
+	msg: impl ToString,
+) -> SedResult<T> {
+	located_compilation_error(lines, lines.char_offset(line, false), msg)
+}
+
+/// Fails with a compile error found after reading the current character, or
+/// the line's newline at its end, in GNU's format.
+pub fn compilation_error_through_newline<T>(
+	lines: &ScriptLineProvider,
+	line: &ScriptCharProvider,
+	msg: impl ToString,
+) -> SedResult<T> {
+	let offset = if line.eol() { lines.line_end_offset() } else { lines.char_offset(line, true) };
+	located_compilation_error(lines, offset, msg)
+}
+
+fn located_compilation_error<T>(lines: &ScriptLineProvider, offset: usize, msg: impl ToString) -> SedResult<T> {
+	let location = lines.origin().describe(offset);
+	Err(SedError::new(1, format!("{location}: {}", msg.to_string())))
+}
+
+/// Fails with a compile error at a command's recorded location, in GNU's format.
+pub fn semantic_error<T>(location: &ScriptLocation, msg: impl ToString) -> SedResult<T> {
 	Err(SedError::new(
-		2,
-		format!(
-			"{}:{}:{}: {}:{} error: {}",
-			location.input_name,
-			location.line_number,
-			location.column_number,
-			context.input_name,
-			context.line_number,
-			msg.to_string()
-		),
+		1,
+		format!("{}: {}", location.origin.describe(location.offset), msg.to_string()),
 	))
+}
+
+/// Fails with a script error GNU finds only at run time; it locates it at the
+/// end of the last script piece.
+pub fn script_runtime_error<T>(context: &ProcessingContext, msg: impl ToString) -> SedResult<T> {
+	Err(SedError::new(1, format!("{}: {}", context.script_end, msg.to_string())))
+}
+
+/// GNU's message for an `s` replacement naming a group its regex lacks.
+pub fn invalid_reference(group: usize) -> String {
+	format!("invalid reference \\{group} on `s' command's RHS")
+}
+
+/// GNU's fatal error for a failed read of the input or `r`/`R` file `name`.
+pub fn read_error(name: &Path, error: &io::Error) -> SedError {
+	SedError::new(4, format!("read error on {}: {}", name.display(), strip_errno(error)))
 }
 }
 pub mod fast_io {
@@ -5091,7 +5171,8 @@ use std::{
 #[cfg(unix)]
 use memchr::memchr;
 use omp_vfs::BlockingFs;
-use crate::{host::Host, sed::error_handling::SedError};
+use crate::host::Host;
+use crate::sed::error_handling::{SedResult, read_error};
 
 // Define two cursors for iterating over lines:
 // - SliceLineCursor over a file read whole into memory,
@@ -5100,8 +5181,9 @@ use crate::{host::Host, sed::error_handling::SedError};
 /// Cursor for zero-copy iteration over an in-memory file snapshot.
 #[cfg(unix)]
 pub struct SliceLineCursor<'a> {
-	data: &'a [u8], // Snapshot data
-	pos:  usize,    // Position within the data
+	data:      &'a [u8], // Snapshot data
+	pos:       usize,
+	separator: u8,
 }
 
 #[cfg(unix)]
@@ -5113,8 +5195,8 @@ pub struct NextSliceLine<'a> {
 
 #[cfg(unix)]
 impl<'a> SliceLineCursor<'a> {
-	fn new(data: &'a [u8]) -> Self {
-		Self { data, pos: 0 }
+	fn new(data: &'a [u8], separator: u8) -> Self {
+		Self { data, pos: 0, separator }
 	}
 
 	/// Return the next line, if available, or None.
@@ -5125,25 +5207,14 @@ impl<'a> SliceLineCursor<'a> {
 
 		let start = self.pos;
 
-		let mut end = if let Some(pos) = memchr(b'\n', &self.data[start..]) {
-			pos + start
-		} else {
-			self.data.len()
-		};
-
-		if end < self.data.len() {
-			end += 1; // include \n in full span
-		}
-
+		let content_end = memchr(self.separator, &self.data[start..])
+			.map_or(self.data.len(), |pos| start + pos);
+		let end = content_end + usize::from(content_end < self.data.len());
 		self.pos = end;
-		let full_span = &self.data[start..end];
-		let content = if full_span.ends_with(b"\n") {
-			&full_span[..full_span.len() - 1]
-		} else {
-			full_span
-		};
-
-		Ok(Some(NextSliceLine { content, full_span }))
+		Ok(Some(NextSliceLine {
+			content: &self.data[start..content_end],
+			full_span: &self.data[start..end],
+		}))
 	}
 
 	/// Return true if the previously returned line was the last one.
@@ -5152,34 +5223,34 @@ impl<'a> SliceLineCursor<'a> {
 	}
 }
 
-/// Buffered line reader from any BufRead input.
+/// Streaming record reader with a reusable pattern buffer.
 pub struct ReadLineCursor {
-	reader: Box<dyn BufRead>,
-	buffer: String,
+	reader:    BufReader<Box<dyn Read>>,
+	buffer:    Vec<u8>,
+	separator: u8,
 }
 
 impl ReadLineCursor {
 	/// Construct from anything that implements `Read`.
-	fn new<R: Read + 'static>(r: R) -> Self {
-		let buf = BufReader::new(r);
-		Self { reader: Box::new(buf), buffer: String::new() }
+	fn new(r: impl Read + 'static, separator: u8, unbuffered: bool) -> Self {
+		let r: Box<dyn Read> = Box::new(r);
+		// A one-byte capacity avoids read-ahead on pipes under -u.
+		let reader = if unbuffered { BufReader::with_capacity(1, r) } else { BufReader::new(r) };
+		Self { reader, buffer: Vec::new(), separator }
 	}
 
 
-	/// If a line is available, return it and its \n termination.
-	fn get_line(&mut self) -> io::Result<Option<(String, bool)>> {
+	/// If a record is available, return it and whether it was terminated.
+	fn get_line(&mut self) -> io::Result<Option<(Vec<u8>, bool)>> {
 		self.buffer.clear();
-		// read_line *includes* the '\n' if present
-		let bytes_read = self.reader.read_line(&mut self.buffer)?;
-		if bytes_read == 0 {
+		if self.reader.read_until(self.separator, &mut self.buffer)? == 0 {
 			return Ok(None);
 		}
-		// O(1) check whether it ended in '\n'
-		let has_newline = self.buffer.ends_with('\n');
-		// strip it if you don’t want to expose it to the caller
-		if has_newline { self.buffer.pop(); }
-		let line = std::mem::take(&mut self.buffer);
-		Ok(Some((line, has_newline)))
+		let terminated = self.buffer.last() == Some(&self.separator);
+		if terminated {
+			self.buffer.pop();
+		}
+		Ok(Some((std::mem::take(&mut self.buffer), terminated)))
 	}
 
 	/// Return true if the previously returned line was the last one.
@@ -5193,27 +5264,27 @@ impl ReadLineCursor {
 /// A chunk of data that is input and can be output, often very efficiently
 #[derive(Debug, PartialEq, Eq)]
 pub struct IOChunk<'a> {
-	utf8_verified: Cell<bool>, // True if the contents are valid UTF-8
+	utf8_valid: Cell<Option<bool>>,
 	content:       IOChunkContent<'a>,
 }
 
 impl<'a> IOChunk<'a> {
 	/// Construct an IOChunk from the given content
 	fn from_content(content: IOChunkContent<'a>) -> Self {
-		Self { utf8_verified: Cell::new(false), content }
+		Self { utf8_valid: Cell::new(None), content }
 	}
 
 	/// Clear the object's contents, converting it into Owned if needed.
 	pub fn clear(&mut self) {
-		self.utf8_verified.set(true);
+		self.utf8_valid.set(Some(true));
 		match &mut self.content {
-			IOChunkContent::Owned { content, has_newline, .. } => {
+			IOChunkContent::Owned { content, terminated, .. } => {
 				content.clear();
-				*has_newline = false;
+				*terminated = false;
 			},
 			#[cfg(unix)]
 			_ => {
-				self.content = IOChunkContent::new_owned(String::new(), false);
+				self.content = IOChunkContent::new_owned(Vec::new(), false);
 			},
 		}
 	}
@@ -5223,99 +5294,79 @@ impl<'a> IOChunk<'a> {
 		self.content.len() == 0
 	}
 
-	/// Return true if the content ends with a newline.
-	pub fn is_newline_terminated(&self) -> bool {
+	/// Return true if the content was followed by a record separator.
+	pub fn is_terminated(&self) -> bool {
 		match &self.content {
-			IOChunkContent::Owned { has_newline, .. } => *has_newline,
+			IOChunkContent::Owned { terminated, .. } => *terminated,
 			#[cfg(unix)]
-			IOChunkContent::SliceInput { full_span, .. } => {
-				if let Some(&last) = full_span.last() {
-					last == b'\n'
-				} else {
-					false
-				}
-			},
+			IOChunkContent::SliceInput { content, full_span } => content.len() < full_span.len(),
 		}
 	}
 
 	#[cfg(test)]
 	/// Create an Owned newline-terminated IOChunk from a string.
 	pub fn new_from_str(s: &str) -> Self {
-		IOChunk {
-			content:       IOChunkContent::new_owned(s.to_string(), true),
-			utf8_verified: Cell::new(false),
-		}
+		Self { content: IOChunkContent::new_owned(s.as_bytes().to_vec(), true), utf8_valid: Cell::new(Some(true)) }
 	}
 
-	/// Set the object's contents to the specified string.
-	/// Convert it into Owned if needed.
-	pub fn set_to_string(&mut self, new_content: String, add_newline: bool) {
-		self.utf8_verified.set(true);
+	/// Replace the pattern space, reusing an owned buffer when possible.
+	pub fn copy_bytes(&mut self, bytes: &[u8], terminated: bool) {
+		self.utf8_valid.set(None);
 		match &mut self.content {
-			IOChunkContent::Owned { content, has_newline, .. } => {
-				*content = new_content;
-				*has_newline = add_newline;
+			IOChunkContent::Owned { content, terminated: old_terminated, .. } => {
+				content.clear();
+				content.extend_from_slice(bytes);
+				*old_terminated = terminated;
 			},
 			#[cfg(unix)]
-			_ => {
-				self.content = IOChunkContent::new_owned(new_content, add_newline);
+			IOChunkContent::SliceInput { .. } => {
+				self.content = IOChunkContent::new_owned(bytes.to_vec(), terminated);
 			},
 		}
 	}
 
-	/// Return the content as a str.
-	pub fn as_str(&self) -> Result<&str, SedError> {
-		match &self.content {
-			#[cfg(unix)]
-			IOChunkContent::SliceInput { content, .. } => {
-				if self.utf8_verified.get() {
-					// Use cached result
-					Ok(unsafe { self.content.as_str_unchecked() })
-				} else {
-					let result = str::from_utf8(content);
-					self.utf8_verified.set(true);
-					result.map_err(|e| SedError::new(2, e.to_string()))
-				}
+	/// Replace the pattern space with raw bytes.
+	pub fn set_bytes(&mut self, content: Vec<u8>, terminated: bool) {
+		self.utf8_valid.set(None);
+		self.content = IOChunkContent::new_owned(content, terminated);
+	}
+
+	/// Borrow UTF-8 text only if the original bytes are valid.
+	pub fn as_str(&self) -> Option<&str> {
+		let bytes = self.as_bytes();
+		match self.utf8_valid.get() {
+			// SAFETY: the cache is set only after validation (or for known-valid
+			// data), and every mutation invalidates it before changing bytes.
+			Some(true) => Some(unsafe { str::from_utf8_unchecked(bytes) }),
+			Some(false) => None,
+			None => {
+				let text = str::from_utf8(bytes).ok();
+				self.utf8_valid.set(Some(text.is_some()));
+				text
 			},
-			IOChunkContent::Owned { content, .. } => Ok(content),
 		}
 	}
 
-	/// Return the raw byte content (always safe).
+	/// Return the raw byte content.
 	pub fn as_bytes(&self) -> &[u8] {
 		match &self.content {
 			#[cfg(unix)]
 			IOChunkContent::SliceInput { content, .. } => content,
-			IOChunkContent::Owned { content, .. } => content.as_bytes(),
+			IOChunkContent::Owned { content, .. } => content,
 		}
 	}
 
-	/// Convert content to the Owned variant if it's not already.
-	/// Fails if the conversion to UTF-8 fails.
-	pub fn ensure_owned(&mut self) -> Result<(), SedError> {
-		match &self.content {
-			IOChunkContent::Owned { .. } => Ok(()), // already owned
-			#[cfg(unix)]
-			IOChunkContent::SliceInput { content, full_span, .. } => match std::str::from_utf8(content) {
-				Ok(valid_str) => {
-					let has_newline = full_span.last().copied() == Some(b'\n');
-					self.content = IOChunkContent::new_owned(valid_str.to_string(), has_newline);
-					self.utf8_verified.set(true);
-					Ok(())
-				},
-				Err(e) => Err(SedError::new(2, e.to_string())),
-			},
+	/// Convert a borrowed snapshot line to owned bytes on the first mutation.
+	pub fn fields_mut(&mut self) -> (&mut Vec<u8>, &mut bool) {
+		#[cfg(unix)]
+		if let IOChunkContent::SliceInput { content, full_span } = &self.content {
+			self.content = IOChunkContent::new_owned(content.to_vec(), content.len() < full_span.len());
 		}
-	}
-
-	/// Return mutable access to the content and has_newline fields.
-	pub fn fields_mut(&mut self) -> Result<(&mut String, &mut bool), SedError> {
-		self.ensure_owned()?;
-
+		self.utf8_valid.set(None);
 		match &mut self.content {
-			IOChunkContent::Owned { content, has_newline, .. } => Ok((content, has_newline)),
-			#[allow(unreachable_patterns)]
-			_ => unreachable!("ensure_owned should convert to Owned"),
+			IOChunkContent::Owned { content, terminated, .. } => (content, terminated),
+			#[cfg(unix)]
+			_ => unreachable!("pattern space is owned after conversion"),
 		}
 	}
 }
@@ -5328,12 +5379,12 @@ impl<'a> IOChunk<'a> {
 enum IOChunkContent<'a> {
 	#[cfg(unix)]
 	SliceInput {
-		content:   &'a [u8], // Line without newline
-		full_span: &'a [u8], // Line including original newline, if any
+		content:   &'a [u8], // Record without its separator
+		full_span: &'a [u8], // Record with its original separator, if any
 	},
 	Owned {
-		content:     String, // Line content without newline
-		has_newline: bool,   // True if \n-terminated
+		content:    Vec<u8>, // Record without its separator
+		terminated: bool,
 		#[cfg(not(unix))]
 		_phantom:    PhantomData<&'a ()>, // Silence E0392 warning
 	},
@@ -5341,30 +5392,20 @@ enum IOChunkContent<'a> {
 
 impl IOChunkContent<'_> {
 	/// Construct a new Owned chunk.
-	pub fn new_owned(content: String, has_newline: bool) -> Self {
+	pub fn new_owned(content: Vec<u8>, terminated: bool) -> Self {
 		#[cfg(unix)]
-		return IOChunkContent::Owned { content, has_newline };
+		return IOChunkContent::Owned { content, terminated };
 
 		#[cfg(not(unix))]
 		return IOChunkContent::Owned {
 			content,
-			has_newline,
+			terminated,
 			// Avoid E0063 missing _phantom initialization errors
 			_phantom: std::marker::PhantomData,
 		};
 	}
 
-	#[cfg(unix)]
-	unsafe fn as_str_unchecked(&self) -> &str {
-		match self {
-			IOChunkContent::SliceInput { content, .. } => unsafe {
-				std::str::from_utf8_unchecked(content)
-			},
-			IOChunkContent::Owned { content, .. } => content,
-		}
-	}
-
-	/// Return the content's length (in bytes or characters).
+	/// Return the content's length in bytes.
 	pub fn len(&self) -> usize {
 		match self {
 			#[cfg(unix)]
@@ -5392,63 +5433,61 @@ pub enum LineReader<'a> {
 	_Phantom(std::marker::PhantomData<&'a ()>),
 }
 
-/// Return a LineReader that uses the ReadInput method fot the specified file.
-fn line_reader_read_input(file: impl Read + 'static) -> io::Result<LineReader<'static>> {
-	let boxed: Box<dyn Read> = Box::new(file);
-	let reader = BufReader::new(boxed);
-	Ok(LineReader::ReadInput(ReadLineCursor::new(reader)))
+/// Stream an open input using the specified record separator.
+fn line_reader_read_input(file: impl Read + 'static, separator: u8, unbuffered: bool) -> LineReader<'static> {
+	LineReader::ReadInput(ReadLineCursor::new(file, separator, unbuffered))
 }
 
 /// Return a LineReader that serves all of `file`, read into memory up front.
 #[cfg(unix)]
-fn line_reader_slice_input(mut file: impl Read) -> io::Result<LineReader<'static>> {
+fn line_reader_slice_input(mut file: impl Read, separator: u8) -> io::Result<LineReader<'static>> {
 	let mut data = Vec::new();
 	file.read_to_end(&mut data)?;
 	// SAFETY: the heap buffer of `data` is never mutated or reallocated, and it
 	// lives in the same variant as the cursor borrowing it.
 	let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-	Ok(LineReader::SliceInput { _data: data, cursor: SliceLineCursor::new(slice) })
+	Ok(LineReader::SliceInput { _data: data, cursor: SliceLineCursor::new(slice, separator) })
 }
 
 impl<'a> LineReader<'a> {
 	/// Open the specified file for line input.
 	// Use "-" to read from the standard input.
-	pub fn open_with_host(path: &PathBuf, host: &mut Host) -> io::Result<Self> {
+	pub fn open_with_host(path: &PathBuf, host: &Host, separator: u8, unbuffered: bool) -> io::Result<Self> {
 		if path.as_os_str() == "-" {
-			// read the context stdin.
-			let boxed: Box<dyn Read> = Box::new(host.stdin.file().clone());
-			let reader = BufReader::new(boxed);
-			return Ok(LineReader::ReadInput(ReadLineCursor::new(reader)));
+			return Ok(line_reader_read_input(host.stdin.file().clone(), separator, unbuffered));
 		}
 
 		// input file operands resolve
 		// against the shell working directory.
 		let file = host.fs().open(host.resolve(path))?;
+		if file.metadata().is_ok_and(|meta| meta.is_dir()) {
+			return Err(io::Error::new(io::ErrorKind::IsADirectory, "Is a directory"));
+		}
 
 		// Regular host files are read whole, never memory-mapped: sed runs in
 		// the host process, where truncating a mapped file under it raises
 		// SIGBUS and kills the host. Provider files and non-regular host files
 		// (pipes, process substitution) stream.
 		#[cfg(unix)]
-		if file.native().is_some() && file.metadata().is_ok_and(|meta| meta.is_file()) {
-			return line_reader_slice_input(file);
+		if !unbuffered && file.native().is_some() && file.metadata().is_ok_and(|meta| meta.is_file()) {
+			return line_reader_slice_input(file, separator);
 		}
 
-		line_reader_read_input(file)
+		Ok(line_reader_read_input(file, separator, unbuffered))
 	}
 
 	/// Opens a file directly for unit tests.
 	#[cfg(test)]
 	pub fn open(path: &PathBuf) -> io::Result<Self> {
-		let (mut host, _) = Host::for_test("sed", "", ".");
-		Self::open_with_host(path, &mut host)
+		let (host, _) = Host::for_test("sed", "", ".");
+		Self::open_with_host(path, &host, b'\n', false)
 	}
 
 	/// Open the specified file to read as a stream.
 	#[cfg(test)]
 	pub fn open_stream(path: &PathBuf) -> io::Result<Self> {
 		let file = std::fs::File::open(path)?;
-		line_reader_read_input(file)
+		Ok(line_reader_read_input(file, b'\n', false))
 	}
 
 	/// Return the next line, if available.
@@ -5466,8 +5505,8 @@ impl<'a> LineReader<'a> {
 			},
 
 			LineReader::ReadInput(cursor) => {
-				if let Some((line, _has_newline)) = cursor.get_line()? {
-					let chunk = IOChunk::from_content(IOChunkContent::new_owned(line, _has_newline));
+				if let Some((line, terminated)) = cursor.get_line()? {
+					let chunk = IOChunk::from_content(IOChunkContent::new_owned(line, terminated));
 					Ok(Some(chunk))
 				} else {
 					Ok(None)
@@ -5476,6 +5515,25 @@ impl<'a> LineReader<'a> {
 
 			#[cfg(not(unix))]
 			LineReader::_Phantom(_) => unreachable!("_Phantom should never be constructed"),
+		}
+	}
+
+	/// Return the number of unread bytes fetched by a streaming input.
+	pub fn unread_bytes(&self) -> usize {
+		match self {
+			Self::ReadInput(cursor) => cursor.reader.buffer().len(),
+			_ => 0,
+		}
+	}
+
+	/// Recover the last owned pattern as the buffer for the next input line.
+	pub fn recycle(&mut self, chunk: IOChunk<'a>) {
+		if let Self::ReadInput(cursor) = self {
+			match chunk.content {
+				IOChunkContent::Owned { content, .. } => cursor.buffer = content,
+				#[cfg(unix)]
+				IOChunkContent::SliceInput { .. } => unreachable!("streaming chunks are always owned"),
+			}
 		}
 	}
 
@@ -5519,9 +5577,9 @@ pub struct OutputBuffer {
 	                                                               * flushing */
 	#[cfg(unix)]
 	slice_chunk:       Option<SliceOutput>, // Chunk to write
-	// True when the last write didn't end with \n; the \n is deferred so
-	// that commands like `p` don't emit a spurious newline under -n.
-	pending_newline:   bool,
+	separator:         u8,
+	// Defer a missing terminator until the next output record.
+	pending_separator: bool,
 	#[cfg(test)]
 	low_level_flushes: usize, // Number of system call flushes
 }
@@ -5539,72 +5597,122 @@ const MIN_DIRECT_WRITE: usize = 4 * 1024;
 const MAX_PENDING_WRITE_NON_FILE: usize = 64 * 1024;
 
 impl OutputBuffer {
-	#[cfg(not(unix))]
-	pub fn new(w: Box<dyn OutputWrite + 'static>, line_buffered: bool) -> Self {
+	/// Create buffered output with the invocation's record separator.
+	pub fn new(w: Box<dyn OutputWrite + 'static>, line_buffered: bool, separator: u8) -> Self {
 		Self {
 			out: BufWriter::new(w),
 			line_buffered,
-			pending_newline: false,
-			#[cfg(test)]
-			low_level_flushes: 0,
-		}
-	}
-
-	#[cfg(unix)]
-	pub fn new(w: Box<dyn OutputWrite + 'static>, line_buffered: bool) -> Self {
-		Self {
-			out: BufWriter::new(w),
-			line_buffered,
-			max_pending_write: if line_buffered {
-				MAX_PENDING_WRITE_NON_FILE
-			} else {
-				usize::MAX
-			},
+			#[cfg(unix)]
+			max_pending_write: if line_buffered { MAX_PENDING_WRITE_NON_FILE } else { usize::MAX },
+			#[cfg(unix)]
 			slice_chunk: None,
-			pending_newline: false,
+			separator,
+			pending_separator: false,
 			#[cfg(test)]
 			low_level_flushes: 0,
 		}
 	}
 
-	/// Schedule the specified String or &str for eventual output
-	pub fn write_str<S: Into<String>>(&mut self, s: S) -> io::Result<()> {
-		let mut s = s.into();
-		let has_newline = s.ends_with('\n');
-		if has_newline {
-			s.truncate(s.len() - 1);
-		}
-		self.write_chunk(&IOChunk::from_content(IOChunkContent::new_owned(s, has_newline)))
+	#[cfg(test)]
+	/// Schedule script text for output.
+	pub fn write_str(&mut self, s: impl AsRef<str>) -> io::Result<()> {
+		self.write_bytes(s.as_ref().as_bytes())
 	}
 
-	/// Copy the specified file, opened through `fs`, to the output.
-	pub fn copy_file(&mut self, fs: &BlockingFs, path: &Path) -> io::Result<()> {
+	/// Schedule bytes for output without converting or taking ownership of them.
+	pub fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+		if let Some(content) = bytes.strip_suffix(&[self.separator]) {
+			self.write_owned_content(content, true)
+		} else {
+			self.write_owned_content(bytes, false)
+		}
+	}
+
+	/// Write the parsed text of `i` or `c`, replacing its final script newline.
+	pub(super) fn write_script_text(&mut self, text: &str) -> io::Result<()> {
+		match text.strip_suffix('\n') {
+			Some(content) => self.write_owned_content(content.as_bytes(), true),
+			None => self.write_owned_content(text.as_bytes(), false),
+		}
+	}
+
+	/// Write the current input record number and the output separator.
+	pub(super) fn write_line_number(&mut self, number: usize) -> io::Result<()> {
+		#[cfg(unix)]
+		self.flush_slice(WriteRange::Complete)?;
+		self.flush_pending_separator()?;
+		write!(self.out, "{number}")?;
+		self.out.write_all(&[self.separator])?;
+		self.flush_completed_line()
+	}
+
+	/// Write record content, preserving whether it originally had a terminator.
+	pub(super) fn write_owned_content(&mut self, content: &[u8], terminated: bool) -> io::Result<()> {
+		if content.is_empty() && !terminated {
+			return Ok(());
+		}
+		#[cfg(unix)]
+		self.flush_slice(WriteRange::Complete)?;
+		if self.pending_separator {
+			self.out.write_all(&[self.separator])?;
+			self.flush_completed_line()?;
+		}
+		self.out.write_all(content)?;
+		if terminated {
+			self.out.write_all(&[self.separator])?;
+			self.flush_completed_line()?;
+		}
+		self.pending_separator = !terminated;
+		Ok(())
+	}
+
+	/// Copy the file the script calls `name`, opened through `fs` at `path`, to
+	/// the output. A file that can't be opened counts as empty (POSIX); a
+	/// directory or a failed read is GNU's fatal `read error`.
+	pub fn copy_file(&mut self, fs: &BlockingFs, path: &Path, name: &Path) -> SedResult<()> {
 		// Flush snapshot writes, if any.
 		#[cfg(unix)]
 		{
 			self.flush_slice(WriteRange::Complete)?;
 		}
 
-		let Ok(file) = fs.open(path) else {
-			// Per POSIX, if the file can't be read treat it as empty.
-			return Ok(());
+		let mut file = match fs.open(path) {
+			Ok(file) if file.metadata().is_ok_and(|meta| meta.is_dir()) => {
+				return Err(read_error(name, &io::Error::new(io::ErrorKind::IsADirectory, "Is a directory")));
+			},
+			Ok(file) => file,
+			Err(e) if e.kind() == io::ErrorKind::IsADirectory => return Err(read_error(name, &e)),
+			Err(_) => return Ok(()),
 		};
 
-		let mut reader = BufReader::new(file);
-		if self.line_buffered {
-			let mut buf = [0; 8 * 1024];
-			loop {
-				let len = reader.read(&mut buf)?;
-				if len == 0 {
-					break;
-				}
-				self.out.write_all(&buf[..len])?;
-				if buf[..len].contains(&b'\n') {
-					self.flush_completed_line()?;
-				}
+		self.flush_pending_separator()?;
+		let mut buf = [0; 8 * 1024];
+		loop {
+			let len = match file.read(&mut buf) {
+				Ok(0) => break,
+				Ok(len) => len,
+				Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+				Err(e) => return Err(read_error(name, &e)),
+			};
+			self.out.write_all(&buf[..len])?;
+			if self.line_buffered && (buf[..len].contains(&self.separator) || buf[..len].contains(&b'\n')) {
+				self.flush_completed_line()?;
 			}
-		} else {
-			io::copy(&mut reader, &mut self.out)?;
+		}
+		Ok(())
+	}
+
+	/// Write raw output without adding or deferring a separator for it.
+	pub fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+		if bytes.is_empty() {
+			return Ok(());
+		}
+		self.flush_pending_separator()?;
+		#[cfg(unix)]
+		self.flush_slice(WriteRange::Complete)?;
+		self.out.write_all(bytes)?;
+		if bytes.contains(&self.separator) || bytes.contains(&b'\n') {
+			self.flush_completed_line()?;
 		}
 		Ok(())
 	}
@@ -5625,9 +5733,7 @@ impl OutputBuffer {
 /// Implementation of the std::io::Write trait
 impl Write for OutputBuffer {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		let s =
-			std::str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-		self.write_str(s)?;
+		self.write_bytes(buf)?;
 		Ok(buf.len())
 	}
 
@@ -5648,14 +5754,17 @@ enum WriteRange {
 impl OutputBuffer {
 	/// Schedule the specified output chunk for eventual output
 	pub fn write_chunk(&mut self, new_chunk: &IOChunk) -> io::Result<()> {
-		if new_chunk.is_empty() && !new_chunk.is_newline_terminated() {
+		if let IOChunkContent::Owned { content, terminated, .. } = &new_chunk.content {
+			return self.write_owned_content(content, *terminated);
+		}
+		if new_chunk.is_empty() && !new_chunk.is_terminated() {
 			return Ok(());
 		}
 
-		if self.pending_newline {
+		if self.pending_separator {
 			self.flush_slice(WriteRange::Complete)?;
-			self.out.write_all(b"\n")?;
-			self.pending_newline = false;
+			self.out.write_all(&[self.separator])?;
+			self.pending_separator = false;
 			self.flush_completed_line()?;
 		}
 
@@ -5694,20 +5803,13 @@ impl OutputBuffer {
 				if reset {
 					self.slice_chunk = Some(SliceOutput { out_ptr: new_ptr, len: new_len });
 				}
-				self.pending_newline = !new_chunk.is_newline_terminated();
+				self.pending_separator = !new_chunk.is_terminated();
 			},
 
-			IOChunkContent::Owned { content, has_newline, .. } => {
-				self.flush_slice(WriteRange::Complete)?;
-				self.out.write_all(content.as_bytes())?;
-				if *has_newline {
-					self.out.write_all(b"\n")?;
-				}
-				self.pending_newline = !has_newline;
-			},
+			IOChunkContent::Owned { .. } => unreachable!("owned content handled above"),
 		}
 
-		if self.line_buffered && new_chunk.is_newline_terminated() {
+		if self.line_buffered && new_chunk.is_terminated() {
 			// Snapshot output reaches the BufWriter only here; file-backed
 			// output is block-buffered, so this cannot affect its fast path.
 			self.flush_slice(WriteRange::Complete)?;
@@ -5723,26 +5825,23 @@ impl OutputBuffer {
 	// irrelevant and every flush writes the complete pending span.
 	#[cfg(unix)]
 	fn flush_slice(&mut self, _cover: WriteRange) -> io::Result<()> {
-		if let Some(chunk) = self.slice_chunk.as_mut() {
+		if let Some(chunk) = self.slice_chunk.take() {
 			#[cfg(test)]
 			if chunk.len >= MIN_DIRECT_WRITE {
 				self.low_level_flushes += 1;
 			}
 			let slice = unsafe { std::slice::from_raw_parts(chunk.out_ptr, chunk.len) };
 			self.out.write_all(slice)?;
-			let written = slice.len();
-			chunk.len -= written;
-			unsafe { chunk.out_ptr = chunk.out_ptr.add(written) };
 		}
 		Ok(())
 	}
 
 	/// Write a deferred newline if the last output didn't end with one.
-	pub fn flush_pending_newline(&mut self) -> io::Result<()> {
-		if self.pending_newline {
+	pub fn flush_pending_separator(&mut self) -> io::Result<()> {
+		if self.pending_separator {
 			self.flush_slice(WriteRange::Complete)?;
-			self.out.write_all(b"\n")?;
-			self.pending_newline = false;
+			self.out.write_all(&[self.separator])?;
+			self.pending_separator = false;
 			self.flush_completed_line()?;
 		}
 		Ok(())
@@ -5759,36 +5858,14 @@ impl OutputBuffer {
 impl OutputBuffer {
 	/// Schedule the specified output chunk for eventual output
 	pub fn write_chunk(&mut self, chunk: &IOChunk) -> io::Result<()> {
-		if chunk.is_empty() && !chunk.is_newline_terminated() {
-			return Ok(());
-		}
-
-		if self.pending_newline {
-			self.out.write_all(b"\n")?;
-			self.pending_newline = false;
-			self.flush_completed_line()?;
-		}
-
-		match &chunk.content {
-			IOChunkContent::Owned { content, has_newline, .. } => {
-				self.out.write_all(content.as_bytes())?;
-				if *has_newline {
-					self.out.write_all(b"\n")?;
-				}
-				self.pending_newline = !has_newline;
-				if *has_newline {
-					self.flush_completed_line()?;
-				}
-				Ok(())
-			},
-		}
+		self.write_owned_content(chunk.as_bytes(), chunk.is_terminated())
 	}
 
 	/// Write a deferred newline if the last output didn't end with one.
-	pub fn flush_pending_newline(&mut self) -> io::Result<()> {
-		if self.pending_newline {
-			self.out.write_all(b"\n")?;
-			self.pending_newline = false;
+	pub fn flush_pending_separator(&mut self) -> io::Result<()> {
+		if self.pending_separator {
+			self.out.write_all(&[self.separator])?;
+			self.pending_separator = false;
 			self.flush_completed_line()?;
 		}
 		Ok(())
@@ -5833,7 +5910,7 @@ mod tests {
 		let tmp = NamedTempFile::new()?;
 		{
 			let file = tmp.reopen()?;
-			let mut out = OutputBuffer::new(Box::new(file), false);
+			let mut out = OutputBuffer::new(Box::new(file), false, b'\n');
 			out.write_str("foo\n")?;
 			out.write_str("bar\n")?;
 			out.flush()?;
@@ -5868,7 +5945,7 @@ mod tests {
 		let output = NamedTempFile::new()?;
 		let output_path = output.path().to_path_buf();
 		let out_file = std::fs::File::create(&output_path)?;
-		let mut out = OutputBuffer::new(Box::new(Box::new(out_file)), false);
+		let mut out = OutputBuffer::new(Box::new(Box::new(out_file)), false, b'\n');
 
 		// Drain reader → writer
 		while let Some(chunk) = reader.get_line()? {
@@ -5903,7 +5980,7 @@ mod tests {
 		let output = NamedTempFile::new()?;
 		let output_path = output.path().to_path_buf();
 		let out_file = File::create(&output_path)?;
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 
 		// Read the first snapshot line ("zero\n") and write it
 		if let Some(chunk) = reader.get_line()? {
@@ -5957,7 +6034,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -5996,7 +6073,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -6031,7 +6108,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -6066,7 +6143,7 @@ mod tests {
 		let out_file = File::create(&output_path)?;
 
 		// Wrap it in your OutputBuffer and run the loop:
-		let mut out = OutputBuffer::new(Box::new(out_file), false);
+		let mut out = OutputBuffer::new(Box::new(out_file), false, b'\n');
 		let mut nline = 0;
 		while let Some(chunk) = reader.get_line()? {
 			out.write_chunk(&chunk)?;
@@ -6096,25 +6173,25 @@ mod tests {
 
 		// Verify the reader's operation
 		if let Some(IOChunk {
-			content: IOChunkContent::Owned { content, has_newline, .. },
-			utf8_verified,
+			content: IOChunkContent::Owned { content, terminated, .. },
+			utf8_valid,
 			..
 		}) = reader.get_line()?
 		{
-			assert_eq!(content, "first line");
+			assert_eq!(content, b"first line");
 			assert_eq!(content.len(), 10);
-			assert!(has_newline);
-			assert!(!utf8_verified.get());
+			assert!(terminated);
+			assert_eq!(utf8_valid.get(), None);
 			assert!(!reader.last_line().unwrap());
 		} else {
 			panic!("Expected IOChunkContent::Owned");
 		}
 
-		if let Some(IOChunk { content: IOChunkContent::Owned { content, has_newline, .. }, .. }) =
+		if let Some(IOChunk { content: IOChunkContent::Owned { content, terminated, .. }, .. }) =
 			reader.get_line()?
 		{
-			assert_eq!(content, "second line");
-			assert!(has_newline);
+			assert_eq!(content, b"second line");
+			assert!(terminated);
 			assert!(!reader.last_line().unwrap());
 		} else {
 			panic!("Expected IOChunkContent::Owned");
@@ -6146,14 +6223,14 @@ mod tests {
 		// Verify the reader's operation
 		if let Some(IOChunk {
 			content: IOChunkContent::SliceInput { content, full_span, .. },
-			utf8_verified,
+			utf8_valid,
 			..
 		}) = reader.get_line()?
 		{
 			assert_eq!(content, b"first line");
 			assert_eq!(content.len(), 10);
 			assert_eq!(full_span, b"first line\n");
-			assert!(!utf8_verified.get());
+			assert_eq!(utf8_valid.get(), None);
 			assert!(!reader.last_line().unwrap());
 		} else {
 			panic!("Expected IOChunkContent::SliceInput");
@@ -6161,13 +6238,13 @@ mod tests {
 
 		if let Some(IOChunk {
 			content: IOChunkContent::SliceInput { content, full_span, .. },
-			utf8_verified,
+			utf8_valid,
 			..
 		}) = reader.get_line()?
 		{
 			assert_eq!(content, b"second line");
 			assert_eq!(full_span, b"second line\n");
-			assert!(!utf8_verified.get());
+			assert_eq!(utf8_valid.get(), None);
 			assert!(!reader.last_line().unwrap());
 		} else {
 			panic!("Expected IOChunkContent::SliceInput");
@@ -6176,7 +6253,7 @@ mod tests {
 		if let Some(content) = reader.get_line()? {
 			assert_eq!(content.as_bytes(), b"last line");
 			assert_eq!(content.as_str().unwrap(), "last line");
-			assert!(content.utf8_verified.get());
+			assert_eq!(content.utf8_valid.get(), Some(true));
 			assert!(reader.last_line().unwrap());
 			// Cached version
 			assert_eq!(content.as_str().unwrap(), "last line");
@@ -6213,25 +6290,25 @@ mod tests {
 		Ok(())
 	}
 
-	// is_newline_terminated, is_empty
+	// is_terminated, is_empty
 	#[test]
 	fn test_owned_newline_terminated_non_empty() {
-		let chunk = IOChunk::from_content(IOChunkContent::new_owned("line".to_string(), true));
-		assert!(chunk.is_newline_terminated());
+		let chunk = IOChunk::from_content(IOChunkContent::new_owned(b"line".to_vec(), true));
+		assert!(chunk.is_terminated());
 		assert!(!chunk.is_empty());
 	}
 
 	#[test]
 	fn test_owned_newline_terminated_empty() {
-		let chunk = IOChunk::from_content(IOChunkContent::new_owned(String::new(), true));
-		assert!(chunk.is_newline_terminated());
+		let chunk = IOChunk::from_content(IOChunkContent::new_owned(Vec::new(), true));
+		assert!(chunk.is_terminated());
 		assert!(chunk.is_empty());
 	}
 
 	#[test]
 	fn test_owned_not_newline_terminated() {
-		let chunk = IOChunk::from_content(IOChunkContent::new_owned("line".to_string(), false));
-		assert!(!chunk.is_newline_terminated());
+		let chunk = IOChunk::from_content(IOChunkContent::new_owned(b"line".to_vec(), false));
+		assert!(!chunk.is_terminated());
 	}
 
 	#[cfg(unix)]
@@ -6240,7 +6317,7 @@ mod tests {
 		let content = b"line";
 		let full_span = b"line\n";
 		let chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
-		assert!(chunk.is_newline_terminated());
+		assert!(chunk.is_terminated());
 	}
 
 	#[cfg(unix)]
@@ -6249,7 +6326,7 @@ mod tests {
 		let content = b"line";
 		let full_span = b"line";
 		let chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
-		assert!(!chunk.is_newline_terminated());
+		assert!(!chunk.is_terminated());
 	}
 
 	#[cfg(unix)]
@@ -6258,90 +6335,16 @@ mod tests {
 		let content = b"";
 		let full_span = b"";
 		let chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
-		assert!(!chunk.is_newline_terminated());
-	}
-
-	// ensure_owned()
-	#[test]
-	fn test_ensure_owned_on_owned() {
-		let mut chunk =
-			IOChunk::from_content(IOChunkContent::new_owned("already owned".to_string(), true));
-
-		let result = chunk.ensure_owned();
-		assert!(result.is_ok());
-
-		// Content must be unchanged
-		match &chunk.content {
-			IOChunkContent::Owned { content, has_newline, .. } => {
-				assert_eq!(content, "already owned");
-				assert!(*has_newline);
-			},
-			#[cfg(unix)]
-			_ => panic!("Expected Owned variant"),
-		}
-	}
-
-	#[cfg(unix)]
-	#[test]
-	fn test_ensure_owned_on_slice_valid_utf8() {
-		let content = b"slice string";
-		let full_span = b"slice string\n";
-
-		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
-
-		let result = chunk.ensure_owned();
-		assert!(result.is_ok());
-
-		match &chunk.content {
-			IOChunkContent::Owned { content, has_newline, .. } => {
-				assert_eq!(content, "slice string");
-				assert!(*has_newline);
-			},
-			_ => panic!("Expected Owned variant after ensure_owned"),
-		}
-	}
-
-	#[cfg(unix)]
-	#[test]
-	fn test_ensure_owned_on_slice_valid_utf8_no_newline() {
-		let content = b"no newline";
-		let full_span = b"no newline";
-
-		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
-
-		let result = chunk.ensure_owned();
-		assert!(result.is_ok());
-
-		match &chunk.content {
-			IOChunkContent::Owned { content, has_newline, .. } => {
-				assert_eq!(content, "no newline");
-				assert!(!*has_newline);
-			},
-			_ => panic!("Expected Owned variant after ensure_owned"),
-		}
-	}
-
-	#[cfg(unix)]
-	#[test]
-	fn test_ensure_owned_on_slice_invalid_utf8() {
-		let content = b"bad\xFFutf8";
-		let full_span = b"bad\xFFutf8\n";
-
-		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
-
-		let result = chunk.ensure_owned();
-		assert!(result.is_err());
-		let err_msg = format!("{}", result.unwrap_err());
-		assert!(err_msg.contains("invalid utf-8"), "Unexpected error message: {}", err_msg);
+		assert!(!chunk.is_terminated());
 	}
 
 	// fields_mut
 	#[test]
 	fn test_fields_mut_on_owned() {
-		let mut chunk = IOChunk::from_content(IOChunkContent::new_owned("hello".to_string(), false));
+		let mut chunk = IOChunk::from_content(IOChunkContent::new_owned(b"hello".to_vec(), false));
 
-		let (s, _) = chunk.fields_mut().unwrap();
-		s.push_str(" world");
+		let (s, _) = chunk.fields_mut();
+		s.extend_from_slice(b" world");
 
 		assert_eq!(chunk.as_str().unwrap(), "hello world");
 	}
@@ -6354,8 +6357,8 @@ mod tests {
 		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
 
 		{
-			let (s, _) = chunk.fields_mut().unwrap();
-			s.push_str("bar");
+			let (s, _) = chunk.fields_mut();
+			s.extend_from_slice(b"bar");
 		}
 
 		assert_eq!(chunk.as_str().unwrap(), "foobar");
@@ -6368,8 +6371,8 @@ mod tests {
 		let full_span = "Ζωντανά!\n".as_bytes();
 		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
 
-		let (s, _) = chunk.fields_mut().unwrap();
-		s.push_str(" Δεδομένα");
+		let (s, _) = chunk.fields_mut();
+		s.extend_from_slice(" Δεδομένα".as_bytes());
 
 		assert_eq!(chunk.as_str().unwrap(), "Ζωντανά! Δεδομένα");
 	}
@@ -6381,9 +6384,10 @@ mod tests {
 		let full_span = b"abc\xFF\n";
 		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
 
-		let result = chunk.fields_mut();
-		assert!(result.is_err());
-		assert!(format!("{}", result.unwrap_err()).contains("invalid utf-8"));
+		assert_eq!(chunk.as_str(), None);
+		assert_eq!(chunk.as_str(), None);
+		chunk.fields_mut().0.extend_from_slice(b"def");
+		assert_eq!(chunk.as_bytes(), b"abc\xffdef");
 	}
 
 	///////////////////////////////
@@ -6399,7 +6403,8 @@ mod tests {
 			max_pending_write: 8,
 			#[cfg(unix)]
 			slice_chunk: None,
-			pending_newline: false,
+			separator: b'\n',
+			pending_separator: false,
 			low_level_flushes: 0,
 		};
 		(buf, file)
@@ -6407,18 +6412,16 @@ mod tests {
 
 	#[cfg(unix)]
 	fn make_slice_chunk(bytes: &'static [u8]) -> IOChunk<'static> {
-		IOChunk {
-			utf8_verified: Cell::new(true),
-			content:       IOChunkContent::SliceInput { content: bytes, full_span: bytes },
-		}
+		let content = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+		IOChunk::from_content(IOChunkContent::SliceInput { content, full_span: bytes })
 	}
 
 	fn make_owned_chunk(s: &str, has_nl: bool) -> IOChunk<'_> {
 		IOChunk {
-			utf8_verified: Cell::new(true),
+			utf8_valid: Cell::new(Some(true)),
 			content:       IOChunkContent::Owned {
-				content:                    s.to_string(),
-				has_newline:                has_nl,
+				content:                    s.as_bytes().to_vec(),
+				terminated:                has_nl,
 				#[cfg(not(unix))]
 				_phantom:                   std::marker::PhantomData,
 			},
@@ -6480,8 +6483,8 @@ mod tests {
 
 		buf.write_chunk(&c1).unwrap();
 		buf.write_chunk(&c2).unwrap();
-		// After a flush triggered by exceeding max_pending_write
-		assert_eq!(buf.slice_chunk.as_ref().unwrap().len, 0);
+		// Exceeding max_pending_write flushes and clears the saved snapshot span.
+		assert!(buf.slice_chunk.is_none());
 	}
 
 	#[test]
@@ -6512,7 +6515,7 @@ mod tests {
 		assert_eq!(out, "world\n");
 	}
 
-	// pending_newline is injected between two no-newline chunks
+	// pending_separator is injected between two no-newline chunks
 	#[test]
 	fn pending_newline_injected_between_chunks() {
 		let (mut buf, mut file) = new_for_test();
@@ -6525,14 +6528,14 @@ mod tests {
 		assert_eq!(out, "first\nsecond\n");
 	}
 
-	// flush_pending_newline emits the deferred newline
+	// flush_pending_separator emits the deferred newline
 	#[test]
 	fn flush_pending_newline_emits_newline() {
 		let (mut buf, mut file) = new_for_test();
 		buf.write_chunk(&make_owned_chunk("foo", false)).unwrap();
-		assert!(buf.pending_newline);
-		buf.flush_pending_newline().unwrap();
-		assert!(!buf.pending_newline);
+		assert!(buf.pending_separator);
+		buf.flush_pending_separator().unwrap();
+		assert!(!buf.pending_separator);
 		buf.out.flush().unwrap();
 		file.seek(SeekFrom::Start(0)).unwrap();
 		let mut out = String::new();
@@ -6540,12 +6543,12 @@ mod tests {
 		assert_eq!(out, "foo\n");
 	}
 
-	// write_str strips trailing newline and sets pending_newline correctly
+	// write_str strips trailing newline and sets pending_separator correctly
 	#[test]
 	fn write_str_with_trailing_newline() {
 		let (mut buf, mut file) = new_for_test();
 		buf.write_str("bar\n").unwrap();
-		assert!(!buf.pending_newline);
+		assert!(!buf.pending_separator);
 		buf.out.flush().unwrap();
 		file.seek(SeekFrom::Start(0)).unwrap();
 		let mut out = String::new();
@@ -6557,8 +6560,8 @@ mod tests {
 	fn write_str_without_trailing_newline() {
 		let (mut buf, mut file) = new_for_test();
 		buf.write_str("baz").unwrap();
-		assert!(buf.pending_newline);
-		buf.flush_pending_newline().unwrap();
+		assert!(buf.pending_separator);
+		buf.flush_pending_separator().unwrap();
 		buf.out.flush().unwrap();
 		file.seek(SeekFrom::Start(0)).unwrap();
 		let mut out = String::new();
@@ -6568,10 +6571,7 @@ mod tests {
 }
 }
 pub mod fast_regex {
-// A unified interface to byte and fancy Regex
-//
-// This allows using byte Regex when possible, resorting to the
-// slower fancy_regex crate when needed.
+// Literal, Unicode and raw-byte regular expression matching.
 //
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2025 Diomidis Spinellis
@@ -6581,58 +6581,45 @@ pub mod fast_regex {
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-use std::{error::Error, sync::LazyLock};
+use std::{borrow::Cow, cell::OnceCell, error::Error, ops::ControlFlow};
 
-use fancy_regex::{
-	CaptureMatches as FancyCaptureMatches, Captures as FancyCaptures, Regex as FancyRegex,
-};
+use fancy_regex::{Captures as FancyCaptures, Regex as FancyRegex};
 use memchr::memmem;
-use regex::{
-	Regex as RustRegex,
-	bytes::{CaptureMatches as ByteCaptureMatches, Captures as ByteCaptures, Regex as ByteRegex},
-};
+use onig::{EncodedBytes, MatchParam, RegexOptions, Region, SearchOptions, Syntax};
+use regex::{Captures as UnicodeCaptures, Regex as RustRegex};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::sed::fast_io::IOChunk;
 
-/// REs requiring the fancy_regex capabilities rather than the
-/// faster regex::bytes engine
-// False positives only result in a small performance pessimization,
-// so this is just a maximally sensitive, good-enough approximation.
-// For example, r"\\1" and r"[\1]" will match, whereas only a number
-// after an odd number of backslashes and outside a character class
-// should match.
-static NEEDS_FANCY_RE: LazyLock<RustRegex> =
-	LazyLock::new(|| regex::Regex::new(r"\\[1-9]").unwrap());
+/// Detects `\1` through `\9`, conservatively including escaped backslashes.
+fn needs_backreferences(pattern: &str) -> bool {
+	let bytes = pattern.as_bytes();
+	memchr::memchr_iter(b'\\', bytes).any(|at| matches!(bytes.get(at + 1), Some(b'1'..=b'9')))
+}
 
-/// All characters signifying that the match must be handled by an RE
-/// rather than by plain string pattern matching.
-// These do not include the ^$ metacharacters, which we can easily handle.
-// Plain string fixed-string matching is currently faster than Regex
-// matching, because Regex always constructs an automaton and needs
-// to handle state transitions, whereas plain string matching can
-// use tailored CPU string or vectored instructions.
-static NEEDS_RE: LazyLock<RustRegex> = LazyLock::new(|| {
-	regex::Regex::new(
-		r"(?x) # Turn on verbose mode
-          ( ^                   # Non-escaped: i.e. at BOL
-             | ^[^\\]            # or after a BOL non \
-             | [^\\] {2}         # or after two non \ characters
-             | \\.               # or after a consumed or escaped \
-           )
-           (                     # A potentially incompatible match
-              [.?|+(\[{*]        # Any magic RE character
-                                 # Some are operators so illegal at
-                                 # BOL but they should error there,
-                                 # not use them as literals.
-             | \\[WwDdSsPp]      # Unicode classes
-             | \\[AzBb]          # Empty matches
-             | \\[0-9]           # Back-references
-           )
-        ",
-	)
-	.unwrap()
-});
+/// Detects metacharacters and escapes that require more than literal matching.
+fn needs_regex(pattern: &str) -> bool {
+	let bytes = pattern.as_bytes();
+	bytes.iter().enumerate().any(|(at, &b)| {
+		let special = match b {
+			b'.' | b'?' | b'|' | b'+' | b'(' | b'[' | b'{' | b'*' => true,
+			b'\\' => matches!(
+				bytes.get(at + 1),
+				Some(b'W' | b'w' | b'D' | b'd' | b'S' | b's' | b'P' | b'p' | b'A' | b'z' | b'B' | b'b' | b'0'..=b'9')
+			),
+			_ => false,
+		};
+		if !special || at == 0 {
+			return special;
+		}
+		// The preceding escape may consume a backslash, but not a newline.
+		match bytes[at - 1] {
+			b'\\' => at >= 2 && bytes[at - 2] == b'\\',
+			b'\n' => at < 2 || bytes[at - 2] != b'\\',
+			_ => true,
+		}
+	})
+}
 
 #[derive(Clone, Debug)]
 /// Types of literal string anchored matches
@@ -6711,38 +6698,24 @@ impl LiteralMatcher {
 	}
 
 	/// Return the position and contents of the matched needle.
-	pub fn find<'t>(&self, haystack: &'t [u8]) -> Option<(usize, usize, &'t str)> {
-		self.anchored_find(haystack).and_then(|start| {
+	pub fn find<'t>(&self, haystack: &'t [u8]) -> Option<(usize, usize, &'t [u8])> {
+		self.anchored_find(haystack).map(|start| {
 			let end = start + self.needle.len();
-			std::str::from_utf8(&haystack[start..end])
-				.ok()
-				.map(|s| (start, end, s))
+			(start, end, &haystack[start..end])
 		})
 	}
 
 	/// Return all positions and contents of the matched needle.
-	pub fn iter<'t>(
-		&'t self,
-		haystack: &'t [u8],
-	) -> Box<dyn Iterator<Item = (usize, usize, &'t str)> + 't> {
+	pub fn iter<'t>(&'t self, haystack: &'t [u8]) -> impl Iterator<Item = (usize, usize, &'t [u8])> + 't {
+		let free = matches!(self.match_type, AnchoredMatch::Free);
+		let anchored = if free { None } else { self.find(haystack) };
 		let needle = &self.needle;
-		let nlen = needle.len();
-
-		match self.match_type {
-			AnchoredMatch::Both | AnchoredMatch::Begin | AnchoredMatch::End => {
-				// At most one match; yield it if present
-				Box::new(self.find(haystack).into_iter())
-			},
-			AnchoredMatch::Free => {
-				// Multiple potential matches
-				Box::new(memmem::find_iter(haystack, needle).filter_map(move |start| {
-					let end = start + nlen;
-					std::str::from_utf8(&haystack[start..end])
-						.ok()
-						.map(|s| (start, end, s))
-				}))
-			},
-		}
+		let unanchored = free.then(|| memmem::find_iter(haystack, needle)).into_iter().flatten()
+			.map(move |start| {
+				let end = start + needle.len();
+				(start, end, &haystack[start..end])
+			});
+		anchored.into_iter().chain(unanchored)
 	}
 }
 
@@ -6766,186 +6739,218 @@ pub fn remove_escapes(pattern: &str) -> String {
 	result
 }
 
-#[derive(Clone, Debug)]
-/// A regular expression that can be implemented in diverse efficient ways
+#[derive(Debug)]
+/// Regexes use Unicode character semantics on UTF-8 and C-locale byte
+/// semantics on an ill-formed pattern space. Literal matches need no decoding.
 pub enum Regex {
-	Literal(LiteralMatcher), // Fastest: literal bytes
-	Byte(ByteRegex),         // Slower: byte-based RE
-	Fancy(FancyRegex),       // Slowest: RE supporting UTF-8 and back-references
+	Literal(LiteralMatcher),
+	Unicode(RustRegex, RawRegex),
+	Fancy(FancyRegex, RawRegex),
+}
+
+#[derive(Debug)]
+pub struct RawRegex {
+	pattern: Box<str>,
+	compiled: OnceCell<Result<onig::Regex, onig::Error>>,
+}
+
+impl RawRegex {
+	fn new(pattern: String) -> Self {
+		Self { pattern: pattern.into_boxed_str(), compiled: OnceCell::new() }
+	}
+
+	fn compiled(&self) -> SedResult<&onig::Regex> {
+		// Oniguruma's single-byte encoding works on arbitrary bytes and, unlike
+		// regex::bytes, also supports the backreferences sed accepts in a BRE.
+		self.compiled.get_or_init(|| {
+			onig::Regex::with_options_and_encoding(
+				EncodedBytes::ascii(self.pattern.as_bytes()),
+				RegexOptions::REGEX_OPTION_NONE,
+				Syntax::perl(),
+			)
+		}).as_ref().map_err(|e| SedError::new(4, e))
+	}
+}
+
+fn raw_search(
+	re: &onig::Regex,
+	text: &[u8],
+	at: usize,
+	region: Option<&mut Region>,
+) -> SedResult<bool> {
+	re.search_with_param(
+		EncodedBytes::ascii(text),
+		at,
+		text.len(),
+		SearchOptions::SEARCH_OPTION_NONE,
+		region,
+		MatchParam::default(),
+	).map(|m| m.is_some()).map_err(|e| SedError::new(4, e))
 }
 
 /// Ensure that a regex matches GNU sed's default semantics for `.`
 /// through the appropriate use of the s flag.
 pub fn ensure_dotall(pattern: &str) -> String {
-	// Add (?s) if no flags present.
-	if !pattern.starts_with("(?") {
+	// A leading inline flag group, `(?im)`; not a group such as `(?:a*)?`.
+	let flags = pattern
+		.strip_prefix("(?")
+		.and_then(|rest| rest.find(')').map(|close| (&rest[..close], close + 3)))
+		.filter(|(flags, _)| flags.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-'));
+	let Some((flags, end)) = flags else {
 		return format!("(?s){pattern}");
-	}
-
-	let Some(close) = pattern.find(')') else {
-		// Malformed inline flag group.
-		return pattern.to_owned();
 	};
 
-	// Add s flag to ?(...) unless 's' or its complement 'm' is there.
-	let flags = &pattern[2..close];
-
+	// Add the s flag unless 's' or its complement 'm' is there.
 	if flags.contains('m') || flags.contains('s') {
 		pattern.to_owned()
 	} else {
-		format!("(?{flags}s){}", &pattern[close + 1..])
+		format!("(?{flags}s){}", &pattern[end..])
 	}
 }
 
 impl Regex {
 	/// Construct the most efficient RE-like matching engine possible.
 	pub fn new(pattern: &str) -> Result<Self, Box<dyn Error>> {
-		if NEEDS_FANCY_RE.is_match(pattern) {
-			Ok(Self::Fancy(FancyRegex::new(&ensure_dotall(pattern))?))
-		} else if NEEDS_RE.is_match(pattern) {
-			Ok(Self::Byte(ByteRegex::new(&ensure_dotall(pattern))?))
+		if needs_backreferences(pattern) {
+			let pattern = ensure_dotall(pattern);
+			Ok(Self::Fancy(FancyRegex::new(&pattern)?, RawRegex::new(pattern)))
+		} else if needs_regex(pattern) {
+			let pattern = ensure_dotall(pattern);
+			Ok(Self::Unicode(RustRegex::new(&pattern)?, RawRegex::new(pattern)))
 		} else {
 			Ok(Self::Literal(LiteralMatcher::new(&remove_escapes(pattern))))
 		}
 	}
 
-	/// Check if the regex matches the content of the IOChunk.
-	pub fn is_match(&self, chunk: &mut IOChunk) -> SedResult<bool> {
+	fn raw_for(&self, chunk: &IOChunk) -> SedResult<Option<&onig::Regex>> {
 		match self {
-			Regex::Literal(m) => Ok(m.is_match(chunk.as_bytes())),
-			Regex::Byte(re) => Ok(re.is_match(chunk.as_bytes())),
-			Regex::Fancy(re) => {
-				let text = chunk.as_str()?;
-				re.is_match(text)
-					.map_err(|e| SedError::new(2, e.to_string()))
+			Self::Unicode(_, raw) | Self::Fancy(_, raw) if chunk.as_str().is_none() => {
+				raw.compiled().map(Some)
 			},
+			_ => Ok(None),
 		}
 	}
 
-	/// Return an iterator over capture groups.
-	pub fn captures_iter<'t>(&'t self, chunk: &'t IOChunk) -> SedResult<CaptureMatches<'t>> {
+	/// Check if the regex matches the content of the IOChunk.
+	pub fn is_match(&self, chunk: &IOChunk) -> SedResult<bool> {
+		if let Some(re) = self.raw_for(chunk)? {
+			return raw_search(re, chunk.as_bytes(), 0, None);
+		}
+
 		match self {
-			Regex::Literal(m) => {
-				let haystack = chunk.as_bytes();
-				Ok(CaptureMatches::Literal(Box::new(
-					m.iter(haystack)
-						.map(|(start, end, text)| Ok(Captures::Literal(Match { start, end, text }))),
-				)))
+			Self::Literal(m) => Ok(m.is_match(chunk.as_bytes())),
+			Self::Unicode(re, _) => Ok(re.is_match(chunk.as_str().unwrap())),
+			Self::Fancy(re, _) => Ok(re.is_match(chunk.as_str().unwrap())?),
+		}
+	}
+
+	/// Visit matches until the callback stops. A byte-mode search reuses the
+	/// same capture region for every match, including matches of invalid bytes.
+	pub fn visit_captures(
+		&self,
+		chunk: &IOChunk,
+		mut visit: impl FnMut(Captures<'_>) -> SedResult<ControlFlow<()>>,
+	) -> SedResult<()> {
+		if let Some(re) = self.raw_for(chunk)? {
+			let text = chunk.as_bytes();
+			let mut region = Region::new();
+			let mut at = 0;
+			let mut previous_end = None;
+			while at <= text.len() && raw_search(re, text, at, Some(&mut region))? {
+				let (start, end) = region.pos(0).unwrap();
+				at = end + usize::from(start == end);
+				if start == end && previous_end == Some(end) {
+					continue;
+				}
+				previous_end = Some(end);
+				if visit(Captures::Raw(Cow::Borrowed(&region), text))?.is_break() {
+					break;
+				}
+			}
+			return Ok(());
+		}
+
+		match self {
+			Self::Literal(m) => {
+				for (start, end, text) in m.iter(chunk.as_bytes()) {
+					if visit(Captures::Literal(Match { start, end, text }))?.is_break() {
+						break;
+					}
+				}
 			},
-
-			Regex::Byte(re) => Ok(CaptureMatches::Byte(re.captures_iter(chunk.as_bytes()))),
-
-			Regex::Fancy(re) => {
-				let text = chunk.as_str()?;
-				Ok(CaptureMatches::Fancy(re.captures_iter(text)))
+			Self::Unicode(re, _) => {
+				for caps in re.captures_iter(chunk.as_str().unwrap()) {
+					if visit(Captures::Unicode(caps))?.is_break() {
+						break;
+					}
+				}
+			},
+			Self::Fancy(re, _) => {
+				for caps in re.captures_iter(chunk.as_str().unwrap()) {
+					if visit(Captures::Fancy(caps?))?.is_break() {
+						break;
+					}
+				}
 			},
 		}
+		Ok(())
 	}
 
 	/// Return the number of capture groups, including group 0.
 	pub fn captures_len(&self) -> usize {
 		match self {
-			Regex::Literal(_) => 1, // Only group 0
-			Regex::Byte(re) => re.captures_len(),
-			Regex::Fancy(re) => re.captures_len(),
+			Self::Literal(_) => 1,
+			Self::Unicode(re, _) => re.captures_len(),
+			Self::Fancy(re, _) => re.captures_len(),
 		}
 	}
 
 	/// Return the elements of the first capture.
 	pub fn captures<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Captures<'t>>> {
+		let bytes = chunk.as_bytes();
+		if let Some(re) = self.raw_for(chunk)? {
+			let mut region = Region::new();
+			return Ok(raw_search(re, bytes, 0, Some(&mut region))?
+				.then_some(Captures::Raw(Cow::Owned(region), bytes)));
+		}
+
 		match self {
-			Regex::Literal(m) => {
-				let haystack = chunk.as_bytes();
-				match m.find(haystack) {
-					Some((start, end, text)) => Ok(Some(Captures::Literal(Match { start, end, text }))),
-					None => Ok(None),
-				}
-			},
-
-			Regex::Byte(re) => {
-				let bytes = chunk.as_bytes();
-				Ok(re.captures(bytes).map(Captures::Byte))
-			},
-
-			Regex::Fancy(re) => {
-				let text = chunk.as_str()?;
-				match re.captures(text) {
-					Ok(Some(caps)) => Ok(Some(Captures::Fancy(caps))),
-					Ok(None) => Ok(None),
-					Err(e) => Err(SedError::new(2, e.to_string())),
-				}
-			},
+			Self::Literal(m) => Ok(m.find(bytes)
+				.map(|(start, end, text)| Captures::Literal(Match { start, end, text }))),
+			Self::Unicode(re, _) => Ok(re.captures(chunk.as_str().unwrap()).map(Captures::Unicode)),
+			Self::Fancy(re, _) => Ok(re.captures(chunk.as_str().unwrap())?.map(Captures::Fancy)),
 		}
 	}
 
 	/// Return a non-capturing result for a single match.
 	pub fn find<'t>(&self, chunk: &'t IOChunk) -> SedResult<Option<Match<'t>>> {
+		let bytes = chunk.as_bytes();
+		if let Some(re) = self.raw_for(chunk)? {
+			let mut region = Region::new();
+			return if raw_search(re, bytes, 0, Some(&mut region))? {
+				let (start, end) = region.pos(0).unwrap();
+				Ok(Some(Match { start, end, text: &bytes[start..end] }))
+			} else {
+				Ok(None)
+			};
+		}
+
 		match self {
-			Regex::Literal(m) => {
-				let haystack = chunk.as_bytes();
-				match m.find(haystack) {
-					Some((start, end, text)) => Ok(Some(Match { start, end, text })),
-					None => Ok(None),
-				}
-			},
-
-			Regex::Byte(re) => {
-				let haystack = chunk.as_bytes();
-				if let Some(m) = re.find(haystack) {
-					// Attempt UTF-8 decode for the match region only
-					let text = std::str::from_utf8(&haystack[m.start()..m.end()])
-						.map_err(|e| SedError::new(2, e.to_string()))?;
-					Ok(Some(Match { start: m.start(), end: m.end(), text }))
-				} else {
-					Ok(None)
-				}
-			},
-
-			Regex::Fancy(re) => {
-				let text = chunk.as_str()?;
-				match re.find(text) {
-					Ok(Some(m)) => {
-						Ok(Some(Match { start: m.start(), end: m.end(), text: m.as_str() }))
-					},
-					Ok(None) => Ok(None),
-					Err(e) => Err(SedError::new(2, e.to_string())),
-				}
-			},
+			Self::Literal(m) => Ok(m.find(bytes).map(|(start, end, text)| Match { start, end, text })),
+			Self::Unicode(re, _) => Ok(re.find(chunk.as_str().unwrap())
+				.map(|m| Match { start: m.start(), end: m.end(), text: m.as_str().as_bytes() })),
+			Self::Fancy(re, _) => Ok(re.find(chunk.as_str().unwrap())?
+				.map(|m| Match { start: m.start(), end: m.end(), text: m.as_str().as_bytes() })),
 		}
 	}
 }
 
-/// Unified enum for holding either byte or fancy capture iterators.
-pub enum CaptureMatches<'t> {
-	Literal(Box<dyn Iterator<Item = SedResult<Captures<'t>>> + 't>),
-	Byte(ByteCaptureMatches<'t, 't>),
-	Fancy(FancyCaptureMatches<'t, 't>),
-}
-
-impl<'t> Iterator for CaptureMatches<'t> {
-	type Item = SedResult<Captures<'t>>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		match self {
-			CaptureMatches::Literal(iter) => iter.next(),
-			CaptureMatches::Byte(iter) => iter.next().map(|caps| Ok(Captures::Byte(caps))),
-			CaptureMatches::Fancy(iter) => match iter.next() {
-				Some(Ok(caps)) => Some(Ok(Captures::Fancy(caps))),
-				Some(Err(e)) => {
-					Some(Err(SedError::new(2, format!("error retrieving RE captures: {e}"))))
-				},
-				None => None,
-			},
-		}
-	}
-}
-
-#[derive(Clone, Debug)]
-/// Result type for RE capture get(n)
+#[derive(Clone, Copy, Debug)]
+/// Original pattern-space bytes and offsets of a match or capture.
 pub struct Match<'t> {
 	start: usize,   // Match start
 	end:   usize,   // Match end
-	text:  &'t str, // Actual match
+	text:  &'t [u8],
 }
 
 /// Provide interface compatible with Regex::Match.
@@ -6958,7 +6963,7 @@ impl<'t> Match<'t> {
 		self.end
 	}
 
-	pub fn as_str(&self) -> &'t str {
+	pub fn as_bytes(&self) -> &'t [u8] {
 		self.text
 	}
 }
@@ -6966,49 +6971,30 @@ impl<'t> Match<'t> {
 /// Provide interface compatible with Regex::Captures.
 pub enum Captures<'t> {
 	Literal(Match<'t>), // only group 0
-	Byte(ByteCaptures<'t>),
-	Fancy(FancyCaptures<'t>),
+	Unicode(UnicodeCaptures<'t>),
+	Fancy(FancyCaptures<'t, str>),
+	Raw(Cow<'t, Region>, &'t [u8]),
 }
 
 impl<'t> Captures<'t> {
-	/// Get capture group at index `i`
-	/// Returns Ok(None) if the group didn't match.
-	/// Returns Err if UTF-8 conversion fails (in Byte variant).
-	pub fn get(&self, i: usize) -> SedResult<Option<Match<'t>>> {
+	/// Get a capture by index, or None if that group didn't match.
+	pub fn get(&self, i: usize) -> Option<Match<'t>> {
 		match self {
-			Captures::Literal(m) => Ok(if i == 0 { Some(m.clone()) } else { None }),
-			Captures::Byte(caps) => match caps.get(i) {
-				Some(m) => Ok(Some(Match {
-					start: m.start(),
-					end:   m.end(),
-					text:  std::str::from_utf8(m.as_bytes())
-						.map_err(|e| SedError::new(1, e.to_string()))?,
-				})),
-				None => Ok(None),
-			},
-			Captures::Fancy(caps) => match caps.get(i) {
-				Some(m) => Ok(Some(Match { start: m.start(), end: m.end(), text: m.as_str() })),
-				None => Ok(None),
-			},
+			Self::Literal(m) => (i == 0).then_some(*m),
+			Self::Unicode(caps) => caps.get(i)
+				.map(|m| Match { start: m.start(), end: m.end(), text: m.as_str().as_bytes() }),
+			Self::Fancy(caps) => caps.get(i)
+				.map(|m| Match { start: m.start(), end: m.end(), text: m.as_str().as_bytes() }),
+			Self::Raw(region, bytes) => region.pos(i)
+				.map(|(start, end)| Match { start, end, text: &bytes[start..end] }),
 		}
 	}
-
-	/// Return the number of capture groups (including group 0).
-	pub fn len(&self) -> usize {
-		match self {
-			Captures::Literal(_) => 1,
-			Captures::Byte(caps) => caps.len(),
-			Captures::Fancy(caps) => caps.len(),
-		}
-	}
-
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	// FANCY_RE
 	#[test]
 	fn test_needs_fancy_re_matches() {
 		let should_match = [
@@ -7016,7 +7002,7 @@ mod tests {
 		];
 
 		for pat in &should_match {
-			assert!(NEEDS_FANCY_RE.is_match(pat), "Expected NEEDS_FANCY_RE to match: {pat:?}");
+			assert!(needs_backreferences(pat), "Expected needs_backreferences to match: {pat:?}");
 		}
 	}
 
@@ -7032,11 +7018,10 @@ mod tests {
 		];
 
 		for pat in &should_not_match {
-			assert!(!NEEDS_FANCY_RE.is_match(pat), "Expected NEEDS_FANCY_RE to NOT match: {pat:?}");
+			assert!(!needs_backreferences(pat), "Expected needs_backreferences to NOT match: {pat:?}");
 		}
 	}
 
-	// NEEDS_RE
 	#[test]
 	fn test_needs_re_matches() {
 		let should_match = [
@@ -7055,7 +7040,7 @@ mod tests {
 		];
 
 		for pat in &should_match {
-			assert!(NEEDS_RE.is_match(pat), "Expected NEEDS_RE to match: {pat:?}");
+			assert!(needs_regex(pat), "Expected needs_regex to match: {pat:?}");
 		}
 	}
 
@@ -7072,21 +7057,21 @@ mod tests {
 		];
 
 		for pat in &should_not_match {
-			assert!(!NEEDS_RE.is_match(pat), "Expected NEEDS_RE to NOT match: {pat:?}");
+			assert!(!needs_regex(pat), "Expected needs_regex to NOT match: {pat:?}");
 		}
 	}
 
 	// Regex::new
 	#[test]
-	fn assert_byte_selection() {
+	fn assert_unicode_selection() {
 		let re = Regex::new(r"x*").unwrap();
-		assert!(matches!(re, Regex::Byte(_)));
+		assert!(matches!(re, Regex::Unicode(..)));
 	}
 
 	#[test]
 	fn assert_fancy() {
 		let re = Regex::new(r"(.)\1").unwrap();
-		assert!(matches!(re, Regex::Fancy(_)));
+		assert!(matches!(re, Regex::Fancy(..)));
 	}
 
 	#[test]
@@ -7157,7 +7142,7 @@ mod tests {
 		let haystack = "contains ✓ unicode".as_bytes();
 		assert!(matcher.is_match(haystack));
 		let found = matcher.find(haystack).unwrap();
-		assert_eq!(found.2, "✓");
+		assert_eq!(found.2, "✓".as_bytes());
 	}
 
 	#[test]
@@ -7168,7 +7153,7 @@ mod tests {
 		assert!(result.is_some());
 		let (start, end, text) = result.unwrap();
 		assert_eq!((start, end), (3, 6));
-		assert_eq!(text, "abc");
+		assert_eq!(text, b"abc");
 	}
 
 	#[test]
@@ -7179,7 +7164,7 @@ mod tests {
 		assert!(result.is_some());
 		let (start, end, text) = result.unwrap();
 		assert_eq!((start, end), (3, 6));
-		assert_eq!(text, "abc");
+		assert_eq!(text, b"abc");
 	}
 
 	#[test]
@@ -7190,7 +7175,7 @@ mod tests {
 		assert_eq!(matches.len(), 3);
 
 		let strings: Vec<_> = matches.iter().map(|(_, _, s)| *s).collect();
-		assert_eq!(strings, ["test", "test", "test"]);
+		assert_eq!(strings, [b"test", b"test", b"test"]);
 	}
 
 	#[test]
@@ -7201,7 +7186,7 @@ mod tests {
 		assert_eq!(matches.len(), 1);
 
 		let strings: Vec<_> = matches.iter().map(|(_, _, s)| *s).collect();
-		assert_eq!(strings, ["test"]);
+		assert_eq!(strings, [b"test"]);
 	}
 
 	#[test]
@@ -7212,7 +7197,7 @@ mod tests {
 		assert_eq!(matches.len(), 1);
 
 		let strings: Vec<_> = matches.iter().map(|(_, _, s)| *s).collect();
-		assert_eq!(strings, ["test"]);
+		assert_eq!(strings, [b"test"]);
 	}
 
 	#[test]
@@ -7242,6 +7227,7 @@ mod tests {
 	fn adds_s_when_no_m_or_s() {
 		assert_eq!(ensure_dotall("(?i)abc"), "(?is)abc");
 		assert_eq!(ensure_dotall("(?)abc"), "(?s)abc");
+		assert_eq!(ensure_dotall("(?:a*)?"), "(?s)(?:a*)?");
 	}
 
 	#[test]
@@ -7257,10 +7243,6 @@ mod tests {
 		assert_eq!(ensure_dotall("(?is)abc"), "(?is)abc");
 	}
 
-	#[test]
-	fn leaves_malformed_flag_group_unchanged() {
-		assert_eq!(ensure_dotall("(?iabc"), "(?iabc");
-	}
 }
 }
 pub mod in_place {
@@ -7344,6 +7326,8 @@ pub struct InPlace {
 	/// Whether stdout is a regular file (block-buffered) rather than a pipe
 	/// or stream (line-buffered); classified once by the host.
 	stdout_is_file:      bool,
+	unbuffered:          bool,
+	separator:           u8,
 	fs:                  BlockingFs,
 	pub output:          OutputBuffer,
 	pub in_place:        bool,
@@ -7359,9 +7343,15 @@ impl InPlace {
 	/// editing, backup the original file, or follow symlinks.
 	pub fn new_with_stdout(context: ProcessingContext, stdout: OpenFile, stdout_is_file: bool) -> Self {
 		Self {
-			output: stdout_output(&stdout, stdout_is_file),
+			output: OutputBuffer::new(
+				Box::new(stdout.clone()),
+				context.unbuffered || !stdout_is_file,
+				context.separator(),
+			),
 			stdout,
 			stdout_is_file,
+			unbuffered: context.unbuffered,
+			separator: context.separator(),
 			fs: context.paths.fs().clone(),
 			in_place: context.in_place,
 			in_place_suffix: context.in_place_suffix,
@@ -7378,10 +7368,10 @@ impl InPlace {
 		Self::new_with_stdout(context, host.stdout_clone(), host.stdout_is_regular_file())
 	}
 
-	/// Return an OutputBuffer for outputting the edits to the specified file.
-	/// The file may be a symbolic link, which will be processed according
-	/// to the context specification.
-	pub fn begin(&mut self, file_name: &Path) -> SedResult<&mut OutputBuffer> {
+	/// Return an OutputBuffer for outputting the edits to the specified file,
+	/// the operand `name`. The file may be a symbolic link, which will be
+	/// processed according to the context specification.
+	pub fn begin(&mut self, file_name: &Path, name: &Path) -> SedResult<&mut OutputBuffer> {
 		let resolved = if self.follow_symlinks {
 			self.fs
 				.canonicalize(file_name)
@@ -7389,15 +7379,14 @@ impl InPlace {
 		} else {
 			file_name.to_path_buf()
 		};
-		self.begin_resolved(&resolved)
+		self.begin_resolved(&resolved, name)
 	}
 
 	/// Return an OutputBuffer for outputting the edits to the specified file.
 	/// The passed file name should have resolved symbolic links according
 	/// to the context settings.
-	fn begin_resolved(&mut self, file_name: &Path) -> SedResult<&mut OutputBuffer> {
+	fn begin_resolved(&mut self, file_name: &Path, name: &Path) -> SedResult<&mut OutputBuffer> {
 		if !self.in_place {
-			self.output = stdout_output(&self.stdout, self.stdout_is_file);
 			return Ok(&mut self.output);
 		}
 
@@ -7406,10 +7395,7 @@ impl InPlace {
 		})?;
 
 		if !metadata.is_file() {
-			return Err(SedError::new(
-				2,
-				format!("cannot in-place edit non-regular file {}", file_name.quote()),
-			));
+			return Err(SedError::new(4, format!("couldn't edit {}: not a regular file", name.display())));
 		}
 
 		// URL-aware: the parent of `local://out` is `local://`, not `local:`.
@@ -7427,7 +7413,7 @@ impl InPlace {
 		}
 
 		let writer = temp_file.file.as_ref().expect("temporary file open").try_clone()?;
-		self.output = OutputBuffer::new(Box::new(writer), false);
+		self.output = OutputBuffer::new(Box::new(writer), self.unbuffered, self.separator);
 		self.temp_file = Some(temp_file);
 		self.original_path = Some(file_name.to_path_buf());
 
@@ -7448,7 +7434,11 @@ impl InPlace {
 
 		// Release the output's handle, then close the last one to surface
 		// deferred write errors before the file replaces the original.
-		self.output = stdout_output(&self.stdout, self.stdout_is_file);
+		self.output = OutputBuffer::new(
+			Box::new(self.stdout.clone()),
+			self.unbuffered || !self.stdout_is_file,
+			self.separator,
+		);
 		temp.close()
 			.map_err_context(|| format!("error writing temporary file {}", temp.path.quote()))?;
 
@@ -7483,10 +7473,6 @@ impl InPlace {
 	}
 }
 
-/// Sed's standard output, line-buffered unless it is a regular file.
-fn stdout_output(stdout: &OpenFile, stdout_is_file: bool) -> OutputBuffer {
-	OutputBuffer::new(Box::new(stdout.clone()), !stdout_is_file)
-}
 
 #[cfg(test)]
 mod tests {
@@ -7551,7 +7537,7 @@ mod tests {
 		ctx.in_place = true;
 
 		let mut inplace = InPlace::new(ctx);
-		let buf = inplace.begin(file.path()).unwrap();
+		let buf = inplace.begin(file.path(), file.path()).unwrap();
 		writeln!(buf, "updated").unwrap();
 		inplace.end().unwrap();
 
@@ -7570,7 +7556,7 @@ mod tests {
 		ctx.in_place_suffix = Some(".bak".to_string());
 
 		let mut inplace = InPlace::new(ctx);
-		let buf = inplace.begin(file.path()).unwrap();
+		let buf = inplace.begin(file.path(), file.path()).unwrap();
 		writeln!(buf, "new content").unwrap();
 		inplace.end().unwrap();
 
@@ -7593,7 +7579,7 @@ mod tests {
 		ctx.follow_symlinks = true;
 
 		let mut inplace = InPlace::new(ctx);
-		let buf = inplace.begin(link.path()).unwrap();
+		let buf = inplace.begin(link.path(), link.path()).unwrap();
 		writeln!(buf, "changed").unwrap();
 		inplace.end().unwrap();
 
@@ -7616,7 +7602,7 @@ mod tests {
 		ctx.follow_symlinks = false;
 
 		let mut inplace = InPlace::new(ctx);
-		let buf = inplace.begin(link.path()).unwrap();
+		let buf = inplace.begin(link.path(), link.path()).unwrap();
 		writeln!(buf, "linked").unwrap();
 		inplace.end().unwrap();
 
@@ -7634,7 +7620,7 @@ mod tests {
 		ctx.in_place = false;
 
 		let mut inplace = InPlace::new(ctx);
-		let _buf = inplace.begin(Path::new("fake.txt")).unwrap();
+		let _buf = inplace.begin(Path::new("fake.txt"), Path::new("fake.txt")).unwrap();
 		assert!(inplace.end().is_ok());
 	}
 }
@@ -7659,13 +7645,12 @@ use std::{
 
 use crate::openfile::{DescriptorPath, STDERR_FD, STDOUT_FD};
 use omp_vfs::{File, OpenOptions};
-use crate::host::{Host, ShellPaths};
-use crate::sed::fast_io::OutputBuffer;
-
-use uucore::display::Quotable;
-use crate::sed::error_handling::SedResult;
-
-use crate::sed::error_handling::{ScriptLocation, runtime_error};
+use crate::host::{Host, ShellPaths, strip_errno};
+use crate::sed::{
+	command::ProcessingContext,
+	error_handling::{SedError, SedResult},
+	fast_io::{IOChunk, OutputBuffer},
+};
 
 thread_local! {
 	 /// Global list of all writers that should be flushed at shutdown
@@ -7690,21 +7675,24 @@ enum Target {
 /// Writer that tracks its file name for better error messages
 pub struct NamedWriter {
 	/// The file name as the script spelled it.
-	pub path: PathBuf,
-	target:   Target,
-	location: ScriptLocation,
+	pub path:          PathBuf,
+	target:            Target,
+	pending_separator: bool,
 }
 
 impl NamedWriter {
-	/// Create a new writer, truncate the file, and register it for flushing.
+	/// Return the writer for `path`: the one an earlier `w` or `W` opened for
+	/// the same name, as GNU shares them, or a new one that truncates the file
+	/// and is registered for flushing.
 	///
 	/// `paths` resolves `path` the way the shell would open it and supplies
 	/// the filesystem that opens it.
-	pub fn new(
-		path: PathBuf,
-		paths: &ShellPaths,
-		location: ScriptLocation,
-	) -> SedResult<Rc<RefCell<Self>>> {
+	pub fn new(path: PathBuf, paths: &ShellPaths) -> SedResult<Rc<RefCell<Self>>> {
+		let shared = FLUSH_LIST.with(|list| list.borrow().iter().find(|writer| writer.borrow().path == path).cloned());
+		if let Some(writer) = shared {
+			return Ok(writer);
+		}
+
 		let target = match DescriptorPath::parse(&path) {
 			Some(DescriptorPath::Fd(STDOUT_FD)) => Target::Stdout,
 			Some(DescriptorPath::Fd(STDERR_FD)) => Target::Stderr,
@@ -7716,41 +7704,71 @@ impl NamedWriter {
 						OpenOptions::new().create(true).write(true).truncate(true),
 					)
 					.map_err(|e| {
-						runtime_error::<()>(&location, format!("creating file {}: {}", path.quote(), e))
-							.unwrap_err()
+						SedError::new(4, format!("couldn't open file {}: {}", path.display(), strip_errno(&e)))
 					})?;
 				Target::File(BufWriter::new(file))
 			},
 		};
 
-		let writer = Rc::new(RefCell::new(NamedWriter { path, target, location }));
+		let writer = Rc::new(RefCell::new(NamedWriter { path, target, pending_separator: false }));
 
 		FLUSH_LIST.with(|list| list.borrow_mut().push(Rc::clone(&writer)));
 		Ok(writer)
 	}
 
-	/// Write a line to the file with a newline, returning descriptive errors.
-	///
-	/// `output` is sed's current output: stdout, or the temporary file under
-	/// `-i`, in which case `/dev/stdout` still means the real stdout.
+	/// Write a pattern record to the destination, preserving its terminator.
 	pub fn write_line(
 		&mut self,
-		line: &str,
+		pattern: &IOChunk,
 		output: &mut OutputBuffer,
-		in_place: bool,
+		context: &ProcessingContext,
 		host: &mut Host,
 	) -> SedResult<()> {
+		if matches!(self.target, Target::Stdout) && !context.in_place {
+			return output.write_chunk(pattern).map_err(|e| self.flush_error(&e));
+		}
+		self.write_record(pattern.as_bytes(), pattern.is_terminated(), output, context, host)
+	}
+
+	/// Write the pattern space up to its first record separator, as `W` does;
+	/// without one the whole pattern space, keeping its own terminator.
+	pub fn write_first_line(
+		&mut self,
+		pattern: &IOChunk,
+		output: &mut OutputBuffer,
+		context: &ProcessingContext,
+		host: &mut Host,
+	) -> SedResult<()> {
+		let bytes = pattern.as_bytes();
+		match memchr::memchr(context.separator(), bytes) {
+			Some(end) => self.write_record(&bytes[..end], true, output, context, host),
+			None => self.write_line(pattern, output, context, host),
+		}
+	}
+
+	/// Write record bytes, followed by the separator when `terminated`.
+	fn write_record(
+		&mut self,
+		bytes: &[u8],
+		terminated: bool,
+		output: &mut OutputBuffer,
+		context: &ProcessingContext,
+		host: &mut Host,
+	) -> SedResult<()> {
+		let pending = &mut self.pending_separator;
 		let result = match &mut self.target {
-			Target::File(writer) => writeln!(writer, "{line}"),
-			Target::Stdout if in_place => writeln!(host.stdout, "{line}"),
-			Target::Stdout => output.write_str(format!("{line}\n")),
-			Target::Stderr => writeln!(host.stderr, "{line}"),
+			Target::File(writer) => write_record_to(writer, bytes, terminated, context, pending),
+			Target::Stdout if context.in_place => write_record_to(&mut host.stdout, bytes, terminated, context, pending),
+			Target::Stdout => output.write_owned_content(bytes, terminated),
+			Target::Stderr => write_record_to(&mut host.stderr, bytes, terminated, context, pending),
 			Target::Closed => Err(std::io::Error::other("file already closed")),
 		};
-		result.map_err(|e| {
-			runtime_error::<()>(&self.location, format!("writing to file {}: {e}", self.path.quote()))
-				.unwrap_err()
-		})
+		result.map_err(|e| self.flush_error(&e))
+	}
+
+	/// GNU's fatal error for output this file could not take.
+	fn flush_error(&self, error: &std::io::Error) -> SedError {
+		SedError::new(4, format!("couldn't flush {}: {}", self.path.display(), strip_errno(error)))
 	}
 
 	/// Flush the writer and close its file, returning a descriptive error.
@@ -7765,14 +7783,31 @@ impl NamedWriter {
 				return Ok(());
 			},
 		};
-		writer.into_inner().map_err(|e| e.into_error()).and_then(File::close).map_err(|e| {
-			runtime_error::<()>(
-				&self.location,
-				format!("writing to file {}: {}", self.path.quote(), e),
-			)
-			.unwrap_err()
-		})
+		writer.into_inner().map_err(|e| e.into_error()).and_then(File::close).map_err(|e| self.flush_error(&e))
 	}
+}
+
+/// Write to a `w` destination other than sed's current output stream.
+fn write_record_to(
+	writer: &mut impl Write,
+	bytes: &[u8],
+	terminated: bool,
+	context: &ProcessingContext,
+	pending_separator: &mut bool,
+) -> std::io::Result<()> {
+	let separator = [context.separator()];
+	if *pending_separator {
+		writer.write_all(&separator)?;
+	}
+	writer.write_all(bytes)?;
+	if terminated {
+		writer.write_all(&separator)?;
+	}
+	*pending_separator = !terminated;
+	if context.unbuffered {
+		writer.flush()?;
+	}
+	Ok(())
 }
 
 /// Flush buffered content to the files and close them, returning
@@ -7807,19 +7842,25 @@ pub mod processor {
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-use std::{borrow::Cow, cell::RefCell, io, path::PathBuf, process::Command as ProcessCommand, rc::Rc};
+use std::{
+	cell::RefCell,
+	fmt::Write as _,
+	io::{self, SeekFrom},
+	ops::ControlFlow,
+	path::PathBuf,
+	process::Command as ProcessCommand,
+	rc::Rc,
+};
 
-use omp_vfs::BlockingFs;
-use uucore::display::Quotable;
+use memchr::memchr;
 
-use crate::host::Host;
-use crate::sed::error_handling::{IoContext, SedResult};
+use crate::host::{Host, ShellPaths, strip_errno};
 
 use crate::sed::{
 	command::{
 		Address, AppendElement, Command, CommandData, InputAction, ProcessingContext, Transliteration,
 	},
-	error_handling::{ScriptLocation, input_runtime_error},
+	error_handling::{SedError, SedResult, invalid_reference, read_error, script_runtime_error},
 	fast_io::{IOChunk, LineReader, OutputBuffer},
 	fast_regex::Regex,
 	in_place::InPlace,
@@ -7841,18 +7882,11 @@ macro_rules! extract_variant {
 fn match_address(
 	addr: &Address,
 	reader: &mut LineReader,
-	pattern: &mut IOChunk,
+	pattern: &IOChunk,
 	context: &mut ProcessingContext,
-	location: &ScriptLocation,
 ) -> SedResult<bool> {
 	match addr {
-		Address::Re(re) => {
-			let regex = re_or_saved_re(re.as_ref(), context, location)?;
-			match regex.is_match(pattern) {
-				Ok(result) => Ok(result),
-				Err(e) => input_runtime_error(location, context, e.to_string()),
-			}
-		},
+		Address::Re(re) => re_or_saved_re(re.as_ref(), context, true)?.is_match(pattern),
 
 		Address::Line(lineno) => Ok(context.line_number == *lineno),
 
@@ -7862,7 +7896,12 @@ fn match_address(
 		// The FreeBSD version checked for subsequent empty files, but this
 		// can lead to destructive reads (e.g. from named pipes),
 		// and is probably an overkill.
-		Address::Last => Ok(reader.last_line()? && (context.last_file || context.separate)),
+		Address::Last => {
+			let last_line = reader.last_line().map_err(|e| read_error(&context.input_name, &e))?;
+			// GNU looks past the following operands here, reading a directory as empty.
+			context.looked_past_input |= last_line;
+			Ok(last_line && (context.last_file || context.separate))
+		},
 
 		_ => panic!("invalid address type in match_address"),
 	}
@@ -7873,7 +7912,7 @@ fn match_address(
 fn applies(
 	command: &mut Command,
 	reader: &mut LineReader,
-	pattern: &mut IOChunk,
+	pattern: &IOChunk,
 	context: &mut ProcessingContext,
 ) -> SedResult<bool> {
 	let linenum = context.line_number;
@@ -7912,7 +7951,7 @@ fn applies(
 					Ok(true)
 				},
 				_ => {
-					if match_address(addr2, reader, pattern, context, &command.location)? {
+					if match_address(addr2, reader, pattern, context)? {
 						command.start_line = None;
 						context.last_address = true;
 					}
@@ -7921,12 +7960,13 @@ fn applies(
 			}
 		} else if let Some(addr1) = &command.addr1 {
 			// See if latch must start.
-			if match_address(addr1, reader, pattern, context, &command.location)? {
+			if match_address(addr1, reader, pattern, context)? {
 				match addr2 {
 					Address::Line(n) if linenum >= *n => {
 						context.last_address = true;
 					},
-					Address::RelLine(n) if *n == 0 => {
+					// `addr1,+0` and GNU's `addr1,~0` select the first line only.
+					Address::RelLine(0) | Address::StepEnd(0) => {
 						context.last_address = true;
 					},
 					_ => {
@@ -7942,7 +7982,7 @@ fn applies(
 		}
 	} else if let Some(addr1) = &command.addr1 {
 		// Single address
-		Ok(match_address(addr1, reader, pattern, context, &command.location)?)
+		Ok(match_address(addr1, reader, pattern, context)?)
 	} else {
 		// All allowed cases have been covered by the above logic.
 		panic!("impossible address combination");
@@ -7971,11 +8011,11 @@ fn write_chunk(
 }
 
 /// Return a reference to the current or the saved RE if the RE is None.
-/// Update the saved RE to RE.
+/// Update the saved RE to RE, noting whether an address supplied it.
 fn re_or_saved_re<'a>(
 	regex: Option<&Rc<Regex>>,
 	context: &'a mut ProcessingContext,
-	location: &ScriptLocation,
+	from_address: bool,
 ) -> SedResult<&'a Regex> {
 	if let Some(re) = regex {
 		// Share the compiled RE rather than cloning it: a cloned `Regex` gets a
@@ -7983,20 +8023,23 @@ fn re_or_saved_re<'a>(
 		if !context.saved_regex.as_ref().is_some_and(|saved| Rc::ptr_eq(saved, re)) {
 			context.saved_regex = Some(Rc::clone(re));
 		}
+		context.saved_regex_from_address = from_address;
 		// Return a reference into context.saved_regex.
 		Ok(context.saved_regex.as_deref().unwrap())
 	} else if let Some(saved_re) = context.saved_regex.as_deref() {
 		// We already have one: just borrow it.
 		Ok(saved_re)
 	} else {
-		input_runtime_error(location, context, "no previous regular expression")
+		script_runtime_error(context, "no previous regular expression")
 	}
 }
 
 #[cfg(unix)]
-fn shell_command(cmd: &str, host: &Host) -> io::Result<ProcessCommand> {
+fn shell_command(cmd: &[u8], host: &Host) -> io::Result<ProcessCommand> {
+	use std::os::unix::ffi::OsStrExt as _;
+
 	let mut c = ProcessCommand::new("sh");
-	c.arg("-c").arg(cmd);
+	c.arg("-c").arg(std::ffi::OsStr::from_bytes(cmd));
 	// `output()` captures the child's stdio instead of inheriting the TUI's.
 	c.current_dir(host.native_cwd()?);
 	c.env_clear().envs(host.env());
@@ -8004,9 +8047,9 @@ fn shell_command(cmd: &str, host: &Host) -> io::Result<ProcessCommand> {
 }
 
 #[cfg(windows)]
-fn shell_command(cmd: &str, host: &Host) -> io::Result<ProcessCommand> {
+fn shell_command(cmd: &[u8], host: &Host) -> io::Result<ProcessCommand> {
 	let mut c = ProcessCommand::new("cmd.exe");
-	c.arg("/C").arg(cmd);
+	c.arg("/C").arg(std::str::from_utf8(cmd).map_err(io::Error::other)?);
 	c.current_dir(host.native_cwd()?);
 	c.env_clear().envs(host.env());
 	Ok(c)
@@ -8014,8 +8057,25 @@ fn shell_command(cmd: &str, host: &Host) -> io::Result<ProcessCommand> {
 
 // Fallback if the target OS is neither Windows nor UNIX-like
 #[cfg(not(any(unix, windows)))]
-fn shell_command(_cmd: &str, _host: &Host) -> io::Result<ProcessCommand> {
-	Err(omp_vfs::unsupported("the 'e' substitute flag requires a platform shell"))
+fn shell_command(_cmd: &[u8], _host: &Host) -> io::Result<ProcessCommand> {
+	Err(omp_vfs::unsupported("the 'e' command requires a platform shell"))
+}
+
+/// Run `cmd` through the platform shell for `e` or `s///e` and return its standard output.
+fn shell_output(cmd: &[u8], host: &Host) -> SedResult<Vec<u8>> {
+	shell_command(cmd, host)
+		.and_then(|mut shell| shell.output())
+		.map(|output| output.stdout)
+		.map_err(|_| SedError::new(4, "error in subprocess"))
+}
+
+/// Drop one trailing line terminator from shell output that replaces the pattern space.
+fn trim_line_end(output: &mut Vec<u8>) {
+	if output.ends_with(b"\r\n") {
+		output.truncate(output.len() - 2);
+	} else if output.ends_with(b"\n") {
+		output.pop();
+	}
 }
 
 /// Perform the specified RE replacement in the provided pattern space.
@@ -8027,169 +8087,114 @@ fn substitute(
 	host: &mut Host,
 ) -> SedResult<()> {
 	let sub = extract_variant!(command, Substitution);
+	// GNU compiles an address regex without its groups and checks them only
+	// when an `s//` first reuses it.
+	if sub.regex.is_none() && context.saved_regex_from_address {
+		let groups = context.saved_regex.as_ref().map_or(0, |saved| saved.captures_len() - 1);
+		if sub.replacement.max_group_number > groups {
+			return script_runtime_error(context, invalid_reference(sub.replacement.max_group_number));
+		}
+		context.saved_regex_from_address = false;
+	}
+	let regex = re_or_saved_re(sub.regex.as_ref(), context, false)?;
+	let text = pattern.as_bytes();
 
-	let mut count = 0;
+	// Leave untouched lines borrowed. Copy unmatched spans only when a
+	// replacement is actually selected (not for every preceding match).
+	let mut result = Vec::new();
 	let mut last_end = 0;
-	let mut result = String::new();
 	let mut replaced = false;
-
-	let mut text: Option<&str> = None;
-
-	let regex = re_or_saved_re(sub.regex.as_ref(), context, &command.location)?;
-
-	// The following let block allows a common input_runtime_error to be
-	// called once in all cases, and most importantly, to finish the regex
-	// mutable borrowing of context, so as to reuse context in the error call.
-	let subst_result = match (sub.occurrence, sub.replacement.max_group_number) {
-		(1, 0) => {
-			// Example: s/foo/bar/: find() is enough.
-			match regex.find(pattern) {
-				Err(e) => Err(e),
-				Ok(Some(m)) => {
-					text = Some(pattern.as_str()?);
-					result.push_str(&text.unwrap()[last_end..m.start()]);
-
-					let replacement = sub.replacement.apply_match(&m);
-					result.push_str(&replacement);
-					replaced = true;
-					last_end = m.end();
-					Ok(())
-				},
-				Ok(None) => Ok(()), // No match
-			}
-		},
-
-		(1, _) => {
-			// Example: s/\(.\)\(.\)/\2\1/: captures() is enough.
-			match regex.captures(pattern) {
-				Err(e) => Err(e),
-				Ok(Some(caps)) => {
-					let m = caps.get(0)?.unwrap();
-					text = Some(pattern.as_str()?);
-					result.push_str(&text.unwrap()[last_end..m.start()]);
-
-					let replacement = sub.replacement.apply_captures(command, &caps)?;
-					result.push_str(&replacement);
-					replaced = true;
-					last_end = m.end();
-					Ok(())
-				},
-				Ok(None) => Ok(()), // No match
-			}
-		},
-
-		(..) => {
-			// Example: s/(.)(.)/\2\1/3: captures_iter() is needed.
-			// Iterate over multiple captures of the RE in the pattern.
-			'captures: {
-				for caps_result in regex.captures_iter(pattern)? {
-					let caps = match caps_result {
-						Ok(caps) => caps,
-						Err(e) => break 'captures Err(e),
-					};
-					let m = caps.get(0)?.unwrap();
-
-					// Always write the unmatched text before this match.
-					if text.is_none() {
-						text = Some(pattern.as_str()?);
-					}
-					// Byte regexes also match empty text inside a character; skip it.
-					if !text.unwrap().is_char_boundary(m.start()) {
-						continue;
-					}
-					count += 1;
-					result.push_str(&text.unwrap()[last_end..m.start()]);
-
-					if sub.occurrence == 0 || count == sub.occurrence {
-						let replacement = sub.replacement.apply_captures(command, &caps)?;
-						result.push_str(&replacement);
-						replaced = true;
-					} else {
-						// Not the target match — leave the match unchanged.
-						result.push_str(m.as_str());
-					}
-
-					last_end = m.end();
-
-					// Early exit if only a specific occurrence,
-					// (likely 1) needed replacing.
-					if count == sub.occurrence {
-						break 'captures Ok(());
-					}
-				}
-				break 'captures Ok(());
-			}
-		},
+	let mut before_match = |result: &mut Vec<u8>, start: usize, end: usize| {
+		if !replaced {
+			result.reserve(text.len());
+			replaced = true;
+		}
+		result.extend_from_slice(&text[last_end..start]);
+		last_end = end;
 	};
 
-	// Handle errors.
-	if let Err(e) = subst_result {
-		return input_runtime_error(&command.location, context, e.to_string());
-	}
-
-	// Handle substitution success.
-	if replaced {
-		result.push_str(&text.unwrap()[last_end..]);
-
-		pattern.set_to_string(result, pattern.is_newline_terminated());
-
-		// Execute the pattern space as a shell command if the 'e' flag is set
-		if sub.execute {
-			let cmd_str = pattern.as_str()?.to_string();
-			let output_bytes = shell_command(&cmd_str, host).and_then(|mut command| command.output()).map_err(|e| {
-				input_runtime_error::<()>(
-					&command.location,
-					context,
-					format!("failed to execute shell command: {e}"),
-				)
-				.unwrap_err()
-			})?;
-			let mut shell_out = String::from_utf8_lossy_owned(output_bytes.stdout);
-			if shell_out.ends_with("\r\n") {
-				// On windows, both return carriage and newline characters are used
-				shell_out.truncate(shell_out.len() - 2);
-			} else if shell_out.ends_with('\n') {
-				// Strip the trailing newline, as GNU sed does
-				shell_out.pop();
+	let single = sub.occurrence == 1 && !sub.global;
+	let subst_result = if single && sub.replacement.max_group_number == 0 {
+		regex.find(pattern).map(|matched| {
+			if let Some(m) = matched {
+				before_match(&mut result, m.start(), m.end());
+				sub.replacement.apply_match(&m, &mut result);
 			}
-			pattern.set_to_string(shell_out, pattern.is_newline_terminated());
-		}
+		})
+	} else if single {
+		regex.captures(pattern).and_then(|matched| {
+			if let Some(caps) = matched {
+				let m = caps.get(0).unwrap();
+				before_match(&mut result, m.start(), m.end());
+				sub.replacement.apply_captures(&caps, &mut result);
+			}
+			Ok(())
+		})
+	} else {
+		let mut count = 0;
+		regex.visit_captures(pattern, |caps| {
+			count += 1;
+			// `Ng` replaces the Nth match and every later one (GNU).
+			if count == sub.occurrence || (sub.global && count > sub.occurrence) {
+				let m = caps.get(0).unwrap();
+				before_match(&mut result, m.start(), m.end());
+				sub.replacement.apply_captures(&caps, &mut result);
+			}
+			Ok(if !sub.global && count == sub.occurrence {
+				ControlFlow::Break(())
+			} else {
+				ControlFlow::Continue(())
+			})
+		})
+	};
+	subst_result?;
+	if !replaced {
+		return Ok(());
+	}
+	result.extend_from_slice(&text[last_end..]);
+	pattern.set_bytes(result, pattern.is_terminated());
 
-		if sub.print_flag {
-			write_chunk(output, context, pattern)?;
-		}
-
-		// Write to file if needed.
-		if let Some(writer) = &sub.write_file {
-			writer.borrow_mut().write_line(pattern.as_str()?, output, context.in_place, host)?;
-		}
-		context.substitution_made = true;
+	if sub.execute {
+		let mut shell_out = shell_output(pattern.as_bytes(), host)?;
+		trim_line_end(&mut shell_out);
+		pattern.set_bytes(shell_out, pattern.is_terminated());
 	}
 
+	if sub.print_flag {
+		write_chunk(output, context, pattern)?;
+	}
+	if let Some(writer) = &sub.write_file {
+		writer.borrow_mut().write_line(pattern, output, context, host)?;
+	}
+	context.substitution_made = true;
 	Ok(())
 }
 
 /// Apply the specified transliteration in the provided pattern space.
-fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) -> SedResult<()> {
-	let text = pattern.as_str()?;
-	let mut result = String::with_capacity(text.len());
-	let mut replaced = false;
-
-	// Perform the transliteration.
-	for ch in text.chars() {
-		let mapped = trans.lookup(ch);
-		if mapped != ch {
-			replaced = true;
+fn transliterate(pattern: &mut IOChunk, trans: &Transliteration) {
+	let bytes = pattern.as_bytes();
+	let mut result = Vec::new();
+	let mut chunk_start = 0;
+	let mut last_end = 0;
+	for chunk in bytes.utf8_chunks() {
+		for (offset, ch) in chunk.valid().char_indices() {
+			let mapped = trans.lookup(ch);
+			if mapped != ch {
+				if last_end == 0 {
+					result.reserve(bytes.len());
+				}
+				let start = chunk_start + offset;
+				result.extend_from_slice(&bytes[last_end..start]);
+				result.extend_from_slice(mapped.encode_utf8(&mut [0; 4]).as_bytes());
+				last_end = start + ch.len_utf8();
+			}
 		}
-		result.push(mapped);
+		chunk_start += chunk.valid().len() + chunk.invalid().len();
 	}
-
-	// Lazy replace.
-	if replaced {
-		pattern.set_to_string(result, pattern.is_newline_terminated());
+	if last_end != 0 {
+		result.extend_from_slice(&bytes[last_end..]);
+		pattern.set_bytes(result, pattern.is_terminated());
 	}
-
-	Ok(())
 }
 
 /// Output any data queued for output at the end of the cycle.
@@ -8197,70 +8202,75 @@ fn flush_appends(output: &mut OutputBuffer, context: &mut ProcessingContext) -> 
 	for elem in &context.append_elements {
 		match elem {
 			AppendElement::Text(text) => {
-				output.write_str(&**text)?;
+				output.write_raw(text.as_bytes())?;
 			},
 			AppendElement::Path(path) => {
-				output.copy_file(context.paths.fs(), path)?;
+				output.copy_file(context.paths.fs(), &context.paths.resolve(path), path)?;
+			},
+			AppendElement::Line(line) => {
+				output.write_raw(line)?;
 			},
 		}
+	}
+	if context.unbuffered && !context.append_elements.is_empty() {
+		output.flush()?;
 	}
 	context.append_elements.clear();
 	Ok(())
 }
 
 /// List the passed pattern space in unambiguous form.
-fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResult<()> {
-	// Special case for an empty pattern space
-	if line.is_empty() {
-		if line.is_newline_terminated() {
-			output.write_str("$\n")?;
-		}
+fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize, null_data: bool) -> SedResult<()> {
+	if line.is_empty() && !line.is_terminated() {
 		return Ok(());
 	}
 
-	let line = line.as_str()?;
-	let mut buff = String::new();
-	let mut line_width = 0;
-
-	for ch in line.chars() {
-		if ch == '\n' {
-			buff.push_str("$\n");
-			output.write_str(&buff)?;
-			line_width = 0;
-			continue;
+	let mut buffer = String::new();
+	let mut escape = String::new();
+	let mut push = |unit: Result<char, u8>| -> io::Result<()> {
+		if !null_data && unit == Ok('\n') {
+			buffer.push('$');
+			output.write_owned_content(buffer.as_bytes(), true)?;
+			buffer.clear();
+			return Ok(());
+		}
+		escape.clear();
+		match unit {
+			Ok('\x07') => escape.push_str(r"\a"),
+			Ok('\x08') => escape.push_str(r"\b"),
+			Ok('\n') => escape.push_str(r"\n"),
+			Ok('\x0b') => escape.push_str(r"\v"),
+			Ok('\x0c') => escape.push_str(r"\f"),
+			Ok('\\') => escape.push_str(r"\\"),
+			Ok('\r') => escape.push_str(r"\r"),
+			Ok('\t') => escape.push_str(r"\t"),
+			Ok(ch) if ch.is_ascii_control() => write!(escape, "\\{:03o}", ch as u8).unwrap(),
+			Ok(ch) if ch.is_ascii() => escape.push(ch),
+			Ok(ch) if (ch as u32) <= 0xffff => write!(escape, "\\u{:04X}", ch as u32).unwrap(),
+			Ok(ch) => write!(escape, "\\U{:08X}", ch as u32).unwrap(),
+			Err(byte) => write!(escape, "\\{byte:03o}").unwrap(),
 		}
 
-		let mut char_buff = [0u8; 1];
-		let out_str: Cow<str> = match ch {
-			'\x07' => Cow::Borrowed(r"\a"),
-			'\x08' => Cow::Borrowed(r"\b"),
-			'\x0b' => Cow::Borrowed(r"\v"),
-			'\x0c' => Cow::Borrowed(r"\f"),
-			'\\' => Cow::Borrowed(r"\\"),
-			'\r' => Cow::Borrowed(r"\r"),
-			'\t' => Cow::Borrowed(r"\t"),
-			c if c.is_ascii_control() => Cow::Owned(format!("\\{:03o}", ch as u8)),
-			c if c == ' ' || c.is_ascii_graphic() => Cow::Borrowed(ch.encode_utf8(&mut char_buff)),
-			c if (c as u32) <= 0xffff => Cow::Owned(format!("\\u{:04X}", c as u32)),
-			_ => Cow::Owned(format!("\\U{:08X}", ch as u32)),
-		};
-
-		// See if folding is required before adding out_str and terminator.
-		let out_len = out_str.len();
-		if line_width + out_len + 1 > max_width {
-			buff.push_str("\\\n");
-			output.write_str(&buff)?;
-			line_width = 0;
-			buff.clear();
+		if buffer.len() + escape.len() + 1 > max_width {
+			buffer.push('\\');
+			output.write_owned_content(buffer.as_bytes(), true)?;
+			buffer.clear();
 		}
-		buff.push_str(out_str.as_ref());
-		line_width += out_len;
-	}
+		buffer.push_str(&escape);
+		Ok(())
+	};
 
-	if !buff.is_empty() {
-		buff.push_str("$\n");
-		output.write_str(buff)?;
+	if let Some(text) = line.as_str() {
+		for ch in text.chars() {
+			push(Ok(ch))?;
+		}
+	} else {
+		for &byte in line.as_bytes() {
+			push(if byte.is_ascii() { Ok(char::from(byte)) } else { Err(byte) })?;
+		}
 	}
+	buffer.push('$');
+	output.write_owned_content(buffer.as_bytes(), true)?;
 	Ok(())
 }
 
@@ -8268,7 +8278,7 @@ fn list(output: &mut OutputBuffer, line: &IOChunk, max_width: usize) -> SedResul
 fn process_address_0(
 	commands: Option<Rc<RefCell<Command>>>,
 	output: &mut OutputBuffer,
-	fs: &BlockingFs,
+	paths: &ShellPaths,
 ) -> SedResult<()> {
 	// Prescan for zero-address which must produce output
 	// before any input line is read.
@@ -8281,7 +8291,7 @@ fn process_address_0(
 				if cmd.code == 'r' && matches!(cmd.addr1, Some(Address::Line(0))) && cmd.addr2.is_none()
 				{
 					let path = extract_variant!(cmd, Path);
-					output.copy_file(fs, path)?;
+					output.copy_file(paths.fs(), &paths.resolve(path), path)?;
 				}
 
 				cmd.next.clone()
@@ -8301,10 +8311,11 @@ fn process_file(
 	context: &mut ProcessingContext,
 	host: &mut Host,
 ) -> SedResult<()> {
-	process_address_0(commands.clone(), output, context.paths.fs())?;
+	process_address_0(commands.clone(), output, &context.paths)?;
+	let separator = context.separator();
 
 	// Loop over the input lines as pattern space.
-	'lines: while let Some(mut pattern) = reader.get_line()? {
+	'lines: while let Some(mut pattern) = reader.get_line().map_err(|e| read_error(&context.input_name, &e))? {
 		// snapshot-backed input never
 		// touches the (cancel-aware) stdin reader, so poll the host cancel
 		// flag here to keep long file runs abortable.
@@ -8317,12 +8328,11 @@ fn process_file(
 		let mut current: Option<Rc<RefCell<Command>>> =
 			if let Some(action) = context.input_action.take() {
 				// Continue processing the `N` command.
-				let current_line = pattern.as_str()?;
 				let mut combined_lines = action.prepend;
-				combined_lines.push('\n');
-				combined_lines.push_str(current_line);
+				combined_lines.push(separator);
+				combined_lines.extend_from_slice(pattern.as_bytes());
 
-				pattern.set_to_string(combined_lines, pattern.is_newline_terminated());
+				pattern.set_bytes(combined_lines, pattern.is_terminated());
 				action.next_command
 			} else {
 				// Start from the script top.
@@ -8333,7 +8343,7 @@ fn process_file(
 		while let Some(command_rc) = current.take() {
 			let mut command = command_rc.borrow_mut();
 
-			if !applies(&mut command, reader, &mut pattern, context)? {
+			if !applies(&mut command, reader, &pattern, context)? {
 				// Advance to next command
 				current.clone_from(&command.next);
 				continue;
@@ -8371,9 +8381,12 @@ fn process_file(
 					// At range end replace pattern space with text and
 					// start the next cycle.
 					pattern.clear();
-					if command.addr2.is_none() || context.last_address || reader.last_line()? {
+					let range_end = command.addr2.is_none()
+						|| context.last_address
+						|| reader.last_line().map_err(|e| read_error(&context.input_name, &e))?;
+					if range_end {
 						let text = extract_variant!(command, Text);
-						output.write_str(text.as_ref())?;
+						output.write_script_text(text)?;
 					}
 					break;
 				},
@@ -8382,10 +8395,23 @@ fn process_file(
 					pattern.clear();
 					break;
 				},
+				'e' => {
+					let shell_cmd = extract_variant!(command, Text);
+					if shell_cmd.is_empty() {
+						// Replace the pattern space with the output of running it.
+						let mut shell_out = shell_output(pattern.as_bytes(), host)?;
+						trim_line_end(&mut shell_out);
+						pattern.set_bytes(shell_out, pattern.is_terminated());
+					} else {
+						// Output the command's output before the end-of-cycle print.
+						let shell_out = shell_output(shell_cmd.as_bytes(), host)?;
+						output.write_raw(&shell_out)?;
+					}
+				},
 				'D' => {
-					// Delete up to \n and start a new cycle without new input.
-					if let Some(pos) = pattern.as_str()?.find('\n') {
-						let (s, _) = pattern.fields_mut()?;
+					// Delete the first record and restart without reading input.
+					if let Some(pos) = memchr(separator, pattern.as_bytes()) {
+						let (s, _) = pattern.fields_mut();
 						s.drain(..=pos);
 						current.clone_from(&commands);
 						continue;
@@ -8394,46 +8420,49 @@ fn process_file(
 					pattern.clear();
 					break;
 				},
+				'F' => {
+					// Output the input file name, `-` for standard input.
+					output.write_owned_content(context.input_name.as_os_str().as_encoded_bytes(), true)?;
+				},
 				'g' => {
 					// Replace pattern with the contents of the hold space.
-					pattern.set_to_string(context.hold.content.clone(), context.hold.has_newline);
+					pattern.copy_bytes(&context.hold.content, context.hold.terminated);
 				},
 				'G' => {
-					// Append to pattern \n followed by hold space contents.
-					let (pat_content, pat_has_newline) = pattern.fields_mut()?;
-					pat_content.push('\n');
-					pat_content.push_str(&context.hold.content);
-					*pat_has_newline = context.hold.has_newline;
+					// Append a separator followed by hold space contents.
+					let (pat_content, pat_terminated) = pattern.fields_mut();
+					pat_content.push(separator);
+					pat_content.extend_from_slice(&context.hold.content);
+					*pat_terminated = context.hold.terminated;
 				},
 				'h' => {
 					// Replace hold with the contents of the pattern space, reusing
 					// the hold buffer.
-					let content = pattern.as_str()?;
 					context.hold.content.clear();
-					context.hold.content.push_str(content);
-					context.hold.has_newline = pattern.is_newline_terminated();
+					context.hold.content.extend_from_slice(pattern.as_bytes());
+					context.hold.terminated = pattern.is_terminated();
 				},
 				'H' => {
-					// Append to hold \n followed by pattern space contents.
-					context.hold.content.push('\n');
-					context.hold.content.push_str(pattern.as_str()?);
-					context.hold.has_newline = pattern.is_newline_terminated();
+					// Append a separator followed by the pattern space contents.
+					context.hold.content.push(separator);
+					context.hold.content.extend_from_slice(pattern.as_bytes());
+					context.hold.terminated = pattern.is_terminated();
 				},
 				'i' => {
 					// Write text to standard output.
 					let text = extract_variant!(command, Text);
-					output.write_str(text.as_ref())?;
+					output.write_script_text(text)?;
 				},
 				'l' => {
 					let width = *extract_variant!(command, Number);
-					list(output, &pattern, width)?;
+					list(output, &pattern, width, context.null_data)?;
 				},
 				'n' => {
 					break;
 				},
 				'N' => {
 					flush_appends(output, context)?;
-					// Append to pattern `\n` and the next line
+					// Append a separator and the next record.
 					// Rather than reading input here, which would result
 					// in a double borrow on reader, modify the action
 					// to perform when the next line is read. This cycle's
@@ -8441,7 +8470,8 @@ fn process_file(
 					// copying the accumulated pattern space each time.
 					context.input_action = Some(InputAction {
 						next_command: command.next.clone(),
-						prepend:      std::mem::take(pattern.fields_mut()?.0),
+						terminated:   pattern.is_terminated(),
+						prepend:      std::mem::take(pattern.fields_mut().0),
 					});
 					continue 'lines;
 				},
@@ -8449,9 +8479,9 @@ fn process_file(
 					write_chunk(output, context, &pattern)?;
 				},
 				'P' => {
-					let line = pattern.as_str()?;
-					if let Some(pos) = line.find('\n') {
-						output.write_str(&line[..=pos])?;
+					let line = pattern.as_bytes();
+					if let Some(pos) = memchr(separator, line) {
+						output.write_owned_content(&line[..pos], true)?;
 					} else {
 						write_chunk(output, context, &pattern)?;
 					}
@@ -8463,11 +8493,10 @@ fn process_file(
 					break;
 				},
 				'Q' => {
-					// Quit immediatelly.
+					// Quit without printing the pattern space or queued appends.
 					host.fail(*extract_variant!(command, Number) as i32);
 					context.stop_processing = true;
-					context.quiet = true;
-					break;
+					return Ok(());
 				},
 				'r' => {
 					// Copy the file to standard output at a later point.
@@ -8475,6 +8504,13 @@ fn process_file(
 					context
 						.append_elements
 						.push(AppendElement::Path(path.clone()));
+				},
+				'R' => {
+					// Queue the file's next line, if any, for output at the end of the cycle.
+					let source = extract_variant!(command, LineSource);
+					if let Some(line) = source.borrow_mut().next_line(host, separator)? {
+						context.append_elements.push(AppendElement::Line(line));
+					}
 				},
 				's' => {
 					substitute(&mut pattern, &command, context, output, host)?;
@@ -8496,34 +8532,38 @@ fn process_file(
 				'w' => {
 					// Append the pattern space to the specified file.
 					let writer = extract_variant!(command, NamedWriter);
-					writer.borrow_mut().write_line(pattern.as_str()?, output, context.in_place, host)?;
+					writer.borrow_mut().write_line(&pattern, output, context, host)?;
+				},
+				'W' => {
+					// Append the pattern space's first line to the specified file.
+					let writer = extract_variant!(command, NamedWriter);
+					writer.borrow_mut().write_first_line(&pattern, output, context, host)?;
 				},
 				'x' => {
 					// Exchange the contents of the pattern and hold spaces.
-					let (pat_content, pat_has_newline) = pattern.fields_mut()?;
+					let (pat_content, pat_terminated) = pattern.fields_mut();
 
-					// Swap newline if hold space is logically non-empty.
-					if !context.hold.content.is_empty() || context.hold.has_newline {
-						std::mem::swap(pat_has_newline, &mut context.hold.has_newline);
+					// Swap terminators if hold space is logically non-empty.
+					if !context.hold.content.is_empty() || context.hold.terminated {
+						std::mem::swap(pat_terminated, &mut context.hold.terminated);
 					}
 					std::mem::swap(pat_content, &mut context.hold.content);
 				},
 				'y' => {
 					let trans = extract_variant!(command, Transliteration);
-					transliterate(&mut pattern, trans)?;
+					transliterate(&mut pattern, trans);
 				},
 				'z' => {
-					// Clear the pattern contents, but preserve newline state
+					// Clear the pattern contents, but preserve termination state
 					// so automatic printing still emits an empty record.
-					let (pat_content, _) = pattern.fields_mut()?;
-					pat_content.clear();
+					pattern.copy_bytes(b"", pattern.is_terminated());
 				},
 				':' => {
 					// Branch target; do nothing.
 				},
 				'=' => {
 					// Output current line number.
-					output.write_str(format!("{}\n", context.line_number))?;
+					output.write_line_number(context.line_number)?;
 				},
 				// The compilation should supply only valid codes.
 				_ => panic!("invalid command code"),
@@ -8537,24 +8577,22 @@ fn process_file(
 		}
 
 		flush_appends(output, context)?;
+		reader.recycle(pattern);
 
 		if context.stop_processing {
-			output.flush_pending_newline()?;
 			break;
 		}
 	}
 
-	// Handle any N command remains.
-	if context.separate
+	Ok(())
+}
+
+/// Finish a pending `N` when there is no next record.
+fn finish_pending_input(output: &mut OutputBuffer, context: &mut ProcessingContext) -> SedResult<()> {
+	if let Some(action) = context.input_action.take()
 		&& !context.quiet
-		&& let Some(action) = context.input_action.take()
 	{
-		let mut pending = action.prepend;
-		pending.push('\n');
-		output.write_str(pending)?;
-		if context.unbuffered {
-			output.flush()?;
-		}
+		output.write_owned_content(&action.prepend, action.terminated)?;
 	}
 
 	Ok(())
@@ -8575,6 +8613,41 @@ fn reset_latched_address_ranges(range_commands: &mut [Rc<RefCell<Command>>]) {
 	}
 }
 
+/// Open the next readable input file, returning the directory operands met
+/// before it. Unreadable files are reported as GNU does and set exit status 2
+/// without stopping the run.
+fn open_next_input<'p>(
+	paths: &mut std::slice::Iter<'p, PathBuf>,
+	host: &mut Host,
+	context: &ProcessingContext,
+) -> (Vec<(&'p PathBuf, io::Error)>, Option<(&'p PathBuf, LineReader<'static>)>) {
+	let mut directories = Vec::new();
+	for path in paths.by_ref() {
+		match LineReader::open_with_host(path, host, context.separator(), context.unbuffered) {
+			Ok(reader) => return (directories, Some((path, reader))),
+			Err(e) if e.kind() == io::ErrorKind::IsADirectory => directories.push((path, e)),
+			Err(e) => host.error(format_args!("can't read {}: {}", path.display(), strip_errno(&e)), 2),
+		}
+	}
+	(directories, None)
+}
+
+/// Fail on directory operands reached as input, as GNU does, unless its `$` or
+/// `N` lookahead past the previous file already read them as empty.
+fn check_directories(
+	directories: Vec<(&PathBuf, io::Error)>,
+	lookahead: bool,
+	context: &ProcessingContext,
+) -> SedResult<()> {
+	match directories.into_iter().next() {
+		Some((path, _)) if context.in_place => {
+			Err(SedError::new(4, format!("couldn't edit {}: not a regular file", path.display())))
+		},
+		Some((path, error)) if !(lookahead && context.looked_past_input) => Err(read_error(path, &error)),
+		_ => Ok(()),
+	}
+}
+
 /// Process all input files
 pub fn process_all_files(
 	commands: Option<Rc<RefCell<Command>>>,
@@ -8588,42 +8661,63 @@ pub fn process_all_files(
 
 	let mut in_place =
 		InPlace::new_with_stdout(context.clone(), host.stdout_clone(), host.stdout_is_regular_file());
-	let last_file_index = files.len() - 1;
+	// Like GNU, look past unreadable files to tell whether a file holds the
+	// last line; per-file processing opens each file only when it is reached.
+	let lookahead = !context.separate && !context.in_place;
+	let mut paths = files.iter();
+	let (mut directories, mut next) = open_next_input(&mut paths, host, context);
+	let mut first = true;
 
-	for (index, path) in files.iter().enumerate() {
-		context.last_file = index == last_file_index;
-		let mut reader = LineReader::open_with_host(path, host)
-			.map_err_context(|| format!("error opening input file {}", path.quote()))?;
+	loop {
+		check_directories(directories, lookahead, context)?;
+		let Some((path, mut reader)) = next.take() else {
+			break;
+		};
+		if lookahead {
+			(directories, next) = open_next_input(&mut paths, host, context);
+			context.last_file = next.is_none();
+		} else {
+			directories = Vec::new();
+			context.last_file = paths.len() == 0;
+		}
 		let resolved_path = host.resolve(path);
-		let output = in_place.begin(&resolved_path)?;
+		let output = in_place.begin(&resolved_path, path)?;
 
-		if context.separate || index == 0 {
+		if context.separate || first {
+			first = false;
 			context.line_number = 0;
 			reset_latched_address_ranges(&mut context.range_commands);
 
 			// Reset hold space for separate file processing
 			context.hold.content.clear();
-			context.hold.has_newline = true;
+			context.hold.terminated = true;
 		}
 
-		context.input_name = path.quote().to_string();
+		context.input_name.clone_from(path);
+		context.looked_past_input = false;
 		process_file(commands.clone(), &mut reader, output, context, host)?;
+		// A pending `N` at the end of a file read ahead into the next one.
+		context.looked_past_input |= context.input_action.is_some();
 
-		// Handle any N command remains.
-		if context.last_file
-			&& !context.separate
-			&& !context.quiet
-			&& let Some(action) = context.input_action.take()
-		{
-			let mut pending = action.prepend;
-			pending.push('\n');
-			output.write_str(pending)?;
+		if context.stop_processing && path.as_os_str() == "-" {
+			let unread = reader.unread_bytes();
+			if unread != 0 {
+				// The shared stdin offset must point just past the last
+				// consumed record. Pipes cannot return buffered bytes.
+				let _ = host.stdin.file().seek(SeekFrom::Current(-(unread as i64)));
+			}
+		}
+		if context.last_file || context.separate {
+			finish_pending_input(output, context)?;
 		}
 
 		in_place.end()?;
 
 		if context.stop_processing {
 			break;
+		}
+		if !lookahead {
+			(directories, next) = open_next_input(&mut paths, host, context);
 		}
 	}
 
@@ -8692,6 +8786,14 @@ impl ScriptCharProvider {
 	/// Return current position
 	pub fn get_pos(&self) -> usize {
 		self.pos
+	}
+
+	/// Returns the UTF-8 byte offset of the current position; GNU counts script bytes.
+	pub fn byte_pos(&self) -> usize {
+		self.line[..self.pos.min(self.line.len())]
+			.iter()
+			.map(|c| c.len_utf8())
+			.sum()
 	}
 }
 
@@ -8787,14 +8889,18 @@ pub mod script_line_provider {
 
 use std::{
 	fmt,
-	io::{BufRead, BufReader},
+	io::{self, BufRead, BufReader},
 	path::PathBuf,
 };
 
-use uucore::display::Quotable;
-
 use crate::openfile::OpenFile;
-use crate::{host::ShellPaths, sed::error_handling::{IoContext, SedResult}};
+use crate::{
+	host::{ShellPaths, strip_errno},
+	sed::{
+		error_handling::{ScriptOrigin, SedError, SedResult},
+		script_char_provider::ScriptCharProvider,
+	},
+};
 
 #[derive(Debug, PartialEq)]
 /// The specification of a script: through a string or a file
@@ -8806,10 +8912,22 @@ pub enum ScriptValue {
 /// The provider of script lines across all specified scripts
 /// Scripts can be specified to sed as files or as strings.
 pub struct ScriptLineProvider {
-	sources: Vec<ScriptValue>,
-	state:   State,
-	stdin:   Option<OpenFile>,
-	paths:   ShellPaths,
+	sources:         Vec<ScriptValue>,
+	state:           State,
+	stdin:           Option<OpenFile>,
+	paths:           ShellPaths,
+	/// String expressions opened so far; GNU numbers them from 1.
+	expressions:     usize,
+	/// GNU-style origin of the current line, kept after the scripts run out.
+	origin:          ScriptOrigin,
+	/// Bytes of the current string expression before the current line.
+	line_start:      usize,
+	/// Bytes of the current line, including its newline.
+	line_len:        usize,
+	/// Whether the current line ended with a newline.
+	line_terminated: bool,
+	/// True once every script source has been read.
+	exhausted:       bool,
 }
 
 /// Encapsulation of the script line provider's state
@@ -8818,7 +8936,6 @@ enum State {
 	Active {
 		index:       usize,
 		reader:      Box<dyn BufRead>, // Object on which read_line is called
-		input_name:  String,           // Input description (path or script string)
 		line_number: usize,            // Current line number
 	},
 	Done, // All scripts have been processed
@@ -8828,12 +8945,73 @@ impl ScriptLineProvider {
 	/// Construct the script provider from the specified script sources
 	#[cfg(test)]
 	pub fn new(sources: Vec<ScriptValue>) -> Self {
-		Self { sources, state: State::NotStarted, stdin: None, paths: ShellPaths::default() }
+		Self::with_parts(sources, None, ShellPaths::default())
 	}
 
 	/// Constructs a provider with the builtin stdin stream.
 	pub fn with_stdin(sources: Vec<ScriptValue>, stdin: OpenFile, paths: ShellPaths) -> Self {
-		Self { sources, state: State::NotStarted, stdin: Some(stdin), paths }
+		Self::with_parts(sources, Some(stdin), paths)
+	}
+
+	fn with_parts(sources: Vec<ScriptValue>, stdin: Option<OpenFile>, paths: ShellPaths) -> Self {
+		Self {
+			sources,
+			state: State::NotStarted,
+			stdin,
+			paths,
+			expressions: 0,
+			origin: ScriptOrigin::default(),
+			line_start: 0,
+			line_len: 0,
+			line_terminated: false,
+			exhausted: false,
+		}
+	}
+
+	/// Returns the GNU-style origin of the current script line.
+	pub fn origin(&self) -> &ScriptOrigin {
+		&self.origin
+	}
+
+	/// Returns GNU's `char` count at `line`: expression bytes read, counting the
+	/// current character when `consumed`, or the whole expression once the
+	/// scripts are exhausted.
+	pub fn char_offset(&self, line: &ScriptCharProvider, consumed: bool) -> usize {
+		if self.exhausted {
+			return self.line_start + self.line_len;
+		}
+		self.line_start + line.byte_pos() + usize::from(consumed && !line.eol())
+	}
+
+	/// Returns GNU's `char` count once the current line and its newline are read.
+	pub fn line_end_offset(&self) -> usize {
+		self.line_start + self.line_len
+	}
+
+	/// Returns GNU's `char` count when a command's delimiter would be the
+	/// newline ending the current line: the newline, plus the character after
+	/// it unless that is another newline or the end of the source. `None` when
+	/// the line has no newline.
+	pub fn newline_delimiter_offset(&mut self) -> Option<usize> {
+		if !self.line_terminated {
+			return None;
+		}
+		let next = match &mut self.state {
+			State::Active { reader, .. } => reader.fill_buf().ok().and_then(|bytes| bytes.first().copied()),
+			_ => None,
+		};
+		Some(self.line_end_offset() + usize::from(next.is_some_and(|byte| byte != b'\n')))
+	}
+
+	/// Returns where GNU locates script errors it finds at run time: char 0 of
+	/// the last expression, or the line after the last newline of the last file.
+	pub fn end_origin(&self) -> String {
+		match &self.origin {
+			ScriptOrigin::Expression(_) => self.origin.describe(0),
+			ScriptOrigin::File(name, line) => {
+				ScriptOrigin::File(name.clone(), (line + usize::from(self.line_terminated)).max(1)).describe(0)
+			},
+		}
 	}
 
 	/// Return the currently processed script line number.
@@ -8844,86 +9022,82 @@ impl ScriptLineProvider {
 		}
 	}
 
-	/// Return the currently processed script descriptive name.
-	pub fn get_input_name(&self) -> &str {
-		match &self.state {
-			State::Active { input_name, .. } => input_name.as_str(),
-			_ => "",
+	/// Return the next script line to process across all scripts.
+	pub fn next_line(&mut self) -> SedResult<Option<String>> {
+		loop {
+			let next_index = match self.state {
+				State::NotStarted => 0,
+				State::Active { index, .. } => {
+					if let Some(line) = self.next_line_in_source()? {
+						return Ok(Some(line));
+					}
+					index + 1
+				},
+				State::Done => return Ok(None),
+			};
+			self.advance_source(next_index)?;
 		}
 	}
 
-	/// Return the next script line to process across all scripts.
-	pub fn next_line(&mut self) -> SedResult<Option<String>> {
+	/// Return the next line of the current script source, or `None` at its end.
+	pub fn next_line_in_source(&mut self) -> SedResult<Option<String>> {
+		let State::Active { reader, line_number, .. } = &mut self.state else {
+			return Ok(None);
+		};
 		let mut line = String::new();
-
-		loop {
-			let advance = match &mut self.state {
-				State::NotStarted => Some(0),
-				State::Active { index, reader, line_number, .. } => {
-					line.clear();
-					let bytes = reader.read_line(&mut line)?;
-					if bytes == 0 {
-						Some(*index + 1) // finished reading this source
-					} else {
-						*line_number += 1;
-						// Remove trailing newline
-						if line.ends_with('\n') {
-							line.pop();
-						}
-						return Ok(Some(line));
-					}
-				},
-				State::Done => {
-					return Ok(None);
-				},
-			};
-
-			if let Some(next_index) = advance {
-				self.advance_source(next_index)?;
-			}
+		let bytes = reader.read_line(&mut line)?;
+		if bytes == 0 {
+			return Ok(None);
 		}
+		*line_number += 1;
+		self.line_start += self.line_len;
+		self.line_len = bytes;
+		if let ScriptOrigin::File(_, file_line) = &mut self.origin {
+			*file_line = *line_number;
+		}
+		// Remove trailing newline
+		self.line_terminated = line.ends_with('\n');
+		if self.line_terminated {
+			line.pop();
+		}
+		Ok(Some(line))
 	}
 
 	// Move to the next available script source.
 	fn advance_source(&mut self, next_index: usize) -> SedResult<()> {
 		if next_index >= self.sources.len() {
 			self.state = State::Done;
+			self.exhausted = true;
 			return Ok(());
 		}
 
-		match &self.sources[next_index] {
+		self.line_start = 0;
+		self.line_len = 0;
+		self.line_terminated = false;
+		let reader: Box<dyn BufRead> = match &self.sources[next_index] {
 			ScriptValue::StringVal(s) => {
-				let cursor = std::io::Cursor::new(s.clone());
-				self.state = State::Active {
-					index:       next_index,
-					reader:      Box::new(BufReader::new(cursor)),
-					input_name:  format!("<script argument {}>", next_index + 1),
-					line_number: 0,
-				};
+				self.expressions += 1;
+				self.origin = ScriptOrigin::Expression(self.expressions);
+				Box::new(BufReader::new(std::io::Cursor::new(s.clone())))
 			},
 			ScriptValue::PathVal(p) => {
-				if p.to_string_lossy() == "-" {
-					self.state = State::Active {
-						index:       next_index,
-						reader:      Box::new(BufReader::new(self.stdin.as_ref().expect("stdin stream missing").clone())),
-						input_name:  "<stdin>".to_string(),
-						line_number: 0,
-					};
+				self.origin = ScriptOrigin::File(p.to_string_lossy().into(), 0);
+				if p.as_os_str() == "-" {
+					Box::new(BufReader::new(self.stdin.as_ref().expect("stdin stream missing").clone()))
 				} else {
-					let file = self
-						.paths
-						.fs()
-						.open(self.paths.resolve(p))
-						.map_err_context(|| format!("error opening script file {}", p.quote()))?;
-					self.state = State::Active {
-						index:       next_index,
-						reader:      Box::new(BufReader::new(file)),
-						input_name:  p.to_string_lossy().to_string(),
-						line_number: 0,
-					};
+					let file = self.paths.fs().open(self.paths.resolve(p)).map_err(|e| {
+						SedError::new(4, format!("couldn't open file {}: {}", p.display(), strip_errno(&e)))
+					})?;
+					// GNU reads a directory as an empty script.
+					if file.metadata().is_ok_and(|meta| meta.is_dir()) {
+						Box::new(io::empty())
+					} else {
+						Box::new(BufReader::new(file))
+					}
 				}
 			},
-		}
+		};
+		self.state = State::Active { index: next_index, reader, line_number: 0 };
 
 		Ok(())
 	}
@@ -8934,10 +9108,9 @@ impl fmt::Debug for State {
 		match self {
 			State::NotStarted => f.debug_struct("NotStarted").finish(),
 			State::Done => f.debug_struct("Done").finish(),
-			State::Active { index, input_name, line_number, .. } => f
+			State::Active { index, line_number, .. } => f
 				.debug_struct("Active")
 				.field("index", index)
-				.field("input_name", input_name)
 				.field("line_number", line_number)
 				.finish_non_exhaustive(),
 		}
@@ -8948,15 +9121,13 @@ impl fmt::Debug for State {
 impl ScriptLineProvider {
 	pub fn with_active_state(input_name: &str, line_number: usize) -> Self {
 		Self {
-			sources: vec![],
-			stdin: None,
-			paths: ShellPaths::default(),
-			state:   State::Active {
-				input_name: input_name.to_string(),
+			state: State::Active {
 				line_number,
 				index: 0,
 				reader: Box::new(BufReader::new(std::io::Cursor::new(Vec::<u8>::new()))),
 			},
+			origin: ScriptOrigin::File(input_name.into(), line_number),
+			..Self::with_parts(vec![], None, ShellPaths::default())
 		}
 	}
 }
@@ -9069,7 +9240,7 @@ mod tests {
 		if let Some(line) = provider.next_line().unwrap() {
 			assert_eq!(line.trim(), "l1");
 			assert_eq!(provider.get_line_number(), 1);
-			assert_eq!(provider.get_input_name(), "<script argument 1>");
+			assert_eq!(provider.origin(), &ScriptOrigin::Expression(1));
 		} else {
 			panic!("Expected a line");
 		}
@@ -9077,7 +9248,7 @@ mod tests {
 		if let Some(line) = provider.next_line().unwrap() {
 			assert_eq!(line.trim(), "l2");
 			assert_eq!(provider.get_line_number(), 2);
-			assert_eq!(provider.get_input_name(), "<script argument 1>");
+			assert_eq!(provider.origin(), &ScriptOrigin::Expression(1));
 		} else {
 			panic!("Expected a line");
 		}
@@ -9085,7 +9256,7 @@ mod tests {
 		if let Some(line) = provider.next_line().unwrap() {
 			assert_eq!(line.trim(), "l3");
 			assert_eq!(provider.get_line_number(), 1);
-			assert_eq!(provider.get_input_name(), "<script argument 2>");
+			assert_eq!(provider.origin(), &ScriptOrigin::Expression(2));
 		} else {
 			panic!("Expected a line");
 		}
@@ -9101,7 +9272,7 @@ use crate::host::{Host, ShellPaths, Utility, format_usage, matches_parser};
 use crate::sed::error_handling::{SedError, SedResult};
 
 use crate::sed::{
-	command::{ProcessingContext, StringSpace},
+	command::{ProcessingContext, ByteSpace},
 	processor::process_all_files,
 	script_line_provider::ScriptValue,
 };
@@ -9336,20 +9507,24 @@ fn build_context(matches: &ArgMatches, paths: &ShellPaths) -> ProcessingContext 
 		paths:            paths.clone(),
 
 		// Other context
-		input_name:           "<stdin>".to_string(),
+		script_end:           String::new(),
+		input_name:           PathBuf::from("-"),
 		line_number:          0,
 		last_address:         false,
 		last_line:            false,
 		last_file:            false,
 		stop_processing:      false,
 		saved_regex:          None,
+		saved_regex_from_address: false,
+		looked_past_input:    false,
 		input_action:         None,
-		hold:                 StringSpace { content: String::new(), has_newline: true },
+		hold:                 ByteSpace { content: Vec::new(), terminated: true },
 		parsed_block_nesting: 0,
 		label_to_command_map: HashMap::new(),
 		range_commands:       Vec::new(),
 		substitution_made:    false,
 		append_elements:      Vec::new(),
+		line_sources:         HashMap::new(),
 	}
 }
 
@@ -9598,6 +9773,57 @@ mod tests {
 	}
 
 	#[test]
+	fn builtin_processes_invalid_utf8_streams_without_reencoding() {
+		let input = b"ab\xffcd\n";
+		for (args, stdin, expected) in [
+			(&[""][..], &input[..], &input[..]),
+			(&["-n", "1,12p"], &b"ab\xff\ncd\xfe"[..], &b"ab\xff\ncd\xfe"[..]),
+			(&["s/a/X/"], &input[..], &b"Xb\xffcd\n"[..]),
+			(&["s/[bc]/X/g"], &input[..], &b"aX\xffXd\n"[..]),
+			(&[r"s/\(.\)c/\1X/"], &input[..], &b"ab\xffXd\n"[..]),
+			(&[r"s/\(.\)\1/X/g"], &b"a\xff\xffb\n"[..], &b"aXb\n"[..]),
+			(&["-n", "/c/p"], &input[..], &input[..]),
+			(&["-n", "/.cd/p"], &input[..], &input[..]),
+			(&["s/./X/g"], &input[..], &b"XXXXX\n"[..]),
+			(&["s/./X/g"], "é🙂\n".as_bytes(), &b"XX\n"[..]),
+			(&["s/./X/g"], &b"\xc3\xa9\xff\n"[..], &b"XXX\n"[..]),
+			(&["y/ad/XY/"], &input[..], &b"Xb\xffcY\n"[..]),
+			(&["-n", "l"], &b"ab\xff\t\\cd\x00\xfe\n"[..], &b"ab\\377\\t\\\\cd\\000\\376$\n"[..]),
+			(&["-n", "h;z;g;N;P"], &b"ab\xff\ncd\xfe\n"[..], &b"ab\xff\n"[..]),
+		] {
+			let (mut host, capture) = Host::for_test("sed", stdin, "/");
+			let status = Sed { matches: test_matches(args) }.run(&mut host);
+			assert_eq!(status, 0, "{args:?}: {}", capture.err());
+			assert_eq!(capture.stdout(), expected, "{args:?}");
+			assert!(capture.stderr().is_empty(), "{args:?}: {}", capture.err());
+		}
+	}
+
+	#[test]
+	fn builtin_edits_invalid_utf8_in_place() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("input");
+		std::fs::write(&path, b"ab\xffcd\nno\xfe match").unwrap();
+		let (code, capture) = crate::host::run_util::<Sed>(
+			&["-i", "s/[ac]/X/g", "input"], "", dir.path(),
+		);
+		assert_eq!(code, 0, "{}", capture.err());
+		assert!(capture.stdout().is_empty());
+		assert_eq!(std::fs::read(path).unwrap(), b"Xb\xffXd\nno\xfe mXtXh");
+	}
+
+	#[test]
+	fn builtin_substitutes_literal_posix_bracket_members() {
+		for (script, expected) in [
+			(r"s/[][\.^$*+?(){}|\\]/_/g", "a_b_c_\n"),
+			(r"s/[.^$*+?()[{|\\]/_/g", "a_b_c]\n"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&["-E", script], "a.b[c]\n", "/");
+			assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (0, expected, ""), "{script}");
+		}
+	}
+
+	#[test]
 	fn builtin_substitutes_only_plus_prefixed_lines() {
 		// THE OBSERVABLE DEFECT this change exists for, covered end to end:
 		// argument parsing, BRE compilation and substitution together.
@@ -9611,17 +9837,84 @@ mod tests {
 		assert_eq!(capture.err(), "");
 	}
 
+	// Failure: `s/a**/X/` and friends were accepted; GNU sed refuses a `*` or
+	// interval stacked on another repetition. A following `\?`/`\+` stays legal.
+	#[test]
+	fn builtin_rejects_stacked_repetition() {
+		for (script, char) in [
+			(r"s/a**/X/", 8),
+			(r"s/a*\{2\}/X/", 12),
+			(r"s/a\+*/X/", 9),
+			(r"s/a\?\{2\}/X/", 13),
+			(r"s/\(a\)**/X/", 12),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&[script], "aaab\n", "/");
+			assert_eq!(code, 1, "{script}");
+			assert_eq!(
+				capture.err(),
+				format!("sed: -e expression #1, char {char}: Invalid preceding regular expression\n"),
+				"{script}"
+			);
+		}
+		for (script, out) in [(r"s/a*\?/X/", "Xb\n"), (r"s/a*\+/X/", "Xb\n"), ("s/^**/X/", "Xaaab\n")] {
+			let (code, capture) = crate::host::run_util::<Sed>(&[script], "aaab\n", "/");
+			assert_eq!((code, capture.out().as_str()), (0, out), "{script}");
+		}
+	}
+
+	// Failure: a newline as the `s`/`y` delimiter was located at the command
+	// letter (char 1); GNU counts the newline and the character after it.
+	#[test]
+	fn builtin_locates_a_newline_delimiter_like_gnu() {
+		for (script, location) in [
+			("s\na\nb\n", "char 3: unterminated `s'"),
+			("y\na\nb\n", "char 3: unterminated `y'"),
+			("1s\na\nb\n", "char 4: unterminated `s'"),
+			("s\n", "char 2: unterminated `s'"),
+			("s\n\n", "char 2: unterminated `s'"),
+			("s", "char 1: unterminated `s'"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&[script], "a\n", "/");
+			assert_eq!(code, 1, "{script:?}");
+			assert_eq!(capture.err(), format!("sed: -e expression #1, {location} command\n"), "{script:?}");
+		}
+	}
+
+	// Failure: `-f DIR` failed with "Is a directory"; GNU reads it as an
+	// empty script.
+	#[test]
+	fn builtin_reads_a_directory_script_as_empty() {
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::create_dir(dir.path().join("d")).unwrap();
+		let (code, capture) = crate::host::run_util::<Sed>(&["-f", "d", "-e", "p"], "a\n", dir.path());
+		assert_eq!((code, capture.out().as_str(), capture.err().as_str()), (0, "a\na\n", ""));
+	}
+
+	// Failure: under `M`, `[^x]` matched the newline between lines, so
+	// `N;s/[^x]*/X/M` replaced both lines instead of the first.
+	#[test]
+	fn builtin_multiline_negated_class_stops_at_newline() {
+		for (script, out) in [
+			("N;s/[^x]*/X/M", "X\nb\n"),
+			("N;s/a[^x]b/X/M", "a\nb\n"),
+			("N;s/a[^x]b/X/", "X\n"),
+			("N;s/[^]x]*$/X/M", "X\nb\n"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&[script], "a\nb\n", "/");
+			assert_eq!((code, capture.out().as_str()), (0, out), "{script}");
+		}
+	}
+
 	#[test]
 	fn builtin_rejects_a_brace_quantifier_with_no_operand() {
 		// Real sed refuses this. Emitting the operator gave `^{1,3}`, which
 		// fancy-regex accepts and matches at every line start.
 		let (code, capture) =
 			crate::host::run_util::<Sed>(&[r"s/^\{1,3\}/X/"], "alpha\n+added\n", "/");
-		assert_ne!(code, 0, "must not substitute: {:?}", capture.out());
-		assert!(
-			capture.err().contains("repetition-operator operand invalid"),
-			"{}",
-			capture.err()
+		assert_eq!(code, 1, "must not substitute: {:?}", capture.out());
+		assert_eq!(
+			capture.err(),
+			"sed: -e expression #1, char 13: Invalid preceding regular expression\n"
 		);
 	}
 
@@ -9724,9 +10017,47 @@ mod tests {
 
 	#[test]
 	fn builtin_supports_null_records() {
-		let (code, capture) = crate::host::run_util::<Sed>(&["-z", "s/a/X/"], "a\0b\0", "/");
-		assert_eq!(code, 0);
-		assert_eq!(capture.stdout(), b"X\0b\0");
+		// Without NUL input splitting only the first record gets a prefix.
+		let dir = tempfile::tempdir().unwrap();
+		let input = "\0a\0b";
+		std::fs::write(dir.path().join("input"), input).unwrap();
+		for (args, stdin) in [
+			(&["-z", "s/^/>/"][..], input),
+			(&["-z", "s/^/>/", "input"][..], ""),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, stdin, dir.path());
+			assert_eq!(code, 0, "{}", capture.err());
+			assert_eq!(capture.stdout(), b">\0>a\0>b", "{args:?}");
+		}
+
+		// Newlines inside the one unterminated record are available to the script.
+		let (code, capture) =
+			crate::host::run_util::<Sed>(&["-z", r"s/\n/,/g"], "1\n2\n3\n", "/");
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.stdout(), b"1,2,3,");
+	}
+
+	#[test]
+	fn builtin_null_record_commands_use_the_record_separator() {
+		// Embedded newlines must not split pattern spaces, and generated output
+		// must not append a newline (except for the raw text of `a`).
+		for (script, expected) in [
+			("N;s/^/>/", ">a\nA\0b\0tail"),
+			("N;P;D", "a\nA\0b\0tail"),
+			("=", concat!("1\0a\nA\0", "2\0b\0", "3\0tail")),
+			("l", "a\\nA$\0a\nA\0b$\0b\0tail$\0tail"),
+			("N;l", "a\\nA\\000b$\0a\nA\0b\0tail"),
+			("$s/^/last:/", "a\nA\0b\0last:tail"),
+			("G", "a\nA\0\0b\0\0tail\0\0"),
+			("h;G", "a\nA\0a\nA\0b\0b\0tail\0tail"),
+			("i before", "before\0a\nA\0before\0b\0before\0tail"),
+			("a after", "a\nA\0after\nb\0after\ntail\0after\n"),
+			("c changed", "changed\0changed\0changed\0"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&["-z", script], "a\nA\0b\0tail", "/");
+			assert_eq!(code, 0, "{script}: {}", capture.err());
+			assert_eq!(capture.stdout(), expected.as_bytes(), "{script}");
+		}
 	}
 
 	#[test]
@@ -9754,6 +10085,91 @@ mod tests {
 	}
 
 	#[test]
+	fn builtin_reports_unreadable_input_and_continues() {
+		// GNU names the file with `can't read`, edits the rest, exits 2, and
+		// still finds the last line in a file followed only by unreadable ones.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("f1"), "a\n").unwrap();
+		for (args, expected) in
+			[(&["p", "missing", "f1"][..], "a\na\n"), (&["-n", "$p", "f1", "missing"][..], "a\n")]
+		{
+			let (code, capture) = crate::host::run_util::<Sed>(args, "", dir.path());
+			assert_eq!(code, 2, "{args:?}");
+			assert_eq!(capture.out(), expected, "{args:?}");
+			assert_eq!(capture.err(), "sed: can't read missing: No such file or directory\n", "{args:?}");
+		}
+	}
+
+	#[test]
+	fn builtin_reports_script_errors_in_gnu_format() {
+		// Scripts written against GNU sed are debugged from these locations:
+		// the expression number and the byte GNU had read, or the -f file line.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("bad.sed"), "s/a/b/\np\ns/a\n").unwrap();
+		for (args, expected) in [
+			(&["s/a"][..], "-e expression #1, char 3: unterminated `s' command"),
+			(&["-e", "p", "-e", "s/a/b/q"][..], "-e expression #2, char 7: unknown option to `s'"),
+			(&["p;k"][..], "-e expression #1, char 3: unknown command: `k'"),
+			(&["1,2q"][..], "-e expression #1, char 4: command only uses one address"),
+			(&["p\n\ns/é"][..], "-e expression #1, char 7: unterminated `s' command"),
+			(&["-e", "p", "-e", "1{p"][..], "-e expression #2, char 0: unmatched `{'"),
+			(&["s/a\\{1/x/g;p"][..], "-e expression #1, char 11: Unmatched \\{"),
+			(&["/a\\{1/p"][..], "-e expression #1, char 6: Unmatched \\{"),
+			(&["-f", "bad.sed"][..], "file bad.sed line 3: unterminated `s' command"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "x\n", dir.path());
+			assert_eq!((code, capture.err()), (1, format!("sed: {expected}\n")), "{args:?}");
+			assert_eq!(capture.out(), "", "{args:?}");
+		}
+
+		let (code, capture) = crate::host::run_util::<Sed>(&["b foo"], "x\n", "/");
+		assert_eq!((code, capture.err().as_str()), (4, "sed: can't find label for jump to `foo'\n"));
+	}
+
+	#[test]
+	fn builtin_executes_e_commands() {
+		// GNU `e command` prints the output as-is before the cycle's output;
+		// bare `e` runs the pattern space and replaces it, minus one newline.
+		for (script, stdin, expected) in [
+			("1e echo run", "x\n", "run\nx\n"),
+			("e printf nonl", "x\n", "nonlx\n"),
+			("e", "echo hi\n", "hi\n"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&[script], stdin, "/");
+			assert_eq!((code, capture.out().as_str()), (0, expected), "{script}: {}", capture.err());
+		}
+
+		let (code, capture) = crate::host::run_util::<Sed>(&["--sandbox", "e"], "x\n", "/");
+		assert_eq!(
+			(code, capture.err().as_str()),
+			(1, "sed: -e expression #1, char 1: e/r/w commands disabled in sandbox mode\n")
+		);
+	}
+
+	#[test]
+	fn builtin_appends_one_line_per_r_command() {
+		// GNU `R` queues the next line of a file kept open across cycles and
+		// files; commands naming the same file share it, and EOF queues nothing.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("r"), "L1\nL2\n").unwrap();
+		for (args, stdin, expected) in [
+			(&["R /dev/stdin", "r"][..], "1\n2\n", "L1\n1\nL2\n2\n"),
+			(&["R r\nR r"][..], "1\n2\n", "1\nL1\nL2\n2\n"),
+			(&["R r", "-", "r"][..], "1\n2\n3\n", "1\nL1\n2\nL2\n3\nL1\nL2\n"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, stdin, dir.path());
+			assert_eq!((code, capture.out().as_str()), (0, expected), "{args:?}: {}", capture.err());
+		}
+	}
+
+	#[test]
+	fn builtin_substitutes_from_the_nth_match_with_ng() {
+		// GNU `s///Ng` replaces the Nth match and every one after it.
+		let (code, capture) = crate::host::run_util::<Sed>(&["s/x/y/2g"], "x x x x\n", "/");
+		assert_eq!((code, capture.out().as_str()), (0, "x y y y\n"), "{}", capture.err());
+	}
+
+	#[test]
 	fn builtin_substitutes_empty_matches_around_multibyte_characters() {
 		let (code, capture) = crate::host::run_util::<Sed>(&["s/ */_/g"], "café au lait\n", "/");
 		assert_eq!(code, 0, "{}", capture.err());
@@ -9761,5 +10177,233 @@ mod tests {
 		let (code, capture) = crate::host::run_util::<Sed>(&["s/x*/-/2"], "éa\n", "/");
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "é-a\n");
+	}
+
+	#[test]
+	fn builtin_reports_regex_errors_in_glibc_wording() {
+		// Scripts written for GNU sed are debugged from glibc's regex messages and
+		// GNU's char positions, not the engine's own error text.
+		for (args, expected) in [
+			(&[r"s/\(a/b/"][..], r"char 8: Unmatched ( or \("),
+			(&[r"s/a\)/b/"][..], r"char 8: Unmatched ) or \)"),
+			(&[r"s/a\{1/b/"][..], r"char 9: Unmatched \{"),
+			(&[r"s/\{1\}/b/"][..], "char 10: Invalid preceding regular expression"),
+			(&[r"s/a\{x\}/b/"][..], r"char 11: Invalid content of \{\}"),
+			(&[r"s/a\{99999\}/b/"][..], "char 15: Regular expression too big"),
+			(&["s/[b-a]/b/"][..], "char 10: Invalid range end"),
+			(&[r"s/\(a\)\2/b/"][..], "char 12: Invalid back reference"),
+			(&["s/[[:foo:]]/b/"][..], "char 14: Invalid character class name"),
+			(&["s/[[.ab.]]/b/"][..], "char 13: Invalid collation character"),
+			(&[r"s/a\(\)/\2/"][..], r"char 11: invalid reference \2 on `s' command's RHS"),
+			(&["-E", "s/(a/b/"][..], r"char 7: Unmatched ( or \("),
+			(&["-E", "s/a)/b/"][..], r"char 7: Unmatched ) or \)"),
+			(&["-E", "s/a{1/b/"][..], r"char 8: Unmatched \{"),
+			(&["-E", "s/*a/b/"][..], "char 7: Invalid preceding regular expression"),
+			(&["-E", "s/a|*b/x/"][..], "char 9: Invalid preceding regular expression"),
+			(&["-E", "s/a{x}/b/"][..], r"char 9: Invalid content of \{\}"),
+			(&["-E", r"s/(a)\2/b/"][..], "char 10: Invalid back reference"),
+			(&["-E", r"s/a(b)/\2/"][..], r"char 10: invalid reference \2 on `s' command's RHS"),
+			(&["-n", r"/\(a/Ip"][..], r"char 6: Unmatched ( or \("),
+			(&["-n", r"/x/,/\(a/Mp"][..], r"char 10: Unmatched ( or \("),
+			(&[r"1{s/\(a/b/}"][..], r"char 10: Unmatched ( or \("),
+			(&[r"s/\(a/b/g ; p"][..], r"char 11: Unmatched ( or \("),
+			(&["s/\\(a/b/\np"][..], r"char 9: Unmatched ( or \("),
+			(&["s//x/I;p"][..], "char 7: cannot specify modifiers on empty regexp"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "x\n", "/");
+			assert_eq!(
+				(code, capture.err()),
+				(1, format!("sed: -e expression #1, {expected}\n")),
+				"{args:?}"
+			);
+			assert_eq!(capture.out(), "", "{args:?}");
+		}
+	}
+
+	#[test]
+	fn builtin_writes_the_first_line_with_w_upper() {
+		// `W` wrote nothing: GNU writes the pattern space up to its first
+		// newline, sharing the file `w` opened for the same name.
+		let dir = tempfile::tempdir().unwrap();
+		let (code, capture) =
+			crate::host::run_util::<Sed>(&["-n", "N;W out\nw out"], "a\nb\nc\n", dir.path());
+		assert_eq!((code, capture.err().as_str()), (0, ""));
+		assert_eq!(std::fs::read(dir.path().join("out")).unwrap(), b"a\na\nb\n");
+
+		for (args, stdin, expected) in [
+			(&["-n", "N;W /dev/stdout"][..], "a\nb", &b"a\n"[..]),
+			(&["-n", "W /dev/stdout"][..], "aa", &b"aa"[..]),
+			(&["-z", "-n", "N;W /dev/stdout"][..], "a\0b\nc\0", &b"a\0"[..]),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, stdin, "/");
+			assert_eq!(code, 0, "{args:?}: {}", capture.err());
+			assert_eq!(capture.stdout(), expected, "{args:?}");
+		}
+
+		let (code, capture) = crate::host::run_util::<Sed>(&["--posix", "W x"], "a\n", "/");
+		assert_eq!(
+			(code, capture.err().as_str()),
+			(1, "sed: -e expression #1, char 1: unknown command: `W'\n")
+		);
+	}
+
+	#[test]
+	fn builtin_prints_the_input_file_name_with_f_upper() {
+		// `F` was an unknown command; GNU prints the operand, `-` for stdin.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("f1"), "a\n").unwrap();
+		let (code, capture) = crate::host::run_util::<Sed>(&["F", "f1", "-"], "x\n", dir.path());
+		assert_eq!((code, capture.out().as_str()), (0, "f1\na\n-\nx\n"), "{}", capture.err());
+
+		let (code, capture) = crate::host::run_util::<Sed>(&["-z", "F"], "x\n", "/");
+		assert_eq!((code, capture.stdout()), (0, b"-\0x\n".to_vec()), "{}", capture.err());
+
+		let (code, capture) = crate::host::run_util::<Sed>(&["--posix", "F"], "x\n", "/");
+		assert_eq!(
+			(code, capture.err().as_str()),
+			(1, "sed: -e expression #1, char 1: unknown command: `F'\n")
+		);
+	}
+
+	#[test]
+	fn builtin_matches_embedded_lines_with_the_m_flag() {
+		// Without `M`, `^`/`$` only matched at the ends of a multiline pattern
+		// space, and addresses rejected the flag.
+		for (args, expected) in [
+			(&["N;N;s/^/>/Mg"][..], ">a\n>b\n>c\n"),
+			(&["N;N;s/$/</Mg"][..], "a<\nb<\nc<\n"),
+			(&["N;N;s/\\`/>/Mg"][..], ">a\nb\nc\n"),
+			(&["N;N;s/\\'/</Mg"][..], "a\nb\nc<\n"),
+			(&["N;N;s/a.b/X/M"][..], "a\nb\nc\n"),
+			(&["-n", "$!{N;N};/^b$/Mp"][..], "a\nb\nc\n"),
+			(&["-n", "$!{N;N};/^B$/I M p"][..], "a\nb\nc\n"),
+			(&["-n", "$!{N;N};/^b$/p"][..], ""),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "a\nb\nc\n", "/");
+			assert_eq!((code, capture.out().as_str()), (0, expected), "{args:?}: {}", capture.err());
+		}
+
+		let (code, capture) = crate::host::run_util::<Sed>(&["--posix", "-n", "/x/Mp"], "x\n", "/");
+		assert_eq!(
+			(code, capture.err().as_str()),
+			(1, "sed: -e expression #1, char 4: unknown command: `M'\n")
+		);
+	}
+
+	#[test]
+	fn builtin_accepts_backslash_as_the_delimiter() {
+		// `s\a\x\` was refused; in GNU every backslash ends the part instead.
+		// An unescaped `&` delimiter likewise ends the replacement.
+		for (script, expected) in [
+			("s\\a\\x\\", "x\nb\n"),
+			("y\\a\\x\\", "x\nb\n"),
+			("\\\\a\\d", "b\n"),
+			("s&a&X&", "X\nb\n"),
+			("s&a&\\&&", "&\nb\n"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&[script], "a\nb\n", "/");
+			assert_eq!((code, capture.out().as_str()), (0, expected), "{script}: {}", capture.err());
+		}
+		for (script, expected) in [
+			("s\\a\\\\x\\", "char 6: unknown option to `s'"),
+			("y\\a\\\\\\", "char 5: strings for `y' command are different lengths"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(&[script], "a\n", "/");
+			assert_eq!(
+				(code, capture.err()),
+				(1, format!("sed: -e expression #1, {expected}\n")),
+				"{script}"
+			);
+		}
+	}
+
+	#[test]
+	fn builtin_posix_text_commands_keep_text_after_the_backslash() {
+		// `sed --posix '1a\  text'` failed with "extra characters"; GNU appends it.
+		let (code, capture) = crate::host::run_util::<Sed>(&["--posix", "1a\\  text"], "x\n", "/");
+		assert_eq!((code, capture.out().as_str()), (0, "x\n  text\n"), "{}", capture.err());
+
+		for (args, expected) in [
+			(&["--posix", "1a text"][..], "char 4: expected \\ after `a', `c' or `i'"),
+			(&["--posix", "-e", "1a\\", "-e", "  hello"][..], "char 3: incomplete command"),
+			(&["--posix", "1a\\  x\\"][..], "char 7: incomplete command"),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "x\n", "/");
+			assert_eq!(
+				(code, capture.err()),
+				(1, format!("sed: -e expression #1, {expected}\n")),
+				"{args:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn builtin_reports_unopenable_files_like_gnu() {
+		// A `w` or `-f` file that can't be opened is GNU's "couldn't open file", status 4.
+		let dir = tempfile::tempdir().unwrap();
+		for args in [&["w missing/x"][..], &["-f", "missing/x"][..]] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "x\n", dir.path());
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err().as_str()),
+				(4, "", "sed: couldn't open file missing/x: No such file or directory\n"),
+				"{args:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn builtin_reports_directory_operands_like_gnu() {
+		// A directory operand was "can't read" and skipped; GNU stops with a read
+		// error, unless a `$` check already read past it, and refuses it for -i.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::create_dir(dir.path().join("d")).unwrap();
+		std::fs::write(dir.path().join("f1"), "a\n").unwrap();
+		let read_error = "sed: read error on d: Is a directory\n";
+		for (args, out, err, status) in [
+			(&["p", "d"][..], "", read_error, 4),
+			(&["p", "f1", "d"][..], "a\na\n", read_error, 4),
+			(&["-n", "$p", "f1", "d"][..], "a\n", "", 0),
+			(&["r d"][..], "x\n", read_error, 4),
+			(&["-i", "p", "d"][..], "", "sed: couldn't edit d: not a regular file\n", 4),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, "x\n", dir.path());
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err().as_str()),
+				(status, out, err),
+				"{args:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn builtin_reports_runtime_script_errors_like_gnu() {
+		// These used the old `<script argument N>:L:C` form; GNU locates them at
+		// the end of the last script piece.
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("s3.sed"), "p\n\n//p").unwrap();
+		std::fs::write(dir.path().join("s1.sed"), "//p\n").unwrap();
+		for (args, stdin, out, err) in [
+			(&["//p"][..], "x\n", "", "-e expression #1, char 0: no previous regular expression"),
+			(&["-e", "p", "-e", "//p"][..], "aa\n", "aa\n", "-e expression #2, char 0: no previous regular expression"),
+			(&["-f", "s3.sed"][..], "x\n", "x\n", "file s3.sed line 3: no previous regular expression"),
+			(&["-f", "s1.sed"][..], "x\n", "", "file s1.sed line 2: no previous regular expression"),
+			(
+				&["-n", r"/a/h;s//\1/"][..],
+				"aa\n",
+				"",
+				r"-e expression #1, char 0: invalid reference \1 on `s' command's RHS",
+			),
+		] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, stdin, dir.path());
+			assert_eq!(
+				(code, capture.out().as_str(), capture.err()),
+				(1, out, format!("sed: {err}\n")),
+				"{args:?}"
+			);
+		}
+
+		// A regex reused from another `s` expands its missing groups to nothing.
+		let (code, capture) = crate::host::run_util::<Sed>(&[r"s/a/b/;s//\1/"], "aa\n", "/");
+		assert_eq!((code, capture.out().as_str()), (0, "b\n"), "{}", capture.err());
 	}
 }

@@ -14,7 +14,7 @@
  * classifier and are separately bounded by the caller's policy.
  */
 import * as AIError from "../error";
-import type { AssistantMessage, AssistantMessageEvent, Context } from "../types";
+import type { AssistantMessage, AssistantMessageEvent, Context, DiscardedAttemptReason } from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
 import { waitForRetry } from "./retry-wait";
 
@@ -61,7 +61,17 @@ interface StreamRetryOptions {
 	signal?: AbortSignal;
 	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
 	acceptEmptyResponse?: boolean;
+	onDiscardedAttempt?: (message: AssistantMessage, reason: DiscardedAttemptReason) => void;
 }
+
+/**
+ * Error messages whose transient HTTP status (408, 429, 5xx) the transport
+ * owned: it either spent its retry budget on it or declined to retry it
+ * (`x-should-retry: false`, a zero-limit 429). A replay would multiply or
+ * override that decision, so the provider marks them. In-band errors inside a
+ * 200 stream are not marked and keep their one replay.
+ */
+export const transportExhaustedMessages = new WeakSet<AssistantMessage>();
 
 /** Controls which replay-safe provider results may issue a fresh request. */
 export interface ReplaySafeStreamRetryPolicy {
@@ -156,6 +166,7 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 				failedMessage?.stopReason === "error" &&
 				failedMessage.errorMessage !== undefined &&
 				providerErrorRetries < (policy.maxProviderErrorRetries ?? 0) &&
+				!transportExhaustedMessages.has(failedMessage) &&
 				AIError.isProviderRetryableError(
 					new FinalizedProviderStreamError(failedMessage.errorMessage, failedMessage.errorStatus),
 				);
@@ -181,6 +192,14 @@ export function withReplaySafeStreamRetry<M, O extends StreamRetryOptions>(
 					}
 					return;
 				}
+				// The discarded attempt reached the provider and may be billed; report it before replacing
+				// it. One that carried no token and no billing frame (a bare 429 or 5xx) billed nothing.
+				// Accounting never fails the request it accounts for.
+				const discarded = retryEmpty ? completedMessage : failedMessage;
+				try {
+					if (discarded && ((discarded.usage?.totalTokens ?? 0) > 0 || discarded.usage?.aiu !== undefined))
+						options?.onDiscardedAttempt?.(discarded, retryEmpty ? "empty-completion" : "provider-error");
+				} catch {}
 				continue;
 			}
 

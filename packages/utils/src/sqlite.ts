@@ -1,6 +1,7 @@
 /** Shared SQLite opening, error attribution, and result-code classification for persistent stores. */
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { installSqliteLockShim } from "@oh-my-pi/pi-natives/sqlite-locks";
 import { getDbBusyTimeoutMs } from "./env";
@@ -51,10 +52,26 @@ export type SqliteFileIdentity = string | null | undefined;
  * so the opener that quarantines the store closes its peers' dead handles too.
  */
 const pendingCorruptHandles = new Map<string, Set<Database>>();
+const quarantineReleases = new Map<string, Set<() => void>>();
 
 function corruptHandleKey(dbPath: string): string {
 	const resolved = path.resolve(dbPath);
 	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+/** Release a cached connection after its corrupt files have been copied and before they are removed. */
+export function registerSqliteQuarantineRelease(dbPath: string, release: () => void): () => void {
+	const key = corruptHandleKey(dbPath);
+	let releases = quarantineReleases.get(key);
+	if (!releases) {
+		releases = new Set();
+		quarantineReleases.set(key, releases);
+	}
+	releases.add(release);
+	return () => {
+		releases.delete(release);
+		if (releases.size === 0) quarantineReleases.delete(key);
+	};
 }
 
 function registerCorruptHandle(dbPath: string, db: Database | undefined): void {
@@ -234,6 +251,8 @@ function quarantineCorruptSqliteStore(dbPath: string, db: Database | undefined):
 			throw error;
 		}
 	}
+	const releases = quarantineReleases.get(corruptHandleKey(dbPath));
+	if (releases) for (const release of releases) release();
 	db?.close();
 	// Only Windows refuses to unlink a file another handle still holds. Elsewhere
 	// each peer must keep its own handle until it closes it after adopting the
@@ -340,6 +359,35 @@ export async function openSqliteDatabase<T>(
 }
 
 /**
+ * Initialize a feature on an already-open connection with bounded BUSY retries.
+ * Unlike opening a store, this never quarantines a live database: another
+ * owner may still be using it. Returns undefined if the file was replaced;
+ * the caller must obtain a fresh connection.
+ */
+export async function initializeSqliteConnection<T>(
+	dbPath: string,
+	connection: { db: Database; identity: SqliteFileIdentity },
+	initialize: (db: Database) => T | Promise<T>,
+): Promise<T | undefined> {
+	const { db, identity } = connection;
+	for (let attempt = 0; ; attempt++) {
+		const current = sqliteFileIdentity(dbPath);
+		if (identity !== undefined && current !== undefined && identity !== current) return;
+		try {
+			const result = await initialize(db);
+			const after = sqliteFileIdentity(dbPath);
+			if (identity !== undefined && after !== undefined && identity !== after) return;
+			return result;
+		} catch (error) {
+			if (!isSqliteBusyError(error) || attempt + 1 >= BUSY_MAX_ATTEMPTS) {
+				throw annotateSqliteError(error, dbPath);
+			}
+			await Bun.sleep(BUSY_BASE_DELAY_MS * 2 ** attempt);
+		}
+	}
+}
+
+/**
  * Synchronous counterpart to {@link openSqliteDatabase}. It performs no BUSY
  * retry loop; corruption recovery, when enabled, is bounded to one replacement.
  */
@@ -371,6 +419,89 @@ export function annotateSqliteError(error: unknown, dbPath: string): Error {
 /** Checkpoints committed WAL frames without waiting for concurrent readers. */
 export function checkpointWal(db: Database): void {
 	db.run("PRAGMA wal_checkpoint(PASSIVE)");
+}
+
+/** A scratch copy of a quarantined store, opened for salvage reads. */
+export interface SalvageSource extends Disposable {
+	db: Database;
+	/** True when the copy's header page count had to be lowered to open it. */
+	headerRepaired: boolean;
+}
+
+/**
+ * Lowers a copy's header page count to the pages the file really holds, when the
+ * header claims more. Returns whether the header was changed. A torn checkpoint can leave
+ * page 1 describing a longer file than the tail that survived; SQLite then rejects
+ * every statement, though the table pages are intact.
+ */
+function repairHeaderPageCount(copyPath: string): boolean {
+	const fd = fs.openSync(copyPath, "r+");
+	try {
+		const header = Buffer.alloc(100);
+		if (fs.readSync(fd, header, 0, 100, 0) < 100 || header.toString("latin1", 0, 16) !== "SQLite format 3\0")
+			return false;
+		const rawPageSize = header.readUInt16BE(16);
+		const pageSize = rawPageSize === 1 ? 65536 : rawPageSize;
+		if (pageSize < 512) return false;
+		const actualPages = Math.floor(fs.fstatSync(fd).size / pageSize);
+		if (actualPages < 1 || header.readUInt32BE(28) <= actualPages) return false;
+		const count = Buffer.alloc(4);
+		count.writeUInt32BE(actualPages);
+		fs.writeSync(fd, count, 0, 4, 28);
+		return true;
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+/**
+ * Opens a private copy of a quarantined store (main file and WAL; the original is never
+ * written) so its rows can be read with {@link readSalvageableRows}. When the copy is
+ * rejected as corrupt, retries once after repairing the header page count on the copy.
+ * Dispose the result to close the handle and delete the copy.
+ */
+export function openQuarantinedStoreForSalvage(backupPath: string): SalvageSource {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-salvage-"));
+	let db: Database | undefined;
+	const cleanup = (): void => {
+		try {
+			db?.close();
+		} catch {}
+		fs.rmSync(dir, { recursive: true, force: true });
+	};
+	try {
+		const copyPath = path.join(dir, "store.db");
+		fs.copyFileSync(backupPath, copyPath);
+		fs.chmodSync(copyPath, 0o600);
+		try {
+			fs.copyFileSync(`${backupPath}-wal`, `${copyPath}-wal`);
+			fs.chmodSync(`${copyPath}-wal`, 0o600);
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		const probe = (): Database => {
+			const opened = new Database(copyPath);
+			try {
+				opened.query("SELECT count(*) FROM sqlite_master").get();
+				return opened;
+			} catch (error) {
+				opened.close();
+				throw error;
+			}
+		};
+		let headerRepaired = false;
+		try {
+			db = probe();
+		} catch (error) {
+			if (!isSqliteCorruptionError(error) || !repairHeaderPageCount(copyPath)) throw error;
+			headerRepaired = true;
+			db = probe();
+		}
+		return { db, headerRepaired, [Symbol.dispose]: cleanup };
+	} catch (error) {
+		cleanup();
+		throw error;
+	}
 }
 
 /** Damaged regions one {@link readSalvageableRows} scan skips before abandoning the rest of the table. */

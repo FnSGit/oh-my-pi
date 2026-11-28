@@ -1,16 +1,18 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { disableProvider, enableProvider } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { clearAgentPluginRootCache } from "@oh-my-pi/pi-coding-agent/discovery/agent-plugin-format";
+import { clearClaudePluginRootsCache, injectPluginDirRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import {
 	clearOmpExtensionCliRoots,
 	injectOmpExtensionCliRoots,
 } from "@oh-my-pi/pi-coding-agent/discovery/omp-extension-roots";
-import { clearClaudePluginRootsCache, injectPluginDirRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
+import * as agentParser from "@oh-my-pi/pi-coding-agent/task/agents";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
+import { createAgentFileCache } from "@oh-my-pi/pi-coding-agent/task/discovery-cache";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const OMP_AGENT_MD = [
@@ -59,8 +61,11 @@ async function writeOmpPluginAgent(home: string): Promise<void> {
 	await fs.writeFile(path.join(pluginRoot, "agents", "loom-verify-spec.md"), OMP_PLUGIN_AGENT_MD);
 }
 
-function agentMd(name: string, model: string): string {
-	return ["---", `name: ${name}`, `description: ${name} probe.`, `model: ${model}`, "---", `body ${name}`].join("\n");
+function agentMd(name: string, model: string, tools?: string): string {
+	const lines = ["---", `name: ${name}`, `description: ${name} probe.`, `model: ${model}`];
+	if (tools) lines.push(`tools: ${tools}`);
+	lines.push("---", `body ${name}`);
+	return lines.join("\n");
 }
 
 // Register an omp-installed marketplace plugin via the OMP plugin registry
@@ -75,13 +80,14 @@ async function writeOmpMarketplacePlugin(
 		agentName: string;
 		model: string;
 		manifest: "omp" | "claude" | "both" | "none";
+		tools?: string;
 	},
 ): Promise<void> {
 	const pluginRoot = path.join(home, "marketplace-cache", options.agentName);
 	await fs.mkdir(path.join(pluginRoot, "agents"), { recursive: true });
 	await fs.writeFile(
 		path.join(pluginRoot, "agents", `${options.agentName}.md`),
-		agentMd(options.agentName, options.model),
+		agentMd(options.agentName, options.model, options.tools),
 	);
 
 	const wantsOmp = options.manifest === "omp" || options.manifest === "both";
@@ -151,6 +157,57 @@ describe("discoverAgents", () => {
 		expect(names).toContain("omp-test-agent");
 		expect(names).not.toContain("cc-test-agent");
 		expect(projectAgentsDir).toBe(path.join(projectDir, ".omp", "agents"));
+	});
+
+	test("reuses a persisted parse, but reparses a same-size edit with a restored mtime", async () => {
+		const file = path.join(projectDir, "probe.md");
+		const snapshot = path.join(tempHome, "cache", "agents.bin");
+		const mtime = new Date("2024-01-01T00:00:00Z");
+		await fs.writeFile(file, OMP_AGENT_MD);
+		await fs.utimes(file, mtime, mtime);
+
+		const cold = createAgentFileCache(snapshot);
+		const original = await cold.load(file, "project");
+		await cold.save();
+
+		const parse = spyOn(agentParser, "parseAgent");
+		try {
+			const warm = createAgentFileCache(snapshot);
+			expect(await warm.load(file, "project")).toEqual(original);
+			expect(parse).not.toHaveBeenCalled();
+
+			await fs.writeFile(file, OMP_AGENT_MD.replace("You are", "You use"));
+			await fs.utimes(file, mtime, mtime);
+			const edited = createAgentFileCache(snapshot);
+			expect((await edited.load(file, "project"))?.systemPrompt).toBe("You use an OMP task agent.");
+			expect(parse).toHaveBeenCalledTimes(1);
+
+			await fs.writeFile(snapshot, "not a cache");
+			const corrupt = createAgentFileCache(snapshot);
+			expect((await corrupt.load(file, "project"))?.systemPrompt).toBe("You use an OMP task agent.");
+			expect(parse).toHaveBeenCalledTimes(2);
+		} finally {
+			parse.mockRestore();
+		}
+	});
+
+	test("rescans additions and removals and promotes the next definition of the same name", async () => {
+		const dir = path.join(projectDir, ".omp", "agents");
+		const first = path.join(dir, "01-primary.md");
+		await fs.mkdir(dir, { recursive: true });
+		await fs.writeFile(first, OMP_AGENT_MD);
+		await fs.writeFile(path.join(dir, "02-fallback.md"), OMP_AGENT_MD.replace("You are", "You were"));
+
+		const before = await discoverAgents(projectDir, tempHome);
+		expect(before.agents.find(agent => agent.name === "omp-test-agent")?.filePath).toBe(first);
+
+		await fs.unlink(first);
+		await fs.writeFile(path.join(dir, "03-new.md"), OMP_AGENT_MD.replace("omp-test-agent", "omp-new-agent"));
+		const after = await discoverAgents(projectDir, tempHome);
+		expect(after.agents.find(agent => agent.name === "omp-test-agent")?.systemPrompt).toBe(
+			"You were an OMP task agent.",
+		);
+		expect(after.agents.some(agent => agent.name === "omp-new-agent")).toBe(true);
 	});
 
 	test("loads agents from OMP npm plugins under <home>/.omp/plugins/node_modules", async () => {
@@ -234,10 +291,9 @@ describe("discoverAgents", () => {
 		expect(names).not.toEqual(expect.arrayContaining(["stale-agent", "settings-agent", "loom-verify-spec"]));
 	});
 
-	test("discovers agents from a --plugin-dir root with the foreign claude-plugins opt-in off (#11151)", async () => {
+	test("discovers agents from a user-scope --plugin-dir root (#11151)", async () => {
 		// `--plugin-dir` roots ride the shared plugin registry as user-scope, origin
-		// "plugin-dir" entries. The claude-plugins foreign opt-in is off by default, so
-		// gating user-scope roots purely on scope (as before) dropped these agents.
+		// "plugin-dir" entries; user-scope roots must not be dropped.
 		const pluginDir = path.join(tempHome, "my-plugin");
 		await fs.mkdir(path.join(pluginDir, "agents"), { recursive: true });
 		await fs.writeFile(
@@ -304,5 +360,44 @@ describe("discoverAgents", () => {
 
 		expect(agent).toBeDefined();
 		expect(agent?.model).toEqual(["@advisor", "@smol"]);
+	});
+
+	test("translates Claude-dialect plugin agent tools into OMP built-ins with inferred spawns", async () => {
+		// A `.claude-plugin` package lists Claude Code tool names. They must be
+		// translated (and deduplicated) instead of silently shrinking the
+		// allowlist, and `Agent` must still infer unrestricted spawns.
+		enableProvider("claude-plugins");
+		await writeOmpMarketplacePlugin(tempHome, {
+			agentName: "claude-tools-probe",
+			model: "sonnet",
+			manifest: "claude",
+			tools: "Read, WebFetch, TodoWrite, AskUserQuestion, MultiEdit, Agent",
+		});
+
+		const { agents } = await discoverAgents(projectDir, tempHome);
+		const agent = agents.find(candidate => candidate.name === "claude-tools-probe");
+
+		expect(agent?.tools).toEqual(["read", "todo", "ask", "edit", "task"]);
+		expect(agent?.spawns).toBe("*");
+		expect(agent?.model).toBeUndefined();
+	});
+
+	test("leaves Claude Code tool names untouched on an OMP-native plugin agent", async () => {
+		// Same frontmatter under `.omp-plugin/plugin.json`: OMP-native agents use
+		// OMP names, so only legacy-alias normalization applies.
+		enableProvider("claude-plugins");
+		await writeOmpMarketplacePlugin(tempHome, {
+			agentName: "omp-tools-probe",
+			model: '["@advisor"]',
+			manifest: "omp",
+			tools: "Read, WebFetch, TodoWrite, AskUserQuestion, MultiEdit, Agent",
+		});
+
+		const { agents } = await discoverAgents(projectDir, tempHome);
+		const agent = agents.find(candidate => candidate.name === "omp-tools-probe");
+
+		expect(agent?.tools).toEqual(["read", "WebFetch", "TodoWrite", "AskUserQuestion", "MultiEdit", "Agent"]);
+		expect(agent?.spawns).toBeUndefined();
+		expect(agent?.model).toEqual(["@advisor"]);
 	});
 });

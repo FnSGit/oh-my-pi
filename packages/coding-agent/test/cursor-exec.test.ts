@@ -43,9 +43,10 @@ import { BUILTIN_TOOLS, GrepTool, ReadTool, type Tool, type ToolSession } from "
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
-import type { TruncationMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
-import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
-import { removeWithRetries, spillFileName, spillUrl } from "@oh-my-pi/pi-utils";
+import type { TruncationMeta } from "@oh-my-pi/pi-coding-agent/tools/output-meta-format";
+import type { TodoPhase } from "@oh-my-pi/pi-coding-agent/tools/details/todo";
+import { initWorktreeFixture } from "./helpers/git-worktree";
+import { removeWithRetries, spillFileName, spillUrl, TempDir } from "@oh-my-pi/pi-utils";
 import { AdviseTool } from "../src/advisor/advise-tool";
 
 function yoloToolContext(): AgentToolContext {
@@ -357,7 +358,7 @@ describe("bridge tool resolution beyond the model-facing registry", () => {
 		// `getEditReplaceTool` — otherwise every modern edit answers
 		// `Tool "edit" not available` and the file is untouched.
 		// (Not the `getTool` fallback: that resolver also serves the agent
-		// loop's unadvertised calls, so it stays device-only.)
+		// loop's unadvertised calls, so it stays mounted-tool-only.)
 
 		const target = path.join(cwd, "sample.txt");
 		await Bun.write(target, "alpha\nbeta\n");
@@ -1464,7 +1465,7 @@ describe("CursorExecHandlers argument validation", () => {
 });
 
 describe("CursorExecHandlers mounted tool bridge", () => {
-	it("executes MCP tools resolved from the xd:// registry", async () => {
+	it("executes mounted MCP tools resolved by bare name", async () => {
 		const mountedTool: AgentTool = {
 			name: "mcp__fixture_report",
 			label: "Fixture Report",
@@ -1493,12 +1494,12 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 		expect(result.content).toEqual([{ type: "text", text: "reported" }]);
 	});
 
-	it("routes wrapped mounted devices through the approval gate", async () => {
+	it("routes wrapped mounted tools through the approval gate", async () => {
 		let executed = false;
-		const device: AgentTool = {
+		const mounted: AgentTool = {
 			name: "ast_edit",
 			label: "AST Edit",
-			description: "structural edit device",
+			description: "structural edit tool",
 			parameters: type({}),
 			async execute() {
 				executed = true;
@@ -1508,7 +1509,7 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 		// The deny path throws inside resolveApproval before any handler runs;
 		// the stub only needs the loop-emission marker probe the wrapper always
 		// consults first.
-		const wrapped = new ExtensionToolWrapper(device, {
+		const wrapped = new ExtensionToolWrapper(mounted, {
 			consumeToolCallEmitted: () => false,
 		} as unknown as ExtensionRunner);
 		const settings = Settings.isolated({ "tools.approval": { ast_edit: "deny" } });
@@ -1516,15 +1517,15 @@ describe("CursorExecHandlers mounted tool bridge", () => {
 			cwd: ".",
 			// The canonical map contains the undecorated mounted tool. The execution
 			// override must win or Cursor bypasses the approval gate.
-			tools: new Map([[device.name, device]]),
-			getExecutableTool: name => (name === device.name ? (wrapped as unknown as AgentTool) : undefined),
+			tools: new Map([[mounted.name, mounted]]),
+			getExecutableTool: name => (name === mounted.name ? (wrapped as unknown as AgentTool) : undefined),
 			getToolContext: () => ({ settings }) as AgentToolContext,
 		});
 
 		const result = await handlers.mcp({
-			name: device.name,
+			name: mounted.name,
 			providerIdentifier: "pi-agent",
-			toolName: device.name,
+			toolName: mounted.name,
 			toolCallId: "call-denied",
 			args: {},
 			rawArgs: {},
@@ -2806,5 +2807,68 @@ describe("CursorExecHandlers passive tool context", () => {
 			// The carrier is symbol-keyed and never reaches serialized history.
 			expect(JSON.stringify(result)).not.toContain("tool context");
 		}
+	});
+});
+
+describe("CursorExecHandlers.write edit materialization worktree notice", () => {
+	it("attaches checkoutNotice on details and content when materializing an edit into a sibling worktree", async () => {
+		using temp = TempDir.createSync("@omp-cursor-worktree-");
+		const { cwd, paths } = await initWorktreeFixture(temp, [{ name: "linked", branch: "preview" }]);
+
+		const writeTool = new WriteTool(createTestSession(cwd));
+		const handlers = new CursorExecHandlers({
+			cwd,
+			tools: new Map([["write", writeTool as unknown as AgentTool]]),
+			getToolContext: yoloToolContext,
+		});
+
+		const siblingTarget = path.join(paths.linked, "lesson.txt");
+		const crossResult = await handlers.write(
+			{
+				toolCallId: "cursor-cross",
+				path: siblingTarget,
+				fileText: "after\n",
+				returnFileContentAfterWrite: false,
+				fileBytes: new Uint8Array(),
+			},
+			{ editMaterialization: true },
+		);
+		expect(crossResult.isError).toBe(false);
+		expect(crossResult.details).toMatchObject({ checkoutNotice: "Edited worktree: preview (session: main)" });
+		const crossText = crossResult.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		expect(crossText).toContain("Edited worktree: preview (session: main)");
+
+		// Wrapped path header that WriteTool unwraps into details.resolvedPath
+		const wrappedResult = await handlers.write(
+			{
+				toolCallId: "cursor-wrapped",
+				path: "[../linked/lesson.txt#ABCD]",
+				fileText: "wrapped\n",
+				returnFileContentAfterWrite: false,
+				fileBytes: new Uint8Array(),
+			},
+			{ editMaterialization: true },
+		);
+		expect(wrappedResult.isError).toBe(false);
+		expect(wrappedResult.details).toMatchObject({
+			path: siblingTarget,
+			checkoutNotice: "Edited worktree: preview (session: main)",
+		});
+		const wrappedText = wrappedResult.content.map(c => (c.type === "text" ? c.text : "")).join("\n");
+		expect(wrappedText).toContain("Edited worktree: preview (session: main)");
+
+		const localResult = await handlers.write(
+			{
+				toolCallId: "cursor-local",
+				path: "lesson.txt",
+				fileText: "after\n",
+				returnFileContentAfterWrite: false,
+				fileBytes: new Uint8Array(),
+			},
+			{ editMaterialization: true },
+		);
+		expect(localResult.isError).toBe(false);
+		expect(localResult.details).toBeDefined();
+		expect(localResult.details).not.toHaveProperty("checkoutNotice");
 	});
 });

@@ -9,6 +9,7 @@ use std::{
 use gix::{
 	bstr::{BStr, BString, ByteSlice},
 	diff::blob::platform::prepare_diff::Operation,
+	error::ResultExt as _,
 };
 
 use super::{
@@ -18,7 +19,7 @@ use super::{
 };
 use crate::{
 	error::{Error, Result},
-	types::{DiffOptions, NumstatEntry, ShowResult},
+	types::{BlobChange, DiffOptions, NumstatEntry, ShowResult},
 };
 
 #[derive(Clone)]
@@ -133,10 +134,31 @@ impl GitRepo {
 			similarity: None,
 			worktree_new: false,
 		};
-		let mut cache = repo
-			.diff_resource_cache_for_tree_diff()
-			.map_err(|err| Error::backend("git diff --no-index", err))?;
-		render_change(&repo, &mut cache, &change, 3, binary, None).map(|rendered| rendered.text)
+		render_blob_change(&repo, &change, binary)
+	}
+
+	/// Render a same-path patch between blobs already stored in the object
+	/// database.
+	pub fn diff_blobs(&self, change: &BlobChange, binary: bool) -> Result<String> {
+		let repo = self.gix()?;
+		if change.old_id.is_none() && change.new_id.is_none() {
+			return Ok(String::new());
+		}
+		let null = repo.object_hash().null();
+		let change = FileChange {
+			old_path:     change.path.clone(),
+			new_path:     change.path.clone(),
+			old_id:       parse_blob_id(change.old_id.as_deref())?.unwrap_or(null),
+			new_id:       parse_blob_id(change.new_id.as_deref())?.unwrap_or(null),
+			old_mode:     parse_blob_mode(change.old_mode.as_deref())?,
+			new_mode:     parse_blob_mode(change.new_mode.as_deref())?,
+			similarity:   None,
+			worktree_new: false,
+		};
+		if change.old_id == change.new_id && change.old_mode == change.new_mode {
+			return Ok(String::new());
+		}
+		render_blob_change(&repo, &change, binary)
 	}
 
 	/// Render a commit header and its patch against its first parent.
@@ -200,6 +222,33 @@ impl GitRepo {
 		}
 		Ok(ShowResult { bytes, truncated })
 	}
+}
+
+fn parse_blob_id(id: Option<&str>) -> Result<Option<gix::ObjectId>> {
+	id.map(|id| {
+		gix::ObjectId::from_hex(id.as_bytes())
+			.map_err(|err| Error::backend("git diff blobs", format!("invalid blob id {id}: {err}")))
+	})
+	.transpose()
+}
+
+fn parse_blob_mode(mode: Option<&str>) -> Result<Option<gix::objs::tree::EntryMode>> {
+	mode
+		.map(|mode| {
+			let bits = u32::from_str_radix(mode, 8).map_err(|err| {
+				Error::backend("git diff blobs", format!("invalid mode {mode}: {err}"))
+			})?;
+			gix::objs::tree::EntryMode::try_from(bits)
+				.map_err(|_| Error::backend("git diff blobs", format!("invalid mode {mode}")))
+		})
+		.transpose()
+}
+
+fn render_blob_change(repo: &gix::Repository, change: &FileChange, binary: bool) -> Result<String> {
+	let mut cache = repo
+		.diff_resource_cache_for_tree_diff()
+		.map_err(|err| Error::backend("git diff blobs", err))?;
+	render_change(repo, &mut cache, change, 3, binary, None).map(|rendered| rendered.text)
 }
 
 fn collect_changes(repo: &gix::Repository, options: &DiffOptions) -> Result<Vec<FileChange>> {
@@ -353,8 +402,8 @@ fn index_changes(
 			index,
 			pathspec.as_mut(),
 			gix::status::tree_index::TrackRenames::AsConfigured,
-			|change, _, _| -> Result<_> {
-				out.push(index_change(repo, change.into_owned())?);
+			|change, _, _| -> gix::Result<_> {
+				out.push(index_change(repo, change.into_owned()).or_error()?);
 				Ok(std::ops::ControlFlow::Continue(()))
 			},
 		)
@@ -915,7 +964,10 @@ fn append_metadata(out: &mut String, change: &FileChange, similarity: Option<u8>
 		},
 		_ => {},
 	}
-	if change.old_id != change.new_id {
+	// Binary patches name both blobs in full even when they are equal (a
+	// mode-only change). `git apply` rejects a binary patch without that line,
+	// and the applier compares it with the blob it is about to replace.
+	if change.old_id != change.new_id || full_ids {
 		let old = display_id(change.old_id, full_ids);
 		let new = display_id(change.new_id, full_ids);
 		out.push_str("index ");
@@ -1426,7 +1478,8 @@ const BASE85: &[u8; 85] =
 	b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
 
 fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
-	let mut writer = gix::features::zlib::stream::deflate::Write::new(Vec::new());
+	let mut writer =
+		gix::zlib::stream::deflate::Write::new(Vec::new(), gix::zlib::Compression::BEST_SPEED);
 	writer
 		.write_all(data)
 		.and_then(|()| writer.flush())

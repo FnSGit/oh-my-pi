@@ -91,23 +91,35 @@ pub(crate) fn update_reference(
 /// `expected` is the commit the update started from. `actual` is the value that
 /// broke the swap; a reference that disappeared leaves it `None`, the same way
 /// an unborn HEAD is reported.
-fn head_moved_at_commit(
-	expected: gix::hash::ObjectId,
-	err: &gix::reference::edit::Error,
-) -> Option<Error> {
-	let gix::reference::edit::Error::FileTransactionPrepare(prepare) = err else {
+fn head_moved_at_commit(expected: Option<gix::hash::ObjectId>, err: &gix::Error) -> Option<Error> {
+	use gix::refs::file::transaction::prepare::{MustNotExist, ReferenceOutOfDate};
+	let actual = if let Some(ReferenceOutOfDate { actual, .. }) = err.downcast_any_ref() {
+		match actual {
+			gix::refs::Target::Object(id) => Some(id.to_hex().to_string()),
+			gix::refs::Target::Symbolic(_) => None,
+		}
+	} else if let Some(MustNotExist { actual: gix::refs::Target::Object(id), .. }) =
+		err.downcast_any_ref()
+	{
+		Some(id.to_hex().to_string())
+	} else if is_missing_reference(err) {
+		None
+	} else {
 		return None;
 	};
-	let actual = match prepare {
-		gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate {
-			actual: gix::refs::Target::Object(id),
-			..
-		} => Some(id.to_hex().to_string()),
-		gix::refs::file::transaction::prepare::Error::ReferenceOutOfDate { .. }
-		| gix::refs::file::transaction::prepare::Error::MustExist { .. } => None,
-		_ => return None,
-	};
-	Some(Error::HeadMoved { expected: expected.to_hex().to_string(), actual })
+	Some(Error::HeadMoved { expected: commit_head_label(expected), actual })
+}
+
+/// A must-exist precondition failed: gix reports it as a not-found message,
+/// unlike filesystem not-found errors, which carry an I/O error.
+fn is_missing_reference(err: &gix::Error) -> bool {
+	err.classify().any(|classification| {
+		classification.class() == gix::error::Class::NotFound && classification.io_kind().is_none()
+	})
+}
+
+fn commit_head_label(head: Option<gix::ObjectId>) -> String {
+	head.map_or_else(|| "(unborn)".into(), |id| id.to_hex().to_string())
 }
 
 impl GitRepo {
@@ -221,13 +233,42 @@ impl GitRepo {
 	/// the object is written by `git commit-tree -S` so Git runs the
 	/// configured signer; a signer failure leaves HEAD unchanged.
 	pub fn commit_create(&self, message: &str, options: &CommitOptions) -> Result<String> {
+		self
+			.commit_with_index(message, options, None)
+			.map(|(id, _)| id)
+	}
+
+	/// Publish a private-index commit and its shared-index reconciliation.
+	/// `selection` is the patch applied to the private index; overlapping
+	/// staged edits are preserved and reported. A missing expected HEAD means
+	/// the branch must be unborn.
+	pub fn commit_reconciled(
+		&self,
+		message: &str,
+		options: &CommitOptions,
+		selection: &str,
+	) -> Result<(String, Vec<String>)> {
+		if options.index_path.is_none() || !options.files.is_empty() {
+			return Err(Error::backend(
+				"git commit",
+				"reconciliation requires a complete private index",
+			));
+		}
+		self.commit_with_index(message, options, Some(selection))
+	}
+
+	fn commit_with_index(
+		&self,
+		message: &str,
+		options: &CommitOptions,
+		reconcile: Option<&str>,
+	) -> Result<(String, Vec<String>)> {
 		let repo = self.gix()?;
 		// Git rejects a malformed value before doing any work; reading it as
 		// `false` would silently write unsigned commits.
 		let sign = repo
 			.config_snapshot()
 			.try_boolean("commit.gpgSign")
-			.transpose()
 			.map_err(|err| Error::backend("git commit read commit.gpgSign", err))?
 			.unwrap_or(false);
 		let index_path = options.index_path.as_deref();
@@ -247,6 +288,9 @@ impl GitRepo {
 		// `write_index_tree`.
 		let mut index = load_index()?;
 		reject_unmerged_index(&index, "git commit")?;
+		let selected_tree = (reconcile.is_some() && !options.no_verify)
+			.then(|| write_index_tree(&repo, &index))
+			.transpose()?;
 		if !options.no_verify {
 			run_commit_hook(self, "pre-commit", &[], index_path)?;
 			// The hook may have edited the index.
@@ -267,10 +311,15 @@ impl GitRepo {
 				.detach();
 			if old_commit != Some(expected) {
 				return Err(Error::HeadMoved {
-					expected: expected.to_hex().to_string(),
+					expected: commit_head_label(Some(expected)),
 					actual:   old_commit.map(|id| id.to_hex().to_string()),
 				});
 			}
+		} else if reconcile.is_some() && old_commit.is_some() {
+			return Err(Error::HeadMoved {
+				expected: commit_head_label(None),
+				actual:   old_commit.map(|id| id.to_hex().to_string()),
+			});
 		}
 		let tree = if options.files.is_empty() {
 			write_index_tree(&repo, &index)?
@@ -348,6 +397,17 @@ impl GitRepo {
 				.map_err(|err| Error::backend("git commit", err))?
 				.id
 		};
+		let prepared_index = if let Some(selection) = reconcile {
+			let hook_patch = match selected_tree {
+				Some(selected) if selected != tree => {
+					self.diff_tree(&selected.to_hex().to_string(), &tree.to_hex().to_string(), true)?
+				},
+				_ => String::new(),
+			};
+			Some(Self::prepare_commit_index(&repo, selection, &hook_patch)?)
+		} else {
+			None
+		};
 		let expected = old_commit
 			.map_or(gix::refs::transaction::PreviousValue::MustNotExist, |old| {
 				gix::refs::transaction::PreviousValue::MustExistAndMatch(old.into())
@@ -376,13 +436,27 @@ impl GitRepo {
 			// HEAD moved after the check above, inside the hook/signing window:
 			// the swap lost, which is the `HeadMoved` this option documents, not
 			// a backend failure. Everything else keeps its backend error.
-			if let Some(moved) = old_commit.and_then(|old| head_moved_at_commit(old, &err)) {
+			if let Some(moved) = head_moved_at_commit(old_commit, &err) {
 				return Err(moved);
 			}
 			return Err(Error::backend("git commit", err));
 		}
+		let notes = if let Some((lock, mut notes)) = prepared_index {
+			// As in Git, publish the written index after the ref swap succeeds.
+			// A failed swap drops the lock and leaves the original index in place.
+			if let Err(err) = lock.commit() {
+				notes.push(format!(
+					"Commit {id} was published, but the prepared shared index could not be installed \
+					 ({}); inspect `git diff --cached` before committing again.",
+					err.error
+				));
+			}
+			notes
+		} else {
+			Vec::new()
+		};
 		let _ = run_commit_hook(self, "post-commit", &[], index_path);
-		Ok(id.to_hex().to_string())
+		Ok((id.to_hex().to_string(), notes))
 	}
 
 	/// Write a commit object for `tree` on top of `parents` without touching
@@ -665,6 +739,15 @@ impl GitRepo {
 		index
 			.write(INDEX_WRITE)
 			.map_err(|e| Error::backend("git read-tree", e))
+	}
+
+	/// Write bytes as a blob and return its full object id.
+	pub fn write_blob(&self, bytes: &[u8]) -> Result<String> {
+		self
+			.gix()?
+			.write_blob(bytes)
+			.map(|id| id.detach().to_hex().to_string())
+			.map_err(|err| Error::backend("git write blob", err))
 	}
 
 	/// Seed a private index from `treeish`, retaining the shared index's
@@ -1244,12 +1327,7 @@ fn hook_configured(repository: &GitRepo, name: &str) -> Result<bool> {
 		.sections_by_name("hook")
 		.into_iter()
 		.flatten()
-		.any(|section| {
-			section
-				.values("event")
-				.iter()
-				.any(|event| event.as_ref() == name)
-		}))
+		.any(|section| section.values("event").iter().any(|event| event == name)))
 }
 
 /// Write a signed commit object through `git commit-tree -S`, which runs the
@@ -1765,7 +1843,7 @@ struct TreeNode {
 
 /// Refuse to serialize `index` while any entry is still at a conflict stage.
 /// A tree can store only stage 0; dropping stages 1-3 deletes that path.
-fn reject_unmerged_index(index: &gix::index::File, context: &'static str) -> Result<()> {
+pub(super) fn reject_unmerged_index(index: &gix::index::File, context: &'static str) -> Result<()> {
 	let mut paths = BTreeSet::new();
 	for entry in index.entries() {
 		if entry.stage() != gix::index::entry::Stage::Unconflicted {
@@ -2263,7 +2341,7 @@ fn prune_nonrelocatable_clone_dirs(
 			} else if is_dotenv(&entry.file_name()) {
 				let path = entry.path();
 				let relative = path.strip_prefix(root).expect("cloned entry is under root");
-				let tracked = gix::path::try_into_bstr(relative).is_ok_and(|key| {
+				let tracked = gix::path::into_bstr(relative).is_ok_and(|key| {
 					index
 						.entry_by_path(&gix::path::to_unix_separators_on_windows(key))
 						.is_some()
@@ -2710,7 +2788,7 @@ mod tests {
 		let head = git(temp.path(), &["rev-parse", "HEAD"]);
 		let id = repo
 			.commit_create("alt", &CommitOptions {
-				index_path: Some(alt.clone()),
+				index_path: Some(alt),
 				expected_head: Some(head),
 				..Default::default()
 			})

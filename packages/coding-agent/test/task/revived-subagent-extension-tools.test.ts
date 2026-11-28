@@ -211,7 +211,7 @@ async function spawnAndPark() {
 				settings,
 				enableLsp: false,
 			})(ref);
-			if (!reviver) throw new Error("Expected a persisted reviver");
+			if (typeof reviver !== "function") throw new Error("Expected a persisted reviver");
 			return localSession(await reviver(ref));
 		},
 		/** Wakes `session` with an IRC message, as a peer would, and returns the wake's first request. */
@@ -304,14 +304,14 @@ it("cold-revives with the tools an extension registered at its first turn", asyn
 	}
 }, 30_000);
 
-it("cold-revives with the tools and devices it was parked with", async () => {
+it("cold-revives with the mounted tool commands it was parked with", async () => {
 	const run = await spawnAndPark();
 	let revived: AgentSession | undefined;
 	try {
 		revived = await run.coldRevive();
 		const wake = await run.wake(revived);
 
-		// Tools the spawn mounted as `xd://` devices stay devices: a top-level copy changes the tool list.
+		// Mounted tool commands the spawn registered stay commands: a top-level copy changes the tool list.
 		expect(wake.tools).toEqual(run.parked.tools);
 		expect(wake.systemPrompt).toEqual(run.parked.systemPrompt);
 	} finally {
