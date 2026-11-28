@@ -20,7 +20,7 @@ That's it: nothing needs starting. The relay is up whenever Chrome runs with the
 
 ### Updates
 
-Loading the folder the first time is the one step that stays manual: Chrome gives programs no way to add an unpacked extension to a profile. `omp browser-relay install` checks every Chrome, Chromium and Brave profile on the machine. It prints that step only when no profile has the folder loaded, and skips the Developer mode part when a profile already has it on.
+Loading the folder the first time is the one step that stays manual: browsers give programs no way to add an unpacked extension to a profile. `omp browser-relay install` checks every Chrome, Chromium, Brave and Edge profile on the machine. It prints that step only when no profile has the folder loaded, and skips the Developer mode part when a profile already has it on.
 
 After that, updates need no action. omp keeps registered folders current: `omp update`, the first launch of a new version or rebuilt source checkout, `install`, and `omp browser-relay sync` all rewrite them. Each write asks the running relay to recheck. When the extension runs a different build from the one in its folder, the relay reloads it once it is idle. A relay newer than the extension also rewrites the folder itself. Chrome keeps the extension's ID, settings and _Allow access to file URLs_ through the reload because the ID comes from the folder path; the manifest deliberately carries no `key`. Run `omp browser-relay install --dir <folder>` once for any custom unpacked directory that isn't registered yet. That also adds the folder's ID to the native host's allowed origins.
 

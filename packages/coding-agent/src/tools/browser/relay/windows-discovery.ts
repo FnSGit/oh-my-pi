@@ -12,13 +12,19 @@ const PROBE_OUTPUT_LIMIT = 1024;
 const WINDOWS_RELAY_PROBE = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Google\Chrome\NativeMessagingHosts\' + '${NATIVE_HOST}')
-if (!$key) { return }
-try {
-  $manifest = $key.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-} finally {
-  $key.Dispose()
+$manifest = $null
+foreach ($vendor in @('Google\Chrome', 'Microsoft\Edge')) {
+  $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\$vendor\NativeMessagingHosts\" + '${NATIVE_HOST}')
+  if ($key) {
+    try {
+      $manifest = $key.GetValue('', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally {
+      $key.Dispose()
+    }
+    if ($manifest) { break }
+  }
 }
+if (!$manifest) { return }
 # Reject UNC, device, relative and ADS paths before looking up any filesystem entry.
 if ($manifest -isnot [string] -or $manifest -cnotmatch '\A[A-Za-z]:\\[^/:<>"|?*\x00-\x1f]+\z') { return }
 $parts = $manifest.Substring(3).Split('\')

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { findUnpackedInstalls } from "../../src/tools/browser/relay/chromium-profiles";
+import { findUnpackedInstalls, lastUsedProfile } from "../../src/tools/browser/relay/chromium-profiles";
 
 const ID = "abcdefghijklmnopabcdefghijklmnop";
 
@@ -88,5 +88,31 @@ describe("findUnpackedInstalls", () => {
 				developerMode: false,
 			},
 		]);
+	});
+});
+
+describe("lastUsedProfile", () => {
+	it("prefers the browser's own last-used profile", async () => {
+		await localState("Microsoft Edge", { Default: "Personal", "Profile 1": "Work" });
+		await Bun.write(
+			home.join("Library/Application Support/Microsoft Edge/Local State"),
+			JSON.stringify({ profile: { last_used: "Profile 1", info_cache: { Default: {}, "Profile 1": {} } } }),
+		);
+		await profile("Microsoft Edge", "Profile 1", { prefs: {} });
+
+		expect(await lastUsedProfile(home.join("Library/Application Support/Microsoft Edge"))).toBe("Profile 1");
+	});
+
+	it("falls back to the first profile that exists when no last-used is recorded", async () => {
+		// Edge names its first profile after the account and `Local State` is unreadable
+		// where the data directory is TCC-protected, so `Default` is not a safe fallback.
+		await localState("Microsoft Edge", { "Profile 1": "Work" });
+		await profile("Microsoft Edge", "Profile 1", { prefs: {} });
+
+		expect(await lastUsedProfile(home.join("Library/Application Support/Microsoft Edge"))).toBe("Profile 1");
+	});
+
+	it("keeps Default when the state file is absent", async () => {
+		expect(await lastUsedProfile(home.join("Library/Application Support/Chromium"))).toBe("Default");
 	});
 });

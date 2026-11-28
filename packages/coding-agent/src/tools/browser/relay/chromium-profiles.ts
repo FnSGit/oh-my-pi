@@ -83,6 +83,46 @@ const BROWSERS: readonly BrowserDefinition[] = [
 		winInstall: "BraveSoftware\\Brave-Browser",
 		keychain: "Brave Safe Storage",
 	},
+	{
+		name: "Microsoft Edge",
+		darwin: "Microsoft Edge",
+		linux: "microsoft-edge",
+		win32: "Microsoft/Edge/User Data",
+		app: "Microsoft Edge.app",
+		bundleId: "com.microsoft.edgemac",
+		winInstall: "Microsoft\\Edge",
+		keychain: "Microsoft Edge Safe Storage",
+	},
+	{
+		name: "Microsoft Edge Beta",
+		darwin: "Microsoft Edge Beta",
+		linux: "microsoft-edge-beta",
+		win32: "Microsoft/Edge Beta/User Data",
+		app: "Microsoft Edge Beta.app",
+		bundleId: "com.microsoft.edgemac.beta",
+		winInstall: "Microsoft\\Edge Beta",
+		keychain: "Microsoft Edge Safe Storage",
+	},
+	{
+		name: "Microsoft Edge Dev",
+		darwin: "Microsoft Edge Dev",
+		linux: "microsoft-edge-dev",
+		win32: "Microsoft/Edge Dev/User Data",
+		app: "Microsoft Edge Dev.app",
+		bundleId: "com.microsoft.edgemac.dev",
+		winInstall: "Microsoft\\Edge Dev",
+		keychain: "Microsoft Edge Safe Storage",
+	},
+	{
+		name: "Microsoft Edge Canary",
+		darwin: "Microsoft Edge Canary",
+		linux: "microsoft-edge-canary",
+		win32: "Microsoft/Edge SxS/User Data",
+		app: "Microsoft Edge Canary.app",
+		bundleId: "com.microsoft.edgemac.canary",
+		winInstall: "Microsoft\\Edge SxS",
+		keychain: "Microsoft Edge Safe Storage",
+	},
 ];
 
 /** Where to look for browser user data; each defaults to this user's. */
@@ -271,15 +311,21 @@ export async function installedChromiumBrowsers(options: ChromiumLocations = {})
 	return installed;
 }
 
-/** The profile Chrome itself used last, falling back to `Default`. */
+/** The profile Chrome itself used last, falling back to the first profile that exists. */
 export async function lastUsedProfile(userDataDir: string): Promise<string> {
 	const state = await readJson(path.join(userDataDir, "Local State"));
-	const lastUsed =
-		isRecord(state) && isRecord(state.profile) && typeof state.profile.last_used === "string"
-			? state.profile.last_used
-			: undefined;
+	const profile = isRecord(state) && isRecord(state.profile) ? state.profile : undefined;
+	const lastUsed = typeof profile?.last_used === "string" ? profile.last_used : undefined;
 	if (lastUsed && (await Bun.file(path.join(userDataDir, lastUsed, "Preferences")).exists())) {
 		return lastUsed;
+	}
+	// `Default` is not guaranteed: Edge names its first profile after the account. Where the browser's
+	// data directory is TCC-protected, `Local State` is unreadable and scandir reports EPERM, so the
+	// known profile names are probed directly — a stat on a resolved path still works.
+	const infoCache = isRecord(profile?.info_cache) ? Object.keys(profile.info_cache) : undefined;
+	const candidates = infoCache ?? ["Default", "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"];
+	for (const candidate of candidates) {
+		if (await Bun.file(path.join(userDataDir, candidate, "Preferences")).exists()) return candidate;
 	}
 	return "Default";
 }

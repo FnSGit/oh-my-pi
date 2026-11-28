@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getBrowserRelayInstallRegistryFile, isEnoent } from "@oh-my-pi/pi-utils";
+import { getBrowserRelayInstallRegistryFile, hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { resolveCliEntryCmd } from "../../../subprocess/worker-client";
 import { writeFileAtomically } from "../../../utils/atomic-file";
@@ -8,7 +8,10 @@ import { quotePosixArgv } from "../../../utils/shell-quote";
 import { chromiumUserDataDirs } from "./chromium-profiles";
 import { NATIVE_HOST } from "./protocol";
 
-const CHROME_REGISTRY_KEY = `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${NATIVE_HOST}`;
+const REGISTRY_KEYS: readonly string[] = [
+	`HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${NATIVE_HOST}`,
+	`HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${NATIVE_HOST}`,
+];
 
 /** Locations and executable used to install the host for this user. */
 export interface RelayNativeHostOptions {
@@ -82,7 +85,11 @@ function manifestText(launcher: string, extensionIds: readonly string[]): string
 
 /**
  * Materialize the launcher and manifests admitting `extensionIds` (each install folder's path-derived id); the
- * Windows manifest must also be registered in HKCU.
+ Windows manifest must also be registered in HKCU.
+
+ * A browser directory that cannot be created or written is skipped rather than aborting the others: macOS 27
+ * extends TCC protection to browser data directories, so a machine without that browser reports EPERM for its
+ * whole tree while the browsers it does have stay installable. The return value lists only the targets written.
  */
 export async function writeRelayNativeHost(
 	extensionIds: readonly string[],
@@ -93,22 +100,34 @@ export async function writeRelayNativeHost(
 	await fs.mkdir(dir, { recursive: true });
 	await writeLauncher(launcher, platform, options.command ?? resolveCliEntryCmd());
 	const content = manifestText(launcher, extensionIds);
-	await Promise.all(
+	const written = await Promise.all(
 		targets.map(async target => {
-			await fs.mkdir(path.dirname(target), { recursive: true });
-			await writeFileAtomically(target, content);
+			try {
+				await fs.mkdir(path.dirname(target), { recursive: true });
+				await writeFileAtomically(target, content);
+				return target;
+			} catch (error) {
+				if (isEacces(error) || hasFsCode(error, "EPERM")) {
+					logger.warn("browser relay native host target unwritable", { target });
+					return null;
+				}
+				throw error;
+			}
 		}),
 	);
-	return targets;
+	return written.filter((target): target is string => target !== null);
 }
 
 /** Install the native host manifest admitting `extensionIds` where the user's Chromium browsers look for it. */
 export async function registerRelayNativeHost(extensionIds: readonly string[]): Promise<void> {
 	const [manifest] = await writeRelayNativeHost(extensionIds);
 	if (process.platform !== "win32" || !manifest) return;
-	const result = await $`reg.exe add ${CHROME_REGISTRY_KEY} /ve /t REG_SZ /d ${manifest} /f`.quiet().nothrow();
-	if (result.exitCode !== 0) {
-		throw new Error(`Could not register the omp native messaging host: ${result.stderr.toString().trim()}`);
+	// Edge reads its own key; a manifest registered only under Chrome's is invisible to it.
+	for (const key of REGISTRY_KEYS) {
+		const result = await $`reg.exe add ${key} /ve /t REG_SZ /d ${manifest} /f`.quiet().nothrow();
+		if (result.exitCode !== 0) {
+			throw new Error(`Could not register the omp native messaging host: ${result.stderr.toString().trim()}`);
+		}
 	}
 }
 
@@ -126,13 +145,18 @@ export async function refreshRelayNativeHost(
 	const content = manifestText(launcher, extensionIds);
 	await Promise.all(
 		targets.map(async target => {
-			const prior = await Bun.file(target)
-				.text()
-				.catch((error: unknown) => {
-					if (isEnoent(error)) return null;
-					throw error;
-				});
-			if (prior !== null && prior !== content) await writeFileAtomically(target, content);
+			try {
+				const prior = await Bun.file(target)
+					.text()
+					.catch((error: unknown) => {
+						if (isEnoent(error)) return null;
+						throw error;
+					});
+				if (prior !== null && prior !== content) await writeFileAtomically(target, content);
+			} catch (error) {
+				if (isEacces(error) || hasFsCode(error, "EPERM")) return;
+				throw error;
+			}
 		}),
 	);
 }

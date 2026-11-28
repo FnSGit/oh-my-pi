@@ -4,6 +4,7 @@
  * user-facing output.
  */
 
+import { hasFsCode, isEacces } from "@oh-my-pi/pi-utils";
 import { findUnpackedInstalls } from "../tools/browser/relay/chromium-profiles";
 import { defaultRelayExtensionDir, extensionIdForPath } from "../tools/browser/relay/extension-files";
 import { installRelayExtension, registeredRelayExtensionIds, syncRelayInstalls } from "../tools/browser/relay/installs";
@@ -72,9 +73,15 @@ async function runInstall(args: BrowserRelayCommandArgs): Promise<void> {
 				dir,
 				profile: args.profile,
 			}).catch((error: unknown) => {
-				console.error(
-					`Could not register the extension in Chrome: ${error instanceof Error ? error.message : String(error)}`,
-				);
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(`Could not register the extension in Chrome: ${message}`);
+				// macOS 27 extends TCC protection to browser data directories: reading a
+				// profile's preferences needs Full Disk Access, which only the user can grant.
+				if (hasFsCode(error, "EPERM") || isEacces(error)) {
+					console.error(
+						"Grant Full Disk Access to this terminal (System Settings → Privacy & Security → Full Disk Access), then run this command again; or load the extension by hand in chrome://extensions / edge://extensions.",
+					);
+				}
 				return [];
 			});
 			for (const installed of report) {
@@ -110,9 +117,9 @@ async function runInstall(args: BrowserRelayCommandArgs): Promise<void> {
 	}
 	const developerMode = profiles.some(profile => profile.developerMode);
 	console.log("");
-	console.log("No Chrome profile has it loaded yet. Chrome reserves that for you, once:");
+	console.log("No browser profile has it loaded yet. Chrome and Edge reserve that for you, once:");
 	console.log(
-		`  open chrome://extensions${developerMode ? "" : ", turn on Developer mode"}, click "Load unpacked" and pick ${dir}`,
+		`  open chrome://extensions or edge://extensions${developerMode ? "" : ", turn on Developer mode"}, click "Load unpacked" and pick ${dir}`,
 	);
 	console.log(
 		"From then on omp updates and reloads it by itself. Its toolbar badge shows 'on' while its native host serves the relay.",

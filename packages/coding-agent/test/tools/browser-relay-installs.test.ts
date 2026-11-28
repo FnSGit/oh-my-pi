@@ -262,6 +262,10 @@ describe("Chrome native host install", () => {
 				"Google/Chrome Canary",
 				"Chromium",
 				"BraveSoftware/Brave-Browser",
+				"Microsoft Edge",
+				"Microsoft Edge Beta",
+				"Microsoft Edge Dev",
+				"Microsoft Edge Canary",
 			].map(browser => `Library/Application Support/${browser}/NativeMessagingHosts`),
 		},
 		{
@@ -273,6 +277,10 @@ describe("Chrome native host install", () => {
 				"google-chrome-canary",
 				"chromium",
 				"BraveSoftware/Brave-Browser",
+				"microsoft-edge",
+				"microsoft-edge-beta",
+				"microsoft-edge-dev",
+				"microsoft-edge-canary",
 			].map(browser => `.config/${browser}/NativeMessagingHosts`),
 		},
 		{ platform: "win32", roots: [".omp/browser-relay"] },
@@ -324,6 +332,55 @@ describe("Chrome native host install", () => {
 			expect(await launcher.exited).toBe(0);
 		},
 	);
+
+	it("skips a browser directory the OS refuses to write and still installs the rest", async () => {
+		const dir = home.join(".omp/browser-relay");
+		// macOS 27 extends TCC protection to browser data directories: a browser the
+		// machine does not have reports EPERM for its whole tree, which must not
+		// abort the install for the browsers that are there.
+		const blocked = home.join("Library/Application Support/BraveSoftware");
+		await fs.mkdir(blocked, { recursive: true });
+		const realMkdir = fs.mkdir;
+		const blockedPaths = new Set([
+			blocked,
+			`${blocked}/Brave-Browser`,
+			`${blocked}/Brave-Browser/NativeMessagingHosts`,
+		]);
+		const mkdir = spyOn(fs, "mkdir").mockImplementation(async (target, options) => {
+			if (typeof target === "string" && blockedPaths.has(target)) {
+				throw Object.assign(new Error(`EPERM: operation not permitted, mkdir '${target}'`), {
+					code: "EPERM",
+					errno: -1,
+					syscall: "mkdir",
+				});
+			}
+			await realMkdir(target as string, options);
+		});
+		try {
+			const targets = await writeRelayNativeHost(["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], {
+				platform: "darwin",
+				home: home.path(),
+				dir,
+				command: [process.execPath],
+			});
+			expect(targets).toEqual(
+				[
+					"Google/Chrome",
+					"Google/Chrome Beta",
+					"Google/Chrome Dev",
+					"Google/Chrome Canary",
+					"Chromium",
+					"Microsoft Edge",
+					"Microsoft Edge Beta",
+					"Microsoft Edge Dev",
+					"Microsoft Edge Canary",
+				].map(browser => home.join(`Library/Application Support/${browser}/NativeMessagingHosts/${MANIFEST}`)),
+			);
+			expect(mkdir).toHaveBeenCalled();
+		} finally {
+			mkdir.mockRestore();
+		}
+	});
 });
 
 it.skipIf(process.platform === "win32")(
