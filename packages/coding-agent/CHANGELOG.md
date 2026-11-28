@@ -484,6 +484,9 @@
 
 - Removed `fileToUri`, `uriToFile`, and `EquivalentUriMap` from `@oh-my-pi/pi-coding-agent/lsp/utils`; import them from `@oh-my-pi/pi-coding-agent/lsp/uri` instead.
 - Hindsight forks now retain only turns added by the fork, rather than the inherited parent transcript.
+### Fixed
+
+- Office documents whose OOXML parts use namespaced element names or package-absolute relationship targets now read instead of returning no content.
 
 ## [19.1.1] - 2026-11-23
 
